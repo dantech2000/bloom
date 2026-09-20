@@ -6,7 +6,7 @@ use gpui_icons::LucideIcon;
 use gpui_kit::{
     Context, Div, InteractiveElement as _, ObjectFit, ParentElement as _, Stateful,
     StatefulInteractiveElement as _, Styled, StyledImage as _, Window, canvas, div, img,
-    prelude::FluentBuilder as _, px,
+    linear_color_stop, linear_gradient, prelude::FluentBuilder as _, px,
 };
 
 use crate::{
@@ -121,13 +121,28 @@ impl Jellyui {
                 .child("Subtitles"),
         );
 
+        // Controls overlay the video and fade with pointer activity.
+        let visibility = crate::ui::theme::transition_value(
+            "player.controls-opacity",
+            if self.controls_visible { 1. } else { 0. },
+            t.motion.normal,
+            window,
+            cx,
+        );
         let controls = div()
-            .flex_shrink_0()
-            .w_full()
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
             .px(px(20.))
-            .pt(px(10.))
+            .pt(px(28.))
             .pb(px(14.))
-            .bg(gpui_kit::black().alpha(0.72))
+            .opacity(visibility)
+            .bg(linear_gradient(
+                180.,
+                linear_color_stop(gpui_kit::black().alpha(0.0), 0.0),
+                linear_color_stop(gpui_kit::black().alpha(0.85), 1.0),
+            ))
             .flex()
             .flex_col()
             .gap(px(8.))
@@ -212,6 +227,7 @@ impl Jellyui {
 
         let close = div()
             .absolute()
+            .opacity(visibility)
             .top(px(12.))
             .left(px(if fullscreen { 12. } else { 84. }))
             .child(
@@ -255,8 +271,16 @@ impl Jellyui {
             .on_click(cx.listener(|this, _, window, cx| {
                 window.focus(&this.player_focus, cx);
             }))
+            .on_mouse_move(cx.listener(|this, _, _, cx| {
+                let was_hidden = !this.controls_visible;
+                this.show_controls();
+                if was_hidden {
+                    cx.notify();
+                }
+            }))
             .child(surface)
-            .child(controls)
-            .child(close)
+            .when(self.controls_visible || visibility > 0., |el| {
+                el.child(controls).child(close)
+            })
     }
 }

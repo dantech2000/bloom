@@ -176,7 +176,9 @@ impl Jellyui {
                         .size(ButtonSize::Lg)
                         .child(icon(LucideIcon::Play, 16., t.colors.primary_foreground))
                         .label(format!("Resume from {}", format_duration(resume_at)))
-                        .on_click(cx.listener(move |this, _, _, cx| this.play(&target, true, cx))),
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.play(&target, true, window, cx)
+                        })),
                 );
                 let target = item.clone();
                 row = row.child(
@@ -189,7 +191,9 @@ impl Jellyui {
                             t.colors.secondary_foreground,
                         ))
                         .label("Play from start")
-                        .on_click(cx.listener(move |this, _, _, cx| this.play(&target, false, cx))),
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.play(&target, false, window, cx)
+                        })),
                 );
             } else {
                 let target = item.clone();
@@ -198,7 +202,9 @@ impl Jellyui {
                         .size(ButtonSize::Lg)
                         .child(icon(LucideIcon::Play, 16., t.colors.primary_foreground))
                         .label("Play")
-                        .on_click(cx.listener(move |this, _, _, cx| this.play(&target, false, cx))),
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.play(&target, false, window, cx)
+                        })),
                 );
             }
         }
@@ -374,6 +380,8 @@ fn episode_row(ep: &Item, client: &Client, cx: &mut Context<Jellyui>) -> Statefu
                     "Play episode"
                 })
                 .child(icon(LucideIcon::Play, 15., t.colors.secondary_foreground))
-                .on_click(cx.listener(move |this, _, _, cx| this.play(&play, resume, cx))),
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.play(&play, resume, window, cx)),
+                ),
         )
 }

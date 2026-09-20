@@ -30,6 +30,8 @@ pub const POSTER_H: f32 = 222.;
 pub const WIDE_W: f32 = 264.;
 pub const WIDE_H: f32 = 148.;
 pub const PAGE_SIZE: usize = 100;
+/// Pointer idle time before the player controls fade out.
+const CONTROLS_HIDE_AFTER: Duration = Duration::from_millis(2500);
 
 pub fn theme(dark: bool) -> UiTheme {
     let mut t = if dark {
@@ -151,6 +153,9 @@ pub struct Jellyui {
     pub subtitle_menu: Entity<MenuState>,
     tracks_version: u64,
     pub player_focus: FocusHandle,
+    /// Whether the player overlay controls are shown; hidden after pointer idle.
+    pub controls_visible: bool,
+    last_pointer_activity: std::time::Instant,
     generation: u64,
     _subscriptions: Vec<gpui_kit::Subscription>,
 }
@@ -212,6 +217,8 @@ impl Jellyui {
             subtitle_menu,
             tracks_version: 0,
             player_focus: cx.focus_handle(),
+            controls_visible: true,
+            last_pointer_activity: std::time::Instant::now(),
             generation: 0,
             _subscriptions: subscriptions,
         };
@@ -741,7 +748,7 @@ impl Jellyui {
 
     // ----- playback ---------------------------------------------------------
 
-    pub fn play(&mut self, item: &Item, resume: bool, cx: &mut Context<Self>) {
+    pub fn play(&mut self, item: &Item, resume: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = &self.session else { return };
         let start_secs = if resume { item.resume_secs() } else { 0 };
         self.player.play(PlayRequest {
@@ -753,10 +760,27 @@ impl Jellyui {
         });
         self.player_status = self.player.status();
         self.player_open = true;
+        window.focus(&self.player_focus, cx);
+        self.show_controls();
         self.tracks_version = 0;
         self.rebuild_track_menus(cx);
         self.start_player_poll(cx);
         cx.notify();
+    }
+
+    /// Called on pointer activity over the video; controls hide again after a delay.
+    pub fn show_controls(&mut self) {
+        self.last_pointer_activity = std::time::Instant::now();
+        self.controls_visible = true;
+    }
+
+    /// Controls stay while paused, buffering, scrubbing, or when a track menu is open.
+    fn controls_pinned(&self, cx: &App) -> bool {
+        self.player_status.paused
+            || self.player_status.state != PlayState::Playing
+            || self.scrubbing
+            || self.audio_menu.read(cx).is_open()
+            || self.subtitle_menu.read(cx).is_open()
     }
 
     pub fn close_player_view(&mut self, cx: &mut Context<Self>) {
@@ -888,7 +912,11 @@ impl Jellyui {
                             this.player_status = this.player.status();
                             this.load_page(cx);
                         }
-                        if changed || ended {
+                        let idle = this.last_pointer_activity.elapsed() > CONTROLS_HIDE_AFTER;
+                        let should_show = !this.player_open || !idle || this.controls_pinned(cx);
+                        let controls_changed = should_show != this.controls_visible;
+                        this.controls_visible = should_show;
+                        if changed || ended || controls_changed {
                             cx.notify();
                         }
                         !ended
