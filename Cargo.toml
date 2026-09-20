@@ -1,0 +1,39 @@
+[package]
+name = "jellyui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "AGPL-3.0-or-later"
+description = "A native Jellyfin client built with GPUI and libmpv"
+
+[dependencies]
+web-time = "1.1"
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.4", features = ["font-kit"] }
+gpui-icons = { git = "https://github.com/devaryakjha/gpui-icons", rev = "01ac07dd83e97f9d6a3526466413732fbdfc2975" }
+gpui-kit = { version = "=0.6.1", default-features = false }
+
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", features = ["json"] }
+dirs = "6"
+uuid = { version = "1", features = ["v4"] }
+log = "0.4"
+env_logger = "0.11"
+libmpv2 = "6"
+image = { version = "0.25", default-features = false }
+smallvec = "1"
+libmpv2-sys = "4"
+
+[dev-dependencies]
+gpui-kit = { version = "=0.6.1", default-features = false, features = ["test-support"] }
+
+[profile.dev.package]
+gpui-pre = { opt-level = 3 }
+gpui-component = { opt-level = 3 }
+gpui-kit = { opt-level = 3 }
+gpui-pre-macros = { opt-level = 3 }
+gpui-pre-platform = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+taffy = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }
