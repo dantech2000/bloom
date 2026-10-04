@@ -1,0 +1,23 @@
+#!/bin/sh
+# Starts a second, separate instance for tests, so the instance the user runs
+# is not restarted, driven, or muted by a test. It does not write the config.
+# Drive it with:  BLOOM_DEBUG_SOCK=/tmp/bloom-test.sock dev/jctl <command>
+# Stop it with:   dev/run-test stop
+# BLOOM_TEST_NAME=<name> gives the instance its own files
+# (/tmp/bloom-<name>.sock, .pid, .log), so several tests can run at once.
+# With BLOOM_CONFIG_PATH set, the instance uses (and may write) that config.
+dir=$(cd "$(dirname "$0")/.." && pwd)
+name=${BLOOM_TEST_NAME:-test}
+[ -f /tmp/bloom-$name.pid ] && kill "$(cat /tmp/bloom-$name.pid)" 2>/dev/null
+rm -f /tmp/bloom-$name.pid
+[ "$1" = stop ] && exit 0
+sleep 1
+[ -n "$BLOOM_CONFIG_PATH" ] || export BLOOM_CONFIG_READONLY=1
+# A test instance starts muted and stays muted; the user may be at the Mac.
+export BLOOM_MUTED=1
+# The window shows "TEST INSTANCE" with this name.
+export BLOOM_TEST_NAME=$name
+BLOOM_DEBUG_SOCK=/tmp/bloom-$name.sock RUST_LOG=${RUST_LOG:-bloom=info} RUST_BACKTRACE=1 \
+  nohup "$dir/target/release/bloom" > /tmp/bloom-$name.log 2>&1 &
+echo $! > /tmp/bloom-$name.pid
+sleep "${1:-5}"

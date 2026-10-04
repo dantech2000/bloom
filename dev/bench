@@ -1,0 +1,7 @@
+#!/bin/sh
+# Measures render cost of the running app for N seconds (default 15).
+# Usage: dev/bench [seconds]   (start the app with dev/run first)
+dir=$(cd "$(dirname "$0")" && pwd)
+"$dir/jctl" perf >/dev/null
+sleep "${1:-15}"
+"$dir/jctl" perf

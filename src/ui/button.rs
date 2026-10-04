@@ -115,6 +115,7 @@ pub struct Button {
     aria_label: Option<SharedString>,
     on_click: Option<ButtonClickHandler>,
     style_with: Option<ButtonStyleHandler>,
+    tooltip: Option<Rc<dyn Fn(&mut Window, &mut App) -> gpui_kit::AnyView>>,
     children: Vec<AnyElement>,
 }
 
@@ -130,6 +131,7 @@ impl Button {
             aria_label: None,
             on_click: None,
             style_with: None,
+            tooltip: None,
             children: Vec::new(),
         }
     }
@@ -175,6 +177,15 @@ impl Button {
         self
     }
 
+    /// Shows a view when the pointer rests on the Button; see `ui::tip::tip`.
+    pub fn tooltip(
+        mut self,
+        build: impl Fn(&mut Window, &mut App) -> gpui_kit::AnyView + 'static,
+    ) -> Self {
+        self.tooltip = Some(Rc::new(build));
+        self
+    }
+
     /// Replaces the visual styling while retaining button interaction.
     /// Include a visible keyboard focus treatment in custom styles.
     pub fn style_with(mut self, handler: impl Fn(BaseButton) -> BaseButton + 'static) -> Self {
@@ -206,6 +217,11 @@ impl RenderOnce for Button {
         }
         if let Some(handler) = self.on_click {
             root = root.on_click(move |event, window, cx| handler(event, window, cx));
+        }
+        if let Some(build) = self.tooltip {
+            root = gpui_kit::StatefulInteractiveElement::tooltip(root, move |window, cx| {
+                build(window, cx)
+            });
         }
 
         root

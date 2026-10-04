@@ -26,6 +26,11 @@ pub struct MenuItem {
     handler: Option<Handler>,
     children: Vec<MenuItem>,
     separator: bool,
+    /// A heading: small, quiet text over a group of entries.
+    heading: bool,
+    icon: Option<LucideIcon>,
+    /// A second, quiet line under the label.
+    detail: Option<SharedString>,
 }
 impl MenuItem {
     /// Creates an action with a caller-owned ID, unique within this menu tree.
@@ -40,7 +45,20 @@ impl MenuItem {
             handler: None,
             children: Vec::new(),
             separator: false,
+            heading: false,
+            icon: None,
+            detail: None,
         }
+    }
+    /// Shows an icon before the label.
+    pub fn icon(mut self, icon: LucideIcon) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+    /// Shows a second, quiet line under the label.
+    pub fn detail(mut self, text: impl Into<SharedString>) -> Self {
+        self.detail = Some(text.into());
+        self
     }
     /// Disables interaction and applies the disabled appearance.
     pub fn disabled(mut self, value: bool) -> Self {
@@ -82,6 +100,11 @@ impl MenuItem {
         item
     }
     /// Creates a non-interactive separator between menu entries.
+    /// The text of an entry, for the debug channel; none for a separator.
+    pub fn debug_label(&self) -> Option<String> {
+        (!self.separator).then(|| self.label.to_string())
+    }
+
     pub fn separator() -> Self {
         let mut item = Self::new("separator", "");
         item.separator = true;
@@ -89,7 +112,9 @@ impl MenuItem {
     }
     /// Creates a non-interactive menu heading.
     pub fn label(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Self {
-        Self::new(id, label).disabled(true)
+        let mut item = Self::new(id, label).disabled(true);
+        item.heading = true;
+        item
     }
     fn enabled(&self) -> bool {
         !self.disabled && !self.separator
@@ -182,6 +207,23 @@ impl MenuState {
         self.highlighted = vec![self.items.iter().position(MenuItem::enabled)];
         self.focus.focus(window, cx);
         cx.notify();
+    }
+    /// Opens the menu at its trigger with the submenu of the entry with
+    /// this label shown, as a hover over the entry does.
+    pub fn open_submenu(&mut self, label: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.open(window, cx);
+        if let Some(index) = self
+            .items
+            .iter()
+            .position(|item| item.label == label && !item.children.is_empty())
+        {
+            self.path = vec![index];
+            self.highlighted = vec![
+                Some(index),
+                self.items[index].children.iter().position(MenuItem::enabled),
+            ];
+            cx.notify();
+        }
     }
     /// Closes and optionally restores the prior context focus or menu trigger.
     pub fn close(&mut self, restore: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -350,8 +392,14 @@ impl Focusable for MenuState {
     }
 }
 impl Render for MenuState {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = UiTheme::read(cx).clone();
+        // A menu is as tall as its entries, up to the room it has: under
+        // its trigger or over it, whichever is more, so it does not cover
+        // the trigger. A fixed limit cut the last entry of a long menu off.
+        let window_h = f32::from(window.viewport_size().height);
+        let (top, bottom) = (f32::from(self.anchor.top()), f32::from(self.anchor.bottom()));
+        let beside_trigger = (window_h - bottom).max(top) - 24.;
         let mut root = div()
             .id(("menu", cx.entity_id()))
             .track_focus(&self.focus)
@@ -375,21 +423,43 @@ impl Render for MenuState {
                 )
                     .into()
             };
-            let mut popup = div()
+            // The entries scroll inside the padding of the card, so a long
+            // list ends at the same distance from the edge on every side.
+            let mut list = div()
+                .id((popup_id.clone(), "entries"))
+                .max_h(gpui_kit::px(
+                    if depth == 0 && !self.pointer {
+                        beside_trigger.max(200.)
+                    } else {
+                        (window_h - 48.).max(200.)
+                    } - 24.,
+                ))
+                .overflow_y_scroll();
+            let popup = div()
                 .id(popup_id)
                 .relative()
                 .role(Role::Menu)
-                .min_w(t.space(40.))
-                .max_h(t.space(72.))
-                .overflow_y_scroll()
-                .p(t.space(1.))
-                .rounded(t.radius.lg)
+                // A menu under a trigger is at least as wide as the trigger.
+                .min_w(if depth == 0 && !self.pointer {
+                    self.anchor.size.width.max(t.space(40.))
+                } else {
+                    t.space(40.)
+                })
+                // The look of the popups of the app: the frosted glass of
+                // the web theme (what is behind shows through, blurred), on
+                // a large rounded card with a light edge, and rows with room
+                // around them.
+                // The same room on every side as the SyncPlay panel: 12 px
+                // to a row, and 12 px more to its text.
+                .p(gpui_kit::px(12.))
+                .rounded(gpui_kit::px(20.))
                 .border_1()
-                .border_color(t.colors.border)
-                .bg(t.colors.popover)
+                .border_color(gpui_kit::rgba(0xf5f5f733))
+                .child(super::glass::glass(gpui_kit::px(20.), super::glass::POPUP_TINT))
                 .text_color(t.colors.popover_foreground)
                 .font_family(t.fonts.body.clone())
-                .text_size(t.text(14.))
+                .text_size(gpui_kit::px(15.))
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
                 .shadow(t.shadows.md.clone())
                 .on_prepaint(move |bounds, _, cx| {
                     entity.update(cx, |this, _| this.popup_bounds[depth] = bounds)
@@ -406,13 +476,29 @@ impl Render for MenuState {
                         }
                     },
                 ));
+            // Rows line up when some entries of the menu have an icon.
+            let icons = items.iter().any(|item| item.icon.is_some());
             for (index, item) in items.into_iter().enumerate() {
                 if item.separator {
-                    popup = popup.child(
+                    list = list.child(
                         div()
                             .h(gpui_kit::px(1.))
-                            .my(t.space(1.))
-                            .bg(t.colors.border),
+                            .mx(gpui_kit::px(12.))
+                            .my(gpui_kit::px(8.))
+                            .bg(gpui_kit::rgba(0xf5f5f71f)),
+                    );
+                    continue;
+                }
+                if item.heading {
+                    list = list.child(
+                        div()
+                            .px(gpui_kit::px(12.))
+                            .pt(gpui_kit::px(4.))
+                            .pb(gpui_kit::px(6.))
+                            .text_size(gpui_kit::px(12.))
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_color(gpui_kit::rgba(0xf5f5f7b3))
+                            .child(item.label),
                     );
                     continue;
                 }
@@ -437,12 +523,14 @@ impl Render for MenuState {
                     .accessibility_label(item.label.clone())
                     .relative()
                     .w_full()
-                    .min_h(t.space(8.))
+                    .min_h(gpui_kit::px(if item.detail.is_some() { 52. } else { 38. }))
                     .justify_start()
-                    .gap(t.space(2.))
-                    .px(t.space(1.5))
-                    .rounded(t.radius.sm)
-                    .when(selected, |b| b.bg(t.colors.accent).aria_active_descendant())
+                    .gap(gpui_kit::px(12.))
+                    .px(gpui_kit::px(12.))
+                    .rounded(gpui_kit::px(12.))
+                    .when(selected, |b| {
+                        b.bg(gpui_kit::rgba(0xffffff1f)).aria_active_descendant()
+                    })
                     .when(item.disabled, |b| b.opacity(0.5))
                     .when_some(item.checked, |b, checked| {
                         b.aria_toggled(if checked {
@@ -470,7 +558,33 @@ impl Render for MenuState {
                     .on_click(cx.listener(move |this, event, window, cx| {
                         this.activate(depth, index, event, window, cx)
                     }))
-                    .child(div().flex_1().child(item.label))
+                    .when(icons, |b| {
+                        b.child(div().w(gpui_kit::px(18.)).flex_shrink_0().children(
+                            item.icon.map(|icon| {
+                                lucide(icon)
+                                    .size(gpui_kit::px(18.))
+                                    .text_color(t.colors.popover_foreground)
+                            }),
+                        ))
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .items_start()
+                            .gap(gpui_kit::px(2.))
+                            .line_height(gpui_kit::px(19.))
+                            .child(item.label)
+                            .children(item.detail.map(|detail| {
+                                div()
+                                    .line_height(gpui_kit::px(15.))
+                                    .text_size(gpui_kit::px(12.))
+                                    .font_weight(gpui_kit::FontWeight::NORMAL)
+                                    .text_color(gpui_kit::rgba(0xf5f5f7b3))
+                                    .child(detail)
+                            })),
+                    )
                     .when(item.checked == Some(true), |b| {
                         b.child(
                             lucide(LucideIcon::Check)
@@ -485,8 +599,9 @@ impl Render for MenuState {
                                 .text_color(t.colors.popover_foreground),
                         )
                     });
-                popup = popup.child(row);
+                list = list.child(row);
             }
+            let popup = popup.child(list);
             let anchor = if depth == 0 {
                 self.anchor
             } else {
@@ -501,7 +616,7 @@ impl Render for MenuState {
                         } else {
                             Placement::Bottom
                         })
-                        .offset(t.space(1.))
+                        .offset(gpui_kit::px(8.))
                         .occlude()
                         .child(popup),
                 )

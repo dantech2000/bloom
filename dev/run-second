@@ -1,0 +1,18 @@
+#!/bin/sh
+# Starts a second instance as another device, for SyncPlay tests with two
+# members. It has its own config file, so the server sees a second session:
+# its own device id, and its own sign-in (sign it in once; Quick Connect from
+# the first instance works). It sends no playback reports.
+#   Drive it with:  BLOOM_DEBUG_SOCK=/tmp/bloom-second.sock dev/jctl <command>
+#   Stop it with:   dev/run-second stop
+dir=$(cd "$(dirname "$0")/.." && pwd)
+config="$HOME/Library/Application Support/bloom/second-device.json"
+[ -f /tmp/bloom-second.pid ] && kill "$(cat /tmp/bloom-second.pid)" 2>/dev/null
+rm -f /tmp/bloom-second.pid
+[ "$1" = stop ] && exit 0
+sleep 1
+BLOOM_CONFIG_PATH="$config" BLOOM_NO_REPORT=1 BLOOM_DEBUG_SOCK=/tmp/bloom-second.sock \
+  RUST_LOG=${RUST_LOG:-bloom=info} RUST_BACKTRACE=1 \
+  nohup "$dir/target/release/bloom" > /tmp/bloom-second.log 2>&1 &
+echo $! > /tmp/bloom-second.pid
+sleep "${1:-5}"

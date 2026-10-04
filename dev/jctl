@@ -1,0 +1,5 @@
+#!/bin/sh
+# Sends one command to a running bloom started with BLOOM_DEBUG_SOCK.
+# Usage: dev/jctl state | home | back | library Movies | item <id> | search <text> | resize 1280 820 | scroll 600
+sock=${BLOOM_DEBUG_SOCK:-/tmp/bloom-debug.sock}
+printf '%s\n' "$*" | nc -U "$sock"

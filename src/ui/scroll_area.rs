@@ -39,6 +39,7 @@ pub struct ScrollArea {
     style: gpui_kit::StyleRefinement,
     label: Option<SharedString>,
     axis: Axis,
+    handle: Option<ScrollHandle>,
     children: Vec<AnyElement>,
 }
 impl ScrollArea {
@@ -49,12 +50,18 @@ impl ScrollArea {
             style: Default::default(),
             label: None,
             axis: Axis::Vertical,
+            handle: None,
             children: vec![],
         }
     }
     /// Sets the accessible name of the control.
     pub fn aria_label(mut self, value: impl Into<SharedString>) -> Self {
         self.label = Some(value.into());
+        self
+    }
+    /// Uses a caller-owned scroll handle in place of the internal one.
+    pub fn track(mut self, handle: &ScrollHandle) -> Self {
+        self.handle = Some(handle.clone());
         self
     }
     /// Selects horizontal or vertical layout and keyboard navigation.
@@ -76,10 +83,12 @@ impl Styled for ScrollArea {
 impl RenderOnce for ScrollArea {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let t = UiTheme::read(cx).clone();
-        let handle = window
-            .use_keyed_state((self.id.clone(), "scroll"), cx, |_, _| ScrollHandle::new())
-            .read(cx)
-            .clone();
+        let handle = self.handle.clone().unwrap_or_else(|| {
+            window
+                .use_keyed_state((self.id.clone(), "scroll"), cx, |_, _| ScrollHandle::new())
+                .read(cx)
+                .clone()
+        });
         let keyboard = handle.clone();
         let axis = self.axis;
         let viewport = div()
@@ -87,6 +96,8 @@ impl RenderOnce for ScrollArea {
             .role(Role::ScrollView)
             .focusable()
             .size_full()
+            // A gesture along the other axis does not move this area.
+            .restrict_scroll_to_axis()
             .track_scroll(&handle)
             .when(axis == Axis::Vertical, |viewport| {
                 viewport.overflow_y_scroll()

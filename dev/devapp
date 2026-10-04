@@ -1,0 +1,35 @@
+#!/bin/sh
+# Makes target/dev/<name>.app around the release binary and prints the path
+# of the binary inside it. macOS takes the name in the menu bar and the Dock
+# from the bundle, so a bare binary shows as "bloom". The bundle is light:
+# a copy of the binary, the icon, and a link to vendor/ for the libraries
+# (dev/bundle makes the complete app).
+dir=$(cd "$(dirname "$0")/.." && pwd)
+name=$(sed -n 's/^pub const NAME: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
+folder=$(sed -n 's/^pub const FOLDER: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
+[ -n "$name" ] && [ -n "$folder" ] || { echo "no name in src/brand.rs" >&2; exit 1; }
+app="$dir/target/dev/$name.app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+/bin/cp -c "$dir/target/release/bloom" "$app/Contents/MacOS/$name" 2>/dev/null ||
+  /bin/cp "$dir/target/release/bloom" "$app/Contents/MacOS/$name" || exit 1
+# The binary looks for libmpv two folders above itself, in vendor/mpv/lib.
+ln -sfn "$dir/vendor" "$app/vendor"
+# The icon with its looks for macOS 26 (default, dark, clear, tinted).
+"$dir/dev/icon" "$app/Contents/Resources" || exit 1
+cat > "$app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>$name</string>
+  <key>CFBundleDisplayName</key><string>$name</string>
+  <key>CFBundleIdentifier</key><string>org.$folder.dev</string>
+  <key>CFBundleExecutable</key><string>$name</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+PLIST
+echo "$app/Contents/MacOS/$name"

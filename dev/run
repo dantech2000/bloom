@@ -1,0 +1,10 @@
+#!/bin/sh
+# Restarts the release build with the debug channel on. Log: /tmp/bloom.log
+dir=$(cd "$(dirname "$0")/.." && pwd)
+# The binary runs from a light bundle, so the menu bar shows the app's name.
+bin=$("$dir/dev/devapp") || exit 1
+[ -f /tmp/bloom.pid ] && kill "$(cat /tmp/bloom.pid)" 2>/dev/null; sleep 1
+BLOOM_DEBUG_SOCK=${BLOOM_DEBUG_SOCK:-/tmp/bloom-debug.sock} RUST_LOG=${RUST_LOG:-bloom=info} RUST_BACKTRACE=1 \
+  nohup "$bin" > /tmp/bloom.log 2>&1 &
+echo $! > /tmp/bloom.pid
+sleep "${1:-4}"

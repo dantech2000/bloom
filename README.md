@@ -1,136 +1,106 @@
-# Jellyui
+# Bloom
 
-A fast, native [Jellyfin](https://jellyfin.org) client written in Rust.
-It renders with [GPUI](https://www.gpui.rs/) (the UI framework behind Zed), uses
-editable [gpuicn](https://ui.jha.sh) components for a shadcn-style look, and plays
-video inside the window through an embedded [libmpv](https://mpv.io) core.
+A native [Jellyfin](https://jellyfin.org) client for macOS, written in Rust. The
+interface is drawn with [GPUI](https://www.gpui.rs/) and video plays inside the
+window through an embedded [libmpv](https://mpv.io).
 
-## Features
+Bloom started as a fork of [jellyui](https://github.com/iamd3vil/jellyui) by
+iamd3vil. The first four commits of this repository are that project's.
 
-- **Multiple servers, multiple profiles.** Save any number of Jellyfin servers and any
-  number of user profiles per server. Switch between them from the sidebar footer.
-- **Browse.** Home with Continue Watching, Next Up and Latest per library. Library
-  grids with sorting and paging. Series → seasons → episodes. Search across movies,
-  shows and episodes.
-- **Embedded playback.** Direct-play through libmpv rendered inside the app: resume
-  from where you left off, seek bar, pause, ±10/30s, audio and subtitle track menus
-  (embedded tracks), fullscreen, keyboard shortcuts. Playback progress is reported back
-  to Jellyfin so other clients pick up where you stopped.
-- **Leave the player running.** Escape returns to the library while the video keeps
-  playing; a now-playing bar brings it back.
-- **Dark and light appearance**, Geist typography, GPU-rendered UI.
+## What it does
+
+- **Browse.** Home with Continue Watching, Next Up and recent items, libraries
+  with sort and filter, series, seasons and episodes, collections, playlists,
+  and a search with a local title index.
+- **Play.** Direct play of the original file by default. Resume, chapters,
+  preview images on the seek bar, intro and credit skip, audio and subtitle
+  choice with a timing offset, playback speed, picture in picture, and frame
+  pacing locked to the display.
+- **Quality.** A Quality menu with a bitrate limit and server transcoding when
+  you ask for it. Nothing lowers the quality unless you turn it on.
+- **Watch together.** SyncPlay groups with other Jellyfin clients, with drift
+  correction.
+- **Play on another device.** Other Jellyfin sessions, Chromecast and AirPlay.
+  Other clients can also control Bloom.
+- **Offline.** Downloads with resume, and playback of downloaded files without
+  the server.
+- **Server dashboard** for administrators: users and their access, libraries,
+  devices, activity, scheduled tasks, plugins and their settings, logs, API
+  keys, and the server settings pages.
+- **Your account.** Profile picture, password, Quick Connect, playback,
+  subtitle, home and display settings.
+- **Jellyfin Enhanced** features when the server has that plugin: quality tags,
+  bookmarks, hidden content, requests through Jellyseerr.
+- **macOS.** Media keys and the Now Playing tile, no display sleep during
+  playback, and a layered app icon that follows the system's icon style.
 
 ## Requirements
 
 | Dependency | Notes |
 | --- | --- |
-| Rust 1.97+ | `rustup update stable` |
-| Xcode command line tools | macOS builds need the Metal toolchain |
-| libmpv 2.x | `brew install mpv` or the Nix `mpv` package |
-| ffmpeg (optional) | Only for the playback test; it encodes a short clip |
-| [just](https://github.com/casey/just) (optional) | Task runner for the recipes below |
+| macOS | The app has only been built and run on macOS |
+| Rust 1.97.1 | Pinned in `rust-toolchain.toml`; `rustup` installs it on the first build |
+| Xcode | For the Metal toolchain, and `actool` for the app icon |
+| mpv | libmpv and its libraries are copied into `vendor/mpv` by `dev/vendor-mpv` |
+| ffmpeg (optional) | The playback tests encode short clips with it |
+| [just](https://github.com/casey/just) (optional) | Runs the recipes in `justfile` |
 
-Linux and Windows are supported by GPUI, gpui-kit and libmpv, but this app has only
-been run on macOS so far.
-
-## Quick start
+## Build and run
 
 ```sh
-just run            # or: cargo run
+dev/vendor-mpv          # once: copies libmpv into vendor/mpv
+cargo build --release
+dev/run                 # starts the app with the debug channel on
 ```
 
-On first launch, add your server address (for example `https://jelly.example.com` or
-`192.168.1.10:8096`), then sign in. The users the server publishes on its login screen
-appear as tiles; click one to prefill the form. Signed-in profiles are saved and open
-with a single click next time.
+At the first start, enter the address of your server and sign in, or use Quick
+Connect. To get `Bloom.app`, run `dev/bundle`; `dev/install` builds it and
+copies it to `/Applications`.
 
-### Where things are stored
-
-Servers, profiles and access tokens live in
-`~/Library/Application Support/jellyui/config.json`, written with owner-only
-permissions. Use `just reset-config` to forget everything.
-
-### Finding libmpv
-
-`build.rs` looks for libmpv next to the `mpv` binary on your `PATH`, then via
-`pkg-config`, then in the usual library directories. If linking fails, point at it
-explicitly:
-
-```sh
-MPV_LIB_DIR=/opt/homebrew/lib cargo build
-```
-
-## Keyboard shortcuts (player)
-
-| Key | Action |
-| --- | --- |
-| `space`, `k` | Play / pause |
-| `←` / `→` | Seek −5s / +5s |
-| `j` / `l` | Seek −10s / +10s |
-| `f` | Toggle fullscreen |
-| `esc` | Leave fullscreen, or return to the library while playback continues |
+Servers, profiles, access tokens and downloads are in
+`~/Library/Application Support/bloom`. Cached images are in
+`~/Library/Caches/bloom`.
 
 ## Development
 
-```sh
-just            # list recipes
-just check      # fmt --check, clippy, tests
-just test       # unit tests + a real libmpv playback round-trip
-just lint
-just fmt
-```
+| Command | Purpose |
+| --- | --- |
+| `dev/test` | All tests |
+| `dev/smoke` | Opens every page in a test instance and checks the frame cost |
+| `dev/run-test` | A second, muted instance for tests, labelled "TEST INSTANCE" |
+| `dev/jctl <command>` | Drives an instance through its debug socket (`dev/jctl state`) |
+| `dev/shot <file>` | Captures the window of an instance |
+| `dev/jctl perf`, `dev/jctl pacing` | Frame cost, and how evenly video frames reach the screen |
+
+`CLAUDE.md` has the working rules of this repository, among them the rules for
+tests against a real server.
 
 ### Layout
 
 | Path | Purpose |
 | --- | --- |
-| `src/main.rs` | Window setup, fonts, theme bootstrap |
-| `src/app.rs` | Root view: sessions, navigation, background fetching, player polling |
-| `src/views/` | Screens: connect, shell (sidebar, top bar, now-playing), home, library, detail, player, shared cards |
-| `src/jellyfin.rs` | Blocking Jellyfin REST client and item model |
-| `src/player.rs` | libmpv worker thread, software frame rendering, Jellyfin playback reporting |
-| `src/images.rs` | Remote artwork cache |
-| `src/config.rs` | Persisted servers, profiles and preferences |
-| `src/ui/` | gpuicn components installed as editable source (see below) |
-| `build.rs` | Locates libmpv for linking |
-
-### How playback works
-
-`src/player.rs` owns one libmpv core on a worker thread. Video is rendered with mpv's
-software render API into BGRA frames sized to the visible video area (never larger
-than the source), and each frame is handed to GPUI as an image; the previous GPU
-texture is released as the next one arrives. This keeps the player fully inside the
-GPUI window and works on every platform libmpv supports, at the cost of one CPU copy
-per frame. mpv handles demuxing, decoding (hardware where available), subtitles and
-audio, so anything mpv plays, Jellyui plays.
-
-Progress is posted to Jellyfin on start, every ten seconds while playing, and on stop.
-
-### UI components
-
-The files in `src/ui` come from the gpuicn registry and belong to this app: edit them
-freely. `gpuicn.toml` pins the registry snapshot. To pull updated components:
-
-```sh
-just ui-cli       # install the pinned gpuicn CLI once
-just ui-diff      # see which files an update would replace
-just ui-update -- --overwrite
-```
-
-gpuicn pins `gpui-kit 0.6.1` and the `gpui-pre 0.3.4` runtime, so keep those versions
-in `Cargo.toml` aligned with the registry you install from.
-
-## Known limitations
-
-- Only subtitle tracks embedded in the media file are offered; external subtitle files
-  managed by Jellyfin are not loaded yet.
-- Music, books, live TV and photo libraries are hidden from the sidebar.
-- Transcoding is not requested; playback relies on mpv's broad direct-play support.
+| `src/app.rs` | The root view: session, navigation, player state |
+| `src/views/` | Screens: sign-in, shell, home, library, detail, player |
+| `src/player.rs`, `src/pacing.rs`, `src/video_surface.rs` | The libmpv worker, the render thread and display sync |
+| `src/stream.rs`, `src/adaptive.rs` | Playback negotiation, quality, transcoding |
+| `src/syncplay/` | SyncPlay: protocol, clock, drift control, session |
+| `src/cast/`, `src/chromecast/`, `src/airplay/` | Playing on other devices |
+| `src/downloads/` | Offline downloads |
+| `src/admin/`, `src/settings/`, `src/metadata/` | Dashboard, user settings, metadata editor |
+| `src/jellyfin.rs`, `src/realtime.rs` | REST client and the server socket |
+| `src/ui/` | Components from the gpuicn registry, as editable source |
+| `src/brand.rs` | The name of the app, in one place |
+| `src/debug.rs` | The debug channel |
+| `dev/` | Scripts |
+| `vendor/gpui-pre-apple` | GPUI's macOS backend with two patches (backdrop blur, BGRA surfaces) |
 
 ## License
 
-Jellyui is free software under the [GNU Affero General Public License v3.0 or later](LICENSE).
+Bloom is free software under the
+[GNU Affero General Public License v3.0 or later](LICENSE), as is jellyui.
 
-Third-party components keep their own licenses: the bundled Geist fonts are under the
-SIL Open Font License (`assets/fonts/OFL.txt`), the gpuicn components in `src/ui` are
-MIT licensed, and libmpv is LGPL-2.1+ and linked dynamically.
+Third-party parts keep their own licenses: the fonts in `assets/fonts` are under
+the SIL Open Font License (`assets/fonts/OFL.txt`), the gpuicn components in
+`src/ui` are MIT licensed, the Jellyfin logo is CC BY-SA 4.0, the filled icons
+are from Material Icons (Apache-2.0), and libmpv is LGPL-2.1+ and linked
+dynamically.

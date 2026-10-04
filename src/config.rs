@@ -10,7 +10,8 @@ use std::{fs, path::PathBuf};
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
-pub const APP_NAME: &str = "Jellyui";
+/// The client name the server sees (see `brand.rs`).
+pub const APP_NAME: &str = crate::brand::NAME;
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -25,6 +26,77 @@ pub struct Config {
     pub active: Option<(String, String)>,
     #[serde(default)]
     pub dark: Option<bool>,
+    /// Trailer video behind the home hero; on unless set to false.
+    #[serde(default)]
+    pub hero_video: Option<bool>,
+    /// Quality tags on poster cards. Unset follows the user's setting in the
+    /// Jellyfin Enhanced plugin.
+    #[serde(default)]
+    pub quality_tags: Option<bool>,
+    /// Features of the Jellyfin Enhanced plugin set in this app, by name.
+    /// One that is not here follows the user's setting in the plugin.
+    #[serde(default)]
+    pub enhanced: std::collections::HashMap<String, bool>,
+    /// SyncPlay: correct the position when it drifts from the group. On
+    /// unless set to false.
+    #[serde(default)]
+    pub sync_correction: Option<bool>,
+    /// Other devices may control this app ("Play On"). On unless set to
+    /// false.
+    #[serde(default)]
+    pub remote_control: Option<bool>,
+    /// SyncPlay: milliseconds this player plays later (or, negative,
+    /// earlier) than the group, for a sound output with a delay of its own.
+    #[serde(default)]
+    pub sync_offset_ms: f64,
+    /// Look of the subtitles in the player, as set in this app.
+    #[serde(default)]
+    pub subtitle_look: SubtitleLook,
+    /// Bits per second the player may stream; above it the server
+    /// transcodes. Unset is no limit ("Auto").
+    #[serde(default)]
+    pub max_bitrate: Option<u64>,
+    /// "Auto" measures the connection and lowers the quality when the
+    /// file would not keep up. On unless set to false.
+    #[serde(default)]
+    pub adaptive_quality: Option<bool>,
+    /// The speed of the connection at the last measurement, in bits per
+    /// second, and when (seconds since the Unix epoch).
+    #[serde(default)]
+    pub link_bps: Option<u64>,
+    #[serde(default)]
+    pub link_measured_at: Option<u64>,
+    /// Window position and size at the last run: x, y, width, height.
+    #[serde(default)]
+    pub window: Option<[f32; 4]>,
+    /// Place of the picture-in-picture window, in screen coordinates with
+    /// the origin at the bottom left: x, y, width, height.
+    #[serde(default)]
+    pub pip_window: Option<[f64; 4]>,
+    /// Space the downloads may take, in GB; none for no limit.
+    #[serde(default)]
+    pub download_limit_gb: Option<u64>,
+    /// Downloads that run at the same time: 1 or 2.
+    #[serde(default)]
+    pub download_parallel: Option<u8>,
+}
+
+/// Look of the subtitles. A part that is not set follows the user's
+/// subtitle style in the Jellyfin Enhanced plugin, or the player's own look.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SubtitleLook {
+    /// Size against the normal size.
+    #[serde(default)]
+    pub scale: Option<f64>,
+    /// Text colour as "#AARRGGBB".
+    #[serde(default)]
+    pub color: Option<String>,
+    /// A dark box behind the text.
+    #[serde(default)]
+    pub background: Option<bool>,
+    /// Place from the top, in percent; 100 is the lower edge.
+    #[serde(default)]
+    pub position: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -49,9 +121,14 @@ pub struct Profile {
 
 impl Config {
     pub fn path() -> PathBuf {
+        // A test instance can use its own file, for example an empty one
+        // to see the sign-in page.
+        if let Some(path) = std::env::var_os("BLOOM_CONFIG_PATH") {
+            return PathBuf::from(path);
+        }
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("jellyui")
+            .join(crate::brand::FOLDER)
             .join("config.json")
     }
 
@@ -67,6 +144,11 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
+        // A second instance started for tests must not change the settings
+        // of the instance the user runs.
+        if std::env::var_os("BLOOM_CONFIG_READONLY").is_some() {
+            return Ok(());
+        }
         let path = Self::path();
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;

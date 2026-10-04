@@ -1,0 +1,14 @@
+#!/bin/sh
+# Captures the bloom window to a PNG (default /tmp/bloom-shot.png), scaled to 1400 px.
+# Needs Screen Recording permission for the terminal.
+out=${1:-/tmp/bloom-shot.png}
+dir=$(cd "$(dirname "$0")" && pwd)
+bin="$dir/../target/winid"
+if [ ! -x "$bin" ] || [ "$dir/winid.swift" -nt "$bin" ]; then
+  swiftc -O -o "$bin" "$dir/winid.swift" || exit 1
+fi
+# The window of the instance dev/run started, when it wrote its pid.
+pid=$(cat "${BLOOM_PID_FILE:-/tmp/bloom.pid}" 2>/dev/null)
+id=$("$bin" bloom $pid)
+[ -n "$id" ] || { echo "no bloom window" >&2; exit 1; }
+screencapture -x -o -l "$id" "$out" && sips -Z "${SHOT_SIZE:-1400}" "$out" >/dev/null && echo "$out"

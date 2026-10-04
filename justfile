@@ -1,47 +1,41 @@
-# Jellyui task runner. Run `just` to list recipes.
+# Bloom task runner. Run `just` to list recipes. The scripts are in dev/.
 
 set shell := ["sh", "-cu"]
-
-# Set MPV_LIB_DIR in the environment if libmpv is not found automatically.
-export RUST_LOG := env_var_or_default("RUST_LOG", "jellyui=info")
 
 default:
     @just --list
 
-# Build a debug binary
+# Build the optimized binary
 build:
-    cargo build
-
-# Build an optimized binary
-release:
     cargo build --release
 
-# Run the app (debug build, logs to stderr)
-run *ARGS:
-    cargo run -- {{ARGS}}
+# Start (or restart) the app from a light app bundle, with the debug channel on
+run:
+    dev/run
 
-# Run the optimized build
-run-release:
-    cargo run --release
-
-# Run all tests, including the live libmpv playback round-trip (needs ffmpeg)
+# Run all tests (the ones with the real player need ffmpeg)
 test *ARGS:
-    cargo test --bin jellyui {{ARGS}}
+    dev/test {{ARGS}}
 
-# Lint with warnings treated as errors
-lint:
-    cargo clippy --bin jellyui --all-targets -- -D warnings
+# Walk every page in a test instance and check the frame cost
+smoke:
+    dev/smoke
 
-# Format the source tree
-fmt:
-    cargo fmt
+# Build target/Bloom.app with libmpv inside
+bundle:
+    dev/bundle
 
-# Verify formatting, lints and tests, as CI would
-check: fmt-check lint test
+# Build the app and copy it to /Applications
+install:
+    dev/install
 
-# Fail if the tree is not formatted
-fmt-check:
-    cargo fmt --check
+# Copy libmpv and its libraries into vendor/mpv (needed once before the first build)
+vendor-mpv:
+    dev/vendor-mpv
+
+# Send a command to the running app, for example: just ctl state
+ctl *ARGS:
+    dev/jctl {{ARGS}}
 
 # Update installed gpuicn components to the pinned registry (keeps local edits unless --overwrite)
 ui-update *ARGS:
@@ -55,15 +49,6 @@ ui-diff:
 ui-cli:
     cargo install gpuicn-cli --git https://github.com/devaryakjha/gpuicn --tag v0.5.0-beta.3 --locked
 
-# Print where the build script found libmpv, or how to point at it
-mpv-info:
-    @cargo build 2>&1 | grep -i "libmpv" || echo "libmpv located automatically (see build.rs for the search order)"
-    @command -v mpv >/dev/null && mpv --version | head -1 || echo "mpv binary not on PATH"
-
-# Remove the app's saved servers, profiles and tokens (asks first)
-reset-config:
-    @printf 'Delete %s? [y/N] ' "$HOME/Library/Application Support/jellyui/config.json"; read ans; [ "$ans" = y ] && rm -f "$HOME/Library/Application Support/jellyui/config.json" && echo removed || echo kept
-
-# Remove build artifacts
+# Remove build output
 clean:
     cargo clean

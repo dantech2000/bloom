@@ -1,0 +1,25 @@
+#!/bin/sh
+# Puts the app icon into the Resources folder of a bundle: dev/icon <folder>.
+# The source is assets/icon/AppIcon.icon (an Icon Composer document: layers
+# on a background), so macOS 26 and later can draw the icon in its default,
+# dark, clear and tinted looks. Older systems use the AppIcon.icns beside it.
+# The compiled files are kept in target/icon and made again when the source
+# changes. `dev/icon preview <folder>` writes a PNG of each look.
+dir=$(cd "$(dirname "$0")/.." && pwd)
+src="$dir/assets/icon/AppIcon.icon"
+if [ "$1" = preview ]; then
+  tool="$(xcode-select -p)/../Applications/Icon Composer.app/Contents/Executables/ictool"
+  mkdir -p "$2"
+  for look in Default Dark ClearLight ClearDark TintedLight TintedDark; do
+    "$tool" "$src" --export-image --output-file "$2/$look.png" --platform macOS \
+      --rendition $look --width 256 --height 256 --scale 2 >/dev/null || exit 1
+  done
+  exit 0
+fi
+out="$dir/target/icon"
+if [ ! -f "$out/Assets.car" ] || [ -n "$(find "$src" -newer "$out/Assets.car" -print -quit)" ]; then
+  mkdir -p "$out"
+  xcrun actool "$src" --compile "$out" --app-icon AppIcon --platform macosx \
+    --minimum-deployment-target 11.0 --output-partial-info-plist "$out/partial.plist" >/dev/null || exit 1
+fi
+cp "$out/Assets.car" "$out/AppIcon.icns" "$1/"

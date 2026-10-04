@@ -1,0 +1,13 @@
+#!/bin/sh
+# Frees disk space from builds. The release build of the app stays.
+# Usage: dev/clean          remove debug and test artefacts
+#        dev/clean all      remove the whole target directory
+dir=$(cd "$(dirname "$0")/.." && pwd)
+if [ "$1" = all ]; then
+  rm -rf "$dir/target"
+else
+  rm -rf "$dir/target/debug" "$dir/target/release/incremental"
+  # Old copies of the test and app binaries pile up in deps.
+  find "$dir/target/release/deps" -name 'bloom-*' -type f -mtime +1 -delete 2>/dev/null
+fi
+du -sh "$dir/target" 2>/dev/null

@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""How far apart two instances play, in milliseconds.
+
+Each instance prints the position of its audio with the time of the
+measurement on the clock of the server (`syncplay state`, the `sample=`
+part). Two such samples give the skew: the difference of the positions,
+less the time between the two measurements.
+
+Usage: dev/syncplay-skew [seconds] [socket A] [socket B]
+Defaults: 10 s, /tmp/bloom-test.sock and /tmp/bloom-second.sock.
+"""
+import re, socket, statistics, sys, time
+
+seconds = float(sys.argv[1]) if len(sys.argv) > 1 else 10
+a = sys.argv[2] if len(sys.argv) > 2 else "/tmp/bloom-test.sock"
+b = sys.argv[3] if len(sys.argv) > 3 else "/tmp/bloom-second.sock"
+
+
+def state(path):
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(path)
+    s.sendall(b"syncplay state\n")
+    data = b""
+    while chunk := s.recv(4096):
+        data += chunk
+    return data.decode()
+
+
+def sample(text):
+    m = re.search(r"sample=([0-9.]+)@([0-9.]+)", text)
+    paused = "paused=true" in text
+    return (float(m.group(1)), float(m.group(2)), paused) if m else None
+
+
+skews = []
+end = time.time() + seconds
+while time.time() < end:
+    sa, sb = sample(state(a)), sample(state(b))
+    if sa and sb and not sa[2] and not sb[2]:
+        # Positions in seconds, times in milliseconds.
+        skew = (sa[0] - sb[0]) * 1000 - (sa[1] - sb[1])
+        skews.append(skew)
+        print(f"skew {skew:+7.1f} ms   A {sa[0]:9.3f} s   B {sb[0]:9.3f} s")
+    else:
+        print("no sample from both players (not playing?)")
+    time.sleep(0.5)
+if skews:
+    print(
+        f"{len(skews)} samples: median {statistics.median(skews):+.1f} ms, "
+        f"worst {max(skews, key=abs):+.1f} ms"
+    )

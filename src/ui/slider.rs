@@ -89,14 +89,12 @@ impl RenderOnce for Slider {
             .absolute()
             .left(relative(percent))
             .ml(-theme.space(1.5))
-            .top(-theme.space(1.))
+            .top(theme.space(1.))
             .size(theme.space(3.))
             .rounded_full()
-            .border_1()
-            .border_color(colors.ring)
-            .bg(colors.background)
+            .bg(colors.primary)
             .when(focused && !self.disabled, |t| {
-                t.border_color(colors.foreground)
+                t.border_1().border_color(colors.ring)
             })
             .when(!self.disabled, |t| {
                 t.on_mouse_down(MouseButton::Left, move |_, window, cx| {
@@ -164,18 +162,23 @@ impl RenderOnce for Slider {
                     })
             })
             .child(
+                // The track takes clicks over the full height of the slider;
+                // the line it shows is thin. A click a few pixels off the line
+                // would miss a track of the line's own height.
                 SliderTrack::new(&self.state)
                     .disabled(self.disabled)
                     .relative()
                     .w_full()
-                    .h(theme.space(1.))
+                    .h(theme.space(5.))
+                    .flex()
+                    .items_center()
                     .child(
                         SliderIndicator::new(&self.state)
                             .relative()
                             .w_full()
-                            .h_full()
+                            .h(theme.space(1.))
                             .rounded_full()
-                            .bg(colors.muted)
+                            .bg(colors.foreground.opacity(0.25))
                             .child(
                                 div()
                                     .h_full()

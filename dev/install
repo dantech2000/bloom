@@ -1,0 +1,18 @@
+#!/bin/sh
+# Builds the complete app and puts it in /Applications (or in the folder
+# given as the first argument), so it starts from Spotlight and the Dock
+# without the terminal. An installed copy of the same name is replaced.
+# The app is signed ad hoc, for this Mac only.
+dir=$(cd "$(dirname "$0")/.." && pwd)
+dest=${1:-/Applications}
+name=$(sed -n 's/^pub const NAME: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
+[ -n "$name" ] || { echo "no name in src/brand.rs" >&2; exit 1; }
+(cd "$dir" && cargo build --release) || exit 1
+"$dir/dev/bundle" || exit 1
+if pgrep -f "$dest/$name.app/Contents/MacOS/$name" >/dev/null; then
+  echo "Quit the installed $name first." >&2
+  exit 1
+fi
+rm -rf "$dest/$name.app"
+/bin/cp -R "$dir/target/$name.app" "$dest/" || exit 1
+echo "Installed $dest/$name.app"

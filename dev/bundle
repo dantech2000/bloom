@@ -1,0 +1,63 @@
+#!/bin/sh
+# Builds target/<name>.app from the release binary (the name is in src/brand.rs), so the app has its icon
+# and name in the Dock, Launchpad and the menu bar. Run a release build first.
+# libmpv and its libraries come from vendor/mpv/lib (see dev/vendor-mpv) and
+# go into the bundle, so the app does not need the Nix store.
+dir=$(cd "$(dirname "$0")/.." && pwd)
+name=$(sed -n 's/^pub const NAME: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
+folder=$(sed -n 's/^pub const FOLDER: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
+tagline=$(sed -n 's/^pub const TAGLINE: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
+[ -n "$name" ] && [ -n "$folder" ] || { echo "no name in src/brand.rs" >&2; exit 1; }
+app="$dir/target/$name.app"
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$dir/Cargo.toml" | head -1)
+rm -rf "$app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp "$dir/target/release/bloom" "$app/Contents/MacOS/$name" || exit 1
+if [ -d "$dir/vendor/mpv/lib" ]; then
+  mkdir -p "$app/Contents/Frameworks"
+  cp -R "$dir/vendor/mpv/lib/." "$app/Contents/Frameworks/"
+fi
+# The icon with its looks for macOS 26 (default, dark, clear, tinted).
+"$dir/dev/icon" "$app/Contents/Resources" || exit 1
+
+# rpaths of a file: one per line.
+rpaths() { otool -l "$1" | awk '/cmd LC_RPATH/ {r = 1} r && /^ *path / {print $2; r = 0}'; }
+# Takes out the rpaths that point out of the bundle: the paths of the build
+# (../../vendor/mpv/lib, relative to the binary) and the ones of the Nix
+# store that some libraries keep from their build. Then signs the file
+# again, as a changed file loses its signature.
+clean_rpaths() {
+  changed=
+  for rpath in $(rpaths "$1"); do
+    case $rpath in
+      /nix/store/* | *vendor/mpv/lib) install_name_tool -delete_rpath "$rpath" "$1" 2>/dev/null && changed=1 ;;
+    esac
+  done
+  [ -z "$changed" ] || codesign --force --sign - "$1" 2>/dev/null
+}
+for lib in "$app"/Contents/Frameworks/*.dylib; do
+  [ -L "$lib" ] || clean_rpaths "$lib"
+done
+clean_rpaths "$app/Contents/MacOS/$name"
+cat > "$app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>$name</string>
+  <key>CFBundleDisplayName</key><string>$name</string>
+  <key>CFBundleGetInfoString</key><string>$name, a $tagline</string>
+  <key>CFBundleIdentifier</key><string>org.$folder.app</string>
+  <key>CFBundleExecutable</key><string>$name</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>$version</string>
+  <key>CFBundleVersion</key><string>$version</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.video</string>
+  <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+PLIST
+echo "$app"

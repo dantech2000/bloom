@@ -1,0 +1,177 @@
+#!/bin/sh
+# Smoke test: starts a private instance, opens every page through the debug
+# channel, and reports what broke.
+#
+#   dev/smoke [folder for the screenshots]     (default /tmp/bloom-smoke)
+#
+# For each page it waits for the load, saves a screenshot, scrolls the page a
+# little and prints the `perf` line of that scroll. It fails (exit code 1) on
+# a panic in the log, an `error=` in the page state, an error answer from the
+# debug channel, or a page that does not finish its load. A page whose frames
+# take longer than SMOKE_DRAW_MS (default 8) to draw gets a warning.
+#
+# The instance is separate from the one of dev/run and of dev/run-test: its
+# own socket, pid file and log (/tmp/bloom-smoke.*, or
+# /tmp/bloom-<name>.* with BLOOM_TEST_NAME=<name>, so several agents can
+# run it at once). It reads the config of
+# the user but does not write it, sends no playback reports, starts no
+# playback, and only opens dialogs; it never presses a button in them, so
+# nothing on the server changes. The sign-in page runs in a second instance
+# with an empty config in a temporary file. Its window opens on the screen.
+# Run a release build first.
+dir=$(cd "$(dirname "$0")/.." && pwd)
+out=${1:-/tmp/bloom-smoke}
+limit=${SMOKE_DRAW_MS:-8}
+name=${BLOOM_TEST_NAME:-smoke}
+sock=/tmp/bloom-$name.sock
+pid_file=/tmp/bloom-$name.pid
+log=/tmp/bloom-$name.log
+failures=0
+warnings=0
+mkdir -p "$out"
+
+ctl() { BLOOM_DEBUG_SOCK=$sock "$dir/dev/jctl" "$@"; }
+
+fail() {
+  failures=$((failures + 1))
+  echo "FAIL  $*"
+}
+
+start() {
+  stop
+  : > "$log"
+  env "$@" BLOOM_NO_REPORT=1 BLOOM_NO_SOCKET=1 BLOOM_DEBUG_SOCK=$sock RUST_LOG=bloom=info RUST_BACKTRACE=1 \
+    nohup "$dir/target/release/bloom" >> "$log" 2>&1 &
+  echo $! > "$pid_file"
+  # The debug channel answers once the window is up.
+  for _ in $(seq 1 40); do
+    [ -S "$sock" ] && ctl state >/dev/null 2>&1 && return 0
+    sleep 0.25
+  done
+  fail "the app did not start; see $log"
+  return 1
+}
+
+stop() {
+  if [ -f "$pid_file" ]; then
+    kill "$(cat "$pid_file")" 2>/dev/null
+    wait "$(cat "$pid_file")" 2>/dev/null
+  fi
+  rm -f "$pid_file" "$sock"
+  sleep 1
+}
+
+# settle [text]: waits until the page has its data, and until its state has
+# the text when one is given (the page of an item opens after a request).
+# Prints the state.
+settle() {
+  for _ in $(seq 1 60); do
+    state=$(ctl state)
+    case $state in
+      *loading=true* | *probing=true*) sleep 0.25 ;;
+      *"$1"*) echo "$state"; return 0 ;;
+      *) sleep 0.25 ;;
+    esac
+  done
+  echo "$state"
+  return 1
+}
+
+# page <name> <debug command...>: opens a page and checks it.
+page() {
+  name=$1
+  shift
+  answer=$(ctl "$@")
+  case $answer in error:*) fail "$name: $answer"; return ;; esac
+  expect=
+  [ "$1" = item ] && expect="id=$2"
+  state=$(settle "$expect") || fail "$name: the load did not finish"
+  case $state in
+    *error=Some*) fail "$name: $state" ;;
+  esac
+  if ! kill -0 "$(cat "$pid_file")" 2>/dev/null || grep -q "panicked at" "$log"; then
+    fail "$name: the app panicked; see $log"
+    return
+  fi
+  sleep 0.5
+  BLOOM_PID_FILE=$pid_file "$dir/dev/shot" "$out/$name.png" >/dev/null 2>&1 ||
+    echo "note  $name: no screenshot (Screen Recording permission?)"
+  # The cost of a redraw, from a short scroll down and back.
+  ctl perf >/dev/null
+  for y in 150 300 450 600 450 300 150 0; do
+    ctl scroll $y >/dev/null
+    sleep 0.05
+  done
+  perf=$(ctl perf)
+  # The limit is on the CPU time of the UI thread for a frame: the wall time
+  # ("draw=") grows when other programs load the machine.
+  draw=$(echo "$perf" | sed -n 's/.*frame_cpu=\([0-9.]*\)ms.*/\1/p')
+  mark="ok   "
+  if [ -n "$draw" ] && [ "$(echo "$draw > $limit" | bc)" = 1 ]; then
+    warnings=$((warnings + 1))
+    mark="SLOW "
+  fi
+  echo "$mark $name: $(echo "$perf" | sed 's/^perf: //; s/ main_cpu.*//')"
+}
+
+start BLOOM_CONFIG_READONLY=1 || exit 1
+case $(settle) in
+  home*) ;;
+  *) fail "no signed-in session; sign in with the app first"; stop; exit 1 ;;
+esac
+
+page home home
+movie=
+series=
+ctl libraries > "$out/libraries.txt"
+while IFS= read -r library; do
+  [ -n "$library" ] || continue
+  slug=$(echo "$library" | tr -c 'A-Za-z0-9\n' '-')
+  page "library-$slug" library "$library"
+  # The first item of the library, for the detail pages.
+  id=$(echo "$state" | grep -o '=[0-9a-f]\{32\}' | head -1 | tr -d =)
+  case $library in
+    Movies) movie=$id ;;
+    Shows) series=$id ;;
+  esac
+done < "$out/libraries.txt"
+
+[ -n "$movie" ] && page movie item "$movie"
+if [ -n "$series" ]; then
+  page series item "$series"
+  season=$(echo "$state" | sed -n 's/.* season0=\([0-9a-f]\{32\}\).*/\1/p')
+  [ -n "$season" ] && page season item "$season"
+fi
+page search search the
+for section in dashboard general branding users libraries display metadata nfo transcoding resume \
+  streaming trickplay devices activity plugins networking tasks logs keys; do
+  page "admin-$section" admin "$section"
+done
+# The dialogs are only opened; nothing in them is pressed.
+for dialog in newkey newuser secret; do
+  page "dialog-$dialog" admin-dialog "$dialog"
+  ctl admin-dialog close >/dev/null
+done
+page dialog-authorize authorize
+ctl authorize-close >/dev/null 2>&1
+for section in profile playback subtitles home display; do
+  page "settings-$section" settings "$section"
+done
+page dialog-password settings password
+ctl admin-dialog close >/dev/null
+stop
+
+# The sign-in page, with an empty config of its own.
+config="${TMPDIR:-/tmp}/bloom-smoke-config.$$.json"
+rm -f "$config"
+if start BLOOM_CONFIG_PATH="$config"; then
+  page sign-in-server state
+  server=$(sed -n 's/.*"url": *"\([^"]*\)".*/\1/p' "$HOME/Library/Application Support/bloom/config.json" 2>/dev/null | head -1)
+  [ -n "$server" ] && page sign-in-user connect add "$server"
+fi
+stop
+rm -f "$config"
+
+echo
+echo "$failures failed, $warnings slow (over $limit ms a frame); screenshots in $out"
+[ "$failures" = 0 ]

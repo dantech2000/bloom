@@ -12,6 +12,18 @@ fn main() {
         println!("cargo:rustc-link-search=native={dir}");
         return;
     }
+    // The copy that `dev/vendor-mpv` makes in the project. The binary finds
+    // it from target/<profile>/, and from an app bundle's Frameworks folder.
+    let vendored = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/mpv/lib");
+    println!("cargo:rerun-if-changed={}", vendored.display());
+    if vendored.join("libmpv.dylib").exists() {
+        println!("cargo:rustc-link-search=native={}", vendored.display());
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../../vendor/mpv/lib");
+        // Test binaries are one folder deeper, in target/<profile>/deps/.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../../../vendor/mpv/lib");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../Frameworks");
+        return;
+    }
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(out) = Command::new("pkg-config")
         .args(["--variable=libdir", "mpv"])
