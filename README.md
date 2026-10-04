@@ -57,6 +57,19 @@ At the first start, enter the address of your server and sign in, or use Quick
 Connect. To get `Bloom.app`, run `dev/bundle`; `dev/install` builds it and
 copies it to `/Applications`.
 
+### Updates
+
+A release build updates itself with [Sparkle](https://sparkle-project.org). It
+reads a feed from the newest GitHub release, checks the signature of the
+download, and asks before it installs. To make a release:
+
+```sh
+dev/release key        # once: prints the public key for UPDATE_PUBLIC_KEY in src/brand.rs
+dev/release 0.2.0      # builds target/dist/Bloom-0.2.0.zip and appcast.xml, then prints the upload command
+```
+
+A build with no public key, and a build started with `dev/run`, has no updater.
+
 Servers, profiles, access tokens and downloads are in
 `~/Library/Application Support/bloom`. Cached images are in
 `~/Library/Caches/bloom`.

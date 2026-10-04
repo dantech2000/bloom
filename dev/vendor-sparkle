@@ -1,0 +1,18 @@
+#!/bin/sh
+# Puts the Sparkle update framework and its tools into vendor/sparkle (not
+# tracked by git): the framework goes into the app bundle, the tools sign a
+# release. The version and the checksum of the download are fixed here.
+dir=$(cd "$(dirname "$0")/.." && pwd)
+version=2.10.0
+sum=c2bf58aa8387266ac179357b1415d6f2635f044da8be41042af32425dae6da0c
+out="$dir/vendor/sparkle"
+[ -d "$out/Sparkle.framework" ] && [ "$(cat "$out/VERSION" 2>/dev/null)" = "$version" ] && exit 0
+tmp=$(mktemp -d) || exit 1
+curl -fsSL -o "$tmp/sparkle.tar.xz" \
+  "https://github.com/sparkle-project/Sparkle/releases/download/$version/Sparkle-$version.tar.xz" || exit 1
+[ "$(shasum -a 256 "$tmp/sparkle.tar.xz" | cut -d' ' -f1)" = "$sum" ] ||
+  { echo "the Sparkle download does not match its checksum" >&2; exit 1; }
+rm -rf "$out" && mkdir -p "$out" && tar -xf "$tmp/sparkle.tar.xz" -C "$out" || exit 1
+rm -rf "$out/Sparkle Test App.app" "$out/Symbols" "$tmp"
+echo "$version" > "$out/VERSION"
+echo "Sparkle $version in $out"

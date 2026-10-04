@@ -7,6 +7,7 @@ actions!(
     bloom,
     [
         About,
+        CheckForUpdates,
         Hide,
         HideOthers,
         ShowAll,
@@ -55,6 +56,7 @@ pub fn init(cx: &mut App) {
             crate::brand::NAME,
             vec![
                 MenuItem::action(format!("About {}", crate::brand::NAME), About),
+                MenuItem::action("Check for Updates…", CheckForUpdates),
                 MenuItem::separator(),
                 MenuItem::action(format!("Hide {}", crate::brand::NAME), Hide),
                 MenuItem::action("Hide Others", HideOthers),

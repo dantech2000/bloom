@@ -342,6 +342,16 @@ impl Bloom {
                     },
                 ),
             );
+            if let crate::updates::Status::Ready(version) = crate::updates::status() {
+                items.push(
+                    MenuItem::new("menu.update", "Restart to update")
+                        .icon(LucideIcon::RefreshCw)
+                        .detail(format!("{} {version} is downloaded", crate::brand::NAME))
+                        .on_click(|_, _, _| {
+                            crate::updates::restart_to_update();
+                        }),
+                );
+            }
             let handle = this.clone();
             items.push(
                 MenuItem::new("menu.about", format!("About {}", crate::brand::NAME))
@@ -534,6 +544,8 @@ impl Bloom {
                     .justify_end()
                     .gap(px(6.))
                     // A ring with the percent while something downloads.
+                    // "Restart to update", while a downloaded version waits.
+                    .children(self.render_update_chip(cx))
                     .children(self.render_downloads_chip(cx))
                     .when(self.session.is_some(), |el| {
                         let casting = self.cast.active();

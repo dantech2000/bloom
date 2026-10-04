@@ -490,6 +490,8 @@ impl Bloom {
             // The display-sleep assertion, and the Now Playing tile with the
             // media keys (src/awake.rs, src/nowplaying.rs).
             "awake" => return self.debug_awake(rest, cx),
+            // The updater: its state, and a check of the feed now.
+            "updates" => return self.debug_updates(rest, cx),
             "nowplaying" => return self.debug_nowplaying(rest, cx),
             // SyncPlay: the state, the list of groups, and the actions of
             // the panel.

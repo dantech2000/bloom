@@ -29,6 +29,10 @@ bundle:
 install:
     dev/install
 
+# Make a signed release in target/dist: `just release 0.2.0`; `just release key` prints the public key
+release *ARGS:
+    dev/release {{ARGS}}
+
 # Copy libmpv and its libraries into vendor/mpv (needed once before the first build)
 vendor-mpv:
     dev/vendor-mpv

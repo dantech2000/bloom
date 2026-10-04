@@ -5,6 +5,17 @@
 use std::{path::PathBuf, process::Command};
 
 fn main() {
+    // The commit of the build, for the About page.
+    let commit = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=BLOOM_COMMIT={commit}");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/heads");
     println!("cargo:rerun-if-env-changed=MPV_LIB_DIR");
     if let Ok(dir) = std::env::var("MPV_LIB_DIR").map(|d| d.trim().to_string())
         && !dir.is_empty()

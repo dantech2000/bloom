@@ -9,10 +9,19 @@ name=$(sed -n 's/^pub const NAME: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
 [ -n "$name" ] || { echo "no name in src/brand.rs" >&2; exit 1; }
 (cd "$dir" && cargo build --release) || exit 1
 "$dir/dev/bundle" || exit 1
+# A running copy is asked to quit, as Cmd-Q does, and opened again after.
+was_running=
 if pgrep -f "$dest/$name.app/Contents/MacOS/$name" >/dev/null; then
-  echo "Quit the installed $name first." >&2
-  exit 1
+  was_running=1
+  osascript -e "tell application \"$dest/$name.app\" to quit" >/dev/null 2>&1
+  n=0
+  while pgrep -f "$dest/$name.app/Contents/MacOS/$name" >/dev/null; do
+    n=$((n + 1))
+    [ "$n" -gt 20 ] && { echo "$name did not quit; quit it and run this again." >&2; exit 1; }
+    sleep 0.5
+  done
 fi
 rm -rf "$dest/$name.app"
 /bin/cp -R "$dir/target/$name.app" "$dest/" || exit 1
 echo "Installed $dest/$name.app"
+[ -z "$was_running" ] || open "$dest/$name.app"

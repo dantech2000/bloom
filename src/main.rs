@@ -41,6 +41,7 @@ mod syncplay;
 mod trailer;
 #[allow(dead_code, unused_imports)]
 mod ui;
+mod updates;
 mod video_surface;
 
 /// The installed gpuicn component tests expect `crate::init`.
@@ -143,5 +144,7 @@ fn main() {
             if !test_instance {
                 cx.activate(true);
             }
+            // The updater, when this is a release build in its bundle.
+            updates::start();
         });
 }

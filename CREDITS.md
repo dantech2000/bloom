@@ -24,6 +24,7 @@ Jellyfin and its logo belong to the Jellyfin project.
 | [mpv](https://mpv.io) | Video playback, embedded as libmpv | GPL-2.0-or-later |
 | [FFmpeg](https://ffmpeg.org) | Decoding and demuxing inside mpv | GPL-3.0-or-later (as built here) |
 | [libmpv2](https://github.com/kohsine/libmpv2-rs) | Rust bindings for libmpv | LGPL-2.1 |
+| [Sparkle](https://sparkle-project.org) | Updates of the app in release builds | MIT |
 
 ## Look, icons and fonts
 

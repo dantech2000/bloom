@@ -1,0 +1,57 @@
+#!/bin/sh
+# Makes a release that the app can update itself to.
+#
+#   dev/release key          prints the public key for UPDATE_PUBLIC_KEY in
+#                            src/brand.rs. The private key is made once and
+#                            stays in the macOS Keychain (Sparkle's tool asks
+#                            for access to it).
+#   dev/release <version>    sets the version in Cargo.toml, builds the app
+#                            bundle, and writes into target/dist the archive
+#                            Bloom-<version>.zip and the feed appcast.xml,
+#                            signed with the private key.
+#
+# Nothing is committed, tagged or uploaded. The last lines say how to put
+# the two files on GitHub; the app looks for the feed at UPDATE_FEED of
+# src/brand.rs. BLOOM_UPDATE_KEY_FILE names a private key file to use in
+# place of the Keychain, and BLOOM_UPDATE_URL_PREFIX the place the archive
+# is served from (both for a test on this Mac).
+dir=$(cd "$(dirname "$0")/.." && pwd)
+"$dir/dev/vendor-sparkle" || exit 1
+tools="$dir/vendor/sparkle/bin"
+name=$(sed -n 's/^pub const NAME: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
+feed=$(sed -n 's/^pub const UPDATE_FEED: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
+# https://github.com/<owner>/<repo>/releases/latest/download/appcast.xml
+repo=$(echo "$feed" | sed -n 's|^https://github.com/\([^/]*/[^/]*\)/releases/.*|\1|p')
+
+if [ "$1" = key ]; then
+  exec "$tools/generate_keys"
+fi
+version=$1
+echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' ||
+  { echo "usage: dev/release key | dev/release <major.minor.patch>" >&2; exit 1; }
+key=${BLOOM_UPDATE_KEY:-$(sed -n 's/^pub const UPDATE_PUBLIC_KEY: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")}
+[ -n "$key" ] || { echo "UPDATE_PUBLIC_KEY in src/brand.rs is empty; run dev/release key first" >&2; exit 1; }
+
+# The version of the package is the version of the bundle.
+/usr/bin/sed -i '' "1,/^version = /s/^version = \".*\"/version = \"$version\"/" "$dir/Cargo.toml"
+(cd "$dir" && cargo build --release) || exit 1
+"$dir/dev/bundle" >/dev/null || exit 1
+
+dist="$dir/target/dist"
+mkdir -p "$dist"
+archive="$dist/$name-$version.zip"
+rm -f "$archive"
+# ditto keeps the links and the signature of the bundle intact.
+ditto -c -k --sequesterRsrc --keepParent "$dir/target/$name.app" "$archive" || exit 1
+
+prefix=${BLOOM_UPDATE_URL_PREFIX:-https://github.com/$repo/releases/download/v$version/}
+if [ -n "$BLOOM_UPDATE_KEY_FILE" ]; then
+  "$tools/generate_appcast" --ed-key-file "$BLOOM_UPDATE_KEY_FILE" --download-url-prefix "$prefix" \
+    --maximum-deltas 0 "$dist" || exit 1
+else
+  "$tools/generate_appcast" --download-url-prefix "$prefix" --maximum-deltas 0 "$dist" || exit 1
+fi
+echo
+echo "Made $archive and $dist/appcast.xml"
+echo "To publish (after a commit of the version and a push):"
+echo "  gh release create v$version \"$archive\" \"$dist/appcast.xml\" --repo $repo --title \"$name $version\""

@@ -417,6 +417,8 @@ pub struct Bloom {
     window_buttons_hidden: bool,
     /// The pointer is hidden with the controls of the player.
     pointer_hidden: bool,
+    /// The version the "update is ready" toast was shown for.
+    pub update_said: Option<String>,
     /// The paused player shows the item's details in place of the controls.
     pub pause_screen: bool,
     /// Frame of the normal window while the player is in picture in
@@ -592,6 +594,16 @@ impl Bloom {
         }
         // The bitrate limit of the config, and the end of a transcode at quit.
         subscriptions.push(crate::stream::install(&config, cx));
+        // The updater says when a version is on its way or ready.
+        let update_changes = crate::updates::changes();
+        cx.spawn(async move |this, cx| {
+            while update_changes.recv().await.is_ok() {
+                if this.update(cx, |this, cx| this.update_status_changed(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         // Each new video frame asks for a draw (see `sync_frame`).
         let frames = player_frames.clone();
         cx.spawn(async move |this, cx| {
@@ -700,6 +712,7 @@ impl Bloom {
             controls_visible: true,
             window_buttons_hidden: false,
             pointer_hidden: false,
+            update_said: None,
             pause_screen: false,
             pip: None,
             last_pointer_activity: std::time::Instant::now(),
@@ -2862,6 +2875,9 @@ impl Render for Bloom {
                 if !this.player_open && this.screen == Screen::Main {
                     this.open_settings(crate::settings::Section::About, cx)
                 }
+            }))
+            .on_action(cx.listener(|this, _: &menus::CheckForUpdates, _, cx| {
+                this.check_for_updates(cx)
             }))
             .on_action(cx.listener(|this, _: &menus::Home, _, cx| {
                 if !this.player_open && this.screen == Screen::Main {

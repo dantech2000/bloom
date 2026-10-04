@@ -6,3 +6,5 @@
 *.orig
 # Working notes for Claude Code; local only
 CLAUDE.md
+# The Sparkle update framework and tools, fetched by dev/vendor-sparkle
+/vendor/sparkle

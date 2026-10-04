@@ -30,6 +30,7 @@ pub const GROUPS: &[(&str, &[Credit])] = &[
             Credit { name: "mpv", role: "Video playback, embedded as libmpv", license: "GPL-2.0-or-later", url: "https://mpv.io" },
             Credit { name: "FFmpeg", role: "Decoding and demuxing inside mpv", license: "GPL-3.0-or-later (as built here)", url: "https://ffmpeg.org" },
             Credit { name: "libmpv2", role: "Rust bindings for libmpv", license: "LGPL-2.1", url: "https://github.com/kohsine/libmpv2-rs" },
+            Credit { name: "Sparkle", role: "Updates of the app in release builds", license: "MIT", url: "https://sparkle-project.org" },
         ],
     ),
     (
@@ -102,7 +103,7 @@ impl Bloom {
                     .child(div().text_size(px(14.)).text_color(soft).child(format!(
                         "{} · version {}",
                         crate::brand::TAGLINE,
-                        crate::config::APP_VERSION
+                        crate::updates::version_line()
                     ))),
             );
         let about = group("About", cx)
@@ -125,7 +126,12 @@ impl Bloom {
                     .on_click(|_: &ClickEvent, _, cx| cx.open_url("https://jellyfin.org")),
                 cx,
             ));
-        let mut page = div().flex().flex_col().gap(px(18.)).child(about);
+        let mut page = div()
+            .flex()
+            .flex_col()
+            .gap(px(18.))
+            .child(about)
+            .child(self.render_updates(cx));
         for (title, credits) in GROUPS {
             let mut card = group(*title, cx);
             for credit in credits.iter() {
