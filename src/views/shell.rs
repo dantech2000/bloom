@@ -344,6 +344,19 @@ impl Bloom {
             );
             let handle = this.clone();
             items.push(
+                MenuItem::new("menu.about", format!("About {}", crate::brand::NAME))
+                    .icon(LucideIcon::Info)
+                    .detail("License and the projects it is made with")
+                    .on_click(move |_, _, cx| {
+                        handle
+                            .update(cx, |this, cx| {
+                                this.open_settings(crate::settings::Section::About, cx)
+                            })
+                            .ok();
+                    }),
+            );
+            let handle = this.clone();
+            items.push(
                 MenuItem::new("menu.signout", "Sign out")
                     .icon(LucideIcon::LogOut)
                     .on_click(move |_, _, cx| {

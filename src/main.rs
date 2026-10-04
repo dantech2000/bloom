@@ -10,6 +10,7 @@ mod brand;
 mod chromecast;
 mod cast;
 mod config;
+mod credits;
 mod debug;
 mod downloads;
 mod enhanced;
@@ -105,6 +106,7 @@ fn main() {
                         .any(|display| display.bounds().intersects(bounds))
                 })
                 .unwrap_or_else(|| Bounds::centered(None, size(px(1280.), px(820.)), cx));
+            let test_instance = std::env::var_os("BLOOM_TEST_NAME").is_some();
             cx.open_window(
                 WindowOptions {
                     titlebar: Some(TitlebarOptions {
@@ -118,15 +120,28 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     window_min_size: Some(size(px(900.), px(600.))),
                     window_background: WindowBackgroundAppearance::Opaque,
+                    // A test instance must not take the keyboard from the
+                    // person at the Mac: the keys he types would go to its
+                    // window, and macOS beeps for each one it cannot use.
+                    focus: !test_instance,
                     ..Default::default()
                 },
-                |window, cx| {
+                move |window, cx| {
                     window.set_window_title(brand::NAME);
+                    if test_instance {
+                        // On screen, so it draws and can be captured, but
+                        // the app does not become the active one.
+                        if let Some(ns_window) = pip::ns_window(window) {
+                            macos::send!((), ns_window, c"orderFrontRegardless");
+                        }
+                    }
                     cx.new(|cx| Bloom::new(config, window, cx))
                 },
             )
             .expect("open application window");
             log::debug!("window open {} ms after start", perf::since_start_ms());
-            cx.activate(true);
+            if !test_instance {
+                cx.activate(true);
+            }
         });
 }

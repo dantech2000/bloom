@@ -72,9 +72,6 @@ Servers, profiles, access tokens and downloads are in
 | `dev/shot <file>` | Captures the window of an instance |
 | `dev/jctl perf`, `dev/jctl pacing` | Frame cost, and how evenly video frames reach the screen |
 
-`CLAUDE.md` has the working rules of this repository, among them the rules for
-tests against a real server.
-
 ### Layout
 
 | Path | Purpose |
@@ -99,8 +96,6 @@ tests against a real server.
 Bloom is free software under the
 [GNU Affero General Public License v3.0 or later](LICENSE), as is jellyui.
 
-Third-party parts keep their own licenses: the fonts in `assets/fonts` are under
-the SIL Open Font License (`assets/fonts/OFL.txt`), the gpuicn components in
-`src/ui` are MIT licensed, the Jellyfin logo is CC BY-SA 4.0, the filled icons
-are from Material Icons (Apache-2.0), and libmpv is LGPL-2.1+ and linked
-dynamically.
+Third-party parts keep their own licenses. [CREDITS.md](CREDITS.md) lists the
+projects Bloom is made with, what each is used for, and its license. The same
+list is in the app, in Settings > About.

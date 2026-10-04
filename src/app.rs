@@ -2858,6 +2858,11 @@ impl Render for Bloom {
                     this.back(cx)
                 }
             }))
+            .on_action(cx.listener(|this, _: &menus::About, _, cx| {
+                if !this.player_open && this.screen == Screen::Main {
+                    this.open_settings(crate::settings::Section::About, cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &menus::Home, _, cx| {
                 if !this.player_open && this.screen == Screen::Main {
                     this.open_home(cx)

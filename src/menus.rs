@@ -6,6 +6,7 @@ use gpui_kit::{App, KeyBinding, Menu, MenuItem, actions};
 actions!(
     bloom,
     [
+        About,
         Hide,
         HideOthers,
         ShowAll,
@@ -53,6 +54,8 @@ pub fn init(cx: &mut App) {
         menu(
             crate::brand::NAME,
             vec![
+                MenuItem::action(format!("About {}", crate::brand::NAME), About),
+                MenuItem::separator(),
                 MenuItem::action(format!("Hide {}", crate::brand::NAME), Hide),
                 MenuItem::action("Hide Others", HideOthers),
                 MenuItem::action("Show All", ShowAll),

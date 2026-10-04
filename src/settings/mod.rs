@@ -41,10 +41,12 @@ pub enum Section {
     /// Titles the user hid (Jellyfin Enhanced); shown only when the server
     /// has hidden content on.
     Hidden,
+    /// What Bloom is, its license, and the projects it is made with.
+    About,
 }
 
 impl Section {
-    pub const ALL: [Section; 7] = [
+    pub const ALL: [Section; 8] = [
         Section::Profile,
         Section::Playback,
         Section::Subtitles,
@@ -52,6 +54,7 @@ impl Section {
         Section::Display,
         Section::Downloads,
         Section::Hidden,
+        Section::About,
     ];
 
     pub fn label(self) -> &'static str {
@@ -63,6 +66,7 @@ impl Section {
             Section::Display => "Display",
             Section::Downloads => "Downloads",
             Section::Hidden => "Hidden content",
+            Section::About => "About",
         }
     }
 
@@ -75,6 +79,7 @@ impl Section {
             Section::Display => LucideIcon::Monitor,
             Section::Downloads => LucideIcon::Download,
             Section::Hidden => LucideIcon::EyeOff,
+            Section::About => LucideIcon::Info,
         }
     }
 
@@ -496,6 +501,7 @@ impl Bloom {
             Section::Display => self.render_settings_display(cx),
             Section::Downloads => self.render_settings_downloads(cx),
             Section::Hidden => self.render_settings_hidden(cx),
+            Section::About => self.render_settings_about(cx),
         };
 
         let content = div().flex_1().min_w_0().h_full().child(
