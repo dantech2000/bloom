@@ -15,7 +15,7 @@ use std::{
     ffi::c_void,
     ptr,
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc,
     },
@@ -198,8 +198,8 @@ pub struct Scheduled {
 
 enum Cmd {
     Load(PlayRequest),
-    /// Ends the worker, so mpv is closed before a test process exits.
-    #[cfg(test)]
+    /// Ends the worker, so mpv is closed before the process exits: at the
+    /// quit of the app, and at the end of a test.
     Quit,
     TogglePause,
     SetPaused(bool),
@@ -620,12 +620,13 @@ impl Player {
         }
     }
 
-    /// Ends the worker and waits for it. A process that exits while mpv
-    /// still runs can crash, so a test with the real player ends with this.
+    /// Ends the worker and waits for it, up to `wait`. A process that
+    /// exits while mpv still runs can crash, so a test with the real
+    /// player ends with this; the app quits through [`shut_down_all`].
     #[cfg(test)]
-    pub(crate) fn shut_down(&self) {
+    pub(crate) fn shut_down(&self, wait: Duration) {
         self.send(Cmd::Quit);
-        let end = Instant::now() + Duration::from_secs(10);
+        let end = Instant::now() + wait;
         while self.commands.lock().unwrap().is_some() && Instant::now() < end {
             thread::sleep(Duration::from_millis(10));
         }
@@ -638,6 +639,11 @@ impl Player {
         }
         let (tx, rx) = mpsc::channel();
         *slot = Some(tx);
+        {
+            let mut players = PLAYERS.lock().unwrap();
+            players.retain(|p| !Arc::ptr_eq(&p.commands, &self.commands));
+            players.push(self.clone());
+        }
         let shared = self.shared.clone();
         let commands = self.commands.clone();
         thread::Builder::new()
@@ -653,6 +659,68 @@ impl Player {
             })
             .expect("spawn mpv thread");
     }
+}
+
+/// The players that started a worker, for [`shut_down_all`].
+static PLAYERS: Mutex<Vec<Player>> = Mutex::new(Vec::new());
+
+/// How long the quit of the app waits for the cores to close.
+const QUIT_WAIT: Duration = Duration::from_secs(2);
+
+/// Closes every mpv core, the players and the trailer, and waits for them
+/// up to `QUIT_WAIT`: for the quit of the app, as a process that exits
+/// while a core runs can crash. Each worker frees its render context and
+/// then the core (`run`, `trailer::run`).
+pub fn shut_down_all() {
+    let started = Instant::now();
+    let players: Vec<Player> = PLAYERS.lock().unwrap().clone();
+    for player in &players {
+        player.send(Cmd::Quit);
+    }
+    crate::trailer::ask_to_quit();
+    let running = || {
+        players.iter().any(|p| p.commands.lock().unwrap().is_some()) || crate::trailer::running()
+    };
+    while running() && started.elapsed() < QUIT_WAIT {
+        thread::sleep(Duration::from_millis(5));
+    }
+    if running() {
+        log::warn!("an mpv core did not close within {QUIT_WAIT:?}");
+    } else {
+        log::info!("mpv closed in {} ms", started.elapsed().as_millis());
+    }
+}
+
+/// The root certificates mpv trusts: Mozilla's bundle, the same roots the
+/// REST client has compiled in (`webpki-roots`), so a server the app signs
+/// in to also plays, and no other one does. libmpv checks no certificate
+/// by itself, and its GnuTLS looks for `/etc/ssl/certs/ca-certificates.crt`,
+/// which a Mac does not have. `/etc/ssl/cert.pem` of macOS is a copy of
+/// 2021 and refuses, for one, the ISRG Root X2 chain of Let's Encrypt.
+const TLS_ROOTS: &[u8] = include_bytes!("../assets/cacert.pem");
+
+/// The bundle as a file, as GnuTLS reads one: in the cache folder, written
+/// at the first core of a start when it changed. The file of the system
+/// when the folder cannot be written.
+pub(crate) fn tls_roots_file() -> &'static str {
+    static FILE: OnceLock<String> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let write = || -> std::io::Result<String> {
+            let dir = dirs::cache_dir()
+                .ok_or_else(|| std::io::Error::other("no cache folder"))?
+                .join(crate::brand::FOLDER);
+            std::fs::create_dir_all(&dir)?;
+            let path = dir.join("tls-roots.pem");
+            if std::fs::read(&path).ok().as_deref() != Some(TLS_ROOTS) {
+                std::fs::write(&path, TLS_ROOTS)?;
+            }
+            Ok(path.to_string_lossy().into_owned())
+        };
+        write().unwrap_or_else(|err| {
+            log::warn!("could not write the TLS roots for mpv ({err}); using /etc/ssl/cert.pem");
+            "/etc/ssl/cert.pem".into()
+        })
+    })
 }
 
 // ----- worker thread ---------------------------------------------------------
@@ -816,6 +884,11 @@ impl Worker {
 struct Renderer {
     ctx: *mut sys::mpv_render_context,
     gl: GlRenderer,
+    /// The size the frames are rendered at, the source size they are of,
+    /// and the size the video area asks for since when (see `frame_size`).
+    size: (u32, u32),
+    src: (u32, u32),
+    asked: Option<((u32, u32), Instant)>,
 }
 
 impl Drop for Renderer {
@@ -850,6 +923,23 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Cmd>) -> Result<()> {
             "user-agent",
             format!("{}/{}", crate::config::APP_NAME, crate::config::APP_VERSION),
         )?;
+        // libmpv checks no server certificate by itself (see `tls_roots_file`).
+        init.set_option("tls-verify", "yes")?;
+        init.set_option("tls-ca-file", tls_roots_file())?;
+        // Built-in scripts the player has no use for, each a Lua thread.
+        // `stats` stays: the playback info shows it (`toggle_playback_info`).
+        // An older mpv may lack one.
+        for script in [
+            "osc",
+            "load-osd-console",
+            "load-auto-profiles",
+            "load-select",
+            "load-positioning",
+            "load-commands",
+            "load-context-menu",
+        ] {
+            let _ = init.set_option(script, "no");
+        }
         Ok(())
     })
     .map_err(|e| anyhow!("could not create libmpv core: {e}"))?;
@@ -1195,7 +1285,6 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Cmd>) -> Result<()> {
                     worker.item_id = None;
                     let _ = mpv.command("stop", &[]);
                 }
-                #[cfg(test)]
                 Cmd::Quit => return Ok(()),
             }
         }
@@ -1347,6 +1436,9 @@ fn render_loop(mpv_handle: usize, signal: &'static RenderSignal, ready: mpsc::Se
     let _ = ready.send(Ok(()));
 
     while !signal.quit.load(Ordering::Acquire) {
+        // What CoreVideo and the GL driver autorelease in this turn goes
+        // at its end, not when the thread ends.
+        let _pool = crate::macos::Pool::new();
         // The display refreshed: mpv hears of it first, so it can hand
         // over the frame for the next refresh at once.
         if signal.swap_due.swap(false, Ordering::AcqRel) {
@@ -1437,7 +1529,42 @@ fn create_renderer(mpv_handle: *mut sys::mpv_handle, signal: &'static RenderSign
             signal as *const RenderSignal as *mut c_void,
         );
     }
-    Ok(Renderer { ctx, gl })
+    Ok(Renderer { ctx, gl, size: (0, 0), src: (0, 0), asked: None })
+}
+
+/// A new size of the video area counts once it has held for this long:
+/// in a resize of the window the area changes at every frame, and each
+/// change makes the pool of surfaces anew (`GlRenderer::resize`).
+const SIZE_SETTLE: Duration = Duration::from_millis(150);
+
+/// The size to render the picture at: the one it is shown at, so mpv's
+/// scaler (lanczos) does the upscale and the UI copies the frame one to
+/// one, instead of stretching a frame of the source size. The video area
+/// in device pixels bounds it, a picture smaller than that keeps its
+/// aspect. A new file renders at its size at once; a change of the area
+/// after `SIZE_SETTLE`, and until then the UI stretches the frame.
+fn frame_size(renderer: &mut Renderer, src: (u32, u32), target: (u32, u32)) -> (u32, u32) {
+    let scale = (target.0 as f64 / src.0 as f64).min(target.1 as f64 / src.1 as f64);
+    let even = |v: f64| ((v as u32).max(2) / 2) * 2;
+    let wanted = (even(src.0 as f64 * scale), even(src.1 as f64 * scale));
+    if wanted == renderer.size {
+        renderer.asked = None;
+    } else {
+        let now = Instant::now();
+        let held = match renderer.asked {
+            Some((size, since)) if size == wanted => now.duration_since(since),
+            _ => {
+                renderer.asked = Some((wanted, now));
+                Duration::ZERO
+            }
+        };
+        if renderer.size == (0, 0) || src != renderer.src || held >= SIZE_SETTLE {
+            renderer.size = wanted;
+            renderer.asked = None;
+        }
+    }
+    renderer.src = src;
+    renderer.size
 }
 
 /// What mpv says about the frame it asks to render.
@@ -1451,8 +1578,8 @@ fn next_frame_info(renderer: &Renderer) -> sys::mpv_render_frame_info {
     info
 }
 
-/// Renders the current frame at the largest size that fits the UI's video area
-/// without exceeding the source resolution, then publishes its GPU surface.
+/// Renders the current frame at the size of the UI's video area (see
+/// `frame_size`), then publishes its GPU surface.
 /// With `skip` mpv takes the frame as rendered and nothing is drawn.
 /// `synced` says the frame is in display sync: made for the next refresh.
 fn render_frame(renderer: &mut Renderer, shared: &Shared, skip: bool, synced: bool) -> Result<()> {
@@ -1498,11 +1625,7 @@ fn render_frame(renderer: &mut Renderer, shared: &Shared, skip: bool, synced: bo
     }
     let target_w = shared.target_w.load(Ordering::Relaxed).max(16);
     let target_h = shared.target_h.load(Ordering::Relaxed).max(16);
-    let scale = (target_w as f64 / src_w as f64)
-        .min(target_h as f64 / src_h as f64)
-        .min(1.0);
-    let w = (((src_w as f64 * scale) as u32).max(2) / 2) * 2;
-    let h = (((src_h as f64 * scale) as u32).max(2) / 2) * 2;
+    let (w, h) = frame_size(renderer, (src_w, src_h), (target_w, target_h));
 
     let mut fbo = sys::mpv_opengl_fbo {
         fbo: renderer.gl.begin(w, h)?,
@@ -1706,7 +1829,7 @@ pub(crate) struct Closer(pub Player);
 #[cfg(test)]
 impl Drop for Closer {
     fn drop(&mut self) {
-        self.0.shut_down();
+        self.0.shut_down(Duration::from_secs(10));
     }
 }
 
@@ -1725,8 +1848,9 @@ mod tests {
         assert_eq!(tracks[2].label(), "English SDH · ENG · SUBRIP");
     }
 
-    /// Plays a synthetic clip through the embedded core, checks frames arrive,
-    /// pauses, seeks, and stops. Skipped when libmpv or ffmpeg are unavailable.
+    /// Plays a synthetic clip through the embedded core, checks frames arrive
+    /// at the size of the video area (twice the clip), pauses, seeks, and
+    /// stops. Skipped when libmpv or ffmpeg are unavailable.
     #[test]
     fn embedded_playback_roundtrip() {
         let _one = REAL_PLAYER.lock().unwrap_or_else(|e| e.into_inner());
@@ -1805,8 +1929,9 @@ mod tests {
         wait("first frame", Box::new(move || p.frame().1.is_some()));
         let (_, frame) = player.frame();
         let frame = frame.unwrap();
-        assert_eq!(frame.width(), 320);
-        assert_eq!(frame.height(), 240);
+        // The video area is 640 x 480: mpv scales the 320 x 240 clip up.
+        assert_eq!(frame.width(), 640);
+        assert_eq!(frame.height(), 480);
         // Let the GPU finish, then read pixels (bytes are B, G, R, A).
         thread::sleep(Duration::from_millis(300));
         let buffer = player.frame().1.unwrap().buffer();
@@ -1817,7 +1942,7 @@ mod tests {
             let at = base.add(y * stride + x * 4);
             (*at.add(2), *at.add(1), *at)
         };
-        let (top, bottom) = (pixel(160, 40), pixel(160, 200));
+        let (top, bottom) = (pixel(320, 80), pixel(320, 400));
         buffer.unlock_base_address(core_video::pixel_buffer::kCVPixelBufferLock_ReadOnly);
         assert!(top.0 > 200 && top.2 < 60, "top must be red, got RGB {top:?}");
         assert!(bottom.2 > 200 && bottom.0 < 60, "bottom must be blue, got RGB {bottom:?}");
@@ -1840,6 +1965,100 @@ mod tests {
         );
         player.acknowledge_end();
         assert_eq!(player.status().state, PlayState::Idle);
+    }
+
+    /// Ends a server process with the test, also when the test fails.
+    struct Kill(std::process::Child);
+
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A server whose certificate no root signs is refused: libmpv checks
+    /// nothing by itself (`tls_roots_file`). The server is openssl's own,
+    /// with a certificate it makes for the test. Skipped without openssl.
+    #[test]
+    fn refuses_a_self_signed_server() {
+        let _one = REAL_PLAYER.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(media) = test_clip("bloom-embedded-tls-test.mp4") else {
+            return;
+        };
+        let dir = std::env::temp_dir().join("bloom-tls-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+        let made = std::process::Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=127.0.0.1"])
+            .arg("-keyout")
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .stderr(std::process::Stdio::null())
+            .status();
+        if !made.map(|s| s.success()).unwrap_or(false) {
+            eprintln!("openssl not available; skipping");
+            return;
+        }
+        std::fs::copy(&media, dir.join("clip.mp4")).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        // The server logs `FILE:clip.mp4` when a client asks for the file:
+        // a client that refuses the certificate never does.
+        let log = dir.join("server.log");
+        let _server = Kill(
+            std::process::Command::new("openssl")
+                .args(["s_server", "-WWW", "-accept"])
+                .arg(port.to_string())
+                .arg("-cert")
+                .arg(&cert)
+                .arg("-key")
+                .arg(&key)
+                .current_dir(&dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::fs::File::create(&log).unwrap())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "openssl s_server did not start");
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let client = Client::new("http://127.0.0.1:9", "test-device").with_session("token", "user");
+        let player = Player::default();
+        let _closer = Closer(player.clone());
+        player.set_target_size(320, 240);
+        player.play(PlayRequest {
+            client,
+            item_id: "test".into(),
+            url: format!("https://127.0.0.1:{port}/clip.mp4"),
+            title: "TLS test".into(),
+            start_secs: 0.,
+            paused: false,
+            token: 3,
+            play_session_id: None,
+            play_method: String::new(),
+            media_source_id: String::new(),
+            subtitles: Vec::new(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while player.status().state != PlayState::Ended {
+            assert!(player.frame().1.is_none(), "a frame of the refused server");
+            assert!(Instant::now() < deadline, "not refused: {:?}", player.status());
+            thread::sleep(Duration::from_millis(50));
+        }
+        let status = player.status();
+        assert!(status.error.is_some(), "{status:?}");
+        let events = player.events();
+        let failed = std::iter::from_fn(|| events.try_recv().ok())
+            .any(|event| event == PlayerEvent::LoadFailed { token: 3 });
+        assert!(failed, "no LoadFailed event: {status:?}");
+        thread::sleep(Duration::from_millis(200));
+        let served = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(!served.contains("FILE:"), "the file was asked for: {served}");
     }
 
     /// The next event that fits, within ten seconds.

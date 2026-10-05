@@ -25,6 +25,7 @@ Jellyfin and its logo belong to the Jellyfin project.
 | [FFmpeg](https://ffmpeg.org) | Decoding and demuxing inside mpv | GPL-3.0-or-later (as built here) |
 | [libmpv2](https://github.com/kohsine/libmpv2-rs) | Rust bindings for libmpv | LGPL-2.1 |
 | [Sparkle](https://sparkle-project.org) | Updates of the app in release builds | MIT |
+| [Mozilla CA certificate list](https://curl.se/docs/caextract.html) | The certificate authorities the player trusts for HTTPS streams | MPL-2.0 |
 
 ## Look, icons and fonts
 

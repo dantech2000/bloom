@@ -5,7 +5,10 @@
 //! Stored as JSON under the OS config directory with owner-only permissions,
 //! because it holds Jellyfin access tokens.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -60,6 +63,10 @@ pub struct Config {
     /// file would not keep up. On unless set to false.
     #[serde(default)]
     pub adaptive_quality: Option<bool>,
+    /// The debug channel: a socket in the folder of the app through which a
+    /// tool on this Mac can drive the app. Off unless set to true.
+    #[serde(default)]
+    pub debug_channel: Option<bool>,
     /// The speed of the connection at the last measurement, in bits per
     /// second, and when (seconds since the Unix epoch).
     #[serde(default)]
@@ -133,10 +140,30 @@ impl Config {
     }
 
     pub fn load() -> Self {
-        let mut config = fs::read(Self::path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Config>(&bytes).ok())
-            .unwrap_or_default();
+        Self::load_from(&Self::path())
+    }
+
+    /// A missing file is the first start: the default. A file that is there
+    /// but does not parse is copied to `<name>.broken` first (the next save
+    /// would overwrite the servers and tokens in it), and a field of the
+    /// wrong type is dropped alone, so the rest of the config stays.
+    fn load_from(path: &Path) -> Self {
+        let mut config = match fs::read(path) {
+            Ok(bytes) => match serde_json::from_slice::<Config>(&bytes) {
+                Ok(config) => config,
+                Err(err) => {
+                    // The message has a line and column, never file content.
+                    log::warn!("config {} does not parse ({err}); keeping a copy", path.display());
+                    keep_broken_copy(path, &bytes);
+                    salvage(&bytes)
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Config::default(),
+            Err(err) => {
+                log::warn!("config {} cannot be read: {err}", path.display());
+                Config::default()
+            }
+        };
         if config.device_id.is_empty() {
             config.device_id = uuid::Uuid::new_v4().to_string();
         }
@@ -149,18 +176,12 @@ impl Config {
         if std::env::var_os("BLOOM_CONFIG_READONLY").is_some() {
             return Ok(());
         }
-        let path = Self::path();
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        }
+        self.save_to(&Self::path())
+    }
+
+    fn save_to(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_vec_pretty(self)?;
-        fs::write(&path, json).with_context(|| format!("write {}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
+        write_private(path, &json).with_context(|| format!("write {}", path.display()))
     }
 
     pub fn server(&self, id: &str) -> Option<&Server> {
@@ -220,6 +241,69 @@ pub fn normalize_url(input: &str) -> String {
     }
 }
 
+/// Writes `bytes` to a temp file in the same folder (mode 0600 from the
+/// start, the file holds tokens), syncs it, and renames it over `path`: a
+/// crash or a full disk leaves the old file whole.
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".tmp{}", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| -> Result<()> {
+        let mut file = options.open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Copies an unreadable config to `<name>.broken`. An existing copy with the
+/// same content stays; one with other content is replaced (the latest
+/// failure is the one worth looking at).
+fn keep_broken_copy(path: &Path, bytes: &[u8]) {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".broken");
+    let copy = path.with_file_name(name);
+    if fs::read(&copy).is_ok_and(|old| old == bytes) {
+        return;
+    }
+    if let Err(err) = write_private(&copy, bytes) {
+        log::warn!("cannot keep a copy of the broken config: {err:#}");
+    }
+}
+
+/// Keeps every top-level field of a JSON object that fits its type; the
+/// others take their default. Not an object: the default.
+fn salvage(bytes: &[u8]) -> Config {
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_slice(bytes) else {
+        return Config::default();
+    };
+    let mut kept = serde_json::Map::new();
+    for (key, value) in fields {
+        let mut trial = kept.clone();
+        trial.insert(key.clone(), value.clone());
+        if serde_json::from_value::<Config>(trial.into()).is_ok() {
+            kept.insert(key, value);
+        }
+    }
+    serde_json::from_value(kept.into()).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +360,114 @@ mod tests {
         });
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.server("s").unwrap().name, "Renamed");
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bloom-config-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sample() -> Config {
+        let mut config = Config::default();
+        config.device_id = "dev".into();
+        config.upsert_server(Server {
+            id: "s".into(),
+            name: "S".into(),
+            url: "http://s".into(),
+            profiles: vec![],
+        });
+        config.upsert_profile(
+            "s",
+            Profile { user_id: "u".into(), name: "U".into(), token: "secret".into(), image_tag: None },
+        );
+        config
+    }
+
+    #[test]
+    fn save_then_load_round_trips() {
+        let dir = temp_dir("round");
+        let path = dir.join("config.json");
+        sample().save_to(&path).unwrap();
+        let loaded = Config::load_from(&path);
+        assert_eq!(loaded.device_id, "dev");
+        assert_eq!(loaded.server("s").unwrap().profiles[0].token, "secret");
+        assert!(!dir.join("config.json.broken").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_file_is_the_default_and_makes_no_copy() {
+        let dir = temp_dir("missing");
+        let loaded = Config::load_from(&dir.join("config.json"));
+        assert!(loaded.servers.is_empty());
+        assert!(!loaded.device_id.is_empty());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncated_file_is_kept_as_broken() {
+        let dir = temp_dir("broken");
+        let path = dir.join("config.json");
+        sample().save_to(&path).unwrap();
+        let whole = fs::read(&path).unwrap();
+        let cut = &whole[..whole.len() / 2];
+        fs::write(&path, cut).unwrap();
+        let loaded = Config::load_from(&path);
+        assert!(loaded.servers.is_empty());
+        assert_eq!(fs::read(dir.join("config.json.broken")).unwrap(), cut);
+        // The same content again leaves the copy; other content replaces it.
+        Config::load_from(&path);
+        fs::write(&path, b"{ not json").unwrap();
+        Config::load_from(&path);
+        assert_eq!(fs::read(dir.join("config.json.broken")).unwrap(), b"{ not json");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wrong_type_drops_one_field_only() {
+        let dir = temp_dir("lenient");
+        let path = dir.join("config.json");
+        let mut value = serde_json::to_value(sample()).unwrap();
+        value["dark"] = serde_json::json!("yes");
+        value["unknown_future_field"] = serde_json::json!(1);
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = Config::load_from(&path);
+        assert_eq!(loaded.dark, None);
+        assert_eq!(loaded.servers.len(), 1);
+        assert!(dir.join("config.json.broken").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_and_missing_fields_load() {
+        let dir = temp_dir("fields");
+        let path = dir.join("config.json");
+        fs::write(&path, br#"{"device_id":"d","from_the_future":{"a":1}}"#).unwrap();
+        let loaded = Config::load_from(&path);
+        assert_eq!(loaded.device_id, "d");
+        assert!(!dir.join("config.json.broken").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_file_is_private_and_leaves_no_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("mode");
+        let path = dir.join("config.json");
+        sample().save_to(&path).unwrap();
+        sample().save_to(&path).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let names: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("config.json")]);
+        // A broken copy is private too.
+        fs::write(&path, b"{").unwrap();
+        Config::load_from(&path);
+        let mode = fs::metadata(dir.join("config.json.broken")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

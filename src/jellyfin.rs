@@ -43,6 +43,8 @@ impl Client {
     pub fn with_session(mut self, token: &str, user_id: &str) -> Self {
         self.token = Some(token.into());
         self.user_id = Some(user_id.into());
+        // The image loader sends this header to this server only.
+        register_image_auth(&self.base, self.auth_header());
         self
     }
 
@@ -796,12 +798,37 @@ fn item_fields() -> String {
     }
 }
 
-fn map_err(err: ureq::Error, path: &str) -> anyhow::Error {
-    match err {
-        ureq::Error::StatusCode(401) => anyhow!("unauthorized (401) at {path}"),
-        ureq::Error::StatusCode(code) => anyhow!("HTTP {code} at {path}"),
-        other => anyhow!("{other} ({path})"),
+/// A failed request. Its text is as before ("HTTP 530 at /Items"); the
+/// verdict says, without the text, whether the server is there
+/// (`connection::classify`).
+#[derive(Debug)]
+pub struct RequestError {
+    pub verdict: crate::connection::Verdict,
+    text: String,
+}
+
+impl RequestError {
+    pub fn new(verdict: crate::connection::Verdict, text: String) -> Self {
+        Self { verdict, text }
     }
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::error::Error for RequestError {}
+
+fn map_err(err: ureq::Error, path: &str) -> anyhow::Error {
+    let verdict = crate::connection::classify_ureq(&err);
+    let text = match err {
+        ureq::Error::StatusCode(401) => format!("unauthorized (401) at {path}"),
+        ureq::Error::StatusCode(code) => format!("HTTP {code} at {path}"),
+        other => format!("{other} ({path})"),
+    };
+    RequestError::new(verdict, text).into()
 }
 
 fn urlencode(s: &str) -> String {
@@ -821,6 +848,62 @@ fn urlencode(s: &str) -> String {
 /// once: every request sends it, and the answer takes a process to get.
 /// Characters that are not plain ASCII are replaced, because a header value
 /// with them is refused.
+/// Scheme, host and port of a URL, lower case, with the default port filled
+/// in. `None` for anything that is not an `http(s)` URL with a host.
+fn origin_of(url: &str) -> Option<(String, String, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let default = match scheme.as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // A name before `@` is login data, not the host.
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !port.contains(']') => (host, port.parse().ok()?),
+        _ => (authority, default),
+    };
+    (!host.is_empty()).then(|| (scheme, host.to_ascii_lowercase(), port))
+}
+
+type ImageAuth = Vec<((String, String, u16), String)>;
+
+static IMAGE_AUTH: std::sync::Mutex<ImageAuth> = std::sync::Mutex::new(Vec::new());
+/// Counts the sign-ins; the image loader retries failed images after one.
+static SESSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn register_image_auth(base: &str, header: String) {
+    let Some(origin) = origin_of(base) else { return };
+    let mut all = IMAGE_AUTH.lock().unwrap();
+    all.retain(|(known, _)| *known != origin);
+    all.push((origin, header));
+    SESSIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Number of sessions opened so far. A change means the app connected again.
+pub fn session_count() -> u64 {
+    SESSIONS.load(Ordering::Relaxed)
+}
+
+/// The server answers again after an outage: images that failed may be
+/// tried again at once.
+pub fn reconnected() {
+    SESSIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+fn header_for<'a>(all: &'a ImageAuth, url: &str) -> Option<&'a str> {
+    let origin = origin_of(url)?;
+    all.iter().find(|(known, _)| *known == origin).map(|(_, header)| header.as_str())
+}
+
+/// The `Authorization` header for an image URL of the signed-in server, and
+/// `None` for any other origin, so the token never goes to another host.
+pub fn image_auth_header(url: &str) -> Option<String> {
+    header_for(&IMAGE_AUTH.lock().unwrap(), url).map(str::to_string)
+}
+
 fn hostname() -> &'static str {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     NAME.get_or_init(|| {
@@ -1405,6 +1488,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn image_header_goes_to_the_servers_origin_only() {
+        let client = Client::new("https://media.example.com/", "dev-1").with_session("tok", "u");
+        let all: ImageAuth = vec![(origin_of(&client.base).unwrap(), client.auth_header())];
+        let sent = header_for(&all, "https://MEDIA.example.com:443/Items/1/Images/Primary?tag=x");
+        assert_eq!(sent, Some(client.auth_header().as_str()));
+        assert!(sent.unwrap().contains("Token=\"tok\""));
+        for other in [
+            "https://evil.example.com/a.jpg",
+            "http://media.example.com/a.jpg",
+            "https://media.example.com:8443/a.jpg",
+            "https://media.example.com@evil.example.com/a.jpg",
+            "https://media.example.com.evil.net/a.jpg",
+            "file:///etc/passwd",
+            "https://image.tmdb.org/t/p/w500/a.jpg",
+        ] {
+            assert_eq!(header_for(&all, other), None, "{other}");
+        }
+        // The real registry holds the same entry.
+        assert!(image_auth_header("https://media.example.com/x").is_some());
+        assert!(image_auth_header("https://other.example.com/x").is_none());
+    }
+
+    #[test]
+    fn trickplay_url_has_no_token() {
+        let client = Client::new("https://media.example.com", "dev-1").with_session("secret-tok", "u");
+        let url = client.trickplay_url("abc", 320, 2);
+        assert_eq!(url, "https://media.example.com/Videos/abc/Trickplay/320/2.jpg");
+        assert!(!url.contains("secret-tok") && !url.contains("api_key"));
+    }
+
+    #[test]
     fn builds_urls_and_headers() {
         let client =
             Client::new("https://media.example.com/", "dev-1").with_session("tok", "user-1");
@@ -1620,13 +1734,11 @@ impl Client {
         })
     }
 
-    /// Address of one sheet of preview images. The server wants the token
-    /// for these, and the image loader sends no header, so it is in the query.
+    /// Address of one sheet of preview images. The server wants the session
+    /// for these; the image loader sends the header (see [`image_auth_header`]),
+    /// so the token is not in the URL.
     pub fn trickplay_url(&self, item_id: &str, width: u32, sheet: u32) -> String {
-        self.url(
-            &format!("/Videos/{item_id}/Trickplay/{width}/{sheet}.jpg"),
-            &[("api_key", self.token.as_deref().unwrap_or_default().to_string())],
-        )
+        self.url(&format!("/Videos/{item_id}/Trickplay/{width}/{sheet}.jpg"), &[])
     }
 
     /// The episodes that follow an episode in its series, in order.

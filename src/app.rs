@@ -398,6 +398,8 @@ pub struct Bloom {
     pub chromecast: crate::chromecast::State,
     /// Downloads for offline use and the offline mode.
     pub downloads: crate::downloads::DownloadsState,
+    /// Whether the server answers (src/connection.rs).
+    pub connection: crate::connection::ConnectionState,
     pub subtitle_menu: Entity<MenuState>,
     /// Search for subtitles and the timing offsets (`subtitles.rs`).
     pub subs: crate::subtitles::State,
@@ -419,6 +421,10 @@ pub struct Bloom {
     pointer_hidden: bool,
     /// The version the "update is ready" toast was shown for.
     pub update_said: Option<String>,
+    /// The debug channel: where its listeners send the commands, and the
+    /// listener that the setting turned on.
+    pub debug_requests: Option<async_channel::Sender<crate::debug::Request>>,
+    pub debug_listener: Option<crate::debug::Listener>,
     /// The paused player shows the item's details in place of the controls.
     pub pause_screen: bool,
     /// Frame of the normal window while the player is in picture in
@@ -702,6 +708,7 @@ impl Bloom {
             stream: Default::default(),
             chromecast: Default::default(),
             downloads: Default::default(),
+            connection: Default::default(),
             subtitle_menu,
             subs: Default::default(),
             tracks_version: 0,
@@ -713,6 +720,8 @@ impl Bloom {
             window_buttons_hidden: false,
             pointer_hidden: false,
             update_said: None,
+            debug_requests: None,
+            debug_listener: None,
             pause_screen: false,
             pip: None,
             last_pointer_activity: std::time::Instant::now(),
@@ -1912,7 +1921,7 @@ impl Bloom {
                                 }
                                 Err(err) => {
                                     data.loading = false;
-                                    // No server at all: the downloads page takes over.
+                                    // No server at all: the offline state takes over.
                                     if !this.downloads_server_failed(&err, cx) {
                                         this.toast("Could not load home", format!("{err:#}"), cx);
                                     }
@@ -1950,7 +1959,9 @@ impl Bloom {
                                     data.items = page.items;
                                 }
                                 Err(err) => {
-                                    this.toast("Could not load library", format!("{err:#}"), cx)
+                                    if !this.request_failed(&err, cx) {
+                                        this.toast("Could not load library", format!("{err:#}"), cx)
+                                    }
                                 }
                             }
                         }
@@ -2080,7 +2091,9 @@ impl Bloom {
                                 }
                                 Err(err) => {
                                     data.loading = false;
-                                    this.toast("Could not load details", format!("{err:#}"), cx)
+                                    if !this.request_failed(&err, cx) {
+                                        this.toast("Could not load details", format!("{err:#}"), cx)
+                                    }
                                 }
                             }
                         }
@@ -2157,7 +2170,11 @@ impl Bloom {
                                     data.results = items;
                                     data.seerr = seerr;
                                 }
-                                Err(err) => this.toast("Search failed", format!("{err:#}"), cx),
+                                Err(err) => {
+                                    if !this.request_failed(&err, cx) {
+                                        this.toast("Search failed", format!("{err:#}"), cx)
+                                    }
+                                }
                             }
                         }
                         cx.notify();
@@ -2648,8 +2665,15 @@ impl Bloom {
                         if frame_changed {
                             this.note_frame_wait();
                         }
+                        // The seek slider and the time label move by whole
+                        // seconds; a redraw for each 8 ms change of the
+                        // position cost the whole UI about 48 draws a
+                        // second. `player_status` itself stays current for
+                        // everything that reads it.
+                        let position_moved = (status.position * 4.).floor()
+                            != (this.player_status.position * 4.).floor();
                         let changed = frame_changed
-                            || status.position != this.player_status.position
+                            || position_moved
                             || status.paused != this.player_status.paused
                             || status.buffering != this.player_status.buffering
                             || status.state != this.player_status.state

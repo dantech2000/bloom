@@ -128,10 +128,27 @@ impl ConnectState {
 
 /// Says in plain words why a request to a server failed.
 fn explain(err: &anyhow::Error, url: &str) -> String {
+    use crate::connection::{Verdict, Why, classify, plain_words};
     let text = format!("{err:#}");
     let host = url
         .trim_start_matches("https://")
         .trim_start_matches("http://");
+    // Nothing of the server answered: the same rule as the offline state.
+    match classify(err) {
+        Verdict::Unreachable(Why::Gateway(code)) => {
+            return format!(
+                "{host} is offline behind its proxy ({code}): the proxy answers, but the server \
+                 behind it does not. Start the server, or try again later."
+            );
+        }
+        Verdict::Unreachable(why) => {
+            return format!(
+                "{host} does not answer. {} Check the address and your network connection.",
+                plain_words(why)
+            );
+        }
+        _ => {}
+    }
     if text.contains("decode") {
         format!(
             "{host} answered, but not as a Jellyfin server. Check the address; a proxy or a \

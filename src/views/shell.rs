@@ -45,7 +45,10 @@ impl Bloom {
                 .child(self.render_player(window, cx))
                 .into_any_element();
         }
+        // A page with nothing to show because the server does not answer
+        // says so, instead of an empty page.
         let page = match &self.page {
+            _ if self.offline_page_shows() => self.render_offline_page(cx).into_any_element(),
             Page::Home(_) => self.render_home(cx).into_any_element(),
             Page::Library(_) => self.render_library(cx).into_any_element(),
             Page::Detail(_) => self.render_detail(cx).into_any_element(),
@@ -543,6 +546,9 @@ impl Bloom {
                     .items_center()
                     .justify_end()
                     .gap(px(6.))
+                    // "<server> is offline", with Retry, while the server
+                    // does not answer.
+                    .children(self.render_offline_chip(cx))
                     // A ring with the percent while something downloads.
                     // "Restart to update", while a downloaded version waits.
                     .children(self.render_update_chip(cx))
@@ -612,5 +618,178 @@ impl Bloom {
                     .justify_center()
                     .child(tabs),
             )
+    }
+
+    /// The name of the server for the offline texts.
+    fn offline_server(&self) -> String {
+        self.session
+            .as_ref()
+            .map(|s| s.server_name.clone())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "The server".to_string())
+    }
+
+    /// True when the page has nothing to show because the server does not
+    /// answer (or a probe runs after a failed load). Content that is on
+    /// screen stays; the chip says it then.
+    fn offline_page_shows(&self) -> bool {
+        use crate::connection::State;
+        let state = self.connection.core.state;
+        if state == State::Online || self.session.is_none() {
+            return false;
+        }
+        if state == State::Checking && !self.connection.page_failed {
+            return false;
+        }
+        match &self.page {
+            Page::Home(d) => {
+                !d.loading
+                    && d.resume.is_empty()
+                    && d.next_up.is_empty()
+                    && d.latest.is_empty()
+                    && self.hero.is_empty()
+            }
+            Page::Library(d) => !d.loading && d.items.is_empty(),
+            Page::Playlist(d) => !d.loading && d.entries.is_empty(),
+            Page::Admin(d) => !d.loading && d.error.is_some(),
+            _ => false,
+        }
+    }
+
+    /// The offline state as a page: the server, the reason in plain words,
+    /// the next try, Retry, and Open Downloads when there are downloads.
+    fn render_offline_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::connection::{State, plain_words};
+        use crate::settings::raised;
+        let t = UiTheme::read(cx).clone();
+        let fg = t.colors.foreground;
+        let core = &self.connection.core;
+        let server = self.offline_server();
+        let checking = core.state == State::Checking;
+        let title = if checking {
+            format!("Checking the connection to {server}…")
+        } else {
+            format!("{server} is offline")
+        };
+        let mut hint = core.why.map(plain_words).unwrap_or_default();
+        if !checking {
+            hint.push(' ');
+            hint.push_str(&match core.retry_in(std::time::Instant::now()) {
+                Some(secs) if secs > 0 => format!("Trying again in {secs} s."),
+                _ => "Trying again now…".to_string(),
+            });
+        }
+        let mut actions = div().flex().items_center().gap(px(10.));
+        if !checking {
+            actions = actions.child(
+                raised("offline.retry", "Retry", cx)
+                    .on_click(cx.listener(|this, _: &gpui_kit::ClickEvent, _, cx| this.retry_connection(cx))),
+            );
+            if self.has_downloads() {
+                actions = actions.child(
+                    raised("offline.downloads", "Open Downloads", cx)
+                        .on_click(cx.listener(|this, _: &gpui_kit::ClickEvent, _, cx| this.open_downloads(cx))),
+                );
+            }
+        }
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(10.))
+                    .max_w(px(520.))
+                    .px(px(20.))
+                    .child(
+                        div()
+                            .size(px(64.))
+                            .rounded_full()
+                            .bg(gpui_kit::rgba(crate::admin::DISC))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(icon(LucideIcon::WifiOff, 28., fg)),
+                    )
+                    .child(
+                        div()
+                            .mt(px(6.))
+                            .text_size(px(22.))
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_color(fg)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .text_color(fg.opacity(0.7))
+                            .text_center()
+                            .child(hint),
+                    )
+                    .child(actions.mt(px(12.))),
+            )
+    }
+
+    /// The quiet chip of the top bar while the server is offline: an amber
+    /// dot (a state), the server, Retry, and Downloads when there are
+    /// downloads. The reason and the next try are in its tooltip.
+    pub fn render_offline_chip(&self, cx: &mut Context<Self>) -> Option<gpui_kit::Stateful<gpui_kit::Div>> {
+        use crate::connection::plain_words;
+        let core = &self.connection.core;
+        if !core.is_offline() {
+            return None;
+        }
+        let fg = UiTheme::read(cx).colors.foreground;
+        let server = self.offline_server();
+        let next = match core.retry_in(std::time::Instant::now()) {
+            Some(secs) if secs > 0 => format!("Trying again in {secs} s."),
+            _ => "Trying again now…".to_string(),
+        };
+        let reason = core.why.map(plain_words).unwrap_or_default();
+        let action = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .h(px(26.))
+                .px(px(9.))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(gpui_kit::rgba(0xffffff29)))
+                .child(label)
+        };
+        Some(
+            div()
+                .id("top.offline")
+                .h(px(36.))
+                .pl(px(12.))
+                .pr(px(5.))
+                .rounded_full()
+                .bg(gpui_kit::rgba(0xffffff1f))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_size(px(13.))
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                .text_color(fg)
+                .tooltip(tip(format!("{server} is offline. {reason} {next}")))
+                // Amber: the state "needs a look".
+                .child(div().size(px(8.)).rounded_full().bg(gpui_kit::rgb(0xe3b341)))
+                .child(div().mr(px(4.)).child(format!("{server} is offline")))
+                .child(
+                    action("top.offline.retry", "Retry")
+                        .on_click(cx.listener(|this, _, _, cx| this.retry_connection(cx))),
+                )
+                .when(self.has_downloads(), |el| {
+                    el.child(
+                        action("top.offline.downloads", "Downloads")
+                            .on_click(cx.listener(|this, _, _, cx| this.open_downloads(cx))),
+                    )
+                }),
+        )
     }
 }

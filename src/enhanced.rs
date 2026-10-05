@@ -683,7 +683,7 @@ impl Bloom {
                         .font_weight(gpui_kit::FontWeight::MEDIUM)
                         .child(name.clone())
                         .child(icon(LucideIcon::ExternalLink, 14., t.colors.foreground))
-                        .on_click(move |_: &ClickEvent, _, cx| cx.open_url(&url)),
+                        .on_click(move |_: &ClickEvent, _, cx| crate::macos::open_web_url(cx, &url)),
                 );
             }
             block = block.child(row);

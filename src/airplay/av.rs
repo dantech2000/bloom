@@ -10,6 +10,8 @@
 use std::ffi::{CStr, c_char, c_void};
 
 use crate::macos::{Id, class, send};
+// The pool is shared with the render threads of the players.
+pub use crate::macos::Pool;
 
 // The frameworks are loaded with the app; the link lines make the symbols
 // of the classes and of the C calls below resolve.
@@ -20,12 +22,6 @@ use crate::macos::{Id, class, send};
 unsafe extern "C" {
     fn CMTimeMakeWithSeconds(seconds: f64, timescale: i32) -> CMTime;
     fn CMTimeGetSeconds(time: CMTime) -> f64;
-}
-
-#[link(name = "objc")]
-unsafe extern "C" {
-    fn objc_autoreleasePoolPush() -> *mut c_void;
-    fn objc_autoreleasePoolPop(pool: *mut c_void);
 }
 
 /// `CMTime` of CoreMedia: value / timescale seconds.
@@ -56,21 +52,6 @@ impl CMTime {
         }
         let secs = unsafe { CMTimeGetSeconds(self) };
         secs.is_finite().then_some(secs)
-    }
-}
-
-/// An autorelease pool for one turn of a loop on a thread of our own.
-pub struct Pool(*mut c_void);
-
-impl Pool {
-    pub fn new() -> Self {
-        Self(unsafe { objc_autoreleasePoolPush() })
-    }
-}
-
-impl Drop for Pool {
-    fn drop(&mut self) {
-        unsafe { objc_autoreleasePoolPop(self.0) }
     }
 }
 

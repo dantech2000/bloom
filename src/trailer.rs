@@ -45,6 +45,27 @@ enum Cmd {
     Stop,
     Muted(bool),
     Paused(bool),
+    /// Ends the worker, so mpv is closed before the process exits (see
+    /// `player::shut_down_all`).
+    Quit,
+}
+
+/// The trailer players that started a worker, for the quit of the app.
+static TRAILERS: Mutex<Vec<TrailerPlayer>> = Mutex::new(Vec::new());
+
+/// Asks every trailer worker to end; [`running`] says when they are gone.
+pub(crate) fn ask_to_quit() {
+    let trailers: Vec<TrailerPlayer> = TRAILERS.lock().unwrap().clone();
+    for trailer in &trailers {
+        trailer.send(Cmd::Quit);
+    }
+}
+
+pub(crate) fn running() -> bool {
+    let trailers: Vec<TrailerPlayer> = TRAILERS.lock().unwrap().clone();
+    trailers
+        .iter()
+        .any(|trailer| trailer.commands.lock().unwrap().is_some())
 }
 
 struct Shared {
@@ -146,6 +167,11 @@ impl TrailerPlayer {
         }
         let (tx, rx) = mpsc::channel();
         *slot = Some(tx);
+        {
+            let mut trailers = TRAILERS.lock().unwrap();
+            trailers.retain(|t| !Arc::ptr_eq(&t.commands, &self.commands));
+            trailers.push(self.clone());
+        }
         let shared = self.shared.clone();
         let commands = self.commands.clone();
         thread::Builder::new()
@@ -210,6 +236,9 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Cmd>, ytdl: PathBuf) -> Result<()
         init.set_option("mute", "yes")?;
         init.set_option("volume", VOLUME)?;
         init.set_option("ytdl", "yes")?;
+        // The same roots as the player (see `player::tls_roots_file`).
+        init.set_option("tls-verify", "yes")?;
+        init.set_option("tls-ca-file", crate::player::tls_roots_file())?;
         init.set_option(
             "script-opts",
             format!("ytdl_hook-ytdl_path={}", ytdl.display()),
@@ -267,6 +296,9 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Cmd>, ytdl: PathBuf) -> Result<()
     let mut load_started = std::time::Instant::now();
 
     loop {
+        // What CoreVideo and the GL driver autorelease in this turn goes
+        // at its end, not when the thread ends.
+        let _pool = crate::macos::Pool::new();
         while let Some(event) = mpv.wait_event(0.0) {
             let mut status = shared.status.lock().unwrap();
             match event {
@@ -354,6 +386,9 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Cmd>, ytdl: PathBuf) -> Result<()
                 Ok(Cmd::Paused(paused)) => {
                     let _ = mpv.set_property("pause", paused);
                 }
+                // The render context goes first, then the core: `renderer`
+                // is declared after `mpv`.
+                Ok(Cmd::Quit) => return Ok(()),
                 Err(mpsc::TryRecvError::Empty) => break,
                 // The UI is gone.
                 Err(mpsc::TryRecvError::Disconnected) => return Ok(()),

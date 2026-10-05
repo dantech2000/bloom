@@ -394,7 +394,8 @@ impl Bloom {
         let Page::Admin(data) = &self.page else {
             return;
         };
-        if data.loading {
+        // The poll waits while the server is offline; recovery loads the page.
+        if data.loading || crate::connection::is_offline() {
             return;
         }
         let generation = self.generation;
@@ -882,7 +883,11 @@ pub fn ago(date: &str) -> String {
     let Some(then) = parse_date(date) else {
         return String::new();
     };
-    let seconds = jiff::Timestamp::now().as_second() - then.as_second();
+    ago_seconds(jiff::Timestamp::now().as_second() - then.as_second())
+}
+
+/// "5 minutes ago" for a time that many seconds back.
+pub fn ago_seconds(seconds: i64) -> String {
     let unit = |n: i64, name: &str| format!("{n} {name}{} ago", if n == 1 { "" } else { "s" });
     match seconds {
         i64::MIN..60 => "just now".to_string(),

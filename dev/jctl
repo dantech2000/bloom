@@ -1,5 +1,11 @@
 #!/bin/sh
-# Sends one command to a running bloom started with BLOOM_DEBUG_SOCK.
+# Sends one command to a running Bloom through its debug channel.
 # Usage: dev/jctl state | home | back | library Movies | item <id> | search <text> | resize 1280 820 | scroll 600
-sock=${BLOOM_DEBUG_SOCK:-/tmp/bloom-debug.sock}
+# The socket: BLOOM_DEBUG_SOCK, else the one of a development instance
+# (dev/run), else the one that the setting "Debug channel" in Settings >
+# About turns on in the installed app.
+sock=$BLOOM_DEBUG_SOCK
+[ -n "$sock" ] || sock=/tmp/bloom-debug.sock
+[ -S "$sock" ] || [ -n "$BLOOM_DEBUG_SOCK" ] || sock="$HOME/Library/Application Support/bloom/debug.sock"
+[ -S "$sock" ] || { echo "no debug channel at $sock (turn it on in Settings > About, or start the app with dev/run)" >&2; exit 1; }
 printf '%s\n' "$*" | nc -U "$sock"

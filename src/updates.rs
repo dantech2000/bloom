@@ -249,13 +249,15 @@ pub fn set_automatic(on: bool) {
     }
 }
 
-/// When the feed was last asked, as macOS writes a date.
+/// When the feed was last asked, in words: "5 minutes ago".
 fn last_check() -> Option<String> {
     let date = send!(Id, updater()?, c"lastUpdateCheckDate");
     if date.is_null() {
         return None;
     }
-    string_of(send!(Id, date, c"description"))
+    // Negative for a time that is past.
+    let since = send!(f64, date, c"timeIntervalSinceNow");
+    Some(crate::admin::ago_seconds((-since).max(0.) as i64))
 }
 
 /// One line for the debug command `updates`.
@@ -344,7 +346,7 @@ impl Bloom {
     /// reason there is none.
     pub(crate) fn render_updates(&self, cx: &mut Context<Self>) -> Div {
         let card = group("Updates", cx);
-        match off_reason() {
+        let card = match off_reason() {
             Some(why) => card.child(field(
                 format!("Version {}", version_line()),
                 why,
@@ -378,7 +380,22 @@ impl Bloom {
                     )),
                     cx,
                 )),
-        }
+        };
+        // The debug channel is a tool for tests and for a look at a
+        // problem while it happens; it is off unless someone needs it.
+        let on = self.debug_channel_on();
+        card.child(field(
+            "Debug channel",
+            if on {
+                format!("On. A tool on this Mac can drive the app and read its state through {}.", crate::debug::setting_socket())
+            } else {
+                "Off. When on, a tool on this Mac can drive the app and read its state, for tests and for a look at a problem.".to_string()
+            },
+            checkbox("about.debug-channel", on, cx).on_click(cx.listener(
+                move |this, _: &ClickEvent, _, cx| this.set_debug_channel(!on, cx),
+            )),
+            cx,
+        ))
     }
 
     pub fn debug_updates(&mut self, rest: &str, cx: &mut Context<Self>) -> String {
@@ -403,6 +420,11 @@ impl Bloom {
                 } else {
                     "error: no update is ready".into()
                 }
+            }
+            // The setting "Debug channel" of the About page.
+            "channel on" | "channel off" => {
+                self.set_debug_channel(rest == "channel on", cx);
+                format!("debug channel setting: {}", self.debug_channel_on())
             }
             "auto on" | "auto off" => {
                 set_automatic(rest == "auto on");

@@ -221,6 +221,12 @@ fn set_skip_intervals(back: f64, forward: f64) {
 /// An Objective-C object this module retains.
 struct Retained(Id);
 
+impl Retained {
+    fn get(&self) -> Id {
+        self.0
+    }
+}
+
 impl Drop for Retained {
     fn drop(&mut self) {
         send!((), self.0, c"release");
@@ -228,8 +234,9 @@ impl Drop for Retained {
 }
 
 /// `MPMediaItemArtwork` around an `NSImage`, with the block that hands the
-/// image out. The framework calls the block later, on a queue of its own:
-/// the image and the block live as long as this struct, and the block
+/// image out. The framework copies the block and calls it later, on a queue
+/// of its own, maybe after this struct is gone. So the block has a retain of
+/// the image for itself, given back when the block is destroyed, and it
 /// returns the image retained and autoreleased, a live +0 object.
 struct Artwork {
     object: Retained,
@@ -263,8 +270,11 @@ fn make_artwork(bytes: &[u8]) -> Option<Artwork> {
     let size = send!(CGSize, image, c"size");
     // The system asks for the picture at a size; the one image serves
     // every size.
+    let owned = Retained(send!(Id, image, c"retain"));
     let handler = ConcreteBlock::new(move |_wanted: CGSize| -> Id {
-        let image = send!(Id, image, c"retain");
+        // `owned.get()` and not `owned.0`: the closure must capture all of
+        // `owned`, so the retain goes with the block.
+        let image = send!(Id, owned.get(), c"retain");
         send!(Id, image, c"autorelease")
     })
     .copy();
@@ -282,6 +292,37 @@ fn make_artwork(bytes: &[u8]) -> Option<Artwork> {
         image: Retained(image),
         _handler: handler,
     })
+}
+
+/// Makes artwork `rounds` times and drops each `Artwork` while the framework
+/// object of it is still held, as the system may hold it. The block must keep
+/// the image alive on its own, and give it back when the object goes. For the
+/// test and the debug command.
+fn artwork_lifetime_probe(rounds: usize) -> Result<String, String> {
+    let mut png = Vec::new();
+    image::RgbaImage::from_pixel(8, 6, image::Rgba([200, 30, 30, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    let count = |image: Id| send!(usize, image, c"retainCount");
+    let mut last = String::new();
+    for round in 0..rounds {
+        let artwork = make_artwork(&png).ok_or("no artwork")?;
+        let image = artwork.image.0;
+        // The framework's own retain of the artwork object.
+        let held = Retained(send!(Id, artwork.object.0, c"retain"));
+        let before = count(image);
+        drop(artwork);
+        let after = count(image);
+        // Called after the struct is gone, as the system may do.
+        let size = CGSize { width: 4., height: 3. };
+        let shown = send!(Id, held.0, c"imageWithSize:", size => CGSize);
+        let class = string_of(send!(Id, shown, c"className")).unwrap_or_else(|| "nil".into());
+        if after != 1 || shown != image || class != "NSImage" {
+            return Err(format!("round {round}: retain {before} -> {after}, same={}, class={class}", shown == image));
+        }
+        last = format!("retain {before} -> {after} after the struct dropped, class={class}");
+    }
+    Ok(format!("{rounds} rounds ok; last: {last}"))
 }
 
 /// The title, artist and album lines of the tile. An episode shows as its
@@ -696,7 +737,12 @@ impl Bloom {
                 Some((id, artwork)) => format!("item={id} {}", artwork.check()),
                 None => "none".into(),
             },
-            _ => "error: nowplaying state|command <...>|update|artwork".into(),
+            // Makes and drops artwork in a loop with the framework object held.
+            "artwork-probe" => {
+                let rounds = arg.trim().parse().unwrap_or(50);
+                artwork_lifetime_probe(rounds).unwrap_or_else(|e| format!("error: {e}"))
+            }
+            _ => "error: nowplaying state|command <...>|update|artwork|artwork-probe [n]".into(),
         }
     }
 }
@@ -707,6 +753,11 @@ mod tests {
 
     fn item(name: &str) -> Item {
         serde_json::from_value(serde_json::json!({ "Id": "x", "Name": name, "Type": "Movie" })).unwrap()
+    }
+
+    #[test]
+    fn artwork_outlives_its_struct() {
+        println!("{}", artwork_lifetime_probe(20).unwrap());
     }
 
     #[test]

@@ -10,6 +10,7 @@ mod brand;
 mod chromecast;
 mod cast;
 mod config;
+mod connection;
 mod credits;
 mod debug;
 mod downloads;
@@ -141,6 +142,13 @@ fn main() {
             )
             .expect("open application window");
             log::debug!("window open {} ms after start", perf::since_start_ms());
+            // mpv is closed before the process exits: a core that runs at
+            // exit can crash (see `player::shut_down_all`).
+            cx.on_app_quit(|_| {
+                player::shut_down_all();
+                async {}
+            })
+            .detach();
             if !test_instance {
                 cx.activate(true);
             }

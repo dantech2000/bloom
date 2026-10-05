@@ -31,6 +31,7 @@ pub const GROUPS: &[(&str, &[Credit])] = &[
             Credit { name: "FFmpeg", role: "Decoding and demuxing inside mpv", license: "GPL-3.0-or-later (as built here)", url: "https://ffmpeg.org" },
             Credit { name: "libmpv2", role: "Rust bindings for libmpv", license: "LGPL-2.1", url: "https://github.com/kohsine/libmpv2-rs" },
             Credit { name: "Sparkle", role: "Updates of the app in release builds", license: "MIT", url: "https://sparkle-project.org" },
+            Credit { name: "Mozilla CA certificate list", role: "The certificate authorities the player trusts for HTTPS streams", license: "MPL-2.0", url: "https://curl.se/docs/caextract.html" },
         ],
     ),
     (

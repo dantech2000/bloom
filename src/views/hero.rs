@@ -460,7 +460,7 @@ impl Bloom {
                 chips = chips.child(chip().child(format!("{n} {word}")));
             }
         } else if let Some(secs) = item.runtime_secs() {
-            chips = chips.child(chip().child(format!("Ends at {}", ends_at(secs))));
+            chips = chips.child(chip().child(format!("Ends at {}", crate::macos::ends_at(secs))));
         }
 
         let genres = if item.genres.is_empty() {
@@ -763,12 +763,6 @@ impl Bloom {
                 ),
         )
     }
-}
-
-/// Local clock time `secs` from now, as "03:07 AM".
-fn ends_at(secs: i64) -> String {
-    let end = jiff::Zoned::now().saturating_add(jiff::SignedDuration::from_secs(secs));
-    end.strftime("%I:%M %p").to_string()
 }
 
 /// A hero item is usable only with a backdrop to show.

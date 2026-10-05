@@ -7,7 +7,11 @@
 use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixListener,
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::Duration,
 };
@@ -16,31 +20,44 @@ use gpui_kit::{Context, SharedString, Window, px, size};
 
 use crate::app::{Bloom, Page};
 
-struct Request {
+pub struct Request {
     line: String,
     reply: mpsc::Sender<String>,
 }
 
-impl Bloom {
-    /// Starts the listener and the loop that runs its commands on the UI thread.
-    pub fn start_debug_channel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Ok(path) = std::env::var("BLOOM_DEBUG_SOCK") else {
-            return;
-        };
+/// A listener of the debug channel on one socket. Dropping it does not stop
+/// the thread; [`Listener::stop`] does.
+pub struct Listener {
+    path: String,
+    stop: Arc<AtomicBool>,
+}
+
+impl Listener {
+    /// Listens on `path`; each line that comes in goes to `requests`, and
+    /// the answer goes back. The socket is for the owner only.
+    fn start(path: String, requests: async_channel::Sender<Request>) -> Option<Self> {
         let _ = std::fs::remove_file(&path);
         let listener = match UnixListener::bind(&path) {
             Ok(listener) => listener,
             Err(err) => {
                 log::warn!("debug channel: cannot bind {path}: {err}");
-                return;
+                return None;
             }
         };
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
         log::info!("debug channel listening on {path}");
-        let (tx, rx) = mpsc::channel::<Request>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
         thread::Builder::new()
             .name("debug".into())
             .spawn(move || {
                 for stream in listener.incoming().flatten() {
+                    if stopped.load(Ordering::Acquire) {
+                        return;
+                    }
                     let mut line = String::new();
                     if BufReader::new(&stream).read_line(&mut line).is_err() {
                         continue;
@@ -50,7 +67,8 @@ impl Bloom {
                         line: line.trim().to_string(),
                         reply,
                     };
-                    if tx.send(request).is_err() {
+                    // This thread is not async; the UI task awaits the receiver.
+                    if requests.send_blocking(request).is_err() {
                         return;
                     }
                     let text = answer
@@ -61,23 +79,87 @@ impl Bloom {
                 }
             })
             .expect("spawn debug thread");
+        Some(Self { path, stop })
+    }
+
+    /// Ends the thread and takes the socket away.
+    fn stop(self) {
+        self.stop.store(true, Ordering::Release);
+        // The thread waits in `accept`; a connection wakes it.
+        let _ = std::os::unix::net::UnixStream::connect(&self.path);
+        let _ = std::fs::remove_file(&self.path);
+        log::info!("debug channel on {} closed", self.path);
+    }
+}
+
+/// The socket of the debug channel that the setting turns on, in the folder
+/// of the app.
+pub fn setting_socket() -> String {
+    dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(crate::brand::FOLDER)
+        // A test instance must not take the socket of the app the user runs.
+        .join(match std::env::var("BLOOM_TEST_NAME") {
+            Ok(name) => format!("debug-{name}.sock"),
+            Err(_) => "debug.sock".into(),
+        })
+        .display()
+        .to_string()
+}
+
+impl Bloom {
+    /// Starts the loop that runs the commands on the UI thread, and the
+    /// listeners: one on the socket of `BLOOM_DEBUG_SOCK` (a development
+    /// or test instance), one when the setting is on.
+    pub fn start_debug_channel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (tx, rx) = async_channel::unbounded::<Request>();
+        if let Ok(path) = std::env::var("BLOOM_DEBUG_SOCK") {
+            // Lives as long as the app.
+            let _ = Listener::start(path, tx.clone());
+        }
+        self.debug_requests = Some(tx);
+        if self.config.debug_channel == Some(true) {
+            self.listen_for_debug();
+        }
 
         cx.spawn_in(window, async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(50))
-                    .await;
-                while let Ok(request) = rx.try_recv() {
-                    let answer = this
-                        .update_in(cx, |this, window, cx| {
-                            this.run_debug_command(&request.line, window, cx)
-                        })
-                        .unwrap_or_else(|_| "error: app closed".into());
-                    let _ = request.reply.send(answer);
-                }
+            // Sleeps until a listener thread sends; no timer.
+            while let Ok(request) = rx.recv().await {
+                let answer = this
+                    .update_in(cx, |this, window, cx| {
+                        this.run_debug_command(&request.line, window, cx)
+                    })
+                    .unwrap_or_else(|_| "error: app closed".into());
+                let _ = request.reply.send(answer);
             }
         })
         .detach();
+    }
+
+    fn listen_for_debug(&mut self) {
+        if self.debug_listener.is_none()
+            && let Some(requests) = self.debug_requests.clone()
+        {
+            self.debug_listener = Listener::start(setting_socket(), requests);
+        }
+    }
+
+    /// Whether the setting has the debug channel on.
+    pub fn debug_channel_on(&self) -> bool {
+        self.debug_listener.is_some()
+    }
+
+    /// The setting "Debug channel": on or off at once, and kept for the
+    /// next start.
+    pub fn set_debug_channel(&mut self, on: bool, cx: &mut Context<Self>) {
+        if on {
+            self.listen_for_debug();
+        } else if let Some(listener) = self.debug_listener.take() {
+            listener.stop();
+        }
+        self.config.debug_channel = Some(self.debug_listener.is_some());
+        self.save_config(cx);
+        cx.notify();
     }
 
     fn run_debug_command(
@@ -598,6 +680,9 @@ impl Bloom {
             // Downloads for offline use: the list, the queue, the page, the
             // offline mode and a local play.
             "downloads" => return self.debug_downloads(rest, window, cx),
+            // Whether the server answers: the state, and a forced offline
+            // or a probe (src/connection.rs).
+            "connection" => return self.debug_connection(rest, cx),
             // Google Cast: the devices, a connection, and the player on it.
             "chromecast" => return self.debug_chromecast(rest, window, cx),
             // Subtitle timing and the search for subtitles (`subtitles.rs`).
@@ -608,6 +693,11 @@ impl Bloom {
             "episodes" => self.toggle_episode_picker(window, cx),
             "rows" => return self.debug_rows(),
             "perf" => return crate::perf::report(),
+            // Quits as the menu does, so the quit path can be tested.
+            "quit" => {
+                cx.quit();
+                return "quit".into();
+            }
             // How even the video frames reached the screen since the last
             // call; `pacing clock`, `pacing file <path>` (`pacing.rs`).
             "pacing" => return self.debug_pacing(rest, window, cx),

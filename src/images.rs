@@ -86,7 +86,104 @@ impl<T> Lru<T> {
 
 enum Slot {
     Loading,
-    Failed,
+    Failed {
+        failures: u32,
+        at: Instant,
+        /// [`crate::jellyfin::session_count`] when it failed.
+        session: u64,
+        /// A 404 or a file that is no image will not get better.
+        retry: bool,
+    },
+}
+
+/// Waits before the first, second and third retry; later retries wait as
+/// long as the last.
+const RETRY_DELAYS: [Duration; 3] = [Duration::from_secs(5), Duration::from_secs(30), Duration::from_secs(120)];
+
+/// May a download that failed `failures` times, `since` ago, be tried again?
+/// A new session (the app connected again) clears the wait.
+fn may_retry(failures: u32, since: Duration, retry: bool, new_session: bool) -> bool {
+    retry && (new_session || since >= retry_delay(failures))
+}
+
+fn retry_delay(failures: u32) -> Duration {
+    RETRY_DELAYS[(failures.max(1) as usize - 1).min(RETRY_DELAYS.len() - 1)]
+}
+
+/// Is a failed fetch worth another try: a timeout, a network error or a
+/// server error is, a 404 or 410 and a bad image are not.
+fn retryable(err: &anyhow::Error) -> bool {
+    match err.downcast_ref::<ureq::Error>() {
+        Some(ureq::Error::StatusCode(code)) => !matches!(code, 404 | 410),
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// How many images are fetched at once. A page asks for dozens; each fetch
+/// holds a socket and a background thread while it blocks.
+const MAX_FETCHES: usize = 6;
+
+/// Limits the fetches in flight. A waiter does not block a thread: it awaits
+/// a channel. The last to ask is served first, so the images on screen now do
+/// not wait behind those of a page that was scrolled away.
+struct Gate {
+    limit: usize,
+    state: std::sync::Mutex<GateState>,
+}
+
+struct GateState {
+    active: usize,
+    waiting: Vec<async_channel::Sender<()>>,
+}
+
+/// A slot of the [`Gate`]; it is given back when dropped.
+struct Permit(Arc<Gate>);
+
+impl Gate {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            limit,
+            state: std::sync::Mutex::new(GateState { active: 0, waiting: Vec::new() }),
+        })
+    }
+
+    async fn acquire(self: &Arc<Self>) -> Permit {
+        let wait = {
+            let mut state = self.state.lock().unwrap();
+            if state.active < self.limit {
+                state.active += 1;
+                None
+            } else {
+                let (tx, rx) = async_channel::bounded(1);
+                state.waiting.push(tx);
+                Some(rx)
+            }
+        };
+        if let Some(rx) = wait {
+            // The slot is handed over by the permit that was dropped.
+            let _ = rx.recv().await;
+        }
+        Permit(self.clone())
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap();
+        // Pass the slot on to the newest waiter that is still there.
+        while let Some(tx) = state.waiting.pop() {
+            if tx.try_send(()).is_ok() {
+                return;
+            }
+        }
+        state.active -= 1;
+    }
+}
+
+fn gate() -> &'static Arc<Gate> {
+    static GATE: std::sync::LazyLock<Arc<Gate>> = std::sync::LazyLock::new(|| Gate::new(MAX_FETCHES));
+    &GATE
 }
 
 struct ImageStore {
@@ -171,10 +268,12 @@ pub fn preload(urls: Vec<String>, cx: &mut App) {
                 Err(false) => {}
             }
             let (agent, target) = (agent.clone(), url.clone());
+            let permit = gate().acquire().await;
             let fetched = cx
                 .background_executor()
                 .spawn(async move { fetch(&agent, &target) })
                 .await;
+            drop(permit);
             cx.update(|cx| {
                 let store = cx.global_mut::<ImageStore>();
                 if store.raw_epoch != epoch {
@@ -205,15 +304,27 @@ pub fn image(url: &str, cx: &mut App) -> Option<Arc<RenderImage>> {
     if let Some(image) = store.ready.get(url, Instant::now()) {
         return Some(image.clone());
     }
-    if store.slots.contains_key(url) {
-        return None;
-    }
+    let failures = match store.slots.get(url) {
+        None => 0,
+        Some(Slot::Loading) => return None,
+        Some(Slot::Failed { failures, at, session, retry }) => {
+            let new_session = *session != crate::jellyfin::session_count();
+            if !may_retry(*failures, at.elapsed(), *retry, new_session) {
+                return None;
+            }
+            *failures
+        }
+    };
     store.slots.insert(url.to_string(), Slot::Loading);
     let agent = store.agent();
     let raw = store.raw.get(url).cloned();
     let key = url.to_string();
     let target = url.to_string();
     cx.spawn(async move |cx| {
+        let permit = match raw {
+            Some(_) => None,
+            None => Some(gate().acquire().await),
+        };
         let fetched = cx
             .background_executor()
             .spawn(async move {
@@ -223,6 +334,7 @@ pub fn image(url: &str, cx: &mut App) -> Option<Arc<RenderImage>> {
                 }
             })
             .await;
+        drop(permit);
         cx.update(|cx| {
             let store = cx.global_mut::<ImageStore>();
             match fetched {
@@ -242,7 +354,11 @@ pub fn image(url: &str, cx: &mut App) -> Option<Arc<RenderImage>> {
                     // The query can hold the access token; keep it out of the log.
                     let shown = key.split('?').next().unwrap_or_default();
                     log::warn!("image {shown} failed: {err:#}");
-                    store.slots.insert(key, Slot::Failed);
+                    let retry = retryable(&err);
+                    store.slots.insert(key, failed(failures + 1, retry));
+                    if retry {
+                        retry_refresh(failures + 1, cx);
+                    }
                 }
             }
             schedule_refresh(cx);
@@ -280,15 +396,27 @@ pub fn tile(
         }
         return Some(tile);
     }
-    if store.slots.contains_key(url) {
-        return None;
-    }
+    let failures = match store.slots.get(url) {
+        None => 0,
+        Some(Slot::Loading) => return None,
+        Some(Slot::Failed { failures, at, session, retry }) => {
+            let new_session = *session != crate::jellyfin::session_count();
+            if !may_retry(*failures, at.elapsed(), *retry, new_session) {
+                return None;
+            }
+            *failures
+        }
+    };
     store.slots.insert(url.to_string(), Slot::Loading);
     let agent = store.agent();
     let raw = store.raw.get(url).cloned();
     let key = url.to_string();
     let target = url.to_string();
     cx.spawn(async move |cx| {
+        let permit = match raw {
+            Some(_) => None,
+            None => Some(gate().acquire().await),
+        };
         let fetched = cx
             .background_executor()
             .spawn(async move {
@@ -298,6 +426,7 @@ pub fn tile(
                 }
             })
             .await;
+        drop(permit);
         cx.update(|cx| {
             let store = cx.global_mut::<ImageStore>();
             match fetched {
@@ -308,7 +437,11 @@ pub fn tile(
                 Err(err) => {
                     let shown = key.split('?').next().unwrap_or_default();
                     log::warn!("image {shown} failed: {err:#}");
-                    store.slots.insert(key, Slot::Failed);
+                    let retry = retryable(&err);
+                    store.slots.insert(key, failed(failures + 1, retry));
+                    if retry {
+                        retry_refresh(failures + 1, cx);
+                    }
                 }
             }
             schedule_refresh(cx);
@@ -334,6 +467,21 @@ fn crop(sheet: &RenderImage, (columns, rows): (u32, u32), (column, row): (u32, u
     }
     let tile = image::RgbaImage::from_raw(w, h, data)?;
     Some(RenderImage::new(SmallVec::from_elem(Frame::new(tile), 1)))
+}
+
+fn failed(failures: u32, retry: bool) -> Slot {
+    Slot::Failed { failures, at: Instant::now(), session: crate::jellyfin::session_count(), retry }
+}
+
+/// Paints again when a failed image may be tried again; the paint asks for
+/// the image, and that starts the new try.
+fn retry_refresh(failures: u32, cx: &mut App) {
+    let delay = retry_delay(failures);
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(delay).await;
+        cx.update(|cx| cx.refresh_windows());
+    })
+    .detach();
 }
 
 /// Redraws the windows once for all images that arrive close together. A
@@ -412,7 +560,13 @@ fn fetch(agent: &ureq::Agent, url: &str) -> anyhow::Result<(String, Vec<u8>)> {
     {
         return Ok((String::new(), bytes));
     }
-    let mut response = agent.get(url).call()?;
+    let mut request = agent.get(url);
+    // The header goes to the signed-in server only. A redirect to another
+    // host drops it (ureq does not forward it).
+    if let Some(auth) = crate::jellyfin::image_auth_header(url) {
+        request = request.header("Authorization", auth);
+    }
+    let mut response = request.call()?;
     let mime = response
         .headers()
         .get("content-type")
@@ -774,6 +928,151 @@ mod tests {
         assert_eq!((size.width.0, size.height.0), (800, 400));
         // Red, in BGRA order.
         assert_eq!(&image.as_bytes(0).unwrap()[..4], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn retry_rule() {
+        let s = Duration::from_secs;
+        // Waits grow with the failures and stop at two minutes.
+        assert_eq!(retry_delay(1), s(5));
+        assert_eq!(retry_delay(2), s(30));
+        assert_eq!(retry_delay(3), s(120));
+        assert_eq!(retry_delay(40), s(120));
+        assert!(!may_retry(1, s(4), true, false));
+        assert!(may_retry(1, s(5), true, false));
+        assert!(!may_retry(2, s(29), true, false));
+        assert!(may_retry(2, s(30), true, false));
+        assert!(!may_retry(5, s(119), true, false));
+        assert!(may_retry(5, s(120), true, false));
+        // A new session clears the wait.
+        assert!(may_retry(5, s(0), true, true));
+        // A 404 is never retried, not even after a new session.
+        assert!(!may_retry(1, s(100_000), false, true));
+    }
+
+    #[test]
+    fn which_errors_are_retried() {
+        let err = |e: ureq::Error| anyhow::Error::from(e);
+        assert!(!retryable(&err(ureq::Error::StatusCode(404))));
+        assert!(!retryable(&err(ureq::Error::StatusCode(410))));
+        assert!(retryable(&err(ureq::Error::StatusCode(500))));
+        assert!(retryable(&err(ureq::Error::StatusCode(530))));
+        assert!(retryable(&err(ureq::Error::Timeout(ureq::Timeout::Global))));
+        assert!(!retryable(&anyhow::anyhow!("unknown image type")));
+    }
+
+    fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+        struct Wake(std::thread::Thread);
+        impl std::task::Wake for Wake {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = std::task::Waker::from(Arc::new(Wake(std::thread::current())));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            if let std::task::Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return value;
+            }
+            std::thread::park();
+        }
+    }
+
+    /// 40 fetches through the gate against a local server that counts open
+    /// connections and requests in flight: at most `MAX_FETCHES` of each, and
+    /// every image arrives.
+    #[test]
+    fn fetches_are_limited_and_all_arrive() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (open, peak_open) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (busy, peak_busy) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        {
+            let (open, peak_open, busy, peak_busy) =
+                (open.clone(), peak_open.clone(), busy.clone(), peak_busy.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let (open, peak_open, busy, peak_busy) =
+                        (open.clone(), peak_open.clone(), busy.clone(), peak_busy.clone());
+                    std::thread::spawn(move || {
+                        peak_open.fetch_max(open.fetch_add(1, SeqCst) + 1, SeqCst);
+                        let mut buf = [0u8; 4096];
+                        // Keep-alive: answer requests until the client closes.
+                        while let Ok(n) = stream.read(&mut buf) {
+                            if n == 0 {
+                                break;
+                            }
+                            peak_busy.fetch_max(busy.fetch_add(1, SeqCst) + 1, SeqCst);
+                            std::thread::sleep(Duration::from_millis(60));
+                            let body = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"2\" height=\"2\"/>";
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\n\r\n",
+                                body.len()
+                            );
+                            busy.fetch_sub(1, SeqCst);
+                            if stream.write_all(head.as_bytes()).is_err() || stream.write_all(body).is_err() {
+                                break;
+                            }
+                        }
+                        open.fetch_sub(1, SeqCst);
+                    });
+                }
+            });
+        }
+        let gate = Gate::new(MAX_FETCHES);
+        let agent = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(20)))
+                .max_idle_connections(16)
+                .max_idle_connections_per_host(8)
+                .build(),
+        );
+        let handles: Vec<_> = (0..40)
+            .map(|i| {
+                let (gate, agent) = (gate.clone(), agent.clone());
+                std::thread::spawn(move || {
+                    let _permit = block_on(gate.acquire());
+                    let url = format!("http://127.0.0.1:{port}/img/{i}");
+                    fetch(&agent, &url).map(|(_, bytes)| bytes.len())
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert!(handle.join().unwrap().unwrap() > 0);
+        }
+        assert!(peak_busy.load(SeqCst) >= 2, "the test never ran in parallel");
+        assert!(peak_busy.load(SeqCst) <= MAX_FETCHES, "requests: {}", peak_busy.load(SeqCst));
+        assert!(peak_open.load(SeqCst) <= MAX_FETCHES, "connections: {}", peak_open.load(SeqCst));
+        eprintln!("peak connections {}, peak requests {}", peak_open.load(SeqCst), peak_busy.load(SeqCst));
+    }
+
+    #[test]
+    fn gate_serves_the_newest_waiter_first() {
+        let gate = Gate::new(1);
+        let first = block_on(gate.acquire());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut threads = Vec::new();
+        for i in 0..3 {
+            let (waiter, tx) = (gate.clone(), tx.clone());
+            threads.push(std::thread::spawn(move || {
+                let permit = block_on(waiter.acquire());
+                tx.send(i).unwrap();
+                drop(permit);
+            }));
+            // Each thread must be queued before the next one starts.
+            while gate.state.lock().unwrap().waiting.len() < i + 1 {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        drop(first);
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![2, 1, 0]);
     }
 
     #[test]

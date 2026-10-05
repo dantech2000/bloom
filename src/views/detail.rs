@@ -448,7 +448,7 @@ impl Bloom {
             row = row.child(
                 round("detail.trailer", filled(Filled::Trailer, 25., fg))
                     .tooltip(tip("Watch the trailer"))
-                    .on_click(move |_: &ClickEvent, _, cx| cx.open_url(&url)),
+                    .on_click(move |_: &ClickEvent, _, cx| crate::macos::open_web_url(cx, &url)),
             );
         }
 
@@ -688,7 +688,7 @@ fn meta_line(item: &Item, cx: &Context<Bloom>) -> Div {
     }
     if let Some(secs) = runtime {
         let left = (secs - item.resume_secs()).max(0);
-        line = line.child(format!("Ends at {}", ends_at(left)));
+        line = line.child(format!("Ends at {}", crate::macos::ends_at(left)));
     }
     // Audio languages, as the Jellyfin Enhanced plugin lists them.
     let mut languages: Vec<&'static str> = Vec::new();
@@ -1182,8 +1182,3 @@ fn episode_row(ep: &Item, client: &Client, vw: f32, cx: &mut Context<Bloom>) -> 
         )
 }
 
-/// Local clock time `secs` from now, as "3:16 AM".
-fn ends_at(secs: i64) -> String {
-    let end = jiff::Zoned::now().saturating_add(jiff::SignedDuration::from_secs(secs));
-    end.strftime("%-I:%M %p").to_string()
-}

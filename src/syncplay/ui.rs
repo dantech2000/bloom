@@ -176,6 +176,9 @@ impl Bloom {
         self.cast_socket(&event, cx);
         // A socket that opens again may mean another network.
         self.adaptive_socket(&event);
+        // A lost socket asks whether the server is there; one that opens
+        // again ends the offline state.
+        self.connection_socket(&event, cx);
         let ui = match self.sync.session.as_mut() {
             Some(session) => session.socket(event),
             // No session (the socket is off in a test instance): the news

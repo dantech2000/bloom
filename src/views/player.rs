@@ -272,7 +272,7 @@ impl Bloom {
                     .text_color(soft)
                     .child(format!(
                         "Ends at {}",
-                        ends_at((remaining / self.speed.max(0.25) as f64) as i64)
+                        crate::macos::ends_at((remaining / self.speed.max(0.25) as f64) as i64)
                     )),
             );
         }
@@ -1094,7 +1094,7 @@ impl Bloom {
                     .child(format!("{:.0}% watched", fraction * 100.))
                     .child(format!(
                         "Ends at {}",
-                        ends_at((remaining / self.speed.max(0.25) as f64) as i64)
+                        crate::macos::ends_at((remaining / self.speed.max(0.25) as f64) as i64)
                     )),
             );
 
@@ -1144,12 +1144,6 @@ impl Bloom {
                 ),
         )
     }
-}
-
-/// Local clock time `secs` from now, as "3:29 AM".
-fn ends_at(secs: i64) -> String {
-    let end = jiff::Zoned::now().saturating_add(jiff::SignedDuration::from_secs(secs));
-    end.strftime("%-I:%M %p").to_string()
 }
 
 /// Paints one frame out of a sheet of preview images.

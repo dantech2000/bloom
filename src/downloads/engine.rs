@@ -93,6 +93,17 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// Refuses an entry whose ids or file name are not safe in a path. The
+    /// ids and the file name come from the server and become folders.
+    pub fn validate(&self) -> Result<()> {
+        check_id("server id", &self.server_id)?;
+        check_id("item id", &self.item_id)?;
+        if let Some(file) = &self.file {
+            check_file_name(file)?;
+        }
+        Ok(())
+    }
+
     fn from_item(item: &Item, server_id: &str) -> Self {
         Self {
             server_id: server_id.to_string(),
@@ -354,9 +365,13 @@ impl Engine {
 
     /// Puts an item in the queue. One that is paused or failed starts again
     /// from its part file; one that is downloaded or under way stays as it is.
-    pub fn add(&self, item: &Item) {
+    /// An item whose ids are not safe for a path is refused with an error.
+    pub fn add(&self, item: &Item) -> Result<()> {
         let mut s = self.inner.state.lock().unwrap();
         let server_id = s.server_id.clone();
+        if s.entry(&item.id).is_none() {
+            Entry::from_item(item, &server_id).validate()?;
+        }
         match s.entry_mut(&item.id) {
             Some(entry) => {
                 if matches!(entry.state, EntryState::Paused | EntryState::Failed) {
@@ -370,6 +385,7 @@ impl Engine {
         save_index(&s);
         self.inner.bump();
         self.inner.wake.notify_all();
+        Ok(())
     }
 
     /// Stops a download; its part file stays for a resume.
@@ -621,6 +637,7 @@ fn download(inner: &Arc<Inner>, item_id: &str) -> Result<(), Stop> {
         .as_str()
         .map(str::to_string)
         .unwrap_or_else(|| media_file_name(&source));
+    check_file_name(&file).map_err(failed)?;
     {
         let mut s = inner.state.lock().unwrap();
         if let Some(entry) = s.entry_mut(item_id) {
@@ -904,6 +921,22 @@ fn fetch_meta(client: &Client, item_id: &str, server_id: &str) -> Result<Value> 
     }))
 }
 
+/// Jellyfin ids are hex GUIDs, with or without dashes: letters, digits, `-`.
+fn check_id(what: &str, id: &str) -> Result<()> {
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return Err(anyhow!("the {what} {id:?} is not safe for a folder name"));
+    }
+    Ok(())
+}
+
+/// One path component: no `/`, no `..`, no NUL, not empty.
+pub fn check_file_name(name: &str) -> Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
+        return Err(anyhow!("the file name {name:?} is not a single path component"));
+    }
+    Ok(())
+}
+
 /// "video.mkv": the container of the file, else the extension of its path.
 fn media_file_name(source: &Value) -> String {
     let container = source["Container"]
@@ -1049,10 +1082,22 @@ fn get_bytes(agent: &ureq::Agent, url: &str, auth: Option<&Client>) -> Result<Ve
 // ----- index on disk -------------------------------------------------------------
 
 fn load_index(dir: &Path) -> Vec<Entry> {
-    fs::read(dir.join(INDEX_FILE))
+    let entries: Vec<Entry> = fs::read(dir.join(INDEX_FILE))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // An entry with an unsafe id or file name is refused, not repaired. Its
+    // folder is left alone.
+    entries
+        .into_iter()
+        .filter(|entry| match entry.validate() {
+            Ok(()) => true,
+            Err(err) => {
+                log::warn!("download entry refused: {err:#}");
+                false
+            }
+        })
+        .collect()
 }
 
 /// Writes the index; the file is complete or not there, never half.
@@ -1397,7 +1442,7 @@ mod tests {
         let mock = Mock::start(100_000);
         let dir = temp_dir("full");
         let engine = engine(&mock, dir.clone(), options());
-        engine.add(&item("ep1"));
+        engine.add(&item("ep1")).unwrap();
         let entry = wait_state(&engine, "ep1", EntryState::Done);
         assert_eq!(entry.total, Some(100_000));
         assert_eq!(entry.done, 100_000);
@@ -1424,7 +1469,7 @@ mod tests {
         mock.set(Mode::CutAfter(120_000));
         let dir = temp_dir("cut");
         let engine = engine(&mock, dir.clone(), options());
-        engine.add(&item("ep2"));
+        engine.add(&item("ep2")).unwrap();
         wait_state(&engine, "ep2", EntryState::Done);
         let ranges = mock.ranges();
         assert_eq!(ranges.len(), 2, "{ranges:?}");
@@ -1444,7 +1489,7 @@ mod tests {
         fs::write(folder.join("video.bin.part"), vec![9u8; 20_000]).unwrap();
         mock.set(Mode::IgnoreRange);
         let engine = engine(&mock, dir.clone(), options());
-        engine.add(&item("ep3"));
+        engine.add(&item("ep3")).unwrap();
         wait_state(&engine, "ep3", EntryState::Done);
         assert_eq!(mock.ranges()[0].as_deref(), Some("bytes=20000-"));
         assert_eq!(fs::read(engine.local_path("ep3").unwrap()).unwrap(), *mock.file);
@@ -1457,7 +1502,7 @@ mod tests {
         mock.set(Mode::Slow);
         let dir = temp_dir("cancel");
         let engine = engine(&mock, dir.clone(), options());
-        engine.add(&item("ep4"));
+        engine.add(&item("ep4")).unwrap();
         // Some bytes, then stop.
         let deadline = Instant::now() + Duration::from_secs(10);
         while engine.entry("ep4").unwrap().done < 1_000 {
@@ -1488,7 +1533,7 @@ mod tests {
         options.stall = Duration::from_millis(1_500);
         let engine = engine(&mock, dir.clone(), options);
         let began = Instant::now();
-        engine.add(&item("ep9"));
+        engine.add(&item("ep9")).unwrap();
         wait_state(&engine, "ep9", EntryState::Done);
         // The stall of 1.5 s ended the first try; the server still sleeps.
         assert!(began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
@@ -1506,7 +1551,7 @@ mod tests {
         let dir = temp_dir("stallcancel");
         // The stall limit is far away: only the cancel can end the wait.
         let engine = engine(&mock, dir.clone(), options());
-        engine.add(&item("ep10"));
+        engine.add(&item("ep10")).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while engine.entry("ep10").unwrap().done < 3_000 {
             assert!(Instant::now() < deadline);
@@ -1528,7 +1573,7 @@ mod tests {
         mock.set(Mode::WrongSize);
         let dir = temp_dir("wrongsize");
         let engine = engine(&mock, dir.clone(), options());
-        engine.add(&item("ep5"));
+        engine.add(&item("ep5")).unwrap();
         let entry = wait_state(&engine, "ep5", EntryState::Failed);
         assert!(entry.error.as_deref().unwrap_or_default().contains("416") || entry.error.as_deref().unwrap_or_default().contains("bytes"), "{entry:?}");
         assert!(engine.local_path("ep5").is_none());
@@ -1541,10 +1586,10 @@ mod tests {
         let mock = Mock::start(30_000);
         let dir = temp_dir("reload");
         let engine = engine(&mock, dir.clone(), options());
-        engine.add(&item("ep6"));
+        engine.add(&item("ep6")).unwrap();
         wait_state(&engine, "ep6", EntryState::Done);
         mock.set(Mode::Slow);
-        engine.add(&item("ep7"));
+        engine.add(&item("ep7")).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while engine.entry("ep7").unwrap().done < 500 {
             assert!(Instant::now() < deadline);
@@ -1573,7 +1618,7 @@ mod tests {
         let mut options = options();
         options.free_override = Some(MIN_FREE_BYTES + 5_000);
         let engine = engine(&mock, dir.clone(), options);
-        engine.add(&item("ep8"));
+        engine.add(&item("ep8")).unwrap();
         let entry = wait_state(&engine, "ep8", EntryState::Failed);
         assert!(entry.error.as_deref().unwrap().contains("free space"), "{entry:?}");
         assert_eq!(mock.ranges().len(), 0, "no file request was made");
@@ -1585,18 +1630,81 @@ mod tests {
     }
 
     #[test]
+    fn ids_and_file_names_are_checked() {
+        for ok in ["0a1b2c3d4e5f60718293a4b5c6d7e8f9", "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9", "ep1"] {
+            check_id("id", ok).unwrap();
+        }
+        for bad in ["", "..", "a/b", "a\\b", "../x", "a.b", "a b", "a\0b", "\u{e9}", "/abs"] {
+            assert!(check_id("id", bad).is_err(), "{bad:?}");
+        }
+        for ok in ["video.mkv", "sub-1.srt", "a b.mp4", "..x", "x.."] {
+            check_file_name(ok).unwrap();
+        }
+        for bad in ["", ".", "..", "a/b", "../video.mkv", "/etc/passwd", "a\\b", "a\0b"] {
+            assert!(check_file_name(bad).is_err(), "{bad:?}");
+        }
+        // The name made from the server's data is always fine.
+        for source in [
+            serde_json::json!({ "Container": "mkv,webm" }),
+            serde_json::json!({ "Container": "../../x", "Path": "/a/b/c.MP4" }),
+            serde_json::json!({ "Container": "", "Path": "/a/b/../..\\x" }),
+            Value::Null,
+        ] {
+            check_file_name(&media_file_name(&source)).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_item_with_an_unsafe_id_is_refused() {
+        let mock = Mock::start(10_000);
+        let dir = temp_dir("refuse");
+        let engine = engine(&mock, dir.clone(), options());
+        for bad in ["../../evil", "a/b", ""] {
+            let err = engine.add(&item(bad)).unwrap_err();
+            assert!(format!("{err:#}").contains("item id"), "{err:#}");
+        }
+        assert!(engine.entries().is_empty());
+        // A server id of this kind is refused the same way.
+        let other = Engine::open(temp_dir("refuse2"), options());
+        other.set_client(Some(mock.client()), "../x");
+        assert!(other.add(&item("ep1")).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_index_entry_with_an_unsafe_name_is_not_loaded() {
+        let dir = temp_dir("index");
+        let entry = |id: &str, file: Option<&str>| {
+            let mut e = Entry::from_item(&item(id), "server1");
+            e.file = file.map(str::to_string);
+            e
+        };
+        let index = vec![
+            entry("ok1", Some("video.mkv")),
+            entry("../bad", None),
+            entry("ok2", Some("../../escape")),
+            entry("ok3", None),
+        ];
+        write_json(&dir.join(INDEX_FILE), &index).unwrap();
+        let loaded = load_index(&dir);
+        let ids: Vec<_> = loaded.iter().map(|e| e.item_id.as_str()).collect();
+        assert_eq!(ids, ["ok1", "ok3"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn a_restart_retries_what_failed_and_leaves_a_pause_alone() {
         let mock = Mock::start(10_000);
         let dir = temp_dir("restart");
         let mut tight = options();
         tight.free_override = Some(MIN_FREE_BYTES + 5_000);
         let first = engine(&mock, dir.clone(), tight);
-        first.add(&item("ep20"));
+        first.add(&item("ep20")).unwrap();
         wait_state(&first, "ep20", EntryState::Failed);
         // The user pauses another one before it starts.
         mock.set(Mode::Slow);
         first.set_options(|o| o.free_override = Some(MIN_FREE_BYTES + 50_000));
-        first.add(&item("ep21"));
+        first.add(&item("ep21")).unwrap();
         first.cancel("ep21");
         wait_state(&first, "ep21", EntryState::Paused);
         drop(first);
@@ -1618,9 +1726,9 @@ mod tests {
         let mut options = options();
         options.limit_bytes = Some(15_000);
         let engine = engine(&mock, dir.clone(), options);
-        engine.add(&item("ep9"));
+        engine.add(&item("ep9")).unwrap();
         wait_state(&engine, "ep9", EntryState::Done);
-        engine.add(&item("ep10"));
+        engine.add(&item("ep10")).unwrap();
         let entry = wait_state(&engine, "ep10", EntryState::Failed);
         assert!(entry.error.as_deref().unwrap().contains("storage limit"), "{entry:?}");
         let _ = fs::remove_dir_all(dir);
@@ -1633,7 +1741,7 @@ mod tests {
         let mut options = options();
         options.byte_limit = Some(30_000);
         let engine = engine(&mock, dir.clone(), options.clone());
-        engine.add(&item("ep11"));
+        engine.add(&item("ep11")).unwrap();
         let entry = wait_state(&engine, "ep11", EntryState::Paused);
         assert!(entry.done >= 30_000 && entry.done < 90_000, "{entry:?}");
         options.byte_limit = None;
@@ -1651,7 +1759,7 @@ mod tests {
         let mock = Mock::start(5_000);
         let dir = temp_dir("remove");
         let engine = engine(&mock, dir.clone(), options());
-        engine.add(&item("ep12"));
+        engine.add(&item("ep12")).unwrap();
         wait_state(&engine, "ep12", EntryState::Done);
         let folder = dir.join("server1").join("ep12");
         assert!(folder.join("video.bin").exists());

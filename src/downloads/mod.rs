@@ -68,7 +68,8 @@ pub fn local_source(player: &Player, item_id: &str) -> Option<String> {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(|s| s["File"].as_str().map(|f| folder.join(f).display().to_string()))
+                .filter_map(|s| s["File"].as_str().filter(|f| engine::check_file_name(f).is_ok()))
+                .map(|f| folder.join(f).display().to_string())
                 .collect()
         })
         .unwrap_or_default();
@@ -110,6 +111,13 @@ pub struct DownloadsState {
     online_client: Option<Client>,
 }
 
+impl DownloadsState {
+    /// True while a test points the session at a dead address.
+    pub fn is_unreachable_simulated(&self) -> bool {
+        self.online_client.is_some()
+    }
+}
+
 /// Progress reaches the UI this often at most.
 const POLL_EVERY: Duration = Duration::from_millis(250);
 
@@ -129,6 +137,7 @@ impl Bloom {
         self.downloads.allowed = None;
         self.downloads.offline = false;
         self.downloads.online_client = None;
+        self.connection_reset();
         if std::env::var_os("BLOOM_OFFLINE").is_some() {
             self.simulate_unreachable(true);
         }
@@ -140,7 +149,7 @@ impl Bloom {
 
     /// Asks what the server lets the user do. A positive answer also means
     /// the server is there: positions kept from offline plays go now.
-    fn load_download_policy(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn load_download_policy(&mut self, cx: &mut Context<Self>) {
         let Some(opened) = self.session.as_ref().map(|s| s.user_id.clone()) else {
             return;
         };
@@ -212,7 +221,11 @@ impl Bloom {
         }
         let engine = engine();
         let fresh = engine.entry(&item.id).is_none();
-        engine.add(item);
+        if let Err(err) = engine.add(item) {
+            log::warn!("download refused: {err:#}");
+            self.toast("Downloads", "The server sent an item that cannot be saved safely.", cx);
+            return;
+        }
         if fresh {
             self.toast("Download", format!("{} is in the queue.", item.display_title()), cx);
         }
@@ -230,8 +243,10 @@ impl Bloom {
         for episode in episodes.iter().filter(|e| e.is_playable()) {
             let state = engine.entry(&episode.id).map(|e| e.state);
             if state.is_none() || matches!(state, Some(EntryState::Paused | EntryState::Failed)) {
-                engine.add(episode);
-                added += 1;
+                match engine.add(episode) {
+                    Ok(()) => added += 1,
+                    Err(err) => log::warn!("download refused: {err:#}"),
+                }
             }
         }
         if added > 0 {
@@ -249,47 +264,34 @@ impl Bloom {
         self.navigate(Page::Downloads, cx);
     }
 
-    /// A page could not load. When the server cannot be reached and there
-    /// are downloads, the app goes offline: the Downloads page opens and
-    /// the pages stop asking the server. True when that happened.
+    /// A page could not load. When nothing reached the server
+    /// (`connection::classify`), a probe decides whether the app is
+    /// offline; then the Downloads page opens when there are downloads,
+    /// and the pages stop asking the server. True when the error is of
+    /// that kind: the page shows no raw text for it.
     pub fn downloads_server_failed(&mut self, err: &anyhow::Error, cx: &mut Context<Self>) -> bool {
-        let text = format!("{err:#}");
-        // A status code is an answer of the server; anything else is the
-        // network.
-        let transport = !text.starts_with("HTTP ") && !text.starts_with("unauthorized");
-        let has_files = engine().entries().iter().any(|e| e.state == EntryState::Done);
-        if self.downloads.offline || !transport || !has_files {
-            return false;
-        }
-        log::info!("offline: {text}");
-        self.downloads.offline = true;
-        self.stop_sync();
-        engine().set_client(None, "");
-        self.toast(
-            "Offline",
-            "The server cannot be reached. Your downloads play from this Mac.",
-            cx,
-        );
-        self.navigate(Page::Downloads, cx);
-        true
+        self.request_failed(err, cx)
     }
 
-    /// Leaves the offline mode and tries the server again. The home page
-    /// loads; when that fails the app is offline again.
+    /// Tries the server again now. A test that pointed the session at a
+    /// dead address gets the server back. When the probe answers, the app
+    /// is online again and the page loads (`connection::recovered`).
     pub fn retry_connection(&mut self, cx: &mut Context<Self>) {
-        self.downloads.offline = false;
         self.simulate_unreachable(false);
+        if self.connection.core.state != crate::connection::State::Online {
+            self.probe_now(cx);
+            return;
+        }
+        // Nothing to recover: the session is whole again, the page loads.
         if let Some(session) = self.session.as_ref() {
             engine().set_client(Some(session.client.clone()), &session.server_id);
         }
-        self.start_sync(cx);
-        self.load_download_policy(cx);
-        self.open_home(cx);
+        self.load_page(cx);
     }
 
     /// Points the session at an address that answers nothing, or back at
     /// the server. A test of the offline mode uses it.
-    fn simulate_unreachable(&mut self, on: bool) {
+    pub(crate) fn simulate_unreachable(&mut self, on: bool) {
         let device_id = self.config.device_id.clone();
         if on {
             if self.downloads.online_client.is_some() {
@@ -336,6 +338,14 @@ impl Bloom {
                 true
             }
             Page::Search(data) => {
+                data.loading = false;
+                true
+            }
+            Page::Playlist(data) => {
+                data.loading = false;
+                true
+            }
+            Page::Admin(data) => {
                 data.loading = false;
                 true
             }
