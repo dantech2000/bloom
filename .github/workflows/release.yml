@@ -1,0 +1,279 @@
+# Makes a release of the app. Read docs/RELEASING.md first.
+#
+# The only trigger is a manual start (workflow_dispatch). A tag push does not
+# start it: anyone who can push a tag would then reach the signing key. The
+# workflow makes the tag itself, at the commit it ran on, when it publishes.
+#
+# Three jobs:
+#   build    no secret. Builds the archive. On a branch other than main it also
+#            signs with a throwaway key: a rehearsal that can publish nothing.
+#   sign     main only. The environment "release" holds the private key of the
+#            updates and asks the owner to approve the run.
+#   publish  main only. Makes the GitHub release: a DRAFT (no installed app
+#            sees it) unless "publish" is on.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version, x.y.z. Cargo.toml must already say it (commit 'Release x.y.z' first) and docs/releases/x.y.z.md must exist."
+        required: true
+        type: string
+      publish:
+        description: "Publish for real. Off: make a DRAFT release that no installed app sees."
+        required: true
+        type: boolean
+        default: false
+
+permissions: {}
+
+# One release at a time; a second start waits, it never cancels the first.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  # The build folder of dev/build-mpv; see ci.yml.
+  MPV_CACHE_DIR: ${{ github.workspace }}/vendor/mpv/build
+  VERSION: ${{ inputs.version }}
+
+jobs:
+  build:
+    name: Build the archive
+    runs-on: macos-26
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read # to ask whether CI passed for this commit
+    outputs:
+      zip_sha256: ${{ steps.hash.outputs.zip_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the start
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          case "$VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::version must be x.y.z"; exit 1 ;;
+          esac
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::version must be x.y.z (digits only)"; exit 1
+          fi
+          if [ "$GITHUB_REF" = refs/heads/main ]; then
+            # The real thing: only for a commit on which CI passed.
+            ok=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&status=success&per_page=1" --jq '.total_count')
+            if [ "$ok" = 0 ]; then
+              echo "::error::CI has not passed for $GITHUB_SHA. Wait for it, or push the commit and let CI run."; exit 1
+            fi
+          else
+            echo "::notice::Rehearsal: this is not main, so the run signs with a throwaway key and publishes nothing."
+            if [ "$PUBLISH" = true ]; then
+              echo "::error::publish needs a run on main"; exit 1
+            fi
+          fi
+
+      - name: Checks before the build (version, notes, feed)
+        run: dev/release "$VERSION" --check-version --appcast latest --stage check
+
+      - name: Toolchain
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+          cargo --version
+          xcodebuild -version
+
+      # Restore only: a release run never writes a cache. CI on main does.
+      - name: Restore the cargo registry
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Compiler version (part of the libmpv cache key)
+        id: xcode
+        run: echo "id=$(xcodebuild -version | shasum -a 256 | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the libmpv prefix
+        id: mpv-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.MPV_CACHE_DIR }}
+            vendor/mpv/lib
+          key: mpv-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.id }}-${{ hashFiles('dev/build-mpv') }}
+
+      - name: Build libmpv
+        if: steps.mpv-cache.outputs.cache-hit != 'true'
+        run: dev/build-mpv
+
+      - name: Throwaway key (rehearsal only)
+        if: github.ref != 'refs/heads/main'
+        run: |
+          umask 077
+          pub=$(swift dev/test-key.swift "$RUNNER_TEMP/rehearsal.key")
+          echo "BLOOM_UPDATE_KEY=$pub" >> "$GITHUB_ENV"
+
+      - name: Build the archive
+        run: dev/release "$VERSION" --check-version --appcast latest --stage build
+
+      - name: Sign with the throwaway key (rehearsal only)
+        if: github.ref != 'refs/heads/main'
+        run: dev/release "$VERSION" --check-version --appcast latest --stage sign --key-file "$RUNNER_TEMP/rehearsal.key"
+
+      - name: Remove the throwaway key
+        if: always() && github.ref != 'refs/heads/main'
+        run: rm -f "$RUNNER_TEMP/rehearsal.key"
+
+      - name: Hash of the archive
+        id: hash
+        run: echo "zip_sha256=$(shasum -a 256 target/dist/Bloom-"$VERSION".zip | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Keep the files
+        # Always: also a rehearsal and a failed check leave the files to look at.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-unsigned
+          path: |
+            target/dist/*.zip
+            target/dist/*.xml
+            target/dist/notes-*.md
+          retention-days: 14
+          compression-level: 0
+          if-no-files-found: warn
+
+  sign:
+    name: Sign the feed
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    timeout-minutes: 30
+    # Holds the private key and asks the owner to approve (docs/RELEASING.md).
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # for the attestation
+      attestations: write # for the attestation too
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist-unsigned
+          path: target/dist
+
+      - name: The archive is the one the build job made
+        env:
+          WANT: ${{ needs.build.outputs.zip_sha256 }}
+        run: |
+          got=$(shasum -a 256 target/dist/Bloom-"$VERSION".zip | cut -d' ' -f1)
+          [ "$got" = "$WANT" ] || { echo "::error::archive hash $got is not $WANT"; exit 1; }
+
+      - name: Write the key
+        env:
+          SPARKLE_ED_KEY: ${{ secrets.SPARKLE_ED_KEY }}
+        run: |
+          [ -n "$SPARKLE_ED_KEY" ] || { echo "::error::the secret SPARKLE_ED_KEY is empty or missing"; exit 1; }
+          umask 077
+          printf '%s\n' "$SPARKLE_ED_KEY" > "$RUNNER_TEMP/sparkle.key"
+
+      - name: Sign and check
+        run: dev/release "$VERSION" --check-version --appcast latest --stage sign --key-file "$RUNNER_TEMP/sparkle.key"
+
+      - name: Remove the key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/sparkle.key"
+
+      - name: Provenance of the archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: target/dist/Bloom-${{ inputs.version }}.zip
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-signed
+          path: |
+            target/dist/*.zip
+            target/dist/appcast.xml
+            target/dist/notes-*.md
+          retention-days: 14
+          compression-level: 0
+          if-no-files-found: error
+
+  publish:
+    name: Make the GitHub release
+    needs: [build, sign]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # the only job that can create a release or a tag
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist-signed
+          path: dist
+
+      - name: The archive is the one the build job made
+        env:
+          WANT: ${{ needs.build.outputs.zip_sha256 }}
+        run: |
+          got=$(sha256sum dist/Bloom-"$VERSION".zip | cut -d' ' -f1)
+          [ "$got" = "$WANT" ] || { echo "::error::archive hash $got is not $WANT"; exit 1; }
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          tag="v$VERSION"
+          # An old draft of the same version (a dry run) is replaced; a real
+          # release of it, or a tag that exists, stops the run. A draft has no
+          # tag yet, so the list of releases is searched by name of tag.
+          found=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate \
+            --jq ".[] | select(.tag_name == \"$tag\") | \"\(.id) \(.draft)\"")
+          case "$found" in
+            *" true") gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/${found% *}" ;;
+            "") ;;
+            *) echo "::error::release $tag exists already"; exit 1 ;;
+          esac
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::tag $tag exists already"; exit 1
+          fi
+          if [ "$PUBLISH" = true ]; then mode=--latest; else mode=--draft; fi
+          gh release create "$tag" dist/Bloom-"$VERSION".zip dist/appcast.xml \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Bloom $VERSION" --notes-file "dist/notes-$VERSION.md" "$mode"
+
+      - name: What the installed apps see
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          if [ "$PUBLISH" = true ]; then
+            # The feed that every installed app reads must be the feed we made.
+            for _ in 1 2 3 4 5 6; do
+              curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/appcast.xml" -o seen.xml &&
+                cmp -s seen.xml dist/appcast.xml && { echo "The latest feed is the new feed."; exit 0; }
+              sleep 10
+            done
+            echo "::error::the latest feed is not the feed of this run"; exit 1
+          else
+            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate \
+              --jq ".[] | select(.tag_name == \"v$VERSION\") | \"draft=\(.draft) prerelease=\(.prerelease) assets=\([.assets[].name] | join(\",\"))\""
+            echo "A draft is not the latest release: no installed app sees it."
+          fi

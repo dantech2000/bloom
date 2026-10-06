@@ -2229,6 +2229,10 @@ mod tests {
         engine.add(&item("ep30")).unwrap();
         wait_done_at_least(&engine, "ep30", 1_000);
         engine.remove("ep30");
+        // The removed download is still on its slow connection; the new one
+        // needs no slow server, and on a slow machine 20 kB at 64 bytes a
+        // turn does not end within the wait.
+        mock.set(Mode::Normal);
         engine.add(&item("ep30")).unwrap();
         let entry = wait_state(&engine, "ep30", EntryState::Done);
         assert_eq!(entry.done, 20_000);

@@ -70,10 +70,21 @@ pub struct GlRenderer {
 
 impl GlRenderer {
     pub fn new() -> Result<Self> {
-        let attribs = [
+        // A Mac has a renderer on its GPU. A virtual machine (a CI runner, a
+        // remote session) may have none that counts as accelerated: the
+        // second list takes what is there, so the player still works.
+        let accelerated = [
             gl::kCGLPFAOpenGLProfile,
             gl::kCGLOGLPVersion_3_2_Core,
             gl::kCGLPFAAccelerated,
+            gl::kCGLPFAAllowOfflineRenderers,
+            gl::kCGLPFAColorSize,
+            24,
+            0,
+        ];
+        let any = [
+            gl::kCGLPFAOpenGLProfile,
+            gl::kCGLOGLPVersion_3_2_Core,
             gl::kCGLPFAAllowOfflineRenderers,
             gl::kCGLPFAColorSize,
             24,
@@ -83,7 +94,12 @@ impl GlRenderer {
         let mut npix = 0;
         let mut ctx: *mut c_void = ptr::null_mut();
         unsafe {
-            let code = gl::CGLChoosePixelFormat(attribs.as_ptr(), &mut pix, &mut npix);
+            let mut code = gl::CGLChoosePixelFormat(accelerated.as_ptr(), &mut pix, &mut npix);
+            if code != 0 || pix.is_null() {
+                log::warn!("no accelerated OpenGL renderer ({code}); taking any renderer");
+                pix = ptr::null_mut();
+                code = gl::CGLChoosePixelFormat(any.as_ptr(), &mut pix, &mut npix);
+            }
             if code != 0 || pix.is_null() {
                 return Err(anyhow!("CGLChoosePixelFormat failed ({code})"));
             }

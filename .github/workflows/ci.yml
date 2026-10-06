@@ -1,0 +1,214 @@
+# Builds and tests every push to main and every pull request. It never
+# publishes anything and never reads a secret. See docs/RELEASING.md.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # A weekly run keeps the caches alive: GitHub removes a cache that no run
+  # has used for 7 days, and a release then waits for a full libmpv build.
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+# No job has a permission unless it says so.
+permissions: {}
+
+# A new push to a branch cancels the run that is still going for it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  # The build folder of dev/build-mpv (its default): the tarballs, the
+  # install prefix with a stamp per component, and the venv with meson,
+  # ninja, cmake and pkgconf. Cached between runs.
+  MPV_CACHE_DIR: ${{ github.workspace }}/vendor/mpv/build
+
+jobs:
+  build-test:
+    name: Build and test
+    runs-on: macos-26 # Apple Silicon, Xcode 26.6; not macos-latest, so a new image never changes the build unasked
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+          cargo --version
+          rustc --version
+          xcodebuild -version
+          sw_vers
+
+      - name: Restore the cargo cache
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Compiler version (part of the libmpv cache key)
+        id: xcode
+        run: echo "id=$(xcodebuild -version | shasum -a 256 | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the libmpv prefix
+        id: mpv-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.MPV_CACHE_DIR }}
+            vendor/mpv/lib
+          # The script holds every pinned version, checksum and option; the
+          # compiler is the other input.
+          key: mpv-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.id }}-${{ hashFiles('dev/build-mpv') }}
+
+      - name: Build libmpv
+        if: steps.mpv-cache.outputs.cache-hit != 'true'
+        # Needs only Xcode's tools and python3: the script installs meson,
+        # ninja, cmake and pkgconf at pinned versions into its own venv.
+        run: dev/build-mpv
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Icon
+        # The release needs `actool` to compile the Icon Composer document;
+        # a push finds out here and not on release day.
+        run: |
+          mkdir -p target/ci-icon
+          dev/icon target/ci-icon
+          ls -l target/ci-icon
+
+      - name: Bundle and check it
+        # The app bundle with the release binary: libraries, rpaths, version,
+        # signature (the same checks the release runs on the archive).
+        run: |
+          BLOOM_BUNDLE_BIN=target/release/bloom dev/bundle
+          dev/release-verify --bundle target/Bloom.app
+
+      - name: Tests (without the real player)
+        # dev/ci-test sets BLOOM_CI_NO_PLAYER. Each skipped test prints
+        # "SKIPPED in CI"; the count is in the log and in the run summary.
+        run: dev/ci-test
+
+      # Not clippy: the pinned toolchain has no clippy component.
+
+      - name: Make the cache small
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo clean -p bloom --release
+          rm -rf target/Bloom.app target/ci-icon target/dist target/icon
+          du -sh target ~/.cargo/registry ~/.cargo/git 2>/dev/null || true
+
+      # Only a run on main saves a cache, so a pull request cannot fill the
+      # 10 GB of the repository (a pull request still restores the one of main).
+      - name: Save the cargo cache
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Save the libmpv prefix
+        if: github.ref == 'refs/heads/main' && steps.mpv-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.MPV_CACHE_DIR }}
+            vendor/mpv/lib
+          key: mpv-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.id }}-${{ hashFiles('dev/build-mpv') }}
+
+  # The tests with the real player (libmpv, an OpenGL context, a display
+  # link, audio output). A hosted runner may have no display or audio, and
+  # nobody knows yet whether these tests run there. This job tries, and it
+  # may fail without failing the run: when it fails, the run summary says
+  # so, and the release still depends on `dev/test` on a Mac. When it
+  # passes on three runs in a row, remove `continue-on-error` to make it a
+  # gate.
+  player-tests:
+    name: Tests with the real player (trial)
+    if: github.event_name != 'pull_request'
+    runs-on: macos-26
+    timeout-minutes: 30
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+
+      - name: What this runner has (display, GPU, audio)
+        continue-on-error: true
+        run: |
+          sw_vers
+          system_profiler SPDisplaysDataType SPAudioDataType 2>&1 | head -60
+          pgrep -l WindowServer || echo "no WindowServer"
+
+      - name: Restore the cargo cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Compiler version (part of the libmpv cache key)
+        id: xcode
+        run: echo "id=$(xcodebuild -version | shasum -a 256 | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the libmpv prefix
+        id: mpv-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.MPV_CACHE_DIR }}
+            vendor/mpv/lib
+          key: mpv-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.id }}-${{ hashFiles('dev/build-mpv') }}
+
+      - name: Build libmpv
+        if: steps.mpv-cache.outputs.cache-hit != 'true'
+        run: dev/build-mpv
+
+      - name: ffmpeg for the test clips
+        # The bottles of Homebrew are checked against the checksum of the
+        # formula. The version is not pinned: the tests only make a clip.
+        run: brew install ffmpeg
+
+      - name: Tests
+        id: tests
+        run: dev/test
+
+      - name: Say it when the trial failed
+        if: failure()
+        run: |
+          echo "::warning title=Tests with the real player failed::These tests did not pass on the hosted runner. The run is still green by design; run dev/test on a Mac before a release."
+          echo "### Tests with the real player: FAILED on the runner (trial, not a gate)" >> "$GITHUB_STEP_SUMMARY"
