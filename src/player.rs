@@ -1140,6 +1140,11 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>) -> Result<()> {
     let mut mpv = Mpv::with_initializer(|init| {
         init.set_option("vo", "libmpv")?;
         init.set_option("hwdec", "auto-safe")?;
+        // A file with interlaced frames (a DVD rip, a TV recording) shows
+        // comb lines unless its fields are put together; `auto` does that
+        // for the frames a file marks as interlaced and leaves every other
+        // file alone.
+        init.set_option("deinterlace", "auto")?;
         init.set_option("keep-open", "no")?;
         init.set_option("idle", "yes")?;
         init.set_option("terminal", "no")?;
@@ -2866,6 +2871,66 @@ mod tests {
         assert!(player.play_prepared(generation, request(&url, "Second", 62)));
         expect(&player, "second loaded", |e| *e == PlayerEvent::Loaded { token: 62 });
         assert_eq!(player.status().state, PlayState::Playing);
+        player.stop();
+    }
+
+    /// A silent 10 s clip with interlaced frames: what a DVD rip or a TV
+    /// recording holds.
+    fn interlaced_clip(name: &str) -> Option<std::path::PathBuf> {
+        let media = std::env::temp_dir().join(name);
+        let encoded = std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=s=720x576:r=50:d=10"])
+            .args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"])
+            .args(["-vf", "tinterlace=interleave_top,fieldorder=tff", "-flags", "+ilme+ildct"])
+            .args(["-c:v", "mpeg2video", "-q:v", "4", "-top", "1", "-c:a", "aac", "-shortest", "-t", "10"])
+            .arg(&media)
+            .status();
+        // No ffmpeg is a skip (`dev/test` refuses to start without it); an
+        // ffmpeg that runs and fails must not let the test pass unplayed.
+        match encoded {
+            Ok(status) => assert!(status.success(), "ffmpeg could not make the test clip: {status}"),
+            Err(_) => {
+                eprintln!("ffmpeg not available; skipping");
+                return None;
+            }
+        }
+        Some(media)
+    }
+
+    /// An interlaced file is deinterlaced by itself, and a progressive one
+    /// is left alone: no filter, no cost.
+    #[test]
+    fn an_interlaced_file_is_deinterlaced_and_a_progressive_one_is_not() {
+        let Some(_one) = real_player_turn() else { return };
+        let (Some(interlaced), Some(progressive)) =
+            (interlaced_clip("bloom-interlaced-test.mkv"), silent_clip("bloom-progressive-test.mp4"))
+        else {
+            return;
+        };
+        let player = Player::default();
+        let _closer = Closer(player.clone());
+        player.set_target_size(320, 240);
+        player.set_muted(true);
+        // The filter comes in with the first frames, a moment after the load.
+        let active_within = |want: &str, secs: u64| {
+            let deadline = Instant::now() + Duration::from_secs(secs);
+            loop {
+                let got = player.probe("deinterlace-active").unwrap_or_default();
+                if got == want || Instant::now() >= deadline {
+                    return got;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        };
+        player.play(request(&interlaced.display().to_string(), "Interlaced", 95));
+        expect(&player, "interlaced loaded", |e| *e == PlayerEvent::Loaded { token: 95 });
+        assert_eq!(player.probe("deinterlace").as_deref(), Some("auto"));
+        assert_eq!(active_within("yes", 5), "yes", "an interlaced file plays with its comb lines");
+        player.stop();
+        player.play(request(&progressive.display().to_string(), "Progressive", 96));
+        expect(&player, "progressive loaded", |e| *e == PlayerEvent::Loaded { token: 96 });
+        thread::sleep(Duration::from_millis(800));
+        assert_eq!(active_within("no", 1), "no", "a progressive file went through the deinterlace filter");
         player.stop();
     }
 
