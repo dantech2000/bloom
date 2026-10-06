@@ -169,7 +169,16 @@ def fetch(name):
     if not path.exists():
         say(f"downloading {path.name}")
         tmp = path.with_suffix(path.suffix + ".part")
-        subprocess.run(["curl", "-fsSL", "--retry", "3", "-o", str(tmp), url], check=True)
+        # Eleven servers must answer for one build, and one of them fails
+        # now and then (a build on a runner ended on a refused connection of
+        # freedesktop.org): every error is tried again, with a pause. The
+        # checksum below is what makes the file trusted, not the server.
+        curl = ["curl", "-fsSL", "--connect-timeout", "20", "--retry", "6", "--retry-delay", "10",
+                "--retry-all-errors", "-o", str(tmp), url]
+        result = subprocess.run(curl)
+        if result.returncode != 0:
+            tmp.unlink(missing_ok=True)
+            die(f"could not download {url} (curl exit {result.returncode}, after 6 more tries)")
         tmp.rename(path)
     got = sha256_of(path)
     if got != expected:
