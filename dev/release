@@ -1,20 +1,53 @@
 #!/bin/sh
-# Makes a release that the app can update itself to.
+# Makes a release that the app can update itself to. The one script that a
+# person on a Mac and the release workflow of GitHub Actions both run.
 #
-#   dev/release key          prints the public key for UPDATE_PUBLIC_KEY in
-#                            src/brand.rs. The private key is made once and
-#                            stays in the macOS Keychain (Sparkle's tool asks
-#                            for access to it).
-#   dev/release <version>    sets the version in Cargo.toml, builds the app
-#                            bundle, and writes into target/dist the archive
-#                            Bloom-<version>.zip and the feed appcast.xml,
-#                            signed with the private key.
+#   dev/release key                  prints the public key for UPDATE_PUBLIC_KEY
+#                                    in src/brand.rs. The private key is made
+#                                    once and stays in the macOS Keychain.
+#   dev/release <version> [options]  sets the version in Cargo.toml, builds the
+#                                    app bundle, and writes into target/dist the
+#                                    archive Bloom-<version>.zip, the feed
+#                                    appcast.xml (signed with the private key)
+#                                    and the notes notes-<version>.md. Then it
+#                                    checks all of it (dev/release-verify).
+#   dev/release verify <version> [--appcast <path|url|latest>]
+#                                    only the checks, on what is in target/dist
+#                                    (the older entries are compared with the feed
+#                                    the build used, or with the one named).
 #
-# Nothing is committed, tagged or uploaded. The last lines say how to put
-# the two files on GitHub; the app looks for the feed at UPDATE_FEED of
-# src/brand.rs. BLOOM_UPDATE_KEY_FILE names a private key file to use in
-# place of the Keychain, and BLOOM_UPDATE_URL_PREFIX the place the archive
-# is served from (both for a test on this Mac).
+# Options:
+#   --appcast <path|https url|latest>  The feed so far ("latest": the feed of
+#                               the newest release, UPDATE_FEED of src/brand.rs): the entries in it are kept
+#                               as they are and the new one is added. Use the
+#                               address of the feed of the newest release.
+#                               Fails when <version> is in it already, or is
+#                               not newer than every version in it. Without the
+#                               option the feed in target/dist is the base (the
+#                               old archives are there too, on the Mac that made them).
+#   --key-file <file>           A private key file (mode 600) in place of the
+#                               Keychain. BLOOM_UPDATE_KEY_FILE does the same.
+#   --check-version             Cargo.toml must already say <version> (the
+#                               commit "Release x.y.z" did that); it is not
+#                               edited and the build uses --locked, so a
+#                               Cargo.lock that is out of date fails.
+#   --no-verify                 skips the checks at the end.
+#   --stage check|build|sign    Part of the work: `check` only the checks before
+#                               the build (notes, version, feed) and stops.
+#                               Half of the work: `build` does everything up to
+#                               the archive and the notes, `sign` takes the
+#                               archive in target/dist and makes the signed
+#                               feed (and checks it). Without the option both
+#                               run. The workflow runs the two apart, so the
+#                               private key is on the disk only while `sign`
+#                               runs, and never while cargo builds.
+#
+# The notes of the release are docs/releases/<version>.md plus the part that
+# every release has (docs/releases/_footer.md). The release fails at once when
+# the file is missing or empty.
+# Nothing is committed, tagged or uploaded. BLOOM_UPDATE_URL_PREFIX names the
+# place the archive is served from, BLOOM_UPDATE_KEY and BLOOM_UPDATE_FEED
+# replace the public key and the feed of src/brand.rs (all three for a test).
 dir=$(cd "$(dirname "$0")/.." && pwd)
 "$dir/dev/vendor-sparkle" || exit 1
 tools="$dir/vendor/sparkle/bin"
@@ -22,40 +55,130 @@ name=$(sed -n 's/^pub const NAME: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
 feed=$(sed -n 's/^pub const UPDATE_FEED: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
 # https://github.com/<owner>/<repo>/releases/latest/download/appcast.xml
 repo=$(echo "$feed" | sed -n 's|^https://github.com/\([^/]*/[^/]*\)/releases/.*|\1|p')
+dist="$dir/target/dist"
+
+die() { echo "dev/release: $*" >&2; exit 1; }
+usage() { echo "usage: dev/release key | verify <version> | <major.minor.patch> [--appcast F] [--key-file F] [--check-version] [--no-verify] [--stage check|build|sign]" >&2; exit 1; }
+
+# Puts the feed from a path or an https address into $2.
+fetch_feed() {
+  case $1 in
+    https://*) curl -fsSL --retry 3 -o "$2" "$1" || die "cannot download the feed $1" ;;
+    http://*) die "the feed must come from an https address" ;;
+    *) cp "$1" "$2" || die "cannot read the feed $1" ;;
+  esac
+  grep -q '<rss' "$2" || die "$1 is not a feed"
+}
 
 if [ "$1" = key ]; then
   exec "$tools/generate_keys"
 fi
-version=$1
-echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' ||
-  { echo "usage: dev/release key | dev/release <major.minor.patch>" >&2; exit 1; }
-key=${BLOOM_UPDATE_KEY:-$(sed -n 's/^pub const UPDATE_PUBLIC_KEY: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")}
-[ -n "$key" ] || { echo "UPDATE_PUBLIC_KEY in src/brand.rs is empty; run dev/release key first" >&2; exit 1; }
+if [ "$1" = verify ]; then
+  shift
+  version=$1; shift
+  # The feed that the entries are compared with: the one the build used
+  # (target/dist/appcast.source.xml), or the one named by --appcast.
+  src=
+  [ -f "$dist/appcast.source.xml" ] && src=$dist/appcast.source.xml
+  if [ "$1" = --appcast ]; then
+    [ "$2" = latest ] && set -- "$1" "$feed"
+    src=$dist/appcast.source.xml
+    mkdir -p "$dist" && fetch_feed "$2" "$src"
+  fi
+  exec "$dir/dev/release-verify" "$version" ${src:+--source "$src"}
+fi
 
+version=$1; shift
+echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || usage
+appcast= keyfile=${BLOOM_UPDATE_KEY_FILE:-} check_version= verify=1 stage=all
+while [ $# -gt 0 ]; do
+  case $1 in
+    --appcast) appcast=$2; shift 2 ;;
+    --key-file) keyfile=$2; shift 2 ;;
+    --check-version) check_version=1; shift ;;
+    --no-verify) verify=; shift ;;
+    --stage) stage=$2; shift 2; case $stage in build | sign | check) ;; *) usage ;; esac ;;
+    *) usage ;;
+  esac
+done
+[ "$appcast" = latest ] && appcast=$feed
+key=${BLOOM_UPDATE_KEY:-$(sed -n 's/^pub const UPDATE_PUBLIC_KEY: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")}
+[ -n "$key" ] || die "UPDATE_PUBLIC_KEY in src/brand.rs is empty; run dev/release key first"
+if [ -n "$keyfile" ] && [ "$stage" != build ] && [ "$stage" != check ]; then
+  [ -f "$keyfile" ] || die "no key file at $keyfile"
+  case $(/usr/bin/stat -f %Lp "$keyfile") in
+    600 | 400) ;;
+    *) die "the key file must have mode 600 (chmod 600 <file>)" ;;
+  esac
+fi
+
+# Everything that can fail fast comes before the build.
+notes_src="$dir/docs/releases/$version.md"
+footer="$dir/docs/releases/_footer.md"
+[ -s "$notes_src" ] && grep -q '[^[:space:]]' "$notes_src" ||
+  die "no release notes: write docs/releases/$version.md (what is new, in plain words)"
+[ -s "$footer" ] || die "docs/releases/_footer.md is missing"
+current=$(sed -n 's/^version = "\(.*\)"/\1/p' "$dir/Cargo.toml" | head -1)
+if [ -n "$check_version" ] && [ "$current" != "$version" ]; then
+  die "Cargo.toml says $current, not $version; commit the version first (see docs/RELEASING.md)"
+fi
+[ "$stage" = check ] || mkdir -p "$dist"
+source_feed=
+[ -n "$appcast" ] && source_feed="$dist/appcast.source.xml"
+# The stage `check` writes nothing into target/dist.
+[ "$stage" = check ] && [ -n "$appcast" ] && source_feed=$(mktemp "${TMPDIR:-/tmp}/bloom-feed.XXXXXX")
+if [ -n "$appcast" ] && [ "$stage" != sign ]; then
+  fetch_feed "$appcast" "$source_feed"
+  for old in $(sed -n 's|.*<sparkle:version>\(.*\)</sparkle:version>.*|\1|p' "$source_feed"); do
+    [ "$old" = "$version" ] && die "$version is in the feed already"
+    [ "$(printf '%s\n%s\n' "$old" "$version" | sort -V | tail -n 1)" = "$version" ] ||
+      die "$version is not newer than $old, which is in the feed"
+  done
+  [ "$stage" = check ] && rm -f "$source_feed" || cp "$source_feed" "$dist/appcast.xml"
+fi
+[ "$stage" = sign ] || [ "$stage" = check ] || sed "s/{{VERSION}}/$version/g" "$footer" | { cat "$notes_src"; echo; cat; } > "$dist/notes-$version.md"
+archive="$dist/$name-$version.zip"
+
+if [ "$stage" = check ]; then
+  echo "dev/release: $version passes the checks before the build"
+  exit 0
+fi
+if [ "$stage" != sign ]; then
 # The version of the package is the version of the bundle.
-/usr/bin/sed -i '' "1,/^version = /s/^version = \".*\"/version = \"$version\"/" "$dir/Cargo.toml"
+if [ -z "$check_version" ]; then
+  /usr/bin/sed -i '' "1,/^version = /s/^version = \".*\"/version = \"$version\"/" "$dir/Cargo.toml"
+fi
 # The `ship` profile of Cargo.toml: smaller, slower to build.
-(cd "$dir" && cargo build --profile ship) || exit 1
+(cd "$dir" && cargo build ${check_version:+--locked} --profile ship) || exit 1
 "$dir/dev/bundle" >/dev/null || exit 1
 
-dist="$dir/target/dist"
-mkdir -p "$dist"
-archive="$dist/$name-$version.zip"
 rm -f "$archive"
 # ditto keeps the links and the signature of the bundle intact.
 ditto -c -k --sequesterRsrc --keepParent "$dir/target/$name.app" "$archive" || exit 1
+fi
+if [ "$stage" = build ]; then
+  echo "Made $archive and $dist/notes-$version.md; the feed is not signed yet (dev/release $version --stage sign)"
+  exit 0
+fi
+[ -f "$archive" ] || die "no archive at $archive; run the build stage first"
 
 prefix=${BLOOM_UPDATE_URL_PREFIX:-https://github.com/$repo/releases/download/v$version/}
-if [ -n "$BLOOM_UPDATE_KEY_FILE" ]; then
-  "$tools/generate_appcast" --ed-key-file "$BLOOM_UPDATE_KEY_FILE" --download-url-prefix "$prefix" \
-    --maximum-deltas 0 "$dist" || exit 1
+# --maximum-versions 0 keeps every entry (the default drops all but 3);
+# --maximum-deltas 0 makes no delta files.
+if [ -n "$keyfile" ]; then
+  "$tools/generate_appcast" --ed-key-file "$keyfile" --download-url-prefix "$prefix" \
+    --maximum-versions 0 --maximum-deltas 0 "$dist" || exit 1
 else
-  "$tools/generate_appcast" --download-url-prefix "$prefix" --maximum-deltas 0 "$dist" || exit 1
+  "$tools/generate_appcast" --download-url-prefix "$prefix" \
+    --maximum-versions 0 --maximum-deltas 0 "$dist" || exit 1
 fi
 # generate_appcast gives every archive in the folder the address of this
 # release; an older archive is in the release of its own version.
 /usr/bin/sed -i '' -E "s|/download/v$version/($name-([0-9]+\.[0-9]+\.[0-9]+)\.zip)|/download/v\2/\1|" "$dist/appcast.xml"
+if [ -n "$verify" ]; then
+  "$dir/dev/release-verify" "$version" ${source_feed:+--source "$source_feed"} || die "the checks failed; do not publish"
+fi
 echo
-echo "Made $archive and $dist/appcast.xml"
-echo "To publish (after a commit of the version and a push):"
-echo "  gh release create v$version \"$archive\" \"$dist/appcast.xml\" --repo $repo --title \"$name $version\""
+echo "Made $archive, $dist/appcast.xml and $dist/notes-$version.md"
+echo "Files are in $dist. Do not upload them by hand: commit \"Release $version\", push, and start"
+echo "the release workflow (docs/RELEASING.md). The feed of the latest release reaches every installed app."

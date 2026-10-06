@@ -27,6 +27,23 @@ Jellyfin and its logo belong to the Jellyfin project.
 | [Sparkle](https://sparkle-project.org) | Updates of the app in release builds | MIT |
 | [Mozilla CA certificate list](https://curl.se/docs/caextract.html) | The certificate authorities the player trusts for HTTPS streams | MPL-2.0 |
 
+## Inside libmpv
+
+Linked into the one libmpv library that `dev/build-mpv` builds.
+
+| Project | Used for | License |
+| --- | --- | --- |
+| [libass](https://github.com/libass/libass) | Subtitle rendering: ASS and SSA styling, SRT | ISC |
+| [HarfBuzz](https://github.com/harfbuzz/harfbuzz) | Text shaping for subtitles | MIT |
+| [FreeType](https://freetype.org) | Font rendering for subtitles | FTL or GPL-2.0-or-later |
+| [FriBidi](https://github.com/fribidi/fribidi) | Right-to-left text in subtitles | LGPL-2.1-or-later |
+| [dav1d](https://code.videolan.org/videolan/dav1d) | AV1 decoding in software | BSD-2-Clause |
+| [libplacebo](https://code.videolan.org/videolan/libplacebo) | Colour helpers mpv is built on | LGPL-2.1-or-later |
+| [Lua](https://www.lua.org) | mpv's scripts: the playback info panel and ytdl_hook | MIT |
+| [Mbed TLS](https://github.com/Mbed-TLS/mbedtls) | TLS for HTTPS streams, inside FFmpeg | Apache-2.0 or GPL-2.0-or-later |
+| [zvbi](https://github.com/zapping-vbi/zvbi) | Teletext subtitles of TV recordings, inside FFmpeg | LGPL-2.0-or-later |
+| [uchardet](https://www.freedesktop.org/wiki/Software/uchardet/) | Character set detection for subtitle files | MPL-1.1, GPL-2.0-or-later or LGPL-2.1-or-later |
+
 ## Look, icons and fonts
 
 | Project | Used for | License |
@@ -72,8 +89,11 @@ Bloom links several hundred more Rust crates, almost all under MIT or
 Apache-2.0, a few under BSD, ISC, Zlib, MPL-2.0 or Unicode licenses.
 `Cargo.lock` names each one, and `cargo metadata` prints their licenses.
 
-The app bundle made by `dev/bundle` also carries the libraries mpv needs
-(among them x264 and x265, both GPL). Their licenses apply to that bundle.
+The app bundle made by `dev/bundle` also carries libmpv, one library with
+FFmpeg and the projects of the group "Inside libmpv" linked in. mpv is
+GPL-2.0-or-later and FFmpeg, as built, GPL-3.0-or-later (no GPL encoder is
+in; mbedTLS asks for version 3), so that library as a whole is under the
+GPL-3.0-or-later. `dev/build-mpv` names every source, version and checksum.
 
 ## Notes on the licenses
 

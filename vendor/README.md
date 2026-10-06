@@ -1,7 +1,8 @@
 # Vendored crates
 
-`mpv` is libmpv, made by `dev/vendor-mpv`. `sparkle` is the updater
-framework. The two `gpui-pre-*` crates are copies of the published crates
+`mpv/lib` is libmpv, one library built from pinned sources by
+`dev/build-mpv` (the versions, sources and checksums are in that script;
+`mpv/build` is its cache). `sparkle` is the updater framework. The two `gpui-pre-*` crates are copies of the published crates
 (crates.io, version 0.3.4, Apache-2.0, license file carried) with small
 local changes, wired in by `[patch.crates-io]` in `Cargo.toml`. An upgrade
 of GPUI copies the new crate from the registry

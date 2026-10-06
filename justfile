@@ -33,9 +33,9 @@ install:
 release *ARGS:
     dev/release {{ARGS}}
 
-# Copy libmpv and its libraries into vendor/mpv (needed once before the first build)
-vendor-mpv:
-    dev/vendor-mpv
+# Build libmpv from pinned sources into vendor/mpv (needed once before the first build)
+build-mpv:
+    dev/build-mpv
 
 # Send a command to the running app, for example: just ctl state
 ctl *ARGS:

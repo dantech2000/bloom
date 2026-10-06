@@ -684,7 +684,7 @@ mod tests {
 
     #[test]
     fn follows_a_scripted_group_with_the_real_player() {
-        let _one = crate::player::REAL_PLAYER.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_one) = crate::player::real_player_turn() else { return };
         let clip = std::env::temp_dir().join("bloom-syncplay-test-4min.mp4");
         let encoded = std::process::Command::new("ffmpeg")
             .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=s=320x240:r=24:d=240"])

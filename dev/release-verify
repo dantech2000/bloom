@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Checks the output of dev/release in target/dist before anything is published:
+
+  dev/release-verify <version> [--source <appcast.xml the feed was made from>]
+  dev/release-verify --bundle <Bloom.app>      (checks 3 and 4 only, for CI)
+
+Fails (exit 1) with one line for each problem. The checks:
+  1. the feed has one new entry for <version> with the address of its
+     release, the length of the archive, and an EdDSA signature that
+     verifies against the PUBLIC key (BLOOM_UPDATE_KEY, else UPDATE_PUBLIC_KEY
+     of src/brand.rs): a feed signed with a wrong key cannot pass;
+  2. with --source: every older entry is the same text as in the source feed
+     (so its original signature is unchanged) and has its own release address;
+  3. the archive, unpacked: `codesign --verify --deep --strict`; the version
+     in Info.plist; the feed and the public key in Info.plist; arm64 in every file;
+  4. every Mach-O file in the bundle loads only from /usr/lib, /System,
+     @rpath, @loader_path or @executable_path, and has no other rpath
+     than the same or a system one (nothing of the Nix store, the build folder or Homebrew gets in).
+"""
+import os, plistlib, re, subprocess, sys, tempfile
+
+root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+brand = open(os.path.join(root, "src", "brand.rs")).read()
+
+
+def const(name):
+    m = re.search(r'^pub const %s: &str = "(.*)";' % name, brand, re.M)
+    return m.group(1) if m else ""
+
+
+args = sys.argv[1:]
+bundle_only = None
+if "--bundle" in args:
+    i = args.index("--bundle")
+    bundle_only = args[i + 1]
+    del args[i : i + 2]
+source = None
+if "--source" in args:
+    i = args.index("--source")
+    source = args[i + 1]
+    del args[i : i + 2]
+if len(args) != (0 if bundle_only else 1):
+    sys.exit(__doc__)
+version = args[0] if args else re.search(r'^version = "(.*)"', open(os.path.join(root, "Cargo.toml")).read(), re.M).group(1)
+name, feed = const("NAME"), const("UPDATE_FEED")
+repo = re.match(r"https://github\.com/([^/]+/[^/]+)/releases/", feed).group(1)
+key = os.environ.get("BLOOM_UPDATE_KEY") or const("UPDATE_PUBLIC_KEY")
+feed_want = os.environ.get("BLOOM_UPDATE_FEED") or feed
+prefix = os.environ.get("BLOOM_UPDATE_URL_PREFIX")
+dist = os.path.join(root, "target", "dist")
+archive = os.path.join(dist, f"{name}-{version}.zip")
+problems = []
+
+
+def bad(text):
+    problems.append(text)
+
+
+def items(xml):
+    out = {}
+    for block in re.findall(r"<item>.*?</item>", xml, re.S):
+        v = re.search(r"<sparkle:version>(.*?)</sparkle:version>", block)
+        out[v.group(1) if v else "?"] = block
+    return out
+
+
+def enclosure(block):
+    url = re.search(r'<enclosure url="([^"]*)"', block)
+    length = re.search(r'length="(\d+)"', block)
+    sig = re.search(r'sparkle:edSignature="([^"]*)"', block)
+    return (url and url.group(1), length and int(length.group(1)), sig and sig.group(1))
+
+
+# 1 and 2: the feed.
+new_feed = "" if bundle_only else open(os.path.join(dist, "appcast.xml")).read()
+now = items(new_feed)
+if bundle_only:
+    pass
+elif version not in now:
+    bad(f"the feed has no entry for {version}")
+else:
+    url, length, sig = enclosure(now[version])
+    want = (prefix or f"https://github.com/{repo}/releases/download/v{version}/") + f"{name}-{version}.zip"
+    if url != want:
+        bad(f"entry {version}: address {url}, expected {want}")
+    if not os.path.exists(archive):
+        bad(f"no archive {archive}")
+    else:
+        if length != os.path.getsize(archive):
+            bad(f"entry {version}: length {length}, archive has {os.path.getsize(archive)}")
+        if not sig:
+            bad(f"entry {version} has no signature")
+        elif subprocess.run(["swift", os.path.join(root, "dev", "verify-update.swift"), key, archive, sig],
+                            capture_output=True).returncode != 0:
+            bad(f"entry {version}: the signature does NOT verify against the public key {key}")
+if source and not bundle_only:
+    old = items(open(source).read())
+    if len(now) != len(old) + 1:
+        bad(f"the feed has {len(now)} entries, the source had {len(old)} (expected {len(old) + 1})")
+    for v, block in old.items():
+        if now.get(v) != block:
+            bad(f"entry {v} is not the same text as in the source feed")
+        url = enclosure(block)[0]
+        if not prefix and url != f"https://github.com/{repo}/releases/download/v{v}/{name}-{v}.zip":
+            bad(f"entry {v}: address {url} is not the address of its own release")
+
+# 3 and 4: the bundle, as it is in the archive.
+if bundle_only or os.path.exists(archive):
+    with tempfile.TemporaryDirectory() as tmp:
+        if bundle_only:
+            app = os.path.abspath(bundle_only)
+        else:
+            subprocess.run(["ditto", "-x", "-k", archive, tmp], check=True)
+            app = os.path.join(tmp, f"{name}.app")
+        r = subprocess.run(["codesign", "--verify", "--deep", "--strict", app], capture_output=True, text=True)
+        if r.returncode != 0:
+            bad("codesign --verify --deep --strict: " + r.stderr.strip().replace("\n", " "))
+        res = os.path.join(app, "Contents", "Resources")
+        for need in ("Assets.car", "AppIcon.icns"):
+            if not os.path.isfile(os.path.join(res, need)):
+                bad(f"{need} is not in the bundle (the icon did not compile)")
+        car = os.path.join(res, "Assets.car")
+        if os.path.isfile(car):
+            info = subprocess.run(["xcrun", "assetutil", "--info", car], capture_output=True, text=True).stdout
+            # The layered icon of macOS 26 (Icon Composer) is an IconImageStack.
+            if '"AssetType" : "IconImageStack"' not in info:
+                bad("Assets.car has no layered icon (IconImageStack): actool is too old for AppIcon.icon")
+        plist = plistlib.load(open(os.path.join(app, "Contents", "Info.plist"), "rb"))
+        if plist.get("CFBundleShortVersionString") != version or plist.get("CFBundleVersion") != version:
+            bad(f"Info.plist version {plist.get('CFBundleShortVersionString')}/{plist.get('CFBundleVersion')}, expected {version}")
+        if plist.get("SUPublicEDKey") != key:
+            bad("SUPublicEDKey in Info.plist is not the public key the feed is verified with")
+        if plist.get("SUFeedURL") != feed_want:
+            bad(f"SUFeedURL in Info.plist is {plist.get('SUFeedURL')}")
+        okay = ("/usr/lib/", "/System/", "@rpath/", "@loader_path/", "@executable_path/")
+        machos = 0
+        for base, dirs, files in os.walk(app):
+            for f in files:
+                path = os.path.join(base, f)
+                if os.path.islink(path) or not os.path.isfile(path):
+                    continue
+                with open(path, "rb") as fh:
+                    magic = fh.read(4)
+                if magic not in (b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"):
+                    continue
+                machos += 1
+                rel = os.path.relpath(path, app)
+                libs = subprocess.run(["otool", "-L", path], capture_output=True, text=True).stdout.splitlines()[1:]
+                for line in libs:
+                    if line.endswith(":"):  # "<file> (architecture x):" of a fat file
+                        continue
+                    dep = line.split(" (")[0].strip()
+                    if not dep.startswith(okay):
+                        bad(f"{rel} loads {dep}")
+                lc = subprocess.run(["otool", "-l", path], capture_output=True, text=True).stdout
+                for rpath in re.findall(r"cmd LC_RPATH\n.*\n\s+path (.*) \(offset", lc):
+                    if not rpath.startswith(("@loader_path", "@executable_path", "@rpath", "/usr/lib", "/System/")):
+                        bad(f"{rel} has the rpath {rpath}")
+                archs = subprocess.run(["lipo", "-archs", path], capture_output=True, text=True).stdout.split()
+                # Sparkle ships both slices; everything else is arm64 only.
+                if "arm64" not in archs or (rel.startswith("Contents/MacOS/") and archs != ["arm64"]):
+                    bad(f"{rel} has the slices {archs}")
+        if machos == 0:
+            bad("no Mach-O file found in the bundle")
+        print(f"checked {machos} Mach-O files in {name}.app")
+
+if problems:
+    for p in problems:
+        print("FAIL:", p, file=sys.stderr)
+    sys.exit(1)
+print(f"release-verify: {name} {version} is good")

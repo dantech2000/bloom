@@ -2153,6 +2153,22 @@ fn finish(shared: &Shared, session: &mut Option<Session>, worker: &mut Worker) {
 #[cfg(test)]
 pub(crate) static REAL_PLAYER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The turn of a test with the real player (hold the guard to the end of the
+/// test). With `BLOOM_CI_NO_PLAYER` set, as on a hosted CI runner that has no
+/// display or audio, the test does not run: it prints one line that starts
+/// with `SKIPPED in CI` and returns `None`, and the workflow counts the lines
+/// (`dev/ci-test`), so a skipped test is never taken for a passed one.
+#[cfg(test)]
+pub(crate) fn real_player_turn() -> Option<std::sync::MutexGuard<'static, ()>> {
+    if std::env::var_os("BLOOM_CI_NO_PLAYER").is_some_and(|v| !v.is_empty()) {
+        let test = std::thread::current().name().unwrap_or("?").to_owned();
+        // The newline first: the test runner prints "test x ..." without one.
+        eprintln!("\nSKIPPED in CI (BLOOM_CI_NO_PLAYER is set): {test}");
+        return None;
+    }
+    Some(REAL_PLAYER.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// Closes the player of a test when the test ends, also when it fails.
 #[cfg(test)]
 pub(crate) struct Closer(pub Player);
@@ -2249,7 +2265,7 @@ mod tests {
     /// stops. Skipped when libmpv or ffmpeg are unavailable.
     #[test]
     fn embedded_playback_roundtrip() {
-        let _one = REAL_PLAYER.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_one) = real_player_turn() else { return };
         let Some(media) = test_clip("bloom-embedded-test.mp4") else {
             return;
         };
@@ -2257,6 +2273,8 @@ mod tests {
         let player = Player::default();
         let _closer = Closer(player.clone());
         player.set_target_size(640, 480);
+        // The clip has a tone: a test must never be heard.
+        player.set_muted(true);
         player.play(PlayRequest {
             client,
             item_id: "test".into(),
@@ -2326,6 +2344,8 @@ mod tests {
             "playing",
             Box::new(move || p.status().state == PlayState::Playing),
         );
+        // Every caller plays a clip with a tone: the roundtrip must be silent.
+        assert_eq!(player.probe("mute").as_deref(), Some("yes"), "a test plays with sound");
         let p = player.clone();
         wait("first frame", Box::new(move || p.frame().frame.is_some()));
         let frame = player.frame().frame;
@@ -2383,7 +2403,7 @@ mod tests {
     /// with a certificate it makes for the test. Skipped without openssl.
     #[test]
     fn refuses_a_self_signed_server() {
-        let _one = REAL_PLAYER.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_one) = real_player_turn() else { return };
         let Some(media) = test_clip("bloom-embedded-tls-test.mp4") else {
             return;
         };
@@ -2567,7 +2587,7 @@ mod tests {
     /// position measurements, a speed correction, and the end of the item.
     #[test]
     fn precise_control_for_group_playback() {
-        let _one = REAL_PLAYER.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_one) = real_player_turn() else { return };
         let Some(media) = test_clip("bloom-embedded-sync-test.mp4") else {
             return;
         };
@@ -2762,7 +2782,7 @@ mod tests {
     /// closed player. Here the stop comes before the check of the answer.
     #[test]
     fn stop_cancels_a_pending_load() {
-        let _one = REAL_PLAYER.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_one) = real_player_turn() else { return };
         let player = Player::default();
         let _closer = Closer(player.clone());
         let generation = player.prepare("Pending", 0., false);
@@ -2780,7 +2800,7 @@ mod tests {
     /// worker yet (the first item of a launch), then with one.
     #[test]
     fn stop_between_the_check_and_the_load_cancels_it() {
-        let _one = REAL_PLAYER.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_one) = real_player_turn() else { return };
         let Some(media) = silent_clip("bloom-stop-race-test.mp4") else {
             return;
         };
@@ -2830,7 +2850,7 @@ mod tests {
     /// this): the new item plays.
     #[test]
     fn a_start_right_after_a_stop_plays() {
-        let _one = REAL_PLAYER.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_one) = real_player_turn() else { return };
         let Some(media) = silent_clip("bloom-stop-start-test.mp4") else {
             return;
         };
@@ -2854,7 +2874,7 @@ mod tests {
     /// for the first item must reach the first load.
     #[test]
     fn first_load_keeps_settings_sent_before_the_worker() {
-        let _one = REAL_PLAYER.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_one) = real_player_turn() else { return };
         let Some(media) = silent_clip("bloom-first-settings-test.mp4") else {
             return;
         };
@@ -2892,7 +2912,7 @@ mod tests {
     /// cancelled must not reach the next item; the settings do.
     #[test]
     fn a_cancelled_first_load_keeps_its_track_choice_to_itself() {
-        let _one = REAL_PLAYER.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_one) = real_player_turn() else { return };
         let Some(media) = silent_clip("bloom-cancelled-tracks-test.mp4") else {
             return;
         };
@@ -2922,7 +2942,7 @@ mod tests {
     /// item must not get it.
     #[test]
     fn a_load_cancelled_on_its_way_to_the_worker_keeps_its_track_choice_to_itself() {
-        let _one = REAL_PLAYER.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_one) = real_player_turn() else { return };
         let Some(media) = silent_clip("bloom-cancelled-on-the-way-test.mp4") else {
             return;
         };
@@ -2955,7 +2975,7 @@ mod tests {
     #[test]
     fn a_transcode_of_a_load_the_worker_refuses_is_ended_on_the_server() {
         use std::io::{Read, Write};
-        let _one = REAL_PLAYER.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_one) = real_player_turn() else { return };
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (seen_tx, seen_rx) = mpsc::channel::<String>();
@@ -2991,7 +3011,7 @@ mod tests {
     /// that answer; whether the load reached its channel or not.
     #[test]
     fn a_worker_that_fails_to_start_reports_the_load_as_failed() {
-        let _one = REAL_PLAYER.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_one) = real_player_turn() else { return };
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {

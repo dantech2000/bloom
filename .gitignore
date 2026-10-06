@@ -1,6 +1,6 @@
 /target
 .DS_Store
-# libmpv and its libraries, copied by dev/vendor-mpv (about 105 MB)
+# libmpv, built by dev/build-mpv (vendor/mpv/lib), and its build folder
 /vendor/mpv
 *.rej
 *.orig

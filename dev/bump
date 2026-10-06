@@ -1,0 +1,12 @@
+#!/bin/sh
+# Sets the version of the app in Cargo.toml and Cargo.lock: dev/bump x.y.z.
+# Commit both with the notes docs/releases/x.y.z.md as "Release x.y.z"
+# (docs/RELEASING.md). It does not build, commit, tag or upload.
+dir=$(cd "$(dirname "$0")/.." && pwd)
+version=$1
+echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "usage: dev/bump <major.minor.patch>" >&2; exit 1; }
+/usr/bin/sed -i '' "1,/^version = /s/^version = \".*\"/version = \"$version\"/" "$dir/Cargo.toml" || exit 1
+# Cargo writes the new version of the package into Cargo.lock; no crate changes.
+(cd "$dir" && cargo metadata --offline --format-version 1 >/dev/null) || exit 1
+[ -s "$dir/docs/releases/$version.md" ] || echo "dev/bump: write docs/releases/$version.md before the release (the workflow fails without it)" >&2
+git -C "$dir" diff --no-ext-diff --stat -- Cargo.toml Cargo.lock

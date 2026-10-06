@@ -3,8 +3,8 @@
 # is in src/brand.rs), so the app has its icon and name in the Dock,
 # Launchpad and the menu bar. Build it first: `cargo build --profile ship`
 # (`BLOOM_BUNDLE_BIN` names another binary, such as target/release/bloom).
-# libmpv and its libraries come from vendor/mpv/lib (see dev/vendor-mpv) and
-# go into the bundle, so the app does not need the Nix store.
+# libmpv (one library with FFmpeg and the rest linked in, see dev/build-mpv)
+# comes from vendor/mpv/lib and goes into the bundle.
 dir=$(cd "$(dirname "$0")/.." && pwd)
 bin=${BLOOM_BUNDLE_BIN:-$dir/target/ship/bloom}
 [ -f "$bin" ] || { echo "no binary at $bin; run: cargo build --profile ship" >&2; exit 1; }
@@ -31,8 +31,7 @@ fi
 # rpaths of a file: one per line.
 rpaths() { otool -l "$1" | awk '/cmd LC_RPATH/ {r = 1} r && /^ *path / {print $2; r = 0}'; }
 # Takes out the rpaths that point out of the bundle: the paths of the build
-# (../../vendor/mpv/lib, relative to the binary) and the ones of the Nix
-# store that some libraries keep from their build. Then signs the file
+# (../../vendor/mpv/lib, relative to the binary). Then signs the file
 # again, as a changed file loses its signature.
 clean_rpaths() {
   changed=

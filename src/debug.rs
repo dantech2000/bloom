@@ -697,6 +697,15 @@ impl Bloom {
             "mpv" => {
                 return self.player.probe(rest).unwrap_or_else(|| "error: no worker, or no answer".into());
             }
+            // `mpv-set <property> <value>`: an mpv option for a test, such
+            // as `deinterlace yes` or `hwdec no`; the next read shows it.
+            "mpv-set" => {
+                let Some((name, value)) = rest.split_once(' ') else {
+                    return "error: mpv-set <property> <value>".into();
+                };
+                self.player.set_property(name, value);
+                return format!("set {name}");
+            }
             // Quits as the menu does, so the quit path can be tested.
             "quit" => {
                 cx.quit();

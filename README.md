@@ -40,15 +40,15 @@ iamd3vil. The first four commits of this repository are that project's.
 | --- | --- |
 | macOS | The app has only been built and run on macOS |
 | Rust 1.97.1 | Pinned in `rust-toolchain.toml`; `rustup` installs it on the first build |
-| Xcode | For the Metal toolchain, and `actool` for the app icon |
-| mpv | libmpv and its libraries are copied into `vendor/mpv` by `dev/vendor-mpv` |
+| Xcode | For the Metal toolchain, `actool` for the app icon, and clang, swiftc and make for libmpv |
+| Python 3, git | `dev/build-mpv` builds libmpv from source into `vendor/mpv`; meson, ninja, cmake and pkgconf go into a venv there |
 | ffmpeg (optional) | The playback tests encode short clips with it |
 | [just](https://github.com/casey/just) (optional) | Runs the recipes in `justfile` |
 
 ## Build and run
 
 ```sh
-dev/vendor-mpv          # once: copies libmpv into vendor/mpv
+dev/build-mpv           # once: builds libmpv into vendor/mpv (about 5 minutes; the build folder is a cache)
 cargo build --release
 dev/run                 # starts the app with the debug channel on
 ```

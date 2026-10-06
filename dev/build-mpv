@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""Builds libmpv for Bloom from pinned sources into vendor/mpv/lib.
+
+One library comes out: libmpv.2.dylib, with FFmpeg, libass, libplacebo,
+dav1d, Lua, mbedTLS and the rest linked in statically, for arm64 and
+macOS 14.0 or later. It links nothing outside /usr/lib and /System, so
+the app bundle needs no Nix store and no Homebrew.
+
+    dev/build-mpv            builds what is missing, then fills vendor/mpv/lib
+    dev/build-mpv --clean    deletes the build folder first
+
+Every source is a release tarball with its SHA-256 below, or a git tag
+with its commit; a mismatch stops the build. The build folder
+(BLOOM_MPV_BUILD_DIR, default vendor/mpv/build) keeps the tarballs, the
+install prefix and a stamp per component, so a second run builds only
+the components whose recipe changed. CI caches that folder keyed on this
+file. The build tools (meson, ninja, cmake, pkgconf) come from a Python
+venv in the build folder, so every machine builds with the same versions;
+the rest is Xcode's clang, make and git.
+"""
+import hashlib
+import inspect
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import venv
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+BUILD = Path(os.environ.get("BLOOM_MPV_BUILD_DIR") or ROOT / "vendor" / "mpv" / "build").resolve()
+OUT = ROOT / "vendor" / "mpv" / "lib"
+PREFIX = BUILD / "prefix"
+DL = BUILD / "dl"
+SRC = BUILD / "src"
+LOGS = BUILD / "log"
+STAMPS = PREFIX / ".stamps"
+VENV = BUILD / "venv"
+TARGET = "14.0"
+ARCH = "arm64"
+JOBS = str(os.cpu_count() or 4)
+
+# The versions pip installs into the venv: the same on every machine.
+PIP_TOOLS = ["meson==1.12.1", "ninja==1.13.2", "cmake==4.4.4", "pkgconf==3.0.7.post0"]
+
+# name: (version, url, sha256). libplacebo is a git tag with submodules
+# (its tarball has none), pinned by commit.
+TARBALLS = {
+    "lua": ("5.2.4", "https://www.lua.org/ftp/lua-5.2.4.tar.gz",
+            "b9e2e4aad6789b3b63a056d442f7b39f0ecfca3ae0f1fc0ae4e9614401b69f4b"),
+    "mbedtls": ("3.6.7", "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.7/mbedtls-3.6.7.tar.bz2",
+                "a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6"),
+    "dav1d": ("1.5.3", "https://downloads.videolan.org/pub/videolan/dav1d/1.5.3/dav1d-1.5.3.tar.xz",
+              "732010aa5ef461fa93355ed2c6c5fedb48ddc4b74e697eaabe8907eaeb943011"),
+    "freetype": ("2.14.3", "https://sourceforge.net/projects/freetype/files/freetype2/2.14.3/freetype-2.14.3.tar.xz/download",
+                 "36bc4f1cc413335368ee656c42afca65c5a3987e8768cc28cf11ba775e785a5f"),
+    "fribidi": ("1.0.16", "https://github.com/fribidi/fribidi/releases/download/v1.0.16/fribidi-1.0.16.tar.xz",
+                "1b1cde5b235d40479e91be2f0e88a309e3214c8ab470ec8a2744d82a5a9ea05c"),
+    "harfbuzz": ("13.2.1", "https://github.com/harfbuzz/harfbuzz/releases/download/13.2.1/harfbuzz-13.2.1.tar.xz",
+                 "6695da3eb7e1be0aa3092fe4d81433a33b47f4519259c759d729e3a9a55c1429"),
+    "libass": ("0.17.4", "https://github.com/libass/libass/releases/download/0.17.4/libass-0.17.4.tar.xz",
+               "78f1179b838d025e9c26e8fef33f8092f65611444ffa1bfc0cfac6a33511a05a"),
+    "uchardet": ("0.0.8", "https://www.freedesktop.org/software/uchardet/releases/uchardet-0.0.8.tar.xz",
+                 "e97a60cfc00a1c147a674b097bb1422abd9fa78a2d9ce3f3fdcc2e78a34ac5f0"),
+    # The last release with a configure script in the tarball; the newer
+    # tags on GitHub need autotools. FFmpeg asks for 0.2.28 or later.
+    "zvbi": ("0.2.35", "https://sourceforge.net/projects/zapping/files/zvbi/0.2.35/zvbi-0.2.35.tar.bz2/download",
+             "fc883c34111a487c4a783f91b1b2bb5610d8d8e58dcba80c7ab31e67e4765318"),
+    "ffmpeg": ("9.0.1", "https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz",
+               "cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635"),
+    "mpv": ("0.41.0", "https://github.com/mpv-player/mpv/archive/refs/tags/v0.41.0.tar.gz",
+            "ee21092a5ee427353392360929dc64645c54479aefdb5babc5cfbb5fad626209"),
+}
+LIBPLACEBO = ("7.360.1", "https://github.com/haasn/libplacebo.git", "v7.360.1",
+              "cee9b076f2c63104ccfd497fa79c39a867293ec4")
+
+# What FFmpeg keeps: decoders, demuxers, parsers and bitstream filters
+# stay complete, so every file a Jellyfin library holds still plays (the
+# device profile in src/stream.rs lets the server direct play any file).
+# The filters stay too: mpv inserts bwdif for deinterlacing, rotate and
+# vflip for rotated video, and a user filter chain may name any other.
+# Out go the encoders and muxers (the app never writes a file), the
+# devices, and all protocols but the ones a stream takes (a file, HTTP,
+# HTTPS, an HLS segment key). GPL with version 3: mbedTLS asks for
+# version 3, and a few decoders and filters are only built under the
+# GPL; no GPL encoder is in.
+FFMPEG_CONFIGURE = [
+    "--enable-gpl", "--enable-version3", "--disable-shared", "--enable-static", "--enable-pic",
+    "--disable-programs", "--disable-doc", "--disable-debug",
+    "--disable-encoders", "--disable-muxers", "--disable-devices",
+    "--disable-protocols", "--enable-protocol=file,http,https,tls,tcp,crypto,data",
+    "--enable-videotoolbox", "--enable-libdav1d", "--enable-mbedtls", "--enable-libzvbi",
+    "--enable-zlib", "--enable-bzlib", "--enable-iconv",
+    "--disable-audiotoolbox", "--disable-securetransport", "--disable-sdl2",
+    "--disable-lzma", "--disable-libxml2", "--disable-opencl", "--disable-metal", "--disable-coreimage",
+    "--disable-avfoundation", "--disable-xlib", "--disable-vulkan", "--disable-libplacebo",
+    "--disable-autodetect",
+]
+
+# What mpv keeps: the render API with OpenGL and the VideoToolbox
+# interop (gl-cocoa, videotoolbox-gl), the CoreAudio output and the
+# AVFoundation output it falls back to (CoreAudio refuses a mono track on
+# some Bluetooth headphones; mpv then takes the next driver), Lua for the
+# stats panel and ytdl_hook, libass and uchardet for subtitles. The cocoa
+# feature (which videotoolbox-gl needs) compiles mpv's small Swift app
+# bridge; the window of the mpv program (cocoa-cb), Vulkan, discs,
+# JavaScript, screenshots and the sound engines Bloom never selects stay
+# out.
+MPV_OPTIONS = {
+    "libmpv": "true", "cplayer": "false", "tests": "false", "build-date": "false",
+    "lua": "enabled", "uchardet": "enabled", "zlib": "enabled", "iconv": "enabled",
+    "coreaudio": "enabled", "avfoundation": "enabled", "cocoa": "enabled", "gl": "enabled", "gl-cocoa": "enabled",
+    "videotoolbox-gl": "enabled",
+    "swift-build": "enabled", "swift-flags": f"-target {ARCH}-apple-macosx{TARGET}",
+    "macos-cocoa-cb": "disabled", "macos-media-player": "disabled",
+    "macos-touchbar": "disabled", "videotoolbox-pl": "disabled", "vulkan": "disabled",
+    "shaderc": "disabled", "spirv-cross": "disabled", "plain-gl": "disabled",
+    "javascript": "disabled", "libarchive": "disabled", "libbluray": "disabled", "dvdnav": "disabled",
+    "cdda": "disabled", "cplugins": "disabled", "jpeg": "disabled", "lcms2": "disabled",
+    "libavdevice": "disabled", "rubberband": "disabled", "sdl2-gamepad": "disabled",
+    "vapoursynth": "disabled", "zimg": "disabled", "openal": "disabled", "audiounit": "disabled",
+    "sdl2-audio": "disabled", "jack": "disabled", "pulse": "disabled",
+    "pipewire": "disabled", "alsa": "disabled", "oss-audio": "disabled", "sndio": "disabled",
+    "caca": "disabled", "sixel": "disabled", "sdl2-video": "disabled", "x11": "disabled",
+    "wayland": "disabled", "drm": "disabled", "egl": "disabled", "vaapi": "disabled", "vdpau": "disabled",
+    "manpage-build": "disabled", "html-build": "disabled", "pdf-build": "disabled",
+}
+
+# Where a shipped library may link to.
+ALLOWED_LINKS = ("/usr/lib/", "/System/", "@rpath/", "@loader_path/")
+
+
+def say(msg):
+    print(f"build-mpv: {msg}", flush=True)
+
+
+def die(msg):
+    print(f"build-mpv: {msg}", file=sys.stderr, flush=True)
+    sys.exit(1)
+
+
+def sha256_of(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def run(args, log, cwd=None, env=None):
+    """Runs a command with its output in a log; on failure prints the log's
+    end and stops."""
+    with open(log, "ab") as out:
+        out.write(("\n$ " + " ".join(str(a) for a in args) + "\n").encode())
+        out.flush()
+        result = subprocess.run([str(a) for a in args], cwd=cwd, env=env, stdout=out, stderr=subprocess.STDOUT)
+    if result.returncode != 0:
+        tail = subprocess.run(["tail", "-n", "60", str(log)], capture_output=True, text=True).stdout
+        die(f"command failed (exit {result.returncode}); the end of {log}:\n{tail}")
+
+
+def fetch(name):
+    """The tarball of a component, downloaded once and checked every time."""
+    version, url, expected = TARBALLS[name]
+    ext = ".tar." + url.split(".tar.")[1].split("/")[0]
+    path = DL / f"{name}-{version}{ext}"
+    if not path.exists():
+        say(f"downloading {path.name}")
+        tmp = path.with_suffix(path.suffix + ".part")
+        subprocess.run(["curl", "-fsSL", "--retry", "3", "-o", str(tmp), url], check=True)
+        tmp.rename(path)
+    got = sha256_of(path)
+    if got != expected:
+        path.rename(path.with_suffix(path.suffix + ".bad"))
+        die(f"checksum mismatch for {path.name}:\n  expected {expected}\n  got      {got}\n"
+            f"(the file is kept as {path.name}.bad)")
+    return path
+
+
+def extract(name):
+    """A fresh source tree from the tarball."""
+    version = TARBALLS[name][0]
+    tarball = fetch(name)
+    dest = SRC / f"{name}-{version}"
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True)
+    subprocess.run(["tar", "xf", str(tarball), "-C", str(dest), "--strip-components=1"], check=True)
+    return dest
+
+
+def clone_libplacebo():
+    version, url, tag, commit = LIBPLACEBO
+    dest = SRC / f"libplacebo-{version}"
+    shutil.rmtree(dest, ignore_errors=True)
+    log = LOGS / "libplacebo.log"
+    run(["git", "clone", "--quiet", "--branch", tag, "--depth", "1", "--recurse-submodules",
+         "--shallow-submodules", url, str(dest)], log)
+    head = subprocess.run(["git", "-C", str(dest), "rev-parse", "HEAD"], capture_output=True, text=True,
+                          check=True).stdout.strip()
+    if head != commit:
+        die(f"libplacebo tag {tag} is at commit {head}, not the pinned {commit}")
+    return dest
+
+
+def tools():
+    """The build tools in the venv; made on the first run."""
+    py = VENV / "bin" / "python3"
+    wanted = sorted(PIP_TOOLS)
+    marker = VENV / "bloom-tools.json"
+    if not py.exists() or not marker.exists() or json.loads(marker.read_text()) != wanted:
+        say("setting up the build tools (meson, ninja, cmake, pkgconf) in a venv")
+        shutil.rmtree(VENV, ignore_errors=True)
+        venv.EnvBuilder(with_pip=True).create(VENV)
+        subprocess.run([str(py), "-m", "pip", "install", "--quiet", "--disable-pip-version-check"] + wanted, check=True)
+        marker.write_text(json.dumps(wanted))
+    for tool in ["clang", "clang++", "make", "git", "curl", "tar", "install_name_tool", "codesign", "otool", "xcrun"]:
+        if shutil.which(tool) is None:
+            die(f"{tool} is not in PATH; install the Xcode command line tools")
+    return VENV / "bin"
+
+
+def pkg_config_static(bin_dir):
+    wrapper = BUILD / "pkg-config-static"
+    wrapper.write_text(f'#!/bin/sh\nexec "{bin_dir / "pkg-config"}" --static "$@"\n')
+    wrapper.chmod(0o755)
+    return wrapper
+
+
+def base_env(bin_dir):
+    sdk = subprocess.run(["xcrun", "--sdk", "macosx", "--show-sdk-path"], capture_output=True, text=True,
+                         check=True).stdout.strip()
+    flags = f"-arch {ARCH} -mmacosx-version-min={TARGET} -isysroot {sdk}"
+    env = dict(os.environ)
+    env.update({
+        "PATH": f"{bin_dir}:{PREFIX / 'bin'}:/usr/bin:/bin:/usr/sbin:/sbin",
+        "SDKROOT": sdk,
+        "MACOSX_DEPLOYMENT_TARGET": TARGET,
+        "CC": "clang", "CXX": "clang++", "OBJC": "clang",
+        "CFLAGS": flags, "CXXFLAGS": flags, "OBJCFLAGS": flags, "LDFLAGS": flags,
+        # Only our prefix: no Homebrew or system .pc file may leak in. The
+        # wrapper asks for the private libraries of every .pc file, since
+        # the prefix holds static libraries only.
+        "PKG_CONFIG": str(pkg_config_static(bin_dir)),
+        "PKG_CONFIG_PATH": str(PREFIX / "lib" / "pkgconfig"),
+        "PKG_CONFIG_LIBDIR": str(PREFIX / "lib" / "pkgconfig"),
+        "CMAKE_PREFIX_PATH": str(PREFIX),
+    })
+    for var in ["CPATH", "LIBRARY_PATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "DYLD_LIBRARY_PATH"]:
+        env.pop(var, None)
+    return env
+
+
+def meson_build(src, log, env, options, library="static"):
+    build_dir = src / "build-bloom"
+    args = ["meson", "setup", str(build_dir), str(src), f"--prefix={PREFIX}", "--libdir=lib",
+            "--buildtype=release", f"--default-library={library}"]
+    args += [f"-D{k}={v}" for k, v in options.items()]
+    run(args, log, env=env)
+    run(["ninja", "-C", str(build_dir), "-j", JOBS], log, env=env)
+    run(["ninja", "-C", str(build_dir), "install"], log, env=env)
+
+
+def cmake_build(src, log, env, options):
+    build_dir = src / "build-bloom"
+    args = ["cmake", "-S", str(src), "-B", str(build_dir), "-G", "Ninja",
+            f"-DCMAKE_INSTALL_PREFIX={PREFIX}", "-DCMAKE_INSTALL_LIBDIR=lib", "-DCMAKE_BUILD_TYPE=Release",
+            f"-DCMAKE_OSX_DEPLOYMENT_TARGET={TARGET}", f"-DCMAKE_OSX_ARCHITECTURES={ARCH}",
+            "-DBUILD_SHARED_LIBS=OFF"]
+    args += [f"-D{k}={v}" for k, v in options.items()]
+    run(args, log, env=env)
+    run(["cmake", "--build", str(build_dir), "-j", JOBS], log, env=env)
+    run(["cmake", "--install", str(build_dir)], log, env=env)
+
+
+def build_lua(env, log):
+    src = extract("lua")
+    run(["make", "-C", str(src / "src"), "-j", JOBS, "a", "CC=clang", "SYSCFLAGS=-DLUA_USE_MACOSX",
+         f"MYCFLAGS={env['CFLAGS']}"], log, env=env)
+    (PREFIX / "lib" / "pkgconfig").mkdir(parents=True, exist_ok=True)
+    (PREFIX / "include").mkdir(parents=True, exist_ok=True)
+    shutil.copy(src / "src" / "liblua.a", PREFIX / "lib" / "liblua.a")
+    for header in ["lua.h", "luaconf.h", "lualib.h", "lauxlib.h", "lua.hpp"]:
+        shutil.copy(src / "src" / header, PREFIX / "include" / header)
+    (PREFIX / "lib" / "pkgconfig" / "lua.pc").write_text(
+        f"prefix={PREFIX}\nlibdir=${{prefix}}/lib\nincludedir=${{prefix}}/include\n\n"
+        f"Name: lua\nDescription: Lua {TARBALLS['lua'][0]}\nVersion: {TARBALLS['lua'][0]}\n"
+        "Libs: -L${libdir} -llua\nCflags: -I${includedir}\n")
+
+
+def build_mbedtls(env, log):
+    src = extract("mbedtls")
+    cmake_build(src, log, env, {"ENABLE_PROGRAMS": "OFF", "ENABLE_TESTING": "OFF",
+                                "MBEDTLS_FATAL_WARNINGS": "OFF", "GEN_FILES": "OFF",
+                                "USE_SHARED_MBEDTLS_LIBRARY": "OFF", "USE_STATIC_MBEDTLS_LIBRARY": "ON"})
+
+
+def build_dav1d(env, log):
+    meson_build(extract("dav1d"), log, env, {"enable_tools": "false", "enable_tests": "false",
+                                             "enable_examples": "false"})
+
+
+def build_freetype(env, log):
+    # Only what subtitle fonts need: no PNG (bitmap colour emoji, which
+    # libass does not draw), no brotli (WOFF2), no bzip2 (PCF fonts).
+    meson_build(extract("freetype"), log, env, {"zlib": "system", "bzip2": "disabled", "png": "disabled",
+                                                "brotli": "disabled", "harfbuzz": "disabled", "tests": "disabled"})
+
+
+def build_fribidi(env, log):
+    meson_build(extract("fribidi"), log, env, {"docs": "false", "bin": "false", "tests": "false"})
+
+
+def build_harfbuzz(env, log):
+    meson_build(extract("harfbuzz"), log, env, {
+        "freetype": "enabled", "glib": "disabled", "gobject": "disabled", "cairo": "disabled",
+        "chafa": "disabled", "png": "disabled", "zlib": "disabled", "icu": "disabled", "coretext": "disabled",
+        "subset": "disabled", "tests": "disabled", "docs": "disabled", "utilities": "disabled",
+        "introspection": "disabled"})
+
+
+def build_libass(env, log):
+    # Fonts come from CoreText (the system's fonts and the ones embedded
+    # in a file); fontconfig is the Linux way to the same thing.
+    src = extract("libass")
+    run([src / "configure", f"--prefix={PREFIX}", "--disable-shared", "--enable-static", "--with-pic",
+         "--enable-coretext", "--disable-fontconfig", "--disable-libunibreak"], log, cwd=src, env=env)
+    run(["make", "-j", JOBS], log, cwd=src, env=env)
+    run(["make", "install"], log, cwd=src, env=env)
+
+
+def build_uchardet(env, log):
+    # Its CMake files predate the policies of today's CMake.
+    cmake_build(extract("uchardet"), log, env, {"BUILD_BINARY": "OFF", "BUILD_STATIC": "ON",
+                                                "CMAKE_POLICY_VERSION_MINIMUM": "3.5"})
+
+
+def build_libplacebo(env, log):
+    # mpv needs libplacebo to build; Bloom's path through the render API
+    # (vo=libmpv) uses mpv's own OpenGL renderer and no libplacebo GPU
+    # code, so the Vulkan, OpenGL, shader compiler, ICC and libdovi parts
+    # stay out.
+    meson_build(clone_libplacebo(), log, env, {
+        "vulkan": "disabled", "opengl": "disabled", "d3d11": "disabled", "glslang": "disabled",
+        "shaderc": "disabled", "lcms": "disabled", "libdovi": "disabled", "xxhash": "disabled",
+        "unwind": "disabled", "demos": "false", "tests": "false"})
+
+
+def build_zvbi(env, log):
+    # Teletext subtitles of TV recordings (FFmpeg's libzvbi_teletext
+    # decoder). Only the library: no capture drivers, no proxy, no X11.
+    src = extract("zvbi")
+    run([src / "configure", f"--prefix={PREFIX}", "--disable-shared", "--enable-static", "--with-pic",
+         "--without-x", "--disable-v4l", "--disable-dvb", "--disable-bktr", "--disable-proxy",
+         "--without-doxygen", "--disable-nls", "--disable-rpath"], log, cwd=src, env=env)
+    run(["make", "-C", str(src / "src"), "-j", JOBS, "install"], log, env=env)
+    shutil.copy(src / "zvbi-0.2.pc", PREFIX / "lib" / "pkgconfig" / "zvbi-0.2.pc")
+
+
+def build_ffmpeg(env, log):
+    src = extract("ffmpeg")
+    run([src / "configure", f"--prefix={PREFIX}", f"--pkg-config={env['PKG_CONFIG']}",
+         "--pkg-config-flags=--static", "--cc=clang", f"--extra-cflags={env['CFLAGS']}",
+         f"--extra-ldflags={env['LDFLAGS']}"] + FFMPEG_CONFIGURE, log, cwd=src, env=env)
+    run(["make", "-j", JOBS], log, cwd=src, env=env)
+    run(["make", "install"], log, cwd=src, env=env)
+
+
+def build_mpv(env, log):
+    src = extract("mpv")
+    env = dict(env)
+    # Code no exported symbol reaches goes out of the library.
+    env["LDFLAGS"] = env["LDFLAGS"] + " -Wl,-dead_strip"
+    meson_build(src, log, env, MPV_OPTIONS, library="shared")
+
+
+COMPONENTS = [
+    ("lua", build_lua, []),
+    ("mbedtls", build_mbedtls, []),
+    ("dav1d", build_dav1d, []),
+    ("freetype", build_freetype, []),
+    ("fribidi", build_fribidi, []),
+    ("harfbuzz", build_harfbuzz, ["freetype"]),
+    ("libass", build_libass, ["freetype", "fribidi", "harfbuzz"]),
+    ("uchardet", build_uchardet, []),
+    ("libplacebo", build_libplacebo, []),
+    ("zvbi", build_zvbi, []),
+    ("ffmpeg", build_ffmpeg, ["dav1d", "mbedtls", "zvbi"]),
+    ("mpv", build_mpv, ["lua", "libass", "uchardet", "libplacebo", "ffmpeg"]),
+]
+
+
+def recipe_key(name, keys):
+    """A component is built again when its version, source, options, flags
+    or any dependency changed."""
+    source = TARBALLS.get(name) or LIBPLACEBO
+    parts = [name, json.dumps(source), TARGET, ARCH, json.dumps(PIP_TOOLS),
+             json.dumps(FFMPEG_CONFIGURE if name == "ffmpeg" else MPV_OPTIONS if name == "mpv" else None),
+             # The build function's source, so a changed recipe rebuilds.
+             inspect.getsource(COMPONENTS_BY_NAME[name])]
+    parts += [keys[dep] for dep in DEPS_BY_NAME[name]]
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+
+COMPONENTS_BY_NAME = {name: fn for name, fn, _ in COMPONENTS}
+DEPS_BY_NAME = {name: deps for name, _, deps in COMPONENTS}
+
+
+def build_all():
+    bin_dir = tools()
+    env = base_env(bin_dir)
+    for d in [DL, SRC, LOGS, STAMPS, PREFIX / "lib" / "pkgconfig", PREFIX / "include"]:
+        d.mkdir(parents=True, exist_ok=True)
+    keys = {}
+    times = []
+    for name, fn, _ in COMPONENTS:
+        key = recipe_key(name, keys)
+        keys[name] = key
+        stamp = STAMPS / name
+        if stamp.exists() and stamp.read_text().strip() == key:
+            times.append((name, "cached"))
+            continue
+        version = (TARBALLS.get(name) or LIBPLACEBO)[0]
+        say(f"building {name} {version}")
+        log = LOGS / f"{name}.log"
+        log.unlink(missing_ok=True)
+        started = time.monotonic()
+        stamp.unlink(missing_ok=True)
+        fn(env, log)
+        stamp.write_text(key)
+        times.append((name, f"{time.monotonic() - started:.0f} s"))
+        # The source tree is of no further use; the tarball stays.
+        shutil.rmtree(SRC / f"{name}-{version}", ignore_errors=True)
+    return times
+
+
+def install():
+    """libmpv into vendor/mpv/lib, signed, finding nothing outside the
+    system."""
+    built = PREFIX / "lib" / "libmpv.2.dylib"
+    if not built.exists():
+        die(f"no {built}")
+    shutil.rmtree(OUT, ignore_errors=True)
+    OUT.mkdir(parents=True)
+    lib = OUT / built.name
+    shutil.copyfile(built, lib)
+    os.chmod(lib, 0o755)
+    log = LOGS / "install.log"
+    run(["strip", "-x", str(lib)], log)
+    run(["install_name_tool", "-id", f"@rpath/{lib.name}", str(lib)], log)
+    # The library needs no search path of its own: the Swift runtime it
+    # uses is named by its full path in /usr/lib/swift.
+    load = subprocess.run(["otool", "-l", str(lib)], capture_output=True, text=True, check=True).stdout
+    for i, line in enumerate(lines := load.splitlines()):
+        if line.strip() == "cmd LC_RPATH":
+            rpath = lines[i + 2].split("path ", 1)[1].split(" (offset")[0]
+            run(["install_name_tool", "-delete_rpath", rpath, str(lib)], log)
+    run(["codesign", "--force", "--sign", "-", str(lib)], log)
+    # The linker looks for libmpv.dylib.
+    os.symlink(lib.name, OUT / "libmpv.dylib")
+    deps = subprocess.run(["otool", "-L", str(lib)], capture_output=True, text=True, check=True).stdout
+    bad = [line.strip() for line in deps.splitlines()[1:]
+           if not line.strip().startswith(ALLOWED_LINKS)]
+    if bad:
+        die("libmpv links outside the system:\n  " + "\n  ".join(bad))
+    minos = subprocess.run(["otool", "-l", str(lib)], capture_output=True, text=True, check=True).stdout
+    if f"minos {TARGET}" not in minos:
+        die(f"libmpv is not built for macOS {TARGET}")
+    return lib
+
+
+def main():
+    if "--clean" in sys.argv[1:]:
+        shutil.rmtree(BUILD, ignore_errors=True)
+    elif sys.argv[1:]:
+        die("usage: dev/build-mpv [--clean]")
+    started = time.monotonic()
+    times = build_all()
+    lib = install()
+    size = lib.stat().st_size / 1e6
+    for name, took in times:
+        say(f"  {name:<12} {took}")
+    say(f"{lib} ({size:.1f} MB) in {time.monotonic() - started:.0f} s")
+
+
+if __name__ == "__main__":
+    main()

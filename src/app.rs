@@ -368,6 +368,11 @@ pub struct Bloom {
     pub hero_changed: std::time::Instant,
     /// Whether the embedded video view covers the content area.
     pub player_open: bool,
+    /// `player_open` at the frame before, and whether the window was full
+    /// screen when the player opened: full screen that began with the
+    /// player ends with it (`follow_player_fullscreen`).
+    player_was_open: bool,
+    fullscreen_before_player: bool,
     pub current_frame: Option<VideoFrame>,
     frame_seq: u64,
     /// When the frames task last woke, and when the last draw ran (pacing
@@ -745,6 +750,8 @@ impl Bloom {
             hero_previous: None,
             hero_changed: std::time::Instant::now(),
             player_open: false,
+            player_was_open: false,
+            fullscreen_before_player: false,
             current_frame: None,
             frame_seq: 0,
             frame_wake_ns: 0,
@@ -2674,6 +2681,23 @@ impl Bloom {
         cx.notify();
     }
 
+    /// Full screen that the user entered for an item ends when the player
+    /// closes: the page it gives way to has no key and no button to leave
+    /// full screen, and nobody asked for the library in full screen. A
+    /// window that was full screen before the item started stays so, and
+    /// the next item of a queue keeps the player, and so the full screen.
+    fn follow_player_fullscreen(&mut self, window: &mut Window) {
+        if self.player_open == self.player_was_open {
+            return;
+        }
+        self.player_was_open = self.player_open;
+        if self.player_open {
+            self.fullscreen_before_player = window.is_fullscreen();
+        } else if leaves_fullscreen_with_the_player(self.fullscreen_before_player, window.is_fullscreen()) {
+            window.toggle_fullscreen();
+        }
+    }
+
     pub fn close_player_view(&mut self, cx: &mut Context<Self>) {
         self.player_open = false;
         // The preview sheets of the timeline are not needed any more.
@@ -3067,6 +3091,25 @@ fn home_libraries(views: &[Item]) -> Vec<Item> {
         .collect()
 }
 
+/// Whether the window leaves full screen as the player closes: only when
+/// it is full screen now and was not before the item started.
+fn leaves_fullscreen_with_the_player(fullscreen_before: bool, fullscreen_now: bool) -> bool {
+    fullscreen_now && !fullscreen_before
+}
+
+#[cfg(test)]
+mod fullscreen_tests {
+    use super::leaves_fullscreen_with_the_player as leaves;
+
+    #[test]
+    fn full_screen_that_began_with_the_player_ends_with_it() {
+        assert!(leaves(false, true), "entered during the item: back to the window");
+        assert!(!leaves(true, true), "the window was full screen before: it stays");
+        assert!(!leaves(false, false), "left during the item: nothing to do");
+        assert!(!leaves(true, false), "left during the item: it is not put back");
+    }
+}
+
 impl Render for Bloom {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let started = std::time::Instant::now();
@@ -3079,6 +3122,7 @@ impl Render for Bloom {
         if !self.player_open {
             self.leave_pip(window);
         }
+        self.follow_player_fullscreen(window);
         // The window buttons go away with the controls of the player.
         // Picture in picture hides them by itself.
         let buttons_hidden = self.player_open && self.pip.is_none() && !self.controls_visible;

@@ -1,0 +1,34 @@
+#!/bin/sh
+# The tests as CI runs them, on a runner with no display and no audio:
+# the tests with the real player do not run (BLOOM_CI_NO_PLAYER, see
+# `real_player_turn` in src/player.rs). Each one prints "SKIPPED in CI";
+# this script counts the lines, prints the count, and fails when a test
+# failed, when no test passed, or when no test skipped (the switch would
+# then have stopped working and a real player may be running on the runner).
+# A release still needs a full `dev/test` on a Mac: this run does not play.
+# Usage: dev/ci-test [--expect-skipped N]
+cd "$(dirname "$0")/.." || exit 1
+expect=
+[ "$1" = --expect-skipped ] && expect=$2
+log=${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ci-test.log
+BLOOM_CI_NO_PLAYER=1 cargo test --release --bin bloom -- --nocapture >"$log" 2>&1
+status=$?
+tail -n 5 "$log"
+passed=$(sed -n 's/^test result: [a-zA-Z]*\. \([0-9]*\) passed.*/\1/p' "$log" | tail -n 1)
+skipped=$(grep -c '^SKIPPED in CI' "$log")
+summary="${passed:-0} tests report ok; $skipped of them were SKIPPED in CI (real player, not run) and so $(( ${passed:-0} - skipped )) really ran"
+echo "$summary"
+if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+  {
+    echo "### Tests"
+    echo "$summary"
+    grep '^SKIPPED in CI' "$log" | sort -u | sed 's/^/- /'
+    echo
+    echo "The skipped tests need the real player (libmpv, OpenGL, audio). Run \`dev/test\` on a Mac before a release."
+  } >>"$GITHUB_STEP_SUMMARY"
+fi
+[ "$status" -eq 0 ] || { echo "dev/ci-test: cargo test failed (status $status)" >&2; exit 1; }
+[ "${passed:-0}" -gt 0 ] || { echo "dev/ci-test: no test passed" >&2; exit 1; }
+[ "$skipped" -gt 0 ] || { echo "dev/ci-test: no test skipped; BLOOM_CI_NO_PLAYER has no effect" >&2; exit 1; }
+[ -z "$expect" ] || [ "$skipped" -eq "$expect" ] ||
+  { echo "dev/ci-test: expected $expect skipped tests, saw $skipped" >&2; exit 1; }

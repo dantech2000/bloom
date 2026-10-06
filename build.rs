@@ -23,7 +23,7 @@ fn main() {
         println!("cargo:rustc-link-search=native={dir}");
         return;
     }
-    // The copy that `dev/vendor-mpv` makes in the project. The binary finds
+    // The library that `dev/build-mpv` makes in the project. The binary finds
     // it from target/<profile>/, and from an app bundle's Frameworks folder.
     let vendored = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/mpv/lib");
     println!("cargo:rerun-if-changed={}", vendored.display());

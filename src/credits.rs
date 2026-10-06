@@ -35,6 +35,21 @@ pub const GROUPS: &[(&str, &[Credit])] = &[
         ],
     ),
     (
+        "Inside libmpv",
+        &[
+            Credit { name: "libass", role: "Subtitle rendering: ASS and SSA styling, SRT", license: "ISC", url: "https://github.com/libass/libass" },
+            Credit { name: "HarfBuzz", role: "Text shaping for subtitles", license: "MIT", url: "https://github.com/harfbuzz/harfbuzz" },
+            Credit { name: "FreeType", role: "Font rendering for subtitles", license: "FTL or GPL-2.0-or-later", url: "https://freetype.org" },
+            Credit { name: "FriBidi", role: "Right-to-left text in subtitles", license: "LGPL-2.1-or-later", url: "https://github.com/fribidi/fribidi" },
+            Credit { name: "dav1d", role: "AV1 decoding in software", license: "BSD-2-Clause", url: "https://code.videolan.org/videolan/dav1d" },
+            Credit { name: "libplacebo", role: "Colour helpers mpv is built on", license: "LGPL-2.1-or-later", url: "https://code.videolan.org/videolan/libplacebo" },
+            Credit { name: "Lua", role: "mpv's scripts: the playback info panel and ytdl_hook", license: "MIT", url: "https://www.lua.org" },
+            Credit { name: "Mbed TLS", role: "TLS for HTTPS streams, inside FFmpeg", license: "Apache-2.0 or GPL-2.0-or-later", url: "https://github.com/Mbed-TLS/mbedtls" },
+            Credit { name: "zvbi", role: "Teletext subtitles of TV recordings, inside FFmpeg", license: "LGPL-2.0-or-later", url: "https://github.com/zapping-vbi/zvbi" },
+            Credit { name: "uchardet", role: "Character set detection for subtitle files", license: "MPL-1.1, GPL-2.0-or-later or LGPL-2.1-or-later", url: "https://www.freedesktop.org/wiki/Software/uchardet/" },
+        ],
+    ),
+    (
         "Look, icons and fonts",
         &[
             Credit { name: "Abyss theme", role: "The Jellyfin theme whose look Bloom follows", license: "MIT", url: "https://github.com/AumGupta/abyss-jellyfin" },
