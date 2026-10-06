@@ -87,6 +87,29 @@ pub fn theme(dark: bool) -> UiTheme {
     t
 }
 
+/// Which session is open: moves on when a session opens, switches or ends.
+/// A request notes the epoch it started in, and its answer is dropped when
+/// the epoch moved meanwhile: the answer belongs to a session that is gone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionEpoch(pub(crate) u64);
+
+/// One request, or one instance of an editor, among the requests of the
+/// same kind: the latest one owns the answer. From `Bloom::next_revision`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Revision(pub(crate) u64);
+
+/// True while a test keeps this process away from the files and sockets of
+/// the user: no write to the config, no download engine, no server socket.
+#[cfg(test)]
+fn sandboxed() -> bool {
+    race_harness::sandboxed()
+}
+
+#[cfg(not(test))]
+fn sandboxed() -> bool {
+    false
+}
+
 pub struct Session {
     pub server_id: String,
     pub server_name: String,
@@ -256,6 +279,11 @@ pub struct SearchData {
     pub results: Vec<Item>,
     /// Titles from Seerr for the same text ("Discover on Seerr").
     pub seerr: Vec<SeerrItem>,
+    /// Text of the server search on its way, while one is.
+    pub pending: Option<String>,
+    /// The last answer of the server, with the text it is for. `typed` may
+    /// run ahead of it; a return to that text shows it with no request.
+    pub answered: Option<(String, Vec<Item>, Vec<SeerrItem>)>,
 }
 
 pub enum Page {
@@ -318,6 +346,8 @@ pub struct Bloom {
     /// request, and the time they were loaded.
     pub catalog: Vec<Item>,
     catalog_loaded: Option<std::time::Instant>,
+    /// The request of the title index whose answer is wanted.
+    catalog_request: Revision,
     /// Trailer backdrop of the hero.
     pub hero_video: crate::views::hero::HeroVideo,
     /// Hero slides; kept for the session so the list survives navigation.
@@ -340,6 +370,12 @@ pub struct Bloom {
     pub player_open: bool,
     pub current_frame: Option<VideoFrame>,
     frame_seq: u64,
+    /// When the frames task last woke, and when the last draw ran (pacing
+    /// trace).
+    frame_wake_ns: u64,
+    last_draw_ns: u64,
+    /// The position the seek slider was last set to by the frames task.
+    slider_pos: f64,
     /// The newest frame whose wait was measured (`dev/jctl pacing`).
     noticed_frame_seq: u64,
     pub seek_slider: Entity<SliderState>,
@@ -412,6 +448,8 @@ pub struct Bloom {
     /// What the server keeps for the user: configuration and display
     /// preferences. Playback follows some of them.
     pub prefs: crate::settings::Prefs,
+    /// The saves of settings on their way; they outlive a session.
+    pub(crate) pref_lanes: crate::settings::SaveLanes,
     /// Episode list of the player.
     pub episode_picker: crate::views::episodes::EpisodePicker,
     pub controls_visible: bool,
@@ -432,6 +470,10 @@ pub struct Bloom {
     pub pip: Option<crate::pip::Frame>,
     last_pointer_activity: std::time::Instant,
     pub(crate) generation: u64,
+    /// See [`SessionEpoch`].
+    pub(crate) session_epoch: SessionEpoch,
+    /// The last revision given out by `next_revision`.
+    revisions: Revision,
     _subscriptions: Vec<gpui_kit::Subscription>,
 }
 
@@ -610,18 +652,49 @@ impl Bloom {
             }
         })
         .detach();
-        // Each new video frame asks for a draw (see `sync_frame`).
+        // Each new video frame asks for a draw (see `sync_frame`). With
+        // display pacing the draw runs at a set phase after the tick of the
+        // frame, not at gpui's own step at the next tick: that step leaves
+        // the GPU about 4 ms before the compositor's deadline, which a frame
+        // of a 4K picture misses one time in seven (see pacing.rs). The task
+        // waits until the phase, asks for the draw and runs the step at once.
+        crate::pacing::trace::enable_from_env();
         let frames = player_frames.clone();
         cx.spawn(async move |this, cx| {
             while frames.recv().await.is_ok() {
-                let drawn = this.update(cx, |this, cx| {
-                    if this.player.frame_seq() != this.frame_seq {
+                let wait = this
+                    .update(cx, |this, _| {
+                        let (seq, tick) = this.player.frame_timing();
+                        if seq == this.frame_seq {
+                            return None;
+                        }
+                        this.frame_wake_ns = crate::player::clock_ns();
                         this.note_frame_wait();
-                        cx.notify();
-                    }
+                        let (now, period) = this.player.clock_time();
+                        let phased = tick != 0 && this.player.display_pacing();
+                        Some(phased.then(|| crate::pacing::frame_phase(period)).flatten().map(|phase| (tick + phase).saturating_sub(now)))
+                    })
+                    .ok()
+                    .flatten();
+                let Some(wait) = wait else {
+                    continue;
+                };
+                if let Some(wait) = wait
+                    && wait > 0
+                {
+                    cx.background_executor().timer(Duration::from_nanos(wait)).await;
+                }
+                let drawn = this.update(cx, |this, cx| {
+                    let started = crate::player::clock_ns();
+                    this.follow_position(cx);
+                    cx.notify();
+                    crate::pacing::trace::main_job("frame task", started, crate::player::clock_ns());
                 });
                 if drawn.is_err() {
                     break;
+                }
+                if wait.is_some() {
+                    gpui_macos::wake_frame_sources();
                 }
             }
         })
@@ -662,6 +735,7 @@ impl Bloom {
             search_debounce: None,
             catalog: Vec::new(),
             catalog_loaded: None,
+            catalog_request: Revision::default(),
             hero_video: Default::default(),
             hero: Vec::new(),
             rows_view,
@@ -673,6 +747,9 @@ impl Bloom {
             player_open: false,
             current_frame: None,
             frame_seq: 0,
+            frame_wake_ns: 0,
+            last_draw_ns: 0,
+            slider_pos: -1.,
             noticed_frame_seq: 0,
             seek_slider,
             scrubbing: false,
@@ -715,6 +792,7 @@ impl Bloom {
             player_focus: cx.focus_handle(),
             playback_info: false,
             prefs: Default::default(),
+            pref_lanes: Default::default(),
             episode_picker: Default::default(),
             controls_visible: true,
             window_buttons_hidden: false,
@@ -726,6 +804,8 @@ impl Bloom {
             pip: None,
             last_pointer_activity: std::time::Instant::now(),
             generation: 0,
+            session_epoch: SessionEpoch::default(),
+            revisions: Revision::default(),
             _subscriptions: subscriptions,
         };
 
@@ -762,6 +842,9 @@ impl Bloom {
     }
 
     pub fn save_config(&self, cx: &mut App) {
+        if sandboxed() {
+            return;
+        }
         if let Err(err) = self.config.save() {
             log::error!("saving config failed: {err:#}");
             self.toast("Could not save settings", format!("{err:#}"), cx);
@@ -803,6 +886,27 @@ impl Bloom {
         self.generation
     }
 
+    /// A new revision, larger than every one before it.
+    pub(crate) fn next_revision(&mut self) -> Revision {
+        self.revisions.0 += 1;
+        self.revisions
+    }
+
+    /// The session changes: every answer still on its way is for the old one.
+    fn next_session_epoch(&mut self) {
+        self.session_epoch.0 += 1;
+        // The posters of the session before are of no use to the next one.
+        crate::images::cancel_prewarm();
+    }
+
+    /// Ends the session in the app (the server and the config are the
+    /// caller's business), so that what the old session asked for is
+    /// dropped when it answers.
+    pub fn drop_session(&mut self) {
+        self.session = None;
+        self.next_session_epoch();
+    }
+
     // ----- sessions ---------------------------------------------------------
 
     pub fn open_session(&mut self, server_id: &str, user_id: &str, cx: &mut Context<Self>) -> bool {
@@ -813,14 +917,17 @@ impl Bloom {
             return false;
         };
         let client = Client::new(&server.url, &self.config.device_id)
+            .with_server(&server.id)
             .with_session(&profile.token, &profile.user_id);
+        let (id, server_name, profile) = (server.id.clone(), server.name.clone(), profile.clone());
+        self.next_session_epoch();
         let user_image = profile
             .image_tag
             .as_ref()
             .map(|tag| client.user_image_url(&profile.user_id, tag));
         self.session = Some(Session {
-            server_id: server.id.clone(),
-            server_name: server.name.clone(),
+            server_id: id,
+            server_name,
             user_id: profile.user_id.clone(),
             user_name: profile.name.clone(),
             user_image,
@@ -828,7 +935,9 @@ impl Bloom {
             is_admin: false,
             audio_language: None,
         });
-        self.start_downloads(cx);
+        if !sandboxed() {
+            self.start_downloads(cx);
+        }
         self.prefs = Default::default();
         self.load_prefs(cx);
         // The title index of the search loads a moment after the home page,
@@ -841,7 +950,9 @@ impl Bloom {
         })
         .detach();
         // The socket of the server, for SyncPlay and for live news.
-        self.start_sync(cx);
+        if !sandboxed() {
+            self.start_sync(cx);
+        }
         // The speed of the connection, for the "Auto" quality.
         self.adaptive_signed_in(cx);
         self.lists.playlists.clear();
@@ -908,6 +1019,7 @@ impl Bloom {
             self.forget_profile(&server_id, &user_id, cx);
             self.select_server(server_id, cx);
         }
+        // `forget_profile` dropped the session, and with it what it asked for.
         self.config.active = None;
         self.save_config(cx);
         // The pages of the user who left must not show again.
@@ -1053,8 +1165,27 @@ impl Bloom {
             if matches!(self.page, Page::Admin(_)) {
                 self.start_admin_tick(cx);
             }
-            self.next_generation();
+            if self.page_loading() {
+                // The user left before the answer came, and the answer was
+                // thrown away (`generation`); the page asks again.
+                self.load_page(cx);
+            } else {
+                self.next_generation();
+            }
             cx.notify();
+        }
+    }
+
+    /// True while the current page waits for its data.
+    fn page_loading(&self) -> bool {
+        match &self.page {
+            Page::Home(d) => d.loading,
+            Page::Library(d) => d.loading,
+            Page::Detail(d) => d.loading,
+            Page::Search(d) => d.loading,
+            Page::Admin(d) => d.loading,
+            Page::Playlist(d) => d.loading,
+            Page::Settings(_) | Page::Downloads => false,
         }
     }
 
@@ -1533,14 +1664,35 @@ impl Bloom {
                 if data.typed == typed {
                     return;
                 }
+                // Back at the text of the server search before the typing
+                // rested: the debounce skips a text equal to the last one.
+                // The answer shows again when it came, is waited for when
+                // it is on its way, and is asked for when neither (it
+                // failed, or it was thrown away while the text differed).
+                let back_at_query = typed == data.query;
+                let on_its_way = data.loading && data.pending.as_deref() == Some(typed.as_str());
+                let answered = match &data.answered {
+                    Some((text, items, seerr)) if back_at_query && *text == typed => Some((items.clone(), seerr.clone())),
+                    _ => None,
+                };
+                data.typed = typed.clone();
+                self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+                if let Some((items, seerr)) = answered {
+                    data.results = items;
+                    data.seerr = seerr;
+                    data.loading = false;
+                    cx.notify();
+                    return;
+                }
                 data.loading = !typed.is_empty();
                 // Without an index the old results stay until the server answers.
                 if !self.catalog.is_empty() || typed.is_empty() {
                     data.results = results;
                     data.seerr.clear();
                 }
-                data.typed = typed;
-                self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+                if back_at_query && !on_its_way {
+                    self.load_page(cx);
+                }
             }
             _ if typed.is_empty() => return,
             _ => self.navigate(
@@ -1618,7 +1770,17 @@ impl Bloom {
         if self.catalog_loaded.is_some_and(|at| at.elapsed() < MAX_AGE) {
             return;
         }
+        if self.session.is_none() {
+            return;
+        }
         self.catalog_loaded = Some(std::time::Instant::now());
+        // The answer is for the session that asked and for the newest
+        // request: another profile or server may be open by then with an
+        // index of its own, or the library changed and a newer request is
+        // on its way. An older answer is dropped, posters and all.
+        let epoch = self.session_epoch;
+        let request = self.next_revision();
+        self.catalog_request = request;
         let query = ItemQuery {
             include_types: vec!["Movie".into(), "Series".into()],
             recursive: Some(true),
@@ -1637,22 +1799,27 @@ impl Bloom {
                 );
                 Ok(page.items)
             },
-            |this, result, cx| match result {
-                Ok(items) => {
-                    if let Some(session) = &this.session {
-                        let width = (this.metrics().portrait_w * 2.) as u32;
-                        let posters = items
-                            .iter()
-                            .filter_map(|item| item.poster_url(&session.client, width))
-                            .collect();
-                        crate::images::prewarm(posters, cx);
-                    }
-                    this.catalog = items;
+            move |this, result, cx| {
+                if this.session_epoch != epoch || this.catalog_request != request {
+                    return;
                 }
-                // The next search tries again.
-                Err(err) => {
-                    log::warn!("title index failed: {err:#}");
-                    this.catalog_loaded = None;
+                match result {
+                    Ok(items) => {
+                        if let Some(session) = &this.session {
+                            let width = (this.metrics().portrait_w * 2.) as u32;
+                            let posters = items
+                                .iter()
+                                .filter_map(|item| item.poster_url(&session.client, width))
+                                .collect();
+                            crate::images::prewarm(posters, cx);
+                        }
+                        this.catalog = items;
+                    }
+                    // The next search tries again.
+                    Err(err) => {
+                        log::warn!("title index failed: {err:#}");
+                        this.catalog_loaded = None;
+                    }
                 }
             },
         );
@@ -2122,6 +2289,7 @@ impl Bloom {
                     return;
                 }
                 data.loading = true;
+                data.pending = Some(data.query.clone());
                 let query = ItemQuery {
                     search: Some(data.query.clone()),
                     include_types: vec!["Movie".into(), "Series".into(), "Episode".into()],
@@ -2130,6 +2298,7 @@ impl Bloom {
                     ..Default::default()
                 };
                 let text = data.query.clone();
+                let asked = text.clone();
                 self.fetch(
                     cx,
                     move |client| {
@@ -2160,17 +2329,27 @@ impl Bloom {
                             return;
                         }
                         if let Page::Search(data) = &mut this.page {
-                            // The user typed on; a search for the new text follows.
-                            if data.typed != data.query {
-                                return;
+                            if data.pending.as_deref() == Some(asked.as_str()) {
+                                data.pending = None;
                             }
-                            data.loading = false;
+                            // The user typed on; a search for the new text
+                            // follows. The answer is kept for a return to
+                            // this text.
+                            let shown = data.typed == data.query && data.query == asked;
                             match result {
                                 Ok((items, seerr)) => {
-                                    data.results = items;
-                                    data.seerr = seerr;
+                                    if shown {
+                                        data.results = items.clone();
+                                        data.seerr = seerr.clone();
+                                        data.loading = false;
+                                    }
+                                    data.answered = Some((asked, items, seerr));
                                 }
                                 Err(err) => {
+                                    if !shown {
+                                        return;
+                                    }
+                                    data.loading = false;
                                     if !this.request_failed(&err, cx) {
                                         this.toast("Search failed", format!("{err:#}"), cx)
                                     }
@@ -2343,7 +2522,7 @@ impl Bloom {
                 // downloaded item has them in its `meta.json`, so a play
                 // with no server still skips the intro.
                 move |client| {
-                    Ok(crate::downloads::stored_segments(&item_id)
+                    Ok(crate::downloads::stored_segments(client.server_id.as_deref(), &item_id)
                         .unwrap_or_else(|| client.media_segments(&item_id).unwrap_or_default()))
                 }
             },
@@ -2503,6 +2682,32 @@ impl Bloom {
         cx.notify();
     }
 
+    /// The seek slider and the time label follow the position, by whole
+    /// quarter seconds, in the draw of a frame (see the frames task): while
+    /// frames flow, the poll asks for no draw of its own for the position.
+    fn follow_position(&mut self, cx: &mut Context<Self>) {
+        let status = &self.player_status;
+        if self.scrubbing || status.duration <= 0. {
+            return;
+        }
+        let pos = (status.position * 4.).floor() / 4.;
+        if pos == self.slider_pos {
+            return;
+        }
+        self.slider_pos = pos;
+        let (pos, dur) = (status.position as f32, status.duration as f32);
+        self.seek_slider.update(cx, |s, cx| {
+            // Update in place: a fresh state has no bounds, and a click
+            // before the next paint would divide by zero.
+            *s = std::mem::replace(s, SliderState::new())
+                .min(0.)
+                .max(dur)
+                .step(1.)
+                .default_value(pos.clamp(0., dur));
+            cx.notify();
+        });
+    }
+
     /// Measures how long a new frame waited for the UI, once for a frame.
     fn note_frame_wait(&mut self) {
         let seq = self.player.frame_seq();
@@ -2520,27 +2725,44 @@ impl Bloom {
         if display && self.player_open {
             crate::pacing::note_window(window, &self.player);
         }
-        let seq = self.player.frame_seq();
+        let prev_draw = std::mem::replace(&mut self.last_draw_ns, crate::player::clock_ns());
+        // A closed player draws no frame: the surface goes back to the pool
+        // at once, not when the next item plays.
+        if !self.player_open {
+            self.current_frame = None;
+        }
+        if self.player.frame_seq() == self.frame_seq {
+            return;
+        }
+        // One read of the frame, its number and its tick: a frame that is
+        // published between two reads cannot be shown with the tick of the
+        // one before.
+        let published = self.player.frame();
+        let seq = published.seq;
         if seq == self.frame_seq {
             return;
         }
+        let draw_id = gpui_apple::present_trace::next_draw_id();
         if display {
-            let (tick, now, period) = self.player.frame_tick_time();
+            let (now, period) = self.player.clock_time();
             // The frame of this tick came before this draw: it waits for
-            // the next tick, like every frame.
-            if !crate::pacing::due(tick, now, period) {
+            // the draw the frames task asks for, like every frame.
+            if !crate::pacing::due(published.tick_ns, now, period) {
                 crate::pacing::count_held();
+                crate::pacing::trace::held(seq);
                 window.request_animation_frame();
                 return;
             }
-            if crate::pacing::late(tick, now, period) {
+            if crate::pacing::late(published.tick_ns, now, period) {
                 crate::pacing::count_late();
             }
+            // The phase loop hears where this draw comes out.
+            crate::pacing::phase::adopted(seq, draw_id, published.tick_ns, published.vsync_ns, period, now);
         }
         self.frame_seq = seq;
+        crate::pacing::trace::adopted(seq, self.frame_wake_ns, self.last_draw_ns, prev_draw, draw_id);
         crate::perf::video_frame_shown();
-        let (_, frame) = self.player.frame();
-        self.current_frame = frame;
+        self.current_frame = if self.player_open { published.frame } else { None };
     }
 
     /// Rebuilds the audio and subtitle menus from the current track list.
@@ -2651,11 +2873,23 @@ impl Bloom {
                 let fast = this
                     .read_with(cx, |this, _| this.player_open)
                     .unwrap_or(false);
+                // The frames have their own signal; only the old pacing
+                // mode finds them through this poll, and needs its 8 ms.
+                // Everything else here moves by quarter seconds or slower,
+                // or is a change the eye sees within 50 ms (a pause, the
+                // end, a seek's new position; the frame of a seek comes
+                // through the frames task).
+                let interval = match (fast, crate::player::old_pacing()) {
+                    (true, true) => 8,
+                    (true, false) => 50,
+                    (false, _) => 500,
+                };
                 cx.background_executor()
-                    .timer(Duration::from_millis(if fast { 8 } else { 500 }))
+                    .timer(Duration::from_millis(interval))
                     .await;
                 let keep_going = this
                     .update(cx, |this, cx| {
+                        let poll_started = crate::player::clock_ns();
                         let status = this.player.status();
                         let ended = status.state == PlayState::Ended;
                         // The frames have their own signal; the poll only
@@ -2672,8 +2906,17 @@ impl Bloom {
                         // everything that reads it.
                         let position_moved = (status.position * 4.).floor()
                             != (this.player_status.position * 4.).floor();
+                        // While frames come, each of them draws the UI and
+                        // moves the slider (`follow_position`), so a draw
+                        // for the position alone is not needed: it lands at
+                        // the tick, misses the compositor and pushes the
+                        // next frame a refresh late (see pacing.rs).
+                        let frames_flow = this.player.display_pacing()
+                            && status.state == PlayState::Playing
+                            && !status.paused
+                            && this.player.frame_wait_ms() < 100.;
                         let changed = frame_changed
-                            || position_moved
+                            || (position_moved && !frames_flow)
                             || status.paused != this.player_status.paused
                             || status.buffering != this.player_status.buffering
                             || status.state != this.player_status.state
@@ -2735,6 +2978,7 @@ impl Bloom {
                         if changed || ended || controls_changed || pause_changed {
                             cx.notify();
                         }
+                        crate::pacing::trace::main_job("player poll", poll_started, crate::player::clock_ns());
                         !ended
                     })
                     .unwrap_or(false);
@@ -2993,3 +3237,10 @@ impl Render for Bloom {
             ))
     }
 }
+
+/// The real `Bloom` against a small HTTP server, for the races between a
+/// request on its way and what the user does meanwhile.
+#[cfg(test)]
+pub(crate) mod race_harness;
+#[cfg(test)]
+mod race_tests;

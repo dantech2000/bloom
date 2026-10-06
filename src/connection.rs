@@ -335,6 +335,36 @@ pub fn is_offline() -> bool {
     OFFLINE.load(Ordering::Relaxed)
 }
 
+/// The probes, numbered. The answer of a probe counts only while its
+/// number is the current one: an older probe's answer is dropped, and so
+/// is the answer of a probe of the session before a reset.
+#[derive(Debug, Default)]
+pub struct Probes {
+    current: u64,
+}
+
+/// The number of one probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProbeId(u64);
+
+impl Probes {
+    /// A new probe: its number, which is the current one until the next.
+    pub fn start(&mut self) -> ProbeId {
+        self.current += 1;
+        ProbeId(self.current)
+    }
+
+    pub fn is_current(&self, id: ProbeId) -> bool {
+        id == ProbeId(self.current)
+    }
+
+    /// A new session: the probes before it are of no interest, also one
+    /// that answers before the new session starts a probe of its own.
+    pub fn reset(&mut self) {
+        self.current += 1;
+    }
+}
+
 /// The connection as the app holds it: the state machine and its tasks.
 #[derive(Default)]
 pub struct ConnectionState {
@@ -342,8 +372,7 @@ pub struct ConnectionState {
     /// Ticks once a second while offline: the retry timer, and the
     /// countdown on the page.
     tick: Option<Task<()>>,
-    /// Counts the probes started; the answer of an older one is dropped.
-    probe_id: u64,
+    probes: Probes,
     /// The current page failed while the state was checked; a good probe
     /// loads it again.
     pub page_failed: bool,
@@ -354,9 +383,12 @@ pub struct ConnectionState {
 }
 
 impl Bloom {
-    /// A new session: the state starts online.
+    /// A new session: the state starts online. The probe of the session
+    /// before, when one is under way, gets no say in it.
     pub fn connection_reset(&mut self) {
-        self.connection = ConnectionState::default();
+        let mut probes = std::mem::take(&mut self.connection.probes);
+        probes.reset();
+        self.connection = ConnectionState { probes, ..ConnectionState::default() };
         OFFLINE.store(false, Ordering::Relaxed);
     }
 
@@ -421,15 +453,14 @@ impl Bloom {
             self.connection.core.probing = false;
             return;
         };
-        self.connection.probe_id += 1;
-        let id = self.connection.probe_id;
+        let id = self.connection.probes.start();
         let (base, auth) = (client.base.to_string(), client.auth_header());
         self.fetch_with(
             client,
             cx,
             move |_| Ok(probe(&base, &auth)),
             move |this, result, cx| {
-                if id != this.connection.probe_id {
+                if !this.connection.probes.is_current(id) {
                     return;
                 }
                 let event = match result {
@@ -640,6 +671,27 @@ mod tests {
         .into();
         assert_eq!(classify(&err), Verdict::Unreachable(Why::Timeout));
         assert_eq!(format!("{err:#}"), "timeout: global (/Items)");
+    }
+
+    /// Finding 8 of the review: a probe of the session before a reset must
+    /// not decide the state of the new session, whether it answers before
+    /// the new session starts a probe or after.
+    #[test]
+    fn a_probe_of_the_session_before_is_dropped_before_and_after_a_new_probe() {
+        let mut probes = Probes::default();
+        let old = probes.start();
+        assert!(probes.is_current(old));
+        probes.reset();
+        // The old probe answers before the new session probes.
+        assert!(!probes.is_current(old), "the old probe still counts after the reset");
+        // And after the new session started a probe of its own.
+        let new = probes.start();
+        assert!(!probes.is_current(old));
+        assert!(probes.is_current(new));
+        // A later probe makes the one before it stale as well.
+        let later = probes.start();
+        assert!(!probes.is_current(new));
+        assert!(probes.is_current(later));
     }
 
     #[test]

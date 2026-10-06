@@ -2,4 +2,8 @@
 # Runs the tests. The tests with the real player take their turn one at a
 # time (see `REAL_PLAYER` in src/player.rs), so the whole run is one command.
 cd "$(dirname "$0")/.." || exit 1
+# The tests with the real player make their clips with ffmpeg and return
+# early without it: a run with no ffmpeg would pass without playing a frame.
+command -v ffmpeg >/dev/null 2>&1 ||
+  { echo "dev/test: ffmpeg is not in PATH; the playback tests need it" >&2; exit 1; }
 exec cargo test --release --bin bloom "$@"

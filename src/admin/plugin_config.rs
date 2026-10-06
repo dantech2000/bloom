@@ -33,7 +33,7 @@ use super::{
     text_editor::TextEdit,
 };
 use crate::{
-    app::{Bloom, Page},
+    app::{Bloom, Page, Revision},
     settings::{checkbox, field, group},
     ui::{
         input::{Input, InputEvent, InputState},
@@ -320,6 +320,9 @@ pub struct Editor {
     /// Paths of the secret values that are on show.
     revealed: HashSet<String>,
     saving: bool,
+    /// This instance of the editor, among the opens of the same plugin:
+    /// the answer of a save belongs to the instance that sent it.
+    revision: Revision,
     _filter_change: Subscription,
 }
 
@@ -372,6 +375,27 @@ impl Editor {
         put(&mut self.edited, &field.path.clone(), value);
         Ok(())
     }
+
+    /// The server took a save and sent back what it holds now. The editor
+    /// shows that, except at the fields the user changed since the save
+    /// went out (`sent`): those keep the user's value, and stay to save.
+    fn take_saved(&mut self, server: Value, sent: &Value) {
+        let fields = fields_of(&server);
+        let mut edited = server.clone();
+        for field in &fields {
+            let now = get(&self.edited, &field.path);
+            if now != get(sent, &field.path)
+                && let Some(value) = now
+            {
+                put(&mut edited, &field.path, value.clone());
+            }
+        }
+        self.fields = fields;
+        self.raw = serde_json::to_string(&server).unwrap_or_default();
+        self.original = server;
+        self.edited = edited;
+        self.saving = false;
+    }
 }
 
 impl Bloom {
@@ -401,10 +425,22 @@ impl Bloom {
         let filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter the settings"));
         let path = format!("/Plugins/{id}/Configuration");
+        // The answer is for this open: the user may close the editor, open
+        // another plugin or another session before it comes.
+        let epoch = self.session_epoch;
+        let revision = self.next_revision();
+        if let Page::Admin(admin) = &mut self.page {
+            admin.plugin_open = Some(revision);
+        }
         self.fetch(
             cx,
             move |client| client.get_text(&path, &[]),
             move |this, result, cx| {
+                if this.session_epoch != epoch
+                    || !matches!(&this.page, Page::Admin(admin) if admin.plugin_open == Some(revision))
+                {
+                    return;
+                }
                 let result = result.and_then(|text| {
                     let object = serde_json::from_str::<Value>(&text)?;
                     Ok((text, object))
@@ -441,6 +477,7 @@ impl Bloom {
                     filter_input,
                     revealed: HashSet::new(),
                     saving: false,
+                    revision,
                     _filter_change: change,
                 };
                 if let Page::Admin(admin) = &mut this.page {
@@ -491,6 +528,7 @@ impl Bloom {
     fn plugin_leave(&mut self, cx: &mut Context<Self>) {
         if let Page::Admin(admin) = &mut self.page {
             admin.plugin_editor = None;
+            admin.plugin_open = None;
         }
         super::lazy::forget("plugin.");
         cx.notify();
@@ -513,27 +551,32 @@ impl Bloom {
         }
         editor.saving = true;
         let (path, body) = (format!("/Plugins/{}/Configuration", editor.id), editor.edited.clone());
+        // The answer is for this instance of the editor: the user may have
+        // left it and opened another one (of this plugin or another, on
+        // this server or another) meanwhile.
+        let revision = editor.revision;
+        let epoch = self.session_epoch;
+        let sent = body.clone();
         self.fetch(
             cx,
             move |client| -> Result<Value> {
                 client.post(&path, &body)?;
                 client.get::<Value>(&path, &[])
             },
-            |this, result, cx| {
+            move |this, result, cx| {
+                if this.session_epoch != epoch {
+                    return;
+                }
                 match result {
                     Ok(server) => {
                         this.toast("Settings saved", "", cx);
-                        if let Some(editor) = this.plugin_editor_mut() {
-                            editor.fields = fields_of(&server);
-                            editor.raw = serde_json::to_string(&server).unwrap_or_default();
-                            editor.original = server.clone();
-                            editor.edited = server;
-                            editor.saving = false;
+                        if let Some(editor) = this.plugin_editor_mut().filter(|e| e.revision == revision) {
+                            editor.take_saved(server, &sent);
                         }
                     }
                     Err(err) => {
                         this.toast("The server refused the change", format!("{err:#}"), cx);
-                        if let Some(editor) = this.plugin_editor_mut() {
+                        if let Some(editor) = this.plugin_editor_mut().filter(|e| e.revision == revision) {
                             editor.saving = false;
                         }
                     }
@@ -1038,5 +1081,138 @@ mod tests {
         assert!(secret("Tokens"));
         assert!(secret("Secrets.Inner"));
         assert!(!secret("Secrets.Flag"));
+    }
+}
+
+/// Answers that outlive the editor they were for (review of 2026-10-05,
+/// UI finding 4). See `app::race_harness`.
+#[cfg(test)]
+mod race_tests {
+    use std::sync::Mutex;
+
+    use gpui_kit::{Entity, TestAppContext, VisualTestContext};
+    use serde_json::{Value, json};
+
+    use super::{Bloom, Page};
+    use crate::{
+        admin::{AdminData, Section},
+        app::{Screen, race_harness::{MockServer, app, plain, session}},
+    };
+
+    /// A server with the settings of the plugins A and B. A POST changes
+    /// what the next GET of that plugin answers.
+    fn server() -> MockServer {
+        let stored = Mutex::new(json!({
+            "A": {"Name": "alpha", "Count": 1},
+            "B": {"Name": "beta", "Count": 2},
+        }));
+        MockServer::start(move |method, path, body| {
+            let plugin = path.strip_prefix("/Plugins/").and_then(|rest| rest.strip_suffix("/Configuration"));
+            match (method, plugin) {
+                ("GET", Some(id)) => (200, stored.lock().expect("stored")[id].to_string()),
+                ("POST", Some(id)) => {
+                    let mut stored = stored.lock().expect("stored");
+                    stored[id] = serde_json::from_str(body).unwrap_or(Value::Null);
+                    (204, String::new())
+                }
+                _ => plain(method, path),
+            }
+        })
+    }
+
+    fn on_plugins_page<'a>(server: &MockServer, cx: &'a mut TestAppContext) -> (Entity<Bloom>, &'a mut VisualTestContext) {
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, _| {
+            this.session = Some(session(&server.url, "u1"));
+            this.screen = Screen::Main;
+            let mut admin = AdminData::new(Section::Plugins);
+            admin.loading = false;
+            this.page = Page::Admin(admin);
+        });
+        (bloom, cx)
+    }
+
+    fn open(this: &mut Bloom, id: &str, window: &mut gpui_kit::Window, cx: &mut gpui_kit::Context<Bloom>) {
+        this.open_plugin_config(id.into(), id.to_lowercase(), "1".into(), window, cx);
+    }
+
+    #[gpui_kit::test(iterations = 20)]
+    fn a_late_plugin_save_lands_in_the_editor_of_another_plugin(cx: &mut TestAppContext) {
+        let server = server();
+        let (bloom, cx) = on_plugins_page(&server, cx);
+        bloom.update_in(cx, |this, window, cx| open(this, "A", window, cx));
+        cx.run_until_parked();
+        bloom.update_in(cx, |this, window, cx| {
+            assert!(this.plugin_config_state().contains("a v1"), "{}", this.plugin_config_state());
+            assert!(!this.debug_plugin_config("set Count 5", window, cx).starts_with("error"));
+            // Save, leave at once, and open the settings of the other plugin.
+            this.debug_plugin_config("save", window, cx);
+            this.debug_plugin_config("close", window, cx);
+            open(this, "B", window, cx);
+        });
+        cx.run_until_parked();
+        bloom.read_with(cx, |this, _| {
+            let editor = this.plugin_editor().expect("the editor of B is open");
+            assert_eq!(editor.id, "B");
+            assert_eq!(
+                editor.original["Name"],
+                json!("beta"),
+                "the editor of Beta shows the settings of Alpha: {}",
+                this.plugin_config_state()
+            );
+            assert!(!editor.saving);
+        });
+    }
+
+    /// Two opens overlap: the editor shows the plugin opened last. An open
+    /// closed before its answer stays closed.
+    #[gpui_kit::test(iterations = 20)]
+    fn the_editor_shows_the_plugin_opened_last(cx: &mut TestAppContext) {
+        let server = server();
+        let (bloom, cx) = on_plugins_page(&server, cx);
+        bloom.update_in(cx, |this, window, cx| {
+            open(this, "A", window, cx);
+            open(this, "B", window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(server.count("GET", "/Plugins/"), 2);
+        bloom.read_with(cx, |this, _| {
+            let editor = this.plugin_editor().expect("an editor is open");
+            assert_eq!(editor.id, "B", "the answer of the first open came last and took the editor");
+        });
+        bloom.update_in(cx, |this, window, cx| {
+            this.debug_plugin_config("close", window, cx);
+            open(this, "A", window, cx);
+            this.debug_plugin_config("close", window, cx);
+        });
+        cx.run_until_parked();
+        bloom.read_with(cx, |this, _| {
+            assert!(this.plugin_editor().is_none(), "an open the user closed came back: {}", this.plugin_config_state());
+        });
+    }
+
+    /// A field changed after the submit keeps the user's value; every other
+    /// field shows what the server holds.
+    #[gpui_kit::test]
+    fn an_edit_after_the_submit_survives_the_answer(cx: &mut TestAppContext) {
+        let server = server();
+        let (bloom, cx) = on_plugins_page(&server, cx);
+        bloom.update_in(cx, |this, window, cx| open(this, "A", window, cx));
+        cx.run_until_parked();
+        bloom.update_in(cx, |this, window, cx| {
+            assert!(!this.debug_plugin_config("set Count 5", window, cx).starts_with("error"));
+            this.debug_plugin_config("save", window, cx);
+            // The user goes on while the save is on its way.
+            assert!(!this.debug_plugin_config("set Name mine", window, cx).starts_with("error"));
+        });
+        cx.run_until_parked();
+        assert_eq!(server.count("POST", "/Plugins/A/"), 1);
+        bloom.read_with(cx, |this, _| {
+            let editor = this.plugin_editor().expect("the editor is open");
+            assert_eq!(editor.original, json!({"Name": "alpha", "Count": 5}), "the baseline is not what the server holds");
+            assert_eq!(editor.edited["Name"], json!("mine"), "the edit after the submit is gone");
+            assert_eq!(editor.edited["Count"], json!(5));
+            assert!(editor.dirty() && !editor.saving);
+        });
     }
 }

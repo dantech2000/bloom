@@ -125,6 +125,12 @@ impl Control {
         self.in_flight.is_some() || self.pending_seek.is_some()
     }
 
+    /// The user wants the item to run. A player that stands still at the
+    /// end then ran out; one that stands still after a pause did not.
+    pub fn wants_play(&self) -> bool {
+        self.want_play
+    }
+
     pub fn stop(&mut self) -> Vec<Action> {
         self.phase = Phase::Idle;
         self.pending_seek = None;
@@ -186,6 +192,23 @@ mod tests {
         assert!(c.is_loading(2));
         assert_eq!(c.ready(2, t0), Some(vec![Action::Play]));
         assert_eq!(c.ready(2, t0), None);
+    }
+
+    /// What the engine reads as the end: a player paused at the end with
+    /// a play wanted. A pause of the user near the end is not it.
+    #[test]
+    fn a_pause_near_the_end_is_not_the_end() {
+        let mut c = Control::default();
+        let t0 = Instant::now();
+        c.send(1, 0., true);
+        c.ready(1, t0);
+        assert!(c.wants_play());
+        c.pause();
+        assert!(!c.wants_play(), "paused by the user: not the end");
+        c.seek(599.8, t0);
+        assert!(!c.wants_play(), "a seek while paused does not make it the end");
+        assert_eq!(c.play(), Some(Action::Play));
+        assert!(c.wants_play(), "then the player stands at the end: the end");
     }
 
     #[test]

@@ -11,6 +11,8 @@ config="$HOME/Library/Application Support/bloom/second-device.json"
 rm -f /tmp/bloom-second.pid
 [ "$1" = stop ] && exit 0
 sleep 1
+# Its own download folder as well; the user's is the one his app uses.
+export BLOOM_DOWNLOAD_DIR=${BLOOM_DOWNLOAD_DIR:-/tmp/bloom-second-downloads}
 BLOOM_CONFIG_PATH="$config" BLOOM_NO_REPORT=1 BLOOM_DEBUG_SOCK=/tmp/bloom-second.sock \
   RUST_LOG=${RUST_LOG:-bloom=info} RUST_BACKTRACE=1 \
   nohup "$dir/target/release/bloom" > /tmp/bloom-second.log 2>&1 &

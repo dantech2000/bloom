@@ -33,6 +33,8 @@ pub struct Exchange {
     pub server_received: f64,
     pub server_sent: f64,
     pub received: f64,
+    /// The local clock both local times were read from (`LocalClock::epoch`).
+    pub epoch: u64,
 }
 
 impl Exchange {
@@ -52,13 +54,18 @@ impl Exchange {
 pub struct LocalClock {
     start: Instant,
     start_ms: f64,
+    /// Which clock this is: a new one after a sleep of the machine has a
+    /// new origin, and times of the two must not be mixed.
+    pub epoch: u64,
 }
 
 impl LocalClock {
     pub fn new() -> Self {
+        static EPOCHS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
             start: Instant::now(),
             start_ms: wall_ms(),
+            epoch: EPOCHS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -109,12 +116,19 @@ pub struct ServerClock {
     taken: u32,
     /// Milliseconds the user adds, for an output that plays late or early.
     pub extra_offset: f64,
+    /// The local clock the measurements are on; 0 takes any.
+    epoch: u64,
 }
 
 impl ServerClock {
     pub fn record(&mut self, exchange: Exchange) {
         // A reply that "arrived before the question" is a broken measurement.
         if exchange.round_trip() < 0. {
+            return;
+        }
+        // A measurement on a local clock that was replaced is on another
+        // origin: wrong by the time the machine slept.
+        if self.epoch != 0 && exchange.epoch != self.epoch {
             return;
         }
         self.exchanges.push_back(exchange);
@@ -128,6 +142,13 @@ impl ServerClock {
     pub fn reset(&mut self) {
         self.exchanges.clear();
         self.taken = 0;
+    }
+
+    /// Forgets the measurements and takes only those of the local clock
+    /// `epoch` from now on.
+    pub fn reset_for(&mut self, epoch: u64) {
+        self.reset();
+        self.epoch = epoch;
     }
 
     /// True once there is a measurement to work with.
@@ -193,6 +214,7 @@ mod tests {
             server_received: server,
             server_sent: server + 1.,
             received: sent + up + 1. + down,
+            epoch: 0,
         }
     }
 
@@ -247,6 +269,7 @@ mod tests {
             server_received: 0.,
             server_sent: 50.,
             received: 20.,
+            epoch: 0,
         });
         assert_eq!(clock.offset(), before);
     }
@@ -273,6 +296,54 @@ mod tests {
         clock.extra_offset = 40.;
         assert!((clock.to_server(0.) - 140.).abs() < 1e-6);
         assert!((clock.to_local(140.)).abs() < 1e-6);
+    }
+
+    /// A local clock as it is after a sleep of the machine: `Instant` stood
+    /// still for `slept_ms` while the wall clock ran on.
+    fn clock_that_slept(slept_ms: f64) -> LocalClock {
+        LocalClock { start: Instant::now(), start_ms: wall_ms() - slept_ms, ..LocalClock::new() }
+    }
+
+    /// A measurement that started on the clock of before a sleep and ended
+    /// on the clock of after it, and one made wholly before the sleep but
+    /// recorded after the reset: neither may count.
+    #[test]
+    fn a_measurement_across_a_clock_reset_is_rejected() {
+        let old = clock_that_slept(30_000.);
+        let new = LocalClock::new();
+        let server_now = wall_ms() + 500.;
+        let mixed = Exchange {
+            sent: old.now(),
+            server_received: server_now,
+            server_sent: server_now + 1.,
+            received: new.now() + 10.,
+            epoch: old.epoch,
+        };
+        // Not broken by the round-trip rule: the sleep makes the trip long.
+        assert!(mixed.round_trip() > 0.);
+        let mut clock = ServerClock::default();
+        clock.reset_for(new.epoch);
+        clock.record(mixed);
+        assert!(!clock.ready(), "a measurement of the old clock counted: offset {}", clock.offset());
+        let before = Exchange {
+            sent: old.now() - 60_000.,
+            server_received: server_now - 60_000. - 30_000.,
+            server_sent: server_now - 60_000. - 30_000. + 1.,
+            received: old.now() - 60_000. + 10.,
+            epoch: old.epoch,
+        };
+        clock.record(before);
+        assert!(!clock.ready());
+        let fresh = Exchange {
+            sent: new.now(),
+            server_received: server_now,
+            server_sent: server_now + 1.,
+            received: new.now() + 10.,
+            epoch: new.epoch,
+        };
+        clock.record(fresh);
+        assert!(clock.ready());
+        assert!((clock.offset() - 500.).abs() < 20., "offset {}", clock.offset());
     }
 
     #[test]

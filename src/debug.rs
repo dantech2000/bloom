@@ -693,6 +693,10 @@ impl Bloom {
             "episodes" => self.toggle_episode_picker(window, cx),
             "rows" => return self.debug_rows(),
             "perf" => return crate::perf::report(),
+            // An mpv property as the worker sees it (`mpv mute`).
+            "mpv" => {
+                return self.player.probe(rest).unwrap_or_else(|| "error: no worker, or no answer".into());
+            }
             // Quits as the menu does, so the quit path can be tested.
             "quit" => {
                 cx.quit();
@@ -701,6 +705,48 @@ impl Bloom {
             // How even the video frames reached the screen since the last
             // call; `pacing clock`, `pacing file <path>` (`pacing.rs`).
             "pacing" => return self.debug_pacing(rest, window, cx),
+            // Trailer backdrops on or off, as the menu entry does.
+            "hero-video" => {
+                let want = rest == "on";
+                if self.config.hero_video.unwrap_or(true) != want {
+                    self.toggle_hero_video(cx);
+                }
+            }
+            // Sizes of the root and of the pages, and what the history holds.
+            "sizes" => {
+                use std::mem::size_of;
+                return format!(
+                    "Bloom={} Page={} HomeData={} LibraryData={} DetailData={} SearchData={} AdminData={} PlaylistData={} Item={} | history={} retained_items={}",
+                    size_of::<Bloom>(),
+                    size_of::<Page>(),
+                    size_of::<crate::app::HomeData>(),
+                    size_of::<crate::app::LibraryData>(),
+                    size_of::<crate::app::DetailData>(),
+                    size_of::<crate::app::SearchData>(),
+                    size_of::<crate::admin::AdminData>(),
+                    size_of::<crate::lists::PlaylistData>(),
+                    size_of::<crate::jellyfin::Item>(),
+                    self.history.len(),
+                    self.history.iter().map(page_items).sum::<usize>(),
+                );
+            }
+            // One value of the user's settings, for the save race tests.
+            "prefs" => {
+                return format!(
+                    "configuration[{rest}]={} custom[{rest}]={:?} loaded={}",
+                    self.prefs.configuration.get(rest).cloned().unwrap_or(serde_json::Value::Null),
+                    self.prefs.custom(rest),
+                    self.prefs.loaded
+                );
+            }
+            // The title index: its size and the ids of its first titles.
+            "catalog" => {
+                return format!(
+                    "catalog={} first={:?}",
+                    self.catalog.len(),
+                    self.catalog.iter().take(3).map(|i| i.id.as_str()).collect::<Vec<_>>()
+                );
+            }
             "state" => {}
             _ => {
                 return "error: commands: home, back, libraries, library <name>, item <id>, search <text>, type <text>, \
@@ -808,5 +854,17 @@ impl Bloom {
             -f32::from(self.page_scroll.offset().y),
             self.downloads_source_label(),
         )
+    }
+}
+
+/// Items a page holds in memory (for `sizes`: what the history retains).
+fn page_items(page: &Page) -> usize {
+    match page {
+        Page::Home(d) => d.resume.len() + d.next_up.len() + d.latest.iter().map(|(_, i)| i.len()).sum::<usize>(),
+        Page::Library(d) => d.items.len(),
+        Page::Detail(d) => 1 + d.seasons.len() + d.episodes.len() + d.similar.len(),
+        Page::Search(d) => d.results.len(),
+        Page::Playlist(d) => d.entries.len(),
+        Page::Admin(_) | Page::Settings(_) | Page::Downloads => 0,
     }
 }

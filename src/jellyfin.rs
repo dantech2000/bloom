@@ -24,6 +24,9 @@ pub struct Client {
     pub device_id: Arc<str>,
     pub token: Option<Arc<str>>,
     pub user_id: Option<Arc<str>>,
+    /// The id the server gives itself; with the user id, the identity a
+    /// playback report belongs to. Set for the client of a session.
+    pub server_id: Option<Arc<str>>,
 }
 
 impl Client {
@@ -37,6 +40,7 @@ impl Client {
             device_id: device_id.into(),
             token: None,
             user_id: None,
+            server_id: None,
         }
     }
 
@@ -45,6 +49,11 @@ impl Client {
         self.user_id = Some(user_id.into());
         // The image loader sends this header to this server only.
         register_image_auth(&self.base, self.auth_header());
+        self
+    }
+
+    pub fn with_server(mut self, server_id: &str) -> Self {
+        self.server_id = Some(server_id.into());
         self
     }
 
@@ -112,7 +121,7 @@ impl Client {
         response
             .body_mut()
             .read_json::<T>()
-            .with_context(|| format!("decode {path}"))
+            .map_err(|e| map_body_err(e, "decode", path))
     }
 
     pub(crate) fn post<B: Serialize>(&self, path: &str, body: &B) -> Result<ureq::Body> {
@@ -147,7 +156,7 @@ impl Client {
         response
             .body_mut()
             .read_json::<T>()
-            .with_context(|| format!("decode {path}"))
+            .map_err(|e| map_body_err(e, "decode", path))
     }
 
     /// POST or DELETE with no body, for calls whose answer is empty.
@@ -176,7 +185,7 @@ impl Client {
         response
             .body_mut()
             .read_to_string()
-            .with_context(|| format!("read {path}"))
+            .map_err(|e| map_body_err(e, "read", path))
     }
 
     /// True when the signed-in user is a server administrator.
@@ -640,9 +649,11 @@ impl Client {
         format!("{}/web/#/dashboard/plugins/{plugin_id}", self.base)
     }
 
-    pub fn stream_url(&self, item_id: &str) -> String {
+    /// The file of an item as it is, for the media source the server named
+    /// for it (the id of the item itself for the one version of a file).
+    pub fn stream_url(&self, item_id: &str, media_source_id: &str) -> String {
         format!(
-            "{}/Videos/{item_id}/stream?static=true&mediaSourceId={item_id}",
+            "{}/Videos/{item_id}/stream?static=true&mediaSourceId={media_source_id}",
             self.base
         )
     }
@@ -805,11 +816,18 @@ fn item_fields() -> String {
 pub struct RequestError {
     pub verdict: crate::connection::Verdict,
     text: String,
+    /// The error of the HTTP client, kept as the source.
+    source: Option<ureq::Error>,
 }
 
 impl RequestError {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(verdict: crate::connection::Verdict, text: String) -> Self {
-        Self { verdict, text }
+        Self { verdict, text, source: None }
+    }
+
+    fn from_ureq(verdict: crate::connection::Verdict, text: String, source: ureq::Error) -> Self {
+        Self { verdict, text, source: Some(source) }
     }
 }
 
@@ -819,16 +837,28 @@ impl std::fmt::Display for RequestError {
     }
 }
 
-impl std::error::Error for RequestError {}
+impl std::error::Error for RequestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|e| e as &(dyn std::error::Error + 'static))
+    }
+}
 
 fn map_err(err: ureq::Error, path: &str) -> anyhow::Error {
     let verdict = crate::connection::classify_ureq(&err);
-    let text = match err {
+    let text = match &err {
         ureq::Error::StatusCode(401) => format!("unauthorized (401) at {path}"),
         ureq::Error::StatusCode(code) => format!("HTTP {code} at {path}"),
         other => format!("{other} ({path})"),
     };
-    RequestError::new(verdict, text).into()
+    RequestError::from_ureq(verdict, text, err).into()
+}
+
+/// An error while the body was read: a connection that broke or timed out
+/// is the network, a body that is not JSON is an answer of the server. The
+/// text keeps the request ("decode /Items: ...") as before.
+fn map_body_err(err: ureq::Error, what: &str, path: &str) -> anyhow::Error {
+    let verdict = crate::connection::classify_ureq(&err);
+    RequestError::from_ureq(verdict, format!("{what} {path}: {err}"), err).into()
 }
 
 fn urlencode(s: &str) -> String {
@@ -891,6 +921,16 @@ pub fn session_count() -> u64 {
 /// tried again at once.
 pub fn reconnected() {
     SESSIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// True when two URLs have the same scheme, host and port; false when one
+/// of them is no `http(s)` URL. The session header goes with a request only
+/// when its URL has the origin of the server.
+pub(crate) fn same_origin(a: &str, b: &str) -> bool {
+    match (origin_of(a), origin_of(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
 }
 
 fn header_for<'a>(all: &'a ImageAuth, url: &str) -> Option<&'a str> {
@@ -1487,6 +1527,99 @@ pub fn format_runtime(secs: i64) -> String {
 mod tests {
     use super::*;
 
+    /// A server that answers every request with `head` and `body`, then
+    /// closes the connection. `body` may be shorter than the head says. It
+    /// ends with the test.
+    struct Sender {
+        port: u16,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Sender {
+        fn start(head: &'static str, body: &'static str) -> Self {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopping = stop.clone();
+            let thread = std::thread::spawn(move || {
+                for mut stream in listener.incoming().flatten() {
+                    if stopping.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let mut buffer = [0u8; 4096];
+                    let _ = stream.read(&mut buffer);
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(body.as_bytes());
+                    let _ = stream.flush();
+                    // Closed with the rest of the body never sent.
+                }
+            });
+            Self { port, stop, thread: Some(thread) }
+        }
+
+        fn client(&self) -> Client {
+            Client::new(&format!("http://127.0.0.1:{}", self.port), "d")
+        }
+    }
+
+    impl Drop for Sender {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// Finding 9 of the review: a connection that breaks while the body
+    /// comes is a lost connection, not an answer of the server.
+    #[test]
+    fn a_body_cut_short_is_a_lost_connection_not_an_answer() {
+        use crate::connection::{Verdict, Why, classify};
+        let server = Sender::start(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n",
+            "{\"Items\": [{\"Id\": \"a\"",
+        );
+        let err = server.client().get::<serde_json::Value>("/Items", &[]).unwrap_err();
+        assert_eq!(classify(&err), Verdict::Unreachable(Why::Connect), "{err:#}");
+        // The text still names the request, and the error of the HTTP
+        // client is the source.
+        assert!(format!("{err:#}").starts_with("decode /Items: "), "{err:#}");
+        let request = err.downcast_ref::<RequestError>().expect("a typed error");
+        assert!(std::error::Error::source(request).is_some_and(|s| s.downcast_ref::<ureq::Error>().is_some()));
+        // The same for a text body.
+        let err = server.client().get_text("/System/Logs/Log", &[]).unwrap_err();
+        assert_eq!(classify(&err), Verdict::Unreachable(Why::Connect), "{err:#}");
+    }
+
+    /// A whole body that is not JSON is an answer: the server is there.
+    #[test]
+    fn a_whole_body_that_is_not_json_is_an_answer() {
+        use crate::connection::{Verdict, classify};
+        let server = Sender::start(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 6\r\nConnection: close\r\n\r\n",
+            "<html>",
+        );
+        let err = server.client().get::<serde_json::Value>("/Items", &[]).unwrap_err();
+        assert_eq!(classify(&err), Verdict::Answered, "{err:#}");
+        let err = server.client().send::<serde_json::Value>("POST", "/Items", &[]).unwrap_err();
+        assert_eq!(classify(&err), Verdict::Answered, "{err:#}");
+    }
+
+    #[test]
+    fn same_origin_compares_scheme_host_and_port() {
+        assert!(same_origin("https://jf.example.com/a", "https://jf.example.com:443"));
+        assert!(same_origin("HTTP://JF.example.com:80/x", "http://jf.example.com"));
+        assert!(!same_origin("http://jf.example.com/a", "https://jf.example.com"));
+        assert!(!same_origin("https://jf.example.com:8920/a", "https://jf.example.com"));
+        assert!(!same_origin("https://cdn.example.com/a", "https://jf.example.com"));
+        assert!(!same_origin("file:///a", "https://jf.example.com"));
+        assert!(!same_origin("/a", "https://jf.example.com"));
+    }
+
     #[test]
     fn image_header_goes_to_the_servers_origin_only() {
         let client = Client::new("https://media.example.com/", "dev-1").with_session("tok", "u");
@@ -1542,8 +1675,12 @@ mod tests {
         assert!(full.starts_with(&format!("MediaBrowser Client=\"{APP_NAME}\"")));
         assert!(full.contains("DeviceId=\"dev-1\"") && full.ends_with("Token=\"tok\""));
         assert_eq!(
-            client.stream_url("abc"),
+            client.stream_url("abc", "abc"),
             "https://media.example.com/Videos/abc/stream?static=true&mediaSourceId=abc"
+        );
+        assert_eq!(
+            client.stream_url("abc", "def"),
+            "https://media.example.com/Videos/abc/stream?static=true&mediaSourceId=def"
         );
     }
 

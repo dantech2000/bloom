@@ -6,3 +6,5 @@
 
 mod metal_atlas;
 pub mod metal_renderer;
+// Bloom (vendor/README.md): the presented time of each draw.
+pub mod present_trace;

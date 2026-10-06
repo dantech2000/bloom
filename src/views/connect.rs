@@ -298,7 +298,7 @@ impl Bloom {
             .as_ref()
             .is_some_and(|s| s.server_id == server_id && s.user_id == user_id)
         {
-            self.session = None;
+            self.drop_session();
         }
         self.save_config(cx);
         self.rebuild_menu(cx);
@@ -317,7 +317,7 @@ impl Bloom {
             .as_ref()
             .is_some_and(|s| s.server_id == server_id)
         {
-            self.session = None;
+            self.drop_session();
         }
         self.connect.public_users.clear();
         self.connect.quick = None;

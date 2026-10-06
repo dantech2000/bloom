@@ -60,6 +60,24 @@ const SEARCH_NOTE: Duration = Duration::from_secs(6);
 /// `crate::chromecast::mock`.
 const MOCK_ENV: &str = "BLOOM_CHROMECAST_MOCK";
 
+/// Where a poll of the sessions stands: the session that asked, and the
+/// choice of the target at the time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PollTicket {
+    epoch: crate::app::SessionEpoch,
+    target: crate::app::Revision,
+}
+
+impl PollTicket {
+    /// Whether the snapshot of a poll that started under `self` may act on
+    /// the target that is set under `now`: only when it is the same choice.
+    /// A snapshot taken before the choice can lack the target without the
+    /// target being gone, and must not turn it off.
+    fn sees_target(self, now: PollTicket) -> bool {
+        self == now
+    }
+}
+
 /// Remote control as the app holds it.
 #[derive(Default)]
 pub struct CastState {
@@ -76,6 +94,9 @@ pub struct CastState {
     /// When the state of a Jellyfin session came, so the position can
     /// move between reports.
     pub target_at: Option<Instant>,
+    /// The choice of the target, among the choices made: a poll of the
+    /// sessions that started before the choice says nothing about it.
+    target_chosen: crate::app::Revision,
     /// The socket pushes the sessions.
     pub subscribed: bool,
     /// The server has this app's capabilities with media control.
@@ -415,12 +436,13 @@ impl Bloom {
         if place[2] <= 0. || place[3] <= 0. || self.cast.picker_place == Some(place) {
             return;
         }
-        let player = self.airplay.player_id();
-        if player.is_null() {
+        let Some(player) = self.airplay.player() else {
             log::warn!("airplay: no player for the route picker");
             return;
-        }
-        if picker::show(window, player, place) {
+        };
+        // The retain of `player` holds through the show; the view takes
+        // its own.
+        if picker::show(window, player.id(), place) {
             self.cast.picker_place = Some(place);
         }
     }
@@ -477,6 +499,7 @@ impl Bloom {
         // Nothing left and something was set: the same device again.
         let same = leave.is_none() && before != Kind::Local;
         self.cast.target = target;
+        self.cast.target_chosen = self.next_revision();
         if let Some(leave) = leave {
             self.leave_target(leave, cx);
         }
@@ -587,8 +610,13 @@ impl Bloom {
     /// target with them.
     pub fn load_cast_sessions(&mut self, cx: &mut Context<Self>) {
         let Some(session) = &self.session else { return };
+        // One poll on its way at a time: the next one waits for its answer.
+        if self.cast.loading {
+            return;
+        }
         let (user_id, device_id) = (session.user_id.clone(), self.config.device_id.clone());
         self.cast.loading = true;
+        let asked = PollTicket { epoch: self.session_epoch, target: self.cast.target_chosen };
         self.fetch(
             cx,
             move |client| {
@@ -596,11 +624,16 @@ impl Bloom {
                     client.get("/Sessions", &[("controllableByUserId", user_id)])?;
                 Ok(protocol::controllable(sessions, &device_id))
             },
-            |this, result, cx| {
+            move |this, result, cx| {
                 this.cast.loading = false;
+                // The sessions of another user or server are not for this one.
+                if this.session_epoch != asked.epoch {
+                    return;
+                }
+                let now = PollTicket { epoch: this.session_epoch, target: this.cast.target_chosen };
                 match result {
                     Ok(sessions) => {
-                        if let Some(target) = this.cast.session() {
+                        if let Some(target) = this.cast.session().filter(|_| asked.sees_target(now)) {
                             match sessions.iter().find(|s| s.id == target.id) {
                                 Some(fresh) => this.cast_target_update(fresh.clone()),
                                 None => {
@@ -1365,5 +1398,71 @@ impl Bloom {
         }
         cx.notify();
         self.cast_describe()
+    }
+}
+
+/// A poll of the sessions that answers after the target was chosen
+/// (review of 2026-10-05, devices finding 5). See `app::race_harness`.
+#[cfg(test)]
+mod race_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use gpui_kit::TestAppContext;
+    use serde_json::json;
+
+    use crate::app::{Screen, race_harness::{MockServer, app, plain, session, tick_until}};
+
+    /// A server whose second list of the sessions lacks the TV.
+    fn server() -> MockServer {
+        let asked = AtomicUsize::new(0);
+        MockServer::start(move |method, path, _| match (method, path) {
+            ("GET", p) if p.starts_with("/Sessions") => {
+                let tv = json!({
+                    "Id": "s1", "UserId": "u1", "UserName": "U", "Client": "Web", "DeviceName": "TV",
+                    "DeviceId": "dev-tv", "SupportsRemoteControl": true, "SupportsMediaControl": true
+                });
+                let n = asked.fetch_add(1, Ordering::Relaxed) + 1;
+                (200, if n == 2 { json!([]) } else { json!([tv]) }.to_string())
+            }
+            _ => plain(method, path),
+        })
+    }
+
+    #[gpui_kit::test]
+    fn a_snapshot_from_before_the_choice_does_not_turn_the_target_off(cx: &mut TestAppContext) {
+        let server = server();
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            this.session = Some(session(&server.url, "u1"));
+            this.screen = Screen::Main;
+            this.load_cast_sessions(cx);
+        });
+        cx.run_until_parked();
+        bloom.read_with(cx, |this, _| assert_eq!(this.cast.sessions.len(), 1, "the panel lists the TV"));
+        // A poll goes out and is answered (without the TV: it was away for a
+        // moment); the answer waits while the user chooses the TV.
+        bloom.update(cx, |this, cx| this.load_cast_sessions(cx));
+        tick_until(cx, || server.count("GET", "/Sessions") == 2);
+        bloom.update(cx, |this, cx| assert_eq!(this.cast_to("s1", cx), Ok("TV".to_string())));
+        cx.run_until_parked();
+        bloom.read_with(cx, |this, _| {
+            assert_eq!(
+                this.cast.session().map(|s| s.id.as_str()),
+                Some("s1"),
+                "the old snapshot turned the target off"
+            );
+        });
+    }
+
+    #[test]
+    fn a_poll_sees_the_target_of_its_own_choice_only() {
+        use super::PollTicket;
+        use crate::app::{Revision, SessionEpoch};
+        let asked = PollTicket { epoch: SessionEpoch::default(), target: Revision::default() };
+        assert!(asked.sees_target(asked));
+        let chosen_after = PollTicket { epoch: SessionEpoch::default(), target: Revision(1) };
+        assert!(!asked.sees_target(chosen_after));
+        let other_session = PollTicket { epoch: SessionEpoch(1), target: Revision::default() };
+        assert!(!asked.sees_target(other_session));
     }
 }

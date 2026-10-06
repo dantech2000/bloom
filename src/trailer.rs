@@ -74,6 +74,21 @@ struct Shared {
     frame: Mutex<Option<(u64, u64, VideoFrame)>>,
     target_w: AtomicU32,
     target_h: AtomicU32,
+    /// Wakes the worker: mpv has an event or a frame, or a command came.
+    wake: (Mutex<bool>, std::sync::Condvar),
+}
+
+impl Shared {
+    fn wake(&self) {
+        *self.wake.0.lock().unwrap() = true;
+        self.wake.1.notify_one();
+    }
+}
+
+/// What mpv's update callback gets: the flag for the worker and its wake-up.
+struct RenderAsk {
+    needed: AtomicBool,
+    shared: Arc<Shared>,
 }
 
 /// Handle owned by the UI. Cheap to clone.
@@ -92,6 +107,7 @@ impl Default for TrailerPlayer {
                 frame: Mutex::new(None),
                 target_w: AtomicU32::new(1280),
                 target_h: AtomicU32::new(720),
+                wake: (Mutex::new(false), std::sync::Condvar::new()),
             }),
             commands: Arc::new(Mutex::new(None)),
             ytdl: find_ytdl(),
@@ -157,6 +173,8 @@ impl TrailerPlayer {
     fn send(&self, cmd: Cmd) {
         if let Some(tx) = self.commands.lock().unwrap().as_ref() {
             let _ = tx.send(cmd);
+            // The worker sleeps between rounds.
+            self.shared.wake();
         }
     }
 
@@ -220,8 +238,11 @@ impl Drop for Renderer {
 }
 
 unsafe extern "C" fn on_render_update(ctx: *mut c_void) {
-    let flag = unsafe { &*(ctx as *const AtomicBool) };
-    flag.store(true, Ordering::Release);
+    // SAFETY: the context is the leaked `RenderAsk` of `run`, alive for the
+    // process; mpv calls this from its own threads.
+    let ask = unsafe { &*(ctx as *const RenderAsk) };
+    ask.needed.store(true, Ordering::Release);
+    ask.shared.wake();
 }
 
 fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Cmd>, ytdl: PathBuf) -> Result<()> {
@@ -272,19 +293,26 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Cmd>, ytdl: PathBuf) -> Result<()
     .map_err(|e| anyhow!("could not create libmpv core: {e}"))?;
 
     // Wake the loop from mpv's threads on events and on new frames.
-    let wake = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     {
-        let wake = wake.clone();
-        mpv.set_wakeup_callback(move || {
-            *wake.0.lock().unwrap() = true;
-            wake.1.notify_one();
-        });
+        let shared = shared.clone();
+        mpv.set_wakeup_callback(move || shared.wake());
     }
-    let needs_render = Box::leak(Box::new(AtomicBool::new(false)));
+    let needs_render: &'static RenderAsk =
+        Box::leak(Box::new(RenderAsk { needed: AtomicBool::new(false), shared: shared.clone() }));
     let mut renderer = create_renderer(&mpv, needs_render)?;
 
     mpv.observe_property("time-pos", Format::Double, 1)?;
     mpv.observe_property("duration", Format::Double, 2)?;
+    // The size of the picture comes as an event: a property read on this
+    // thread waits for the core, which can wait for this thread's render
+    // (`render.h`, "Threading"). The crop search still reads the core
+    // (`Crop::measure`), a few times per trailer.
+    mpv.observe_property("dwidth", Format::Int64, 3)?;
+    mpv.observe_property("dheight", Format::Int64, 4)?;
+    // The size of the picture of the active load; a frame skipped for want
+    // of it is drawn once the size is there.
+    let mut dims = (0u32, 0u32);
+    let mut dims_wanted = false;
 
     // The load in progress; `None` between trailers.
     let mut active: Option<u64> = None;
@@ -299,8 +327,10 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Cmd>, ytdl: PathBuf) -> Result<()
         // What CoreVideo and the GL driver autorelease in this turn goes
         // at its end, not when the thread ends.
         let _pool = crate::macos::Pool::new();
+        let mut restarted = false;
         while let Some(event) = mpv.wait_event(0.0) {
             let mut status = shared.status.lock().unwrap();
+            restarted |= matches!(event, Ok(Event::PlaybackRestart));
             match event {
                 Ok(Event::PropertyChange { name, change, .. }) if active.is_some() => {
                     match (name, change) {
@@ -309,6 +339,8 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Cmd>, ytdl: PathBuf) -> Result<()
                             status.position = v
                         }
                         ("duration", PropertyData::Double(v)) => status.duration = v,
+                        ("dwidth", PropertyData::Int64(v)) => dims.0 = v.max(0) as u32,
+                        ("dheight", PropertyData::Int64(v)) => dims.1 = v.max(0) as u32,
                         _ => {}
                     }
                 }
@@ -347,10 +379,24 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Cmd>, ytdl: PathBuf) -> Result<()
             }
         }
 
+        // mpv sends a size only when it differs from the last one it sent:
+        // a trailer that replaces one of the same size, with no round of
+        // this loop in between, gets no event. Playback has started, so the
+        // core has the size: it is read once, in that case alone.
+        if restarted && active.is_some() && (dims.0 == 0 || dims.1 == 0) {
+            dims = (
+                mpv.get_property::<i64>("dwidth").unwrap_or(0).max(0) as u32,
+                mpv.get_property::<i64>("dheight").unwrap_or(0).max(0) as u32,
+            );
+        }
+
         loop {
             match rx.try_recv() {
                 Ok(Cmd::Load { url, load }) => {
                     active = Some(load);
+                    // The size is of the file before until its events come.
+                    dims = (0, 0);
+                    dims_wanted = false;
                     // Bars known from an earlier play need no search.
                     crop = crops.get(&url).cloned().map(Crop::known).unwrap_or_default();
                     let _ = mpv.set_property("video-crop", crop.known.rect.as_str());
@@ -395,31 +441,37 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Cmd>, ytdl: PathBuf) -> Result<()
             }
         }
 
-        if needs_render.swap(false, Ordering::AcqRel) {
+        // A frame mpv asked for, or the one skipped before the size came.
+        let size_arrived = dims_wanted && dims.0 > 0 && dims.1 > 0;
+        if needs_render.needed.swap(false, Ordering::AcqRel) || size_arrived {
             let flags = unsafe { sys::mpv_render_context_update(renderer.ctx) };
-            if flags & (sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME as u64) != 0
+            if (flags & (sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME as u64) != 0 || size_arrived)
                 && let Some(load) = active
-                && let Err(err) = render_frame(&mpv, &mut renderer, &shared, &mut crop, load)
             {
-                log::debug!("trailer render skipped: {err}");
+                dims_wanted = false;
+                match render_frame(&mpv, &mut renderer, &shared, &mut crop, load, dims) {
+                    Ok(true) => {}
+                    Ok(false) => dims_wanted = true,
+                    Err(err) => log::debug!("trailer render skipped: {err}"),
+                }
             }
         }
 
-        // Sleep until something happens; commands have no wakeup of their own.
-        let (lock, cvar) = &*wake;
+        // Sleep until something happens: an event or a frame of mpv, or a
+        // command. The wait is a bound, not the clock.
+        let (lock, cvar) = &shared.wake;
         let mut flag = lock.lock().unwrap();
-        if !*flag && !needs_render.load(Ordering::Acquire) {
-            let idle = if active.is_some() { 4 } else { 50 };
-            let (guard, _) = cvar
-                .wait_timeout(flag, Duration::from_millis(idle))
-                .unwrap();
+        if !*flag && !needs_render.needed.load(Ordering::Acquire) {
+            let idle = if active.is_some() { Duration::from_millis(4) } else { Duration::from_secs(1) };
+            let (guard, _) = cvar.wait_timeout(flag, idle).unwrap();
             flag = guard;
         }
         *flag = false;
+        crate::perf::count_loop(crate::perf::Loop::Trailer);
     }
 }
 
-fn create_renderer(mpv: &Mpv, needs_render: &'static AtomicBool) -> Result<Renderer> {
+fn create_renderer(mpv: &Mpv, needs_render: &'static RenderAsk) -> Result<Renderer> {
     // The GL context becomes current on this thread; mpv renders with it.
     let gl = GlRenderer::new()?;
     let mut init = sys::mpv_opengl_init_params {
@@ -450,7 +502,7 @@ fn create_renderer(mpv: &Mpv, needs_render: &'static AtomicBool) -> Result<Rende
         sys::mpv_render_context_set_update_callback(
             ctx,
             Some(on_render_update),
-            needs_render as *const AtomicBool as *mut c_void,
+            needs_render as *const RenderAsk as *mut c_void,
         );
     }
     Ok(Renderer { ctx, gl })
@@ -597,18 +649,20 @@ impl Crop {
 }
 
 /// Renders the current frame large enough to cover the hero, but not larger
-/// than the source, then publishes its GPU surface.
+/// than the source, then publishes its GPU surface. False when the size of
+/// the picture (`dims`, from the events) is not known yet: the frame is
+/// drawn once it is.
 fn render_frame(
     mpv: &Mpv,
     renderer: &mut Renderer,
     shared: &Shared,
     crop: &mut Crop,
     load: u64,
-) -> Result<()> {
-    let mut src_w = mpv.get_property::<i64>("dwidth").unwrap_or(0).max(0) as u32;
-    let mut src_h = mpv.get_property::<i64>("dheight").unwrap_or(0).max(0) as u32;
+    dims: (u32, u32),
+) -> Result<bool> {
+    let (mut src_w, mut src_h) = dims;
     if src_w == 0 || src_h == 0 {
-        return Ok(());
+        return Ok(false);
     }
     let full = (src_w, src_h);
     // The picture is smaller after the crop; mpv may still report the full one.
@@ -647,11 +701,11 @@ fn render_frame(
     if crop.started && !crop.done {
         crop.measure(mpv, renderer, (w, h), full);
         renderer.gl.finish()?;
-        return Ok(());
+        return Ok(true);
     }
     if !crop.shown() {
         renderer.gl.finish()?;
-        return Ok(());
+        return Ok(true);
     }
     let frame = renderer.gl.finish()?;
     let mut slot = shared.frame.lock().unwrap();
@@ -660,7 +714,7 @@ fn render_frame(
         _ => 0,
     };
     *slot = Some((load, seq, frame));
-    Ok(())
+    Ok(true)
 }
 
 /// The trailer link the web plugin would pick: the best YouTube entry by its

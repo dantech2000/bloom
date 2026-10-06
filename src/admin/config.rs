@@ -81,6 +81,14 @@ pub struct Options {
     users: Vec<(String, String)>,
 }
 
+/// What a save did: the objects the server took (source and body), and
+/// why it refused the others.
+#[derive(Default)]
+struct Sent {
+    taken: Vec<(usize, Value)>,
+    refused: Vec<anyhow::Error>,
+}
+
 pub struct Data {
     /// The objects as the server gave them, in the order of the sources.
     values: Vec<Value>,
@@ -751,23 +759,58 @@ impl Bloom {
         };
         // Each object that changed goes back whole: the object the server
         // gave, with the edited values in it.
-        let posts: Vec<(String, Value)> = sources(admin.section)
+        let posts: Vec<(usize, String, Value)> = sources(admin.section)
             .into_iter()
             .enumerate()
             .filter(|(n, _)| data.values[*n] != data.edited[*n])
-            .map(|(n, source)| (endpoint(source), data.edited[n].clone()))
+            .map(|(n, source)| (n, endpoint(source), data.edited[n].clone()))
             .collect();
         if posts.is_empty() {
             return;
         }
-        // The load after the save brings what the server has now.
-        data.values = data.edited.clone();
-        self.admin_action("Settings saved", cx, move |client| {
-            for (path, body) in &posts {
-                client.post(path, body)?;
-            }
-            Ok(())
-        });
+        // An object counts as the server's once the server took it; a
+        // refused one keeps its edits on show, to change or send again. The
+        // answer is for the session that sent the objects.
+        let section = admin.section;
+        let epoch = self.session_epoch;
+        self.fetch(
+            cx,
+            move |client| -> Result<Sent> {
+                let mut sent = Sent::default();
+                for (n, path, body) in posts {
+                    match client.post(&path, &body) {
+                        Ok(_) => sent.taken.push((n, body)),
+                        Err(err) => sent.refused.push(err),
+                    }
+                }
+                Ok(sent)
+            },
+            move |this, result, cx| {
+                if this.session_epoch != epoch {
+                    return;
+                }
+                let sent = result.unwrap_or_else(|err| Sent { taken: Vec::new(), refused: vec![err] });
+                match sent.refused.first() {
+                    None => this.toast("Settings saved", "", cx),
+                    Some(err) => this.toast("The server refused the change", format!("{err:#}"), cx),
+                }
+                if let Page::Admin(admin) = &mut this.page
+                    && let Some(data) = admin.config.get_mut(&section)
+                {
+                    for (n, body) in sent.taken {
+                        if let Some(value) = data.values.get_mut(n) {
+                            *value = body;
+                        }
+                    }
+                }
+                // The load after the save brings what the server has now; a
+                // page with edits left keeps them (`load_admin`).
+                if matches!(this.page, Page::Admin(_)) {
+                    this.load_page(cx);
+                }
+                cx.notify();
+            },
+        );
     }
 
     /// A form for the value of a text, path, number or list field.
@@ -1132,5 +1175,93 @@ mod tests {
         put(&mut data.edited[0], &["MinResumePct"], json!(10));
         assert_eq!(data.changes(&spec), 1);
         assert!(data.dirty());
+    }
+}
+
+/// A refused save (review of 2026-10-05, UI finding 5). See
+/// `app::race_harness`.
+#[cfg(test)]
+mod race_tests {
+    use gpui_kit::TestAppContext;
+    use serde_json::json;
+
+    use super::{Page, Section};
+    use crate::app::{Screen, race_harness::{MockServer, app, plain, session}};
+
+    #[gpui_kit::test]
+    fn a_refused_save_of_the_server_settings_loses_the_edits(cx: &mut TestAppContext) {
+        let server = MockServer::start(|method, path, _| match (method, path) {
+            ("GET", p) if p.starts_with("/System/Configuration") => {
+                (200, r#"{"ServerName":"home","EnableMetrics":false}"#.into())
+            }
+            ("POST", p) if p.starts_with("/System/Configuration") => (500, "refused".into()),
+            _ => plain(method, path),
+        });
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            this.session = Some(session(&server.url, "u1"));
+            this.screen = Screen::Main;
+            this.open_admin(Section::General, cx);
+        });
+        cx.run_until_parked();
+        bloom.update(cx, |this, cx| {
+            let answer = this.config_edit("ServerName", "den", cx);
+            assert!(!answer.starts_with("error"), "{answer}");
+            assert!(this.config_state().contains("1 changed"), "{}", this.config_state());
+            this.config_save(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(server.count("POST", "/System/Configuration"), 1);
+        bloom.read_with(cx, |this, _| {
+            assert!(
+                this.config_state().contains("1 changed"),
+                "the server refused the save, and the edit is gone: {}",
+                this.config_state()
+            );
+        });
+        // The edit is still there to send again.
+        bloom.update(cx, |this, cx| this.config_save(cx));
+        cx.run_until_parked();
+        assert_eq!(server.count("POST", "/System/Configuration"), 2, "the save was not sent again");
+        assert_eq!(server.bodies("POST", "/System/Configuration")[1]["ServerName"], json!("den"));
+    }
+
+    /// Two objects on one page: the server takes the first and refuses the
+    /// second. The first is clean, the second keeps its edit.
+    #[gpui_kit::test]
+    fn a_partly_refused_save_keeps_the_refused_edits_only(cx: &mut TestAppContext) {
+        let server = MockServer::start(|method, path, _| match (method, path) {
+            ("GET", "/System/Configuration/metadata") => (200, r#"{"UseFileCreationTimeForDateAdded":false}"#.into()),
+            ("GET", p) if p.starts_with("/System/Configuration") => (200, r#"{"EnableFolderView":false}"#.into()),
+            ("POST", "/System/Configuration/metadata") => (500, "refused".into()),
+            ("POST", p) if p.starts_with("/System/Configuration") => (204, String::new()),
+            _ => plain(method, path),
+        });
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            this.session = Some(session(&server.url, "u1"));
+            this.screen = Screen::Main;
+            this.open_admin(Section::LibraryDisplay, cx);
+        });
+        cx.run_until_parked();
+        bloom.update(cx, |this, cx| {
+            for key in ["EnableFolderView", "UseFileCreationTimeForDateAdded"] {
+                let answer = this.config_edit(key, "true", cx);
+                assert!(!answer.starts_with("error"), "{answer}");
+            }
+            assert!(this.config_state().contains("2 changed"), "{}", this.config_state());
+            this.config_save(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(server.count("POST", "/System/Configuration"), 2, "both objects go to the server");
+        bloom.read_with(cx, |this, _| {
+            assert!(this.config_state().contains("1 changed"), "{}", this.config_state());
+            let Page::Admin(admin) = &this.page else { panic!("not the dashboard") };
+            let data = &admin.config[&Section::LibraryDisplay];
+            assert_eq!(data.values[0], data.edited[0], "the object the server took is still dirty");
+            assert_eq!(data.values[0]["EnableFolderView"], json!(true), "the taken object is not the baseline");
+            assert_ne!(data.values[1], data.edited[1], "the refused edit is gone");
+            assert_eq!(data.edited[1]["UseFileCreationTimeForDateAdded"], json!(true));
+        });
     }
 }

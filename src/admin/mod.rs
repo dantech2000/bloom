@@ -211,6 +211,10 @@ pub struct AdminData {
     pub text_editor: Option<text_editor::TextEditor>,
     /// The settings of one plugin, while the Plugins page shows them.
     pub plugin_editor: Option<plugin_config::Editor>,
+    /// The open of a plugin editor that is wanted: the one asked for last,
+    /// while the user did not close it. An answer for another open is
+    /// dropped.
+    pub plugin_open: Option<crate::app::Revision>,
     /// When the live reload last asked for a redraw.
     redrawn: Instant,
 }
@@ -236,6 +240,7 @@ impl AdminData {
             log_open: None,
             text_editor: None,
             plugin_editor: None,
+            plugin_open: None,
             redrawn: Instant::now(),
         }
     }

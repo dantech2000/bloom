@@ -44,6 +44,8 @@ pub struct MockState {
     pub available: Vec<String>,
     /// Apps whose launch fails.
     pub fails: Vec<String>,
+    /// Apps whose LAUNCH gets no answer at all, while the heartbeat goes on.
+    pub ignores: Vec<String>,
     /// App id, session id and transport id of the app that runs.
     pub app: Option<(String, String, String)>,
     pub volume: f64,
@@ -54,10 +56,18 @@ pub struct MockState {
     pub jellyfin_paused: bool,
     /// How long a SEEK takes before its answer.
     pub seek_delay: Duration,
+    /// How long the next media GET_STATUS takes before its answer; the
+    /// ones after it are answered at once.
+    pub status_delay: Duration,
+    /// Answers no receiver GET_STATUS, while everything else is answered.
+    pub mute_status: bool,
     /// Answers nothing, not even a PING.
     pub silent: bool,
     /// Closes the socket at the next look.
     pub drop_now: bool,
+    /// Closes the socket right after the next message of this type comes,
+    /// before its answer.
+    pub drop_after: Option<String>,
     pub connections: usize,
     pub launches: usize,
 }
@@ -67,6 +77,7 @@ impl Default for MockState {
         Self {
             available: vec![jellyfin::APP_STABLE.into(), super::messages::APP_DEFAULT_MEDIA.into()],
             fails: Vec::new(),
+            ignores: Vec::new(),
             app: None,
             volume: 0.5,
             muted: false,
@@ -74,8 +85,11 @@ impl Default for MockState {
             jellyfin_position: 0.,
             jellyfin_paused: false,
             seek_delay: Duration::ZERO,
+            status_delay: Duration::ZERO,
+            mute_status: false,
             silent: false,
             drop_now: false,
+            drop_after: None,
             connections: 0,
             launches: 0,
         }
@@ -178,8 +192,16 @@ fn serve(stream: TcpStream, config: Arc<rustls::ServerConfig>, seen: Arc<Mutex<V
         }
         while let Ok(Some(message)) = inbox.next() {
             seen.lock().unwrap().push(message.clone());
-            if state.lock().unwrap().silent {
-                continue;
+            {
+                let mut state = state.lock().unwrap();
+                if state.silent {
+                    continue;
+                }
+                let payload: Value = serde_json::from_str(message.text_payload()).unwrap_or(Value::Null);
+                if state.drop_after.as_deref().is_some_and(|kind| payload["type"] == kind) {
+                    state.drop_after = None;
+                    return;
+                }
             }
             for (namespace, payload) in answer(&message, &state) {
                 let reply = CastMessage::text(&message.destination, &message.source, &namespace, payload.to_string());
@@ -254,6 +276,7 @@ fn answer(message: &CastMessage, state: &Arc<Mutex<MockState>>) -> Vec<(String, 
         NS_RECEIVER => {
             let mut state = state.lock().unwrap();
             match kind {
+                "GET_STATUS" if state.mute_status => {}
                 "GET_STATUS" => out.push((NS_RECEIVER.into(), receiver_status(id, &state))),
                 "GET_APP_AVAILABILITY" => {
                     let map: serde_json::Map<String, Value> = payload["appId"]
@@ -271,7 +294,9 @@ fn answer(message: &CastMessage, state: &Arc<Mutex<MockState>>) -> Vec<(String, 
                 "LAUNCH" => {
                     state.launches += 1;
                     let app = payload["appId"].as_str().unwrap_or("").to_string();
-                    if state.available.contains(&app) && !state.fails.contains(&app) {
+                    if state.ignores.contains(&app) {
+                        // A device that hangs on the launch: nothing comes back.
+                    } else if state.available.contains(&app) && !state.fails.contains(&app) {
                         let n = state.launches;
                         state.app = Some((app, format!("session-{n}"), format!("transport-{n}")));
                         state.media = None;
@@ -303,7 +328,11 @@ fn answer(message: &CastMessage, state: &Arc<Mutex<MockState>>) -> Vec<(String, 
             if transport.as_deref() != Some(&message.destination) {
                 return vec![(NS_MEDIA.into(), json!({"type": "INVALID_REQUEST", "requestId": id, "reason": "INVALID_MEDIA_SESSION_ID"}))];
             }
-            let delay = if kind == "SEEK" { state.lock().unwrap().seek_delay } else { Duration::ZERO };
+            let delay = match kind {
+                "SEEK" => state.lock().unwrap().seek_delay,
+                "GET_STATUS" => std::mem::take(&mut state.lock().unwrap().status_delay),
+                _ => Duration::ZERO,
+            };
             thread::sleep(delay);
             let mut state = state.lock().unwrap();
             match kind {
@@ -331,6 +360,14 @@ fn answer(message: &CastMessage, state: &Arc<Mutex<MockState>>) -> Vec<(String, 
                 "SEEK" => {
                     if let Some(media) = &mut state.media {
                         media.position = payload["currentTime"].as_f64().unwrap_or(0.);
+                        // As the Default Media Receiver: `resumeState` sets
+                        // the state after the seek; without it the state
+                        // stays what it was.
+                        match payload["resumeState"].as_str() {
+                            Some("PLAYBACK_START") => media.state = "PLAYING".into(),
+                            Some("PLAYBACK_PAUSE") => media.state = "PAUSED".into(),
+                            _ => {}
+                        }
                     }
                 }
                 "STOP" => {

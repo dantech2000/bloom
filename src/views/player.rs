@@ -151,248 +151,6 @@ impl Bloom {
                 )
         };
 
-        let remaining = (s.duration - s.position).max(0.);
-        let label = |text: String| {
-            div()
-                .w(px(64.))
-                .flex_shrink_0()
-                .text_size(px(13.))
-                .text_color(soft)
-                .child(text)
-        };
-        let seek = div()
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .child(label(format_duration(s.position as i64)))
-            .child(self.render_timeline(cx))
-            .child(
-                label(if s.duration > 0. {
-                    format!("-{}", format_duration(remaining as i64))
-                } else {
-                    String::new()
-                })
-                .flex()
-                .justify_end(),
-            );
-
-        // The header shows the rating when that feature is on; then the panel
-        // does not show it a second time.
-        let rating = self
-            .playing
-            .as_ref()
-            .and_then(|item| item.community_rating)
-            .filter(|_| self.enhanced_player_rating().is_none());
-        let favorite = self
-            .playing
-            .as_ref()
-            .is_some_and(|item| item.user_data.is_favorite);
-        let has_subs = s.tracks.iter().any(|track| track.kind == "sub");
-        let silent = self.muted || self.volume == 0.;
-
-        let has_previous = !self.queue.history.is_empty();
-        let has_next = !self.queue.upcoming.is_empty();
-        let mut left = div()
-            .flex()
-            .items_center()
-            .gap(px(6.))
-            .when(has_previous || has_next, |el| {
-                el.child(
-                    button(
-                        "player.previous",
-                        icon(LucideIcon::SkipBack, 20., white),
-                    )
-                    .tooltip(tip("Previous (Shift+P)"))
-                    .on_click(cx.listener(|this, _, _, cx| this.request_previous(cx))),
-                )
-            })
-            .child(
-                button("player.rewind", filled(Filled::Rewind, 24., white))
-                    .tooltip(tip(format!("Back {} seconds", self.prefs.skip_back_secs() as u32)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.request_seek_by(-this.prefs.skip_back_secs(), cx)
-                    })),
-            )
-            .child(
-                button(
-                    "player.pause",
-                    filled(
-                        if s.paused {
-                            Filled::Play
-                        } else {
-                            Filled::Pause
-                        },
-                        26.,
-                        white,
-                    ),
-                )
-                .tooltip(tip(if s.paused { "Play (Space)" } else { "Pause (Space)" }))
-                .on_click(cx.listener(|this, _, _, cx| this.request_toggle_pause(cx))),
-            )
-            .child(
-                button("player.forward", filled(Filled::Forward, 24., white))
-                    .tooltip(tip(format!(
-                        "Forward {} seconds",
-                        self.prefs.skip_forward_secs() as u32
-                    )))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.request_seek_by(this.prefs.skip_forward_secs(), cx)
-                    })),
-            )
-            .when(has_next, |el| {
-                el.child(
-                    button("player.next", icon(LucideIcon::SkipForward, 20., white))
-                        .tooltip(tip("Next (Shift+N)"))
-                        .on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.request_next(cx);
-                        }),
-                    ),
-                )
-            });
-        if let Some(score) = rating {
-            left = left.child(
-                div()
-                    .ml(px(6.))
-                    .flex()
-                    .items_center()
-                    .gap(px(4.))
-                    .text_size(px(14.))
-                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                    .text_color(rgb(0xffc107))
-                    .child(filled(Filled::Star, 16., rgb(0xffc107)))
-                    .child(format!("{score:.1}")),
-            );
-        }
-        if s.duration > 0. {
-            left = left.child(
-                div()
-                    .ml(px(10.))
-                    .text_size(px(14.))
-                    .text_color(soft)
-                    .child(format!(
-                        "Ends at {}",
-                        crate::macos::ends_at((remaining / self.speed.max(0.25) as f64) as i64)
-                    )),
-            );
-        }
-
-        let right = div()
-            .flex()
-            .items_center()
-            .gap(px(6.))
-            .child(
-                button(
-                    "player.favorite",
-                    filled(
-                        Filled::Heart,
-                        24.,
-                        if favorite { rgb(0xf92672) } else { white },
-                    ),
-                )
-                .tooltip(tip(if favorite {
-                    "Remove from favorites"
-                } else {
-                    "Add to favorites"
-                }))
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_playing_favorite(cx))),
-            )
-            .child(menu_button(
-                &self.subtitle_menu,
-                "Subtitles",
-                filled(Filled::Captions, 24., if has_subs { white } else { soft }),
-            ))
-            .child(
-                button(
-                    "player.mute",
-                    filled(
-                        if silent {
-                            Filled::VolumeOff
-                        } else {
-                            Filled::VolumeUp
-                        },
-                        24.,
-                        white,
-                    ),
-                )
-                .tooltip(tip(if silent { "Unmute (M)" } else { "Mute (M)" }))
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_mute(cx))),
-            )
-            .child(
-                div().w(px(120.)).mr(px(8.)).child(
-                    Slider::new(&self.volume_slider)
-                        .aria_label("Volume")
-                        .w_full(),
-                ),
-            )
-            .children(self.bookmark_button(cx))
-            .when(self.can_pick_episode(), |el| {
-                el.child(
-                    button("player.episodes", icon(LucideIcon::ListVideo, 22., white))
-                        .tooltip(tip("Episodes (E)"))
-                        .on_click(
-                        cx.listener(|this, _: &ClickEvent, window, cx| {
-                            this.toggle_episode_picker(window, cx)
-                        }),
-                    ),
-                )
-            })
-            .child(menu_button(
-                &self.settings_menu,
-                "Settings",
-                filled(Filled::Settings, 24., white),
-            ))
-            .when(self.sync.allowed() && self.sync.session.is_some(), |el| {
-                let in_group = self.sync.in_group();
-                el.child(
-                    button(
-                        "player.syncplay",
-                        filled(Filled::Groups, 26., if in_group { rgb(0x7ee787) } else { white }),
-                    )
-                    .tooltip(tip(if in_group { "SyncPlay: in a group" } else { "SyncPlay" }))
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.toggle_sync_panel(window, cx)
-                    })),
-                )
-            })
-            .child(
-                button("player.cast", filled(Filled::Cast, 24., if self.cast.active() { rgb(0x7ee787) } else { white }))
-                    .tooltip(tip(if self.cast.active() { "Play on: another device plays" } else { "Play on" }))
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.toggle_cast_panel(window, cx)
-                    })),
-            )
-            .child(
-                button(
-                    "player.pip",
-                    icon(LucideIcon::PictureInPicture2, 22., white),
-                )
-                .tooltip(tip("Picture in picture"))
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.toggle_pip(window, cx)
-                })),
-            )
-            .child(
-                button(
-                    "player.fullscreen",
-                    filled(
-                        if fullscreen {
-                            Filled::FullscreenExit
-                        } else {
-                            Filled::Fullscreen
-                        },
-                        24.,
-                        white,
-                    ),
-                )
-                .tooltip(tip(if fullscreen {
-                    "Exit full screen (F)"
-                } else {
-                    "Enter full screen (F)"
-                }))
-                .on_click(|_: &ClickEvent, window, _| window.toggle_fullscreen()),
-            );
-
         // Controls overlay the video and fade with pointer activity.
         let visibility = crate::ui::theme::transition_value(
             "player.controls-opacity",
@@ -401,73 +159,321 @@ impl Bloom {
             window,
             cx,
         );
-        let panel = div()
-            .absolute()
-            .left(px(PANEL_MARGIN))
-            .right(px(PANEL_MARGIN))
-            .bottom(px(PANEL_MARGIN))
-            .rounded(px(24.))
-            .opacity(visibility)
-            .on_mouse_down(MouseButton::Left, cx.listener(swallow))
-            .child(glass(px(24.), rgba(0x1c1c1cb8)))
-            .px(px(20.))
-            .pt(px(10.))
-            .pb(px(8.))
-            .flex()
-            .flex_col()
-            .gap(px(2.))
-            .child(seek)
-            .child(
+        // The header and the panel are built only while they show or fade.
+        // A video frame redraws the whole player; hidden controls must not
+        // cost a build on each one.
+        let chrome = (self.controls_visible || visibility > 0.).then(|| {
+            let remaining = (s.duration - s.position).max(0.);
+            let label = |text: String| {
                 div()
+                    .w(px(64.))
+                    .flex_shrink_0()
+                    .text_size(px(13.))
+                    .text_color(soft)
+                    .child(text)
+            };
+            let seek = div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(label(format_duration(s.position as i64)))
+                .child(self.render_timeline(cx))
+                .child(
+                    label(if s.duration > 0. {
+                        format!("-{}", format_duration(remaining as i64))
+                    } else {
+                        String::new()
+                    })
                     .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(left)
-                    .child(right),
-            );
+                    .justify_end(),
+                );
 
-        let header = div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .h(px(110.))
-            .opacity(visibility)
-            .bg(linear_gradient(
-                180.,
-                linear_color_stop(gpui_kit::black().alpha(0.75), 0.0),
-                linear_color_stop(gpui_kit::black().alpha(0.0), 1.0),
-            ))
-            .child(
-                div()
-                    .absolute()
-                    .top(px(12.))
-                    // The traffic lights sit at the left edge of a window.
-                    .left(px(if fullscreen { 20. } else { 84. }))
-                    .right(px(24.))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .on_mouse_down(MouseButton::Left, cx.listener(swallow))
-                    .child(
-                        // Back ends playback and returns to the page before.
-                        button("player.close", icon(LucideIcon::ArrowLeft, 20., white))
-                            .tooltip(tip("Back (Esc)"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.request_stop(cx);
-                            })),
+            // The header shows the rating when that feature is on; then the panel
+            // does not show it a second time.
+            let rating = self
+                .playing
+                .as_ref()
+                .and_then(|item| item.community_rating)
+                .filter(|_| self.enhanced_player_rating().is_none());
+            let favorite = self
+                .playing
+                .as_ref()
+                .is_some_and(|item| item.user_data.is_favorite);
+            let has_subs = s.tracks.iter().any(|track| track.kind == "sub");
+            let silent = self.muted || self.volume == 0.;
+
+            let has_previous = !self.queue.history.is_empty();
+            let has_next = !self.queue.upcoming.is_empty();
+            let mut left = div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .when(has_previous || has_next, |el| {
+                    el.child(
+                        button(
+                            "player.previous",
+                            icon(LucideIcon::SkipBack, 20., white),
+                        )
+                        .tooltip(tip("Previous (Shift+P)"))
+                        .on_click(cx.listener(|this, _, _, cx| this.request_previous(cx))),
                     )
-                    .child(
-                        div()
-                            .text_size(px(16.))
-                            .font_weight(gpui_kit::FontWeight::MEDIUM)
-                            .text_color(white)
-                            .truncate()
-                            .child(s.title.clone()),
+                })
+                .child(
+                    button("player.rewind", filled(Filled::Rewind, 24., white))
+                        .tooltip(tip(format!("Back {} seconds", self.prefs.skip_back_secs() as u32)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.request_seek_by(-this.prefs.skip_back_secs(), cx)
+                        })),
+                )
+                .child(
+                    button(
+                        "player.pause",
+                        filled(
+                            if s.paused {
+                                Filled::Play
+                            } else {
+                                Filled::Pause
+                            },
+                            26.,
+                            white,
+                        ),
                     )
-                    .children(self.enhanced_player_rating())
-                    .children(self.sync_player_chip(cx)),
-            );
+                    .tooltip(tip(if s.paused { "Play (Space)" } else { "Pause (Space)" }))
+                    .on_click(cx.listener(|this, _, _, cx| this.request_toggle_pause(cx))),
+                )
+                .child(
+                    button("player.forward", filled(Filled::Forward, 24., white))
+                        .tooltip(tip(format!(
+                            "Forward {} seconds",
+                            self.prefs.skip_forward_secs() as u32
+                        )))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.request_seek_by(this.prefs.skip_forward_secs(), cx)
+                        })),
+                )
+                .when(has_next, |el| {
+                    el.child(
+                        button("player.next", icon(LucideIcon::SkipForward, 20., white))
+                            .tooltip(tip("Next (Shift+N)"))
+                            .on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.request_next(cx);
+                            }),
+                        ),
+                    )
+                });
+            if let Some(score) = rating {
+                left = left.child(
+                    div()
+                        .ml(px(6.))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .text_size(px(14.))
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xffc107))
+                        .child(filled(Filled::Star, 16., rgb(0xffc107)))
+                        .child(format!("{score:.1}")),
+                );
+            }
+            if s.duration > 0. {
+                left = left.child(
+                    div()
+                        .ml(px(10.))
+                        .text_size(px(14.))
+                        .text_color(soft)
+                        .child(format!(
+                            "Ends at {}",
+                            crate::macos::ends_at((remaining / self.speed.max(0.25) as f64) as i64)
+                        )),
+                );
+            }
+
+            let right = div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(
+                    button(
+                        "player.favorite",
+                        filled(
+                            Filled::Heart,
+                            24.,
+                            if favorite { rgb(0xf92672) } else { white },
+                        ),
+                    )
+                    .tooltip(tip(if favorite {
+                        "Remove from favorites"
+                    } else {
+                        "Add to favorites"
+                    }))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_playing_favorite(cx))),
+                )
+                .child(menu_button(
+                    &self.subtitle_menu,
+                    "Subtitles",
+                    filled(Filled::Captions, 24., if has_subs { white } else { soft }),
+                ))
+                .child(
+                    button(
+                        "player.mute",
+                        filled(
+                            if silent {
+                                Filled::VolumeOff
+                            } else {
+                                Filled::VolumeUp
+                            },
+                            24.,
+                            white,
+                        ),
+                    )
+                    .tooltip(tip(if silent { "Unmute (M)" } else { "Mute (M)" }))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_mute(cx))),
+                )
+                .child(
+                    div().w(px(120.)).mr(px(8.)).child(
+                        Slider::new(&self.volume_slider)
+                            .aria_label("Volume")
+                            .w_full(),
+                    ),
+                )
+                .children(self.bookmark_button(cx))
+                .when(self.can_pick_episode(), |el| {
+                    el.child(
+                        button("player.episodes", icon(LucideIcon::ListVideo, 22., white))
+                            .tooltip(tip("Episodes (E)"))
+                            .on_click(
+                            cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.toggle_episode_picker(window, cx)
+                            }),
+                        ),
+                    )
+                })
+                .child(menu_button(
+                    &self.settings_menu,
+                    "Settings",
+                    filled(Filled::Settings, 24., white),
+                ))
+                .when(self.sync.allowed() && self.sync.session.is_some(), |el| {
+                    let in_group = self.sync.in_group();
+                    el.child(
+                        button(
+                            "player.syncplay",
+                            filled(Filled::Groups, 26., if in_group { rgb(0x7ee787) } else { white }),
+                        )
+                        .tooltip(tip(if in_group { "SyncPlay: in a group" } else { "SyncPlay" }))
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.toggle_sync_panel(window, cx)
+                        })),
+                    )
+                })
+                .child(
+                    button("player.cast", filled(Filled::Cast, 24., if self.cast.active() { rgb(0x7ee787) } else { white }))
+                        .tooltip(tip(if self.cast.active() { "Play on: another device plays" } else { "Play on" }))
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.toggle_cast_panel(window, cx)
+                        })),
+                )
+                .child(
+                    button(
+                        "player.pip",
+                        icon(LucideIcon::PictureInPicture2, 22., white),
+                    )
+                    .tooltip(tip("Picture in picture"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.toggle_pip(window, cx)
+                    })),
+                )
+                .child(
+                    button(
+                        "player.fullscreen",
+                        filled(
+                            if fullscreen {
+                                Filled::FullscreenExit
+                            } else {
+                                Filled::Fullscreen
+                            },
+                            24.,
+                            white,
+                        ),
+                    )
+                    .tooltip(tip(if fullscreen {
+                        "Exit full screen (F)"
+                    } else {
+                        "Enter full screen (F)"
+                    }))
+                    .on_click(|_: &ClickEvent, window, _| window.toggle_fullscreen()),
+                );
+
+            let panel = div()
+                .absolute()
+                .left(px(PANEL_MARGIN))
+                .right(px(PANEL_MARGIN))
+                .bottom(px(PANEL_MARGIN))
+                .rounded(px(24.))
+                .opacity(visibility)
+                .on_mouse_down(MouseButton::Left, cx.listener(swallow))
+                .child(glass(px(24.), rgba(0x1c1c1cb8)))
+                .px(px(20.))
+                .pt(px(10.))
+                .pb(px(8.))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(seek)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(left)
+                        .child(right),
+                );
+
+            let header = div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(px(110.))
+                .opacity(visibility)
+                .bg(linear_gradient(
+                    180.,
+                    linear_color_stop(gpui_kit::black().alpha(0.75), 0.0),
+                    linear_color_stop(gpui_kit::black().alpha(0.0), 1.0),
+                ))
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(12.))
+                        // The traffic lights sit at the left edge of a window.
+                        .left(px(if fullscreen { 20. } else { 84. }))
+                        .right(px(24.))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .on_mouse_down(MouseButton::Left, cx.listener(swallow))
+                        .child(
+                            // Back ends playback and returns to the page before.
+                            button("player.close", icon(LucideIcon::ArrowLeft, 20., white))
+                                .tooltip(tip("Back (Esc)"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.request_stop(cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(16.))
+                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                .text_color(white)
+                                .truncate()
+                                .child(s.title.clone()),
+                        )
+                        .children(self.enhanced_player_rating())
+                        .children(self.sync_player_chip(cx)),
+                );
+            (header, panel)
+        });
 
         // Near the end, the card of the next item takes the place of the
         // skip button.
@@ -570,9 +576,7 @@ impl Bloom {
             .when(!self.pause_screen, |el| {
                 el.children(skip)
                     .children(up_next)
-                    .when(self.controls_visible || visibility > 0., |el| {
-                        el.child(header).child(panel)
-                    })
+                    .when_some(chrome, |el, (header, panel)| el.child(header).child(panel))
                     .children(self.render_episode_picker(PANEL_MARGIN + 110., cx))
                     .children(self.render_bookmarks_panel(cx))
                     .children(self.render_sync_panel(None, cx))

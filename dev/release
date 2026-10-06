@@ -34,7 +34,8 @@ key=${BLOOM_UPDATE_KEY:-$(sed -n 's/^pub const UPDATE_PUBLIC_KEY: &str = "\(.*\)
 
 # The version of the package is the version of the bundle.
 /usr/bin/sed -i '' "1,/^version = /s/^version = \".*\"/version = \"$version\"/" "$dir/Cargo.toml"
-(cd "$dir" && cargo build --release) || exit 1
+# The `ship` profile of Cargo.toml: smaller, slower to build.
+(cd "$dir" && cargo build --profile ship) || exit 1
 "$dir/dev/bundle" >/dev/null || exit 1
 
 dist="$dir/target/dist"

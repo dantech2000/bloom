@@ -41,6 +41,7 @@ start() {
   stop
   : > "$log"
   env "$@" BLOOM_NO_REPORT=1 BLOOM_NO_SOCKET=1 BLOOM_DEBUG_SOCK=$sock RUST_LOG=bloom=info RUST_BACKTRACE=1 \
+    BLOOM_DOWNLOAD_DIR="${BLOOM_DOWNLOAD_DIR:-/tmp/bloom-$name-downloads}" \
     nohup "$dir/target/release/bloom" >> "$log" 2>&1 &
   echo $! > "$pid_file"
   # The debug channel answers once the window is up.

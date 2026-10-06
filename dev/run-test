@@ -13,6 +13,11 @@ rm -f /tmp/bloom-$name.pid
 [ "$1" = stop ] && exit 0
 sleep 1
 [ -n "$BLOOM_CONFIG_PATH" ] || export BLOOM_CONFIG_READONLY=1
+# Its own download folder: the index, the part files and the positions of
+# offline plays are written at every start, and the user's folder is the
+# one his app uses. BLOOM_CACHE_DIR does the same for the image cache when
+# a test needs a cold one.
+export BLOOM_DOWNLOAD_DIR=${BLOOM_DOWNLOAD_DIR:-/tmp/bloom-$name-downloads}
 # A test instance starts muted and stays muted; the user may be at the Mac.
 export BLOOM_MUTED=1
 # The window shows "TEST INSTANCE" with this name.

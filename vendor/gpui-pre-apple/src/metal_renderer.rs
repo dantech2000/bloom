@@ -499,6 +499,10 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
+        // Bloom (vendor/README.md): ground truth for frame pacing, when it
+        // was asked for.
+        let trace = crate::present_trace::active();
+        let acquire_started = if trace { crate::present_trace::media_time() } else { 0. };
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
@@ -506,16 +510,45 @@ impl MetalRenderer {
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
             );
+            // Bloom: the number this draw would have had is used up, so
+            // that what was noted for it (`present_trace::next_draw_id`)
+            // can never be matched with the times of another draw.
+            if trace {
+                crate::present_trace::DRAW_ID.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
             return;
         };
+        let acquire_wait = if trace { crate::present_trace::media_time() - acquire_started } else { 0. };
 
         let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
                 log::error!("failed to render: {error:#}");
+                // Bloom: as above, the number of a draw that failed is used up.
+                if trace {
+                    crate::present_trace::DRAW_ID.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                }
                 return;
             }
         };
+
+        if trace {
+            use crate::present_trace::{self, DRAW_ID, media_time};
+            let id = DRAW_ID.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+            present_trace::submitted(id, media_time(), acquire_wait);
+            let presented = ConcreteBlock::new(move |d: &metal::DrawableRef| {
+                present_trace::presented(id, d.presented_time());
+            })
+            .copy();
+            drawable.add_presented_handler(&presented);
+            let completed = ConcreteBlock::new(move |cb: &metal::CommandBufferRef| {
+                let start: f64 = unsafe { msg_send![cb, GPUStartTime] };
+                let end: f64 = unsafe { msg_send![cb, GPUEndTime] };
+                present_trace::completed(id, start, end);
+            })
+            .copy();
+            command_buffer.add_completed_handler(&completed);
+        }
 
         if self.presents_with_transaction {
             command_buffer.commit();

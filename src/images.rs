@@ -271,7 +271,7 @@ pub fn preload(urls: Vec<String>, cx: &mut App) {
             let permit = gate().acquire().await;
             let fetched = cx
                 .background_executor()
-                .spawn(async move { fetch(&agent, &target) })
+                .spawn(async move { fetch_bytes(&agent, &target) })
                 .await;
             drop(permit);
             cx.update(|cx| {
@@ -280,7 +280,7 @@ pub fn preload(urls: Vec<String>, cx: &mut App) {
                     return;
                 }
                 match fetched {
-                    Ok((_, bytes)) => {
+                    Ok(bytes) => {
                         store.raw.insert(url, Arc::new(bytes));
                     }
                     Err(err) => {
@@ -543,22 +543,60 @@ pub fn remote_logo(url: String) -> Canvas<()> {
     )
 }
 
+/// Where the bytes of an image came from, and so what to do with them.
+enum Origin {
+    /// A file of this Mac: nothing to keep.
+    Local,
+    /// The cache on disk. A file that does not decode goes, and the
+    /// network is asked once more.
+    Disk(std::path::PathBuf),
+    /// The network, with the file of the cache the bytes may be kept in
+    /// once they are known to be an image.
+    Network(Option<std::path::PathBuf>),
+}
+
+struct Fetched {
+    mime: String,
+    bytes: Vec<u8>,
+    origin: Origin,
+}
+
+impl Fetched {
+    /// Keeps bytes of the network in the cache on disk. Called only after
+    /// the whole image decoded ([`decodes`] where the caller keeps the
+    /// bytes and not the pixels): a 200 that is no image (the sign-in page
+    /// of a proxy), or an image with a damaged body, must not sit in the
+    /// cache for ever.
+    fn commit(&self) {
+        if let Origin::Network(Some(file)) = &self.origin {
+            disk_write(file, &self.bytes);
+        }
+    }
+}
+
 /// The content type and the bytes of an image, from the cache on disk when
-/// the image is there, else from the network (and then to the disk).
-fn fetch(agent: &ureq::Agent, url: &str) -> anyhow::Result<(String, Vec<u8>)> {
+/// the image is there, else from the network. `cache` is the folder of the
+/// cache (`None` for no cache); the bytes of the network are not written to
+/// it here, see [`Fetched::commit`].
+fn fetch(agent: &ureq::Agent, url: &str, cache: Option<&std::path::Path>) -> anyhow::Result<Fetched> {
+    let local = |bytes: Vec<u8>| Fetched { mime: String::new(), bytes, origin: Origin::Local };
     // A file of this Mac, such as the poster of a download.
     if let Some(path) = url.strip_prefix("file://") {
-        return Ok((String::new(), std::fs::read(path)?));
+        return Ok(local(std::fs::read(path)?));
     }
-    let file = disk_path(url);
+    let file = disk_path_in(cache, url);
     if let Some(bytes) = file.as_deref().and_then(disk_read) {
-        return Ok((String::new(), bytes));
+        return Ok(Fetched {
+            mime: String::new(),
+            bytes,
+            origin: Origin::Disk(file.unwrap_or_default()),
+        });
     }
     // The artwork of a download is on this Mac, server or no server.
     if let Some(path) = crate::downloads::local_image(url)
         && let Ok(bytes) = std::fs::read(path)
     {
-        return Ok((String::new(), bytes));
+        return Ok(local(bytes));
     }
     let mut request = agent.get(url);
     // The header goes to the signed-in server only. A redirect to another
@@ -574,10 +612,48 @@ fn fetch(agent: &ureq::Agent, url: &str) -> anyhow::Result<(String, Vec<u8>)> {
         .map(|s| s.split(';').next().unwrap_or("").trim().to_string())
         .unwrap_or_default();
     let bytes = response.body_mut().read_to_vec()?;
-    if let Some(file) = &file {
-        disk_write(file, &bytes);
+    Ok(Fetched { mime, bytes, origin: Origin::Network(file) })
+}
+
+/// True when the whole image decodes, as the loader decodes it. The
+/// downloads ask before they keep artwork. Blocks for a decode (about 1 to
+/// 2 ms for a poster): not for a GPUI thread.
+pub fn looks_like_image(bytes: &[u8]) -> bool {
+    decodes(bytes)
+}
+
+/// The check for bytes that are kept and not shown now (the raw bytes of
+/// the Now Playing tile, the prewarm of the posters): the complete image
+/// decodes, with the same code the loader uses, so what passes here shows
+/// there. A header check is not enough: a good header over a damaged body
+/// would sit in the cache for ever, and every raw read would find it.
+/// An SVG must parse and draw.
+///
+/// What this does not catch: PNG has a CRC per chunk and the zlib check, so
+/// it catches damage and truncation. WebP (the lossless kind that the
+/// decoder checks as it reads) and GIF are caught when the data is cut or
+/// the structure is hit, but a changed byte inside lossless WebP data can
+/// decode to a wrong pixel. A JPEG has no checksum and the decoder of the
+/// `image` crate is lenient by design (it fills a damaged scan in without
+/// an error), so [`complete`] adds the one check that finds the common
+/// damage, a cut-off file; a changed byte inside the scan of a JPEG is not
+/// found by any decoder here. Damage in the later frames of an animated
+/// GIF is not found either (only the first frame is decoded, as the loader
+/// does).
+fn decodes(bytes: &[u8]) -> bool {
+    decode_checked("", bytes).is_ok_and(|(_, whole)| whole)
+}
+
+/// True when the bytes are not cut short. Only a JPEG needs the question:
+/// the other decoders fail on a cut file, and the lenient one of JPEG does
+/// not. A JPEG ends with the marker EOI (`FF D9`), maybe followed by
+/// zero padding.
+fn complete(format: ImageFormat, bytes: &[u8]) -> bool {
+    if !matches!(format, ImageFormat::Jpeg) {
+        return true;
     }
-    Ok((mime, bytes))
+    let end = bytes.iter().rposition(|&byte| byte != 0).map_or(0, |last| last + 1);
+    bytes[..end].ends_with(&[0xFF, 0xD9])
 }
 
 // ----- cache on disk --------------------------------------------------------
@@ -585,7 +661,8 @@ fn fetch(agent: &ureq::Agent, url: &str) -> anyhow::Result<(String, Vec<u8>)> {
 /// Encoded images kept on disk before the least recently used are removed.
 const DISK_MAX_BYTES: u64 = 500 * 1024 * 1024;
 
-/// Folder of the image files: `~/Library/Caches/bloom/images` on macOS.
+/// Folder of the image files: `~/Library/Caches/bloom/images` on macOS, or
+/// `BLOOM_CACHE_DIR` (a test instance with a cache of its own).
 /// `BLOOM_NO_DISK_CACHE` switches the cache off, for measurements.
 fn disk_dir() -> Option<&'static std::path::Path> {
     static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
@@ -593,7 +670,10 @@ fn disk_dir() -> Option<&'static std::path::Path> {
         if std::env::var_os("BLOOM_NO_DISK_CACHE").is_some() {
             return None;
         }
-        let dir = dirs::cache_dir()?.join(crate::brand::FOLDER).join("images");
+        let dir = match std::env::var_os("BLOOM_CACHE_DIR") {
+            Some(dir) => std::path::PathBuf::from(dir),
+            None => dirs::cache_dir()?.join(crate::brand::FOLDER).join("images"),
+        };
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir)
     })
@@ -604,7 +684,7 @@ fn disk_dir() -> Option<&'static std::path::Path> {
 /// has a tag never changes under that URL, and neither does a TMDB image.
 /// The preview sheets of the player are left out: they are large and one
 /// playback uses them.
-fn disk_path(url: &str) -> Option<std::path::PathBuf> {
+fn disk_path_in(dir: Option<&std::path::Path>, url: &str) -> Option<std::path::PathBuf> {
     let keeps = (url.contains("tag=") || url.contains("image.tmdb.org/"))
         && !url.contains("api_key=")
         && !url.contains("/Trickplay/");
@@ -616,20 +696,29 @@ fn disk_path(url: &str) -> Option<std::path::PathBuf> {
         url.bytes()
             .fold(start, |hash, byte| (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3))
     };
-    Some(disk_dir()?.join(format!(
+    Some(dir?.join(format!(
         "{:016x}{:016x}",
         hash(0xcbf2_9ce4_8422_2325),
         hash(0x8422_2325_cbf2_9ce4)
     )))
 }
 
-/// Puts an image in the cache on disk ahead of a request for it, so a page
-/// shows it without the server. The downloads do this for their artwork.
-pub fn seed(url: &str, bytes: &[u8]) {
-    if let Some(file) = disk_path(url)
+/// Puts a file of this Mac in the cache on disk under a URL, ahead of a
+/// request for it, so a page shows it without the server. The downloads do
+/// this for their artwork, under each width the pages ask for: the copy is
+/// a clone on APFS, so the sixteen files of an item take the space of one.
+pub fn seed_file(url: &str, path: &std::path::Path) {
+    seed_file_in(disk_dir(), url, path)
+}
+
+fn seed_file_in(cache: Option<&std::path::Path>, url: &str, path: &std::path::Path) {
+    if let Some(file) = disk_path_in(cache, url)
         && !file.exists()
     {
-        disk_write(&file, bytes);
+        let partial = file.with_extension("part");
+        if std::fs::copy(path, &partial).is_ok() && std::fs::rename(&partial, &file).is_err() {
+            let _ = std::fs::remove_file(&partial);
+        }
     }
 }
 
@@ -652,7 +741,11 @@ fn disk_write(file: &std::path::Path, bytes: &[u8]) {
 
 /// Removes the least recently used files when the folder is over its limit.
 fn trim_disk_cache() {
-    let Some(dir) = disk_dir() else { return };
+    trim_disk_cache_in(disk_dir(), DISK_MAX_BYTES);
+}
+
+fn trim_disk_cache_in(dir: Option<&std::path::Path>, max_bytes: u64) {
+    let Some(dir) = dir else { return };
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -665,13 +758,13 @@ fn trim_disk_cache() {
         })
         .collect();
     let mut total: u64 = files.iter().map(|file| file.1).sum();
-    if total <= DISK_MAX_BYTES {
+    if total <= max_bytes {
         return;
     }
     files.sort();
     for (_, size, path) in files {
         // Some room is left, so the next few images do not start this again.
-        if total <= DISK_MAX_BYTES / 10 * 9 {
+        if total <= max_bytes / 10 * 9 {
             break;
         }
         if std::fs::remove_file(path).is_ok() {
@@ -692,51 +785,194 @@ pub fn agent(cx: &mut App) -> ureq::Agent {
 /// Blocks; for a background thread. The Now Playing tile makes its artwork
 /// from them.
 pub fn fetch_bytes(agent: &ureq::Agent, url: &str) -> anyhow::Result<Vec<u8>> {
-    fetch(agent, url).map(|(_, bytes)| bytes)
+    fetch_bytes_in(agent, url, disk_dir())
+}
+
+/// The caller wants the bytes, not the pixels, but they are kept only when
+/// the whole image decodes ([`decodes`]); a file of the cache that does not
+/// decode goes and the server is asked once more. For a background thread:
+/// the decode takes a few ms.
+fn fetch_bytes_in(agent: &ureq::Agent, url: &str, cache: Option<&std::path::Path>) -> anyhow::Result<Vec<u8>> {
+    let mut fetched = fetch(agent, url, cache)?;
+    let mut whole = decodes(&fetched.bytes);
+    if !whole && let Origin::Disk(file) = &fetched.origin {
+        let _ = std::fs::remove_file(file);
+        fetched = fetch(agent, url, cache)?;
+        whole = decodes(&fetched.bytes);
+    }
+    if whole {
+        fetched.commit();
+    }
+    Ok(fetched.bytes)
+}
+
+/// Images one prewarm fetches at most, in the order of the catalog: the
+/// cache holds 500 MB, and a library of ten thousand titles would not fit.
+const PREWARM_MAX_URLS: usize = 3000;
+/// Lost connections in a row after which a prewarm gives up: with the
+/// server gone, each try would wait for its timeout.
+const PREWARM_GIVE_UP: u32 = 3;
+/// A long prewarm trims the cache after this many bytes written, so it
+/// does not go over the limit until its end.
+const PREWARM_TRIM_EVERY: u64 = 64 * 1024 * 1024;
+
+/// The bounds of a prewarm; a test sets small ones.
+#[derive(Clone, Copy)]
+struct PrewarmLimits {
+    max_urls: usize,
+    trim_every: u64,
+    cache_max_bytes: u64,
+}
+
+const PREWARM_LIMITS: PrewarmLimits = PrewarmLimits {
+    max_urls: PREWARM_MAX_URLS,
+    trim_every: PREWARM_TRIM_EVERY,
+    cache_max_bytes: DISK_MAX_BYTES,
+};
+
+/// Counts the prewarms started. A run checks it between two fetches and
+/// stops when a newer one was started, or [`cancel_prewarm`] was called.
+static PREWARM_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Stops the prewarm under way, at its next fetch: the session it was for
+/// is gone. For the place a session closes without a new one.
+pub fn cancel_prewarm() {
+    PREWARM_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Fetches images to the cache on disk, so a page that shows them later has
-/// no request to wait for. They are not decoded and take no memory.
+/// no request to wait for. Each is decoded to check it and then dropped, so
+/// none takes memory. A new
+/// prewarm stops the one before it.
 pub fn prewarm(urls: Vec<String>, cx: &mut App) {
     if !cx.has_global::<ImageStore>() {
         cx.set_global(ImageStore::new());
     }
     let agent = cx.global_mut::<ImageStore>().agent();
+    let run = PREWARM_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     cx.background_executor()
         .spawn(async move {
             let started = Instant::now();
-            let mut fetched = 0;
-            for url in &urls {
-                let Some(file) = disk_path(url) else { continue };
-                if file.exists() {
-                    continue;
-                }
-                match fetch(&agent, url) {
-                    Ok(_) => fetched += 1,
-                    Err(err) => log::debug!("prewarm of an image failed: {err:#}"),
-                }
-            }
+            let wanted = urls.len();
+            let outcome = prewarm_blocking(&agent, urls, disk_dir(), (&PREWARM_RUN, run), PREWARM_LIMITS);
             log::info!(
-                "image prewarm: {fetched} of {} fetched in {} ms",
-                urls.len(),
-                started.elapsed().as_millis()
+                "image prewarm: {} of {wanted} fetched in {} ms{}{}",
+                outcome.fetched,
+                started.elapsed().as_millis(),
+                if outcome.failed > 0 { format!(", {} failed", outcome.failed) } else { String::new() },
+                if outcome.stopped { ", stopped" } else { "" }
             );
         })
         .detach();
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PrewarmOutcome {
+    fetched: usize,
+    failed: usize,
+    /// Ended before its list: offline, lost connections, or superseded.
+    stopped: bool,
+}
+
+/// Fetches the images one after the other, lowest priority: one connection
+/// beside the ones the pages use. Stops when the app is offline, after a
+/// few lost connections in a row, and when `run` is no longer the number
+/// in `current` (a newer prewarm started, or the session closed).
+fn prewarm_blocking(
+    agent: &ureq::Agent,
+    mut urls: Vec<String>,
+    cache: Option<&std::path::Path>,
+    (current, run): (&std::sync::atomic::AtomicU64, u64),
+    limits: PrewarmLimits,
+) -> PrewarmOutcome {
+    use std::sync::atomic::Ordering::Relaxed;
+    urls.truncate(limits.max_urls);
+    let mut outcome = PrewarmOutcome::default();
+    let (mut lost_in_a_row, mut written, mut since_trim) = (0, 0u64, 0u64);
+    for url in &urls {
+        if crate::connection::is_offline()
+            || lost_in_a_row >= PREWARM_GIVE_UP
+            || current.load(Relaxed) != run
+        {
+            outcome.stopped = true;
+            break;
+        }
+        let Some(file) = disk_path_in(cache, url) else { continue };
+        if file.exists() {
+            continue;
+        }
+        match fetch(agent, url, cache) {
+            Ok(fetched) => {
+                lost_in_a_row = 0;
+                // The decode is the cost of a prewarm, on this thread; the
+                // pixels are dropped at once, nothing stays in memory.
+                if decodes(&fetched.bytes) {
+                    fetched.commit();
+                    outcome.fetched += 1;
+                    written += fetched.bytes.len() as u64;
+                } else {
+                    outcome.failed += 1;
+                }
+            }
+            Err(err) => {
+                outcome.failed += 1;
+                // An answer of the server (a 404) is not a lost connection.
+                let answered = matches!(err.downcast_ref::<ureq::Error>(), Some(ureq::Error::StatusCode(_)));
+                lost_in_a_row = if answered { 0 } else { lost_in_a_row + 1 };
+                log::debug!("prewarm of an image failed: {err:#}");
+            }
+        }
+        if written - since_trim >= limits.trim_every {
+            since_trim = written;
+            trim_disk_cache_in(cache, limits.cache_max_bytes);
+        }
+    }
+    // What came in counts against the limit of the cache.
+    if written > since_trim {
+        trim_disk_cache_in(cache, limits.cache_max_bytes);
+    }
+    outcome
+}
+
 fn decode_fetched(mime: &str, bytes: &[u8]) -> anyhow::Result<RenderImage> {
+    decode_checked(mime, bytes).map(|(image, _)| image)
+}
+
+/// The image, and whether its bytes are whole ([`complete`]). A cut JPEG
+/// still shows (the decoder fills it in), but it is not kept.
+fn decode_checked(mime: &str, bytes: &[u8]) -> anyhow::Result<(RenderImage, bool)> {
     let format = ImageFormat::from_mime_type(mime)
         .or_else(|| sniff(bytes))
         .ok_or_else(|| anyhow::anyhow!("unknown image type {mime:?}"))?;
-    decode(format, bytes)
+    Ok((decode(format, bytes)?, complete(format, bytes)))
 }
 
 fn download(agent: &ureq::Agent, url: &str) -> anyhow::Result<RenderImage> {
+    download_in(agent, url, disk_dir())
+}
+
+/// Fetches and decodes an image. The bytes go to the cache on disk only
+/// once they decoded whole ([`decodes`]). A file of the cache that does not
+/// (kept by a run before this check, or damaged) goes, and the server is
+/// asked once more.
+fn download_in(agent: &ureq::Agent, url: &str, cache: Option<&std::path::Path>) -> anyhow::Result<RenderImage> {
     let started = Instant::now();
-    let (mime, bytes) = fetch(agent, url)?;
-    let fetched = started.elapsed();
-    let image = decode_fetched(&mime, &bytes)?;
+    let mut fetched = fetch(agent, url, cache)?;
+    let fetch_took = started.elapsed();
+    let mut result = decode_checked(&fetched.mime, &fetched.bytes);
+    if !matches!(result, Ok((_, true)))
+        && let Origin::Disk(file) = &fetched.origin
+    {
+        log::info!("image of the cache does not decode whole, fetched again");
+        let _ = std::fs::remove_file(file);
+        fetched = fetch(agent, url, cache)?;
+        result = decode_checked(&fetched.mime, &fetched.bytes);
+    }
+    let (image, whole) = result?;
+    if whole {
+        fetched.commit();
+    }
+    let bytes = &fetched.bytes;
     if log::log_enabled!(log::Level::Debug) {
         let size = image.size(0);
         log::debug!(
@@ -744,12 +980,20 @@ fn download(agent: &ureq::Agent, url: &str) -> anyhow::Result<RenderImage> {
             size.width.0,
             size.height.0,
             bytes.len() / 1024,
-            fetched.as_millis(),
-            (started.elapsed() - fetched).as_millis(),
+            fetch_took.as_millis(),
+            (started.elapsed() - fetch_took).as_millis(),
             url.split('?').next().unwrap_or(url),
         );
     }
     Ok(image)
+}
+
+/// The most pixels a picture may have to be decoded: five times a 4K
+/// backdrop, and 160 MB as RGBA. Artwork of a server is far below it.
+const MAX_PIXELS: u64 = 40_000_000;
+
+fn fits_in_memory(width: u32, height: u32) -> bool {
+    width as u64 * height as u64 <= MAX_PIXELS
 }
 
 /// Decodes to the BGRA pixels GPUI paints. Only the first frame is kept; the
@@ -764,6 +1008,13 @@ fn decode(format: ImageFormat, bytes: &[u8]) -> anyhow::Result<RenderImage> {
         other => anyhow::bail!("unsupported image type {other:?}"),
     };
     let mut decoder = image::ImageReader::with_format(Cursor::new(bytes), format).into_decoder()?;
+    // The pixels are allocated from the size the header names, before a
+    // byte of them is read: a few bytes can name a picture of gigabytes.
+    let (width, height) = image::ImageDecoder::dimensions(&decoder);
+    anyhow::ensure!(
+        fits_in_memory(width, height),
+        "the picture is too large to decode ({width} by {height})"
+    );
     let orientation = decoder.orientation()?;
     let mut image = DynamicImage::from_decoder(decoder)?;
     image.apply_orientation(orientation);
@@ -777,9 +1028,9 @@ fn decode(format: ImageFormat, bytes: &[u8]) -> anyhow::Result<RenderImage> {
 /// Longest side of a drawn SVG, in pixels. Enough for a card at 2x scale.
 const SVG_MAX_SIDE: f32 = 800.;
 
-/// Draws an SVG to BGRA pixels, scaled so its longest side is `SVG_MAX_SIDE`.
-fn decode_svg(bytes: &[u8]) -> anyhow::Result<RenderImage> {
-    use resvg::{tiny_skia, usvg};
+/// Reads an SVG into its tree, with the fonts of the system.
+fn svg_tree(bytes: &[u8]) -> anyhow::Result<resvg::usvg::Tree> {
+    use resvg::usvg;
 
     static FONTS: std::sync::OnceLock<Arc<usvg::fontdb::Database>> = std::sync::OnceLock::new();
     let options = usvg::Options {
@@ -790,9 +1041,23 @@ fn decode_svg(bytes: &[u8]) -> anyhow::Result<RenderImage> {
                 Arc::new(fonts)
             })
             .clone(),
+        // An SVG can carry or name raster pictures, and those are decoded
+        // at their own size, whatever the size the SVG is drawn at: a small
+        // file could ask for gigabytes. Artwork needs none; they are left out.
+        image_href_resolver: usvg::ImageHrefResolver {
+            resolve_data: Box::new(|_, _, _| None),
+            resolve_string: Box::new(|_, _| None),
+        },
         ..Default::default()
     };
-    let tree = usvg::Tree::from_data(bytes, &options)?;
+    Ok(usvg::Tree::from_data(bytes, &options)?)
+}
+
+/// Draws an SVG to BGRA pixels, scaled so its longest side is `SVG_MAX_SIDE`.
+fn decode_svg(bytes: &[u8]) -> anyhow::Result<RenderImage> {
+    use resvg::tiny_skia;
+
+    let tree = svg_tree(bytes)?;
     let size = tree.size();
     let scale = SVG_MAX_SIDE / size.width().max(size.height());
     let (width, height) = (
@@ -855,6 +1120,8 @@ fn sniff(bytes: &[u8]) -> Option<ImageFormat> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
+
     use super::*;
 
     fn lru(max_bytes: usize) -> (Lru<u32>, Instant) {
@@ -1037,7 +1304,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let _permit = block_on(gate.acquire());
                     let url = format!("http://127.0.0.1:{port}/img/{i}");
-                    fetch(&agent, &url).map(|(_, bytes)| bytes.len())
+                    fetch(&agent, &url, None).map(|f| f.bytes.len())
                 })
             })
             .collect();
@@ -1073,6 +1340,540 @@ mod tests {
             t.join().unwrap();
         }
         assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![2, 1, 0]);
+    }
+
+    /// A server for the cache tests: answers each request from `answers`
+    /// in turn (content type and body), the last one again and again, and
+    /// counts the requests. It ends with the test.
+    struct ImageServer {
+        port: u16,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ImageServer {
+        fn start(answers: Vec<(&'static str, Vec<u8>)>) -> Self {
+            use std::io::{Read, Write};
+            use std::sync::atomic::Ordering::SeqCst;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (count, stopping) = (requests.clone(), stop.clone());
+            let thread = std::thread::spawn(move || {
+                for mut stream in listener.incoming().flatten() {
+                    if stopping.load(SeqCst) {
+                        return;
+                    }
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let n = count.fetch_add(1, SeqCst);
+                    let (mime, body) = &answers[n.min(answers.len() - 1)];
+                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    let _ = stream.write_all(body);
+                }
+            });
+            Self { port, requests, stop, thread: Some(thread) }
+        }
+
+        fn url(&self, item: &str) -> String {
+            format!("http://127.0.0.1:{}/Items/{item}/Images/Primary?tag=t1", self.port)
+        }
+
+        fn requests(&self) -> usize {
+            self.requests.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for ImageServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn png(side: u32) -> Vec<u8> {
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(side, side, image::Rgba([1, 2, 3, 255]))
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        png
+    }
+
+    fn cache_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bloom-images-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn files_in(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir).unwrap().count()
+    }
+
+    fn plain_agent() -> ureq::Agent {
+        ureq::Agent::new_with_config(ureq::Agent::config_builder().build())
+    }
+
+    /// Finding 10 of the review: a 200 that is no image (a login page of a
+    /// proxy) must not sit in the cache on disk for ever.
+    #[test]
+    fn a_bad_200_answer_does_not_poison_the_cache_on_disk() {
+        let dir = cache_dir("html");
+        let server = ImageServer::start(vec![
+            ("text/html", b"<html><body>Please sign in</body></html>".to_vec()),
+            ("image/png", png(2)),
+        ]);
+        let url = server.url("a");
+        let agent = plain_agent();
+        assert!(download_in(&agent, &url, Some(&dir)).is_err(), "a login page is no image");
+        assert_eq!(files_in(&dir), 0, "the login page was kept");
+        // The next ask, as after a restart of the app, gets the real image.
+        let image = download_in(&agent, &url, Some(&dir)).expect("the real image after the bad answer");
+        assert_eq!((image.size(0).width.0, image.size(0).height.0), (2, 2));
+        assert_eq!(server.requests(), 2);
+        // And it is in the cache now: a third ask needs no request.
+        download_in(&agent, &url, Some(&dir)).unwrap();
+        assert_eq!(server.requests(), 2);
+        assert_eq!(files_in(&dir), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An image with a good header and a damaged body is not kept either:
+    /// the bytes go to the disk only once they decoded.
+    #[test]
+    fn an_image_with_a_corrupt_body_is_not_kept() {
+        let dir = cache_dir("corrupt");
+        let mut damaged = png(8);
+        let cut = damaged.len() / 2;
+        damaged.truncate(cut);
+        damaged.extend(std::iter::repeat_n(0xAAu8, cut));
+        let server = ImageServer::start(vec![("image/png", damaged), ("image/png", png(8))]);
+        let url = server.url("b");
+        let agent = plain_agent();
+        assert!(download_in(&agent, &url, Some(&dir)).is_err(), "a damaged image decoded");
+        assert_eq!(files_in(&dir), 0, "the damaged image was kept");
+        let image = download_in(&agent, &url, Some(&dir)).expect("the good image");
+        assert_eq!(image.size(0).width.0, 8);
+        assert_eq!(server.requests(), 2);
+        download_in(&agent, &url, Some(&dir)).unwrap();
+        assert_eq!(server.requests(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file the cache kept before this check (a login page under the
+    /// name of an image) goes, and the image is fetched once more.
+    #[test]
+    fn a_poisoned_file_of_the_cache_is_replaced() {
+        let dir = cache_dir("poisoned");
+        let server = ImageServer::start(vec![("image/png", png(4))]);
+        let url = server.url("c");
+        let file = disk_path_in(Some(&dir), &url).unwrap();
+        std::fs::write(&file, b"<html>Please sign in</html>").unwrap();
+        let agent = plain_agent();
+        let image = download_in(&agent, &url, Some(&dir)).expect("the image after the poisoned file");
+        assert_eq!(image.size(0).width.0, 4);
+        assert_eq!(server.requests(), 1);
+        assert_eq!(std::fs::read(&file).unwrap(), png(4), "the cache still has the old file");
+        download_in(&agent, &url, Some(&dir)).unwrap();
+        assert_eq!(server.requests(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A prewarm, which does not decode, keeps an image and not a page.
+    #[test]
+    fn a_prewarm_keeps_images_only() {
+        let dir = cache_dir("prewarm");
+        let server = ImageServer::start(vec![
+            ("text/html", b"<html>Please sign in</html>".to_vec()),
+            ("image/png", png(2)),
+        ]);
+        let urls = vec![server.url("page"), server.url("image")];
+        let outcome = prewarm_blocking(&plain_agent(), urls.clone(), Some(&dir), (&AtomicU64::new(0), 0), PREWARM_LIMITS);
+        assert_eq!(outcome, PrewarmOutcome { fetched: 1, failed: 1, stopped: false });
+        assert_eq!(files_in(&dir), 1);
+        assert!(disk_path_in(Some(&dir), &urls[1]).unwrap().exists());
+        assert!(!disk_path_in(Some(&dir), &urls[0]).unwrap().exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A prewarm against a server that is gone stops after a few lost
+    /// connections instead of waiting out a timeout for every poster.
+    #[test]
+    fn a_prewarm_gives_up_when_the_connections_are_lost() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        std::thread::spawn(move || {
+            // Every connection is closed without an answer; the thread ends
+            // with the listener, when the test process does.
+            for stream in listener.incoming().flatten() {
+                count.fetch_add(1, SeqCst);
+                drop(stream);
+            }
+        });
+        let dir = cache_dir("giveup");
+        let urls: Vec<String> = (0..20).map(|i| format!("http://127.0.0.1:{port}/i/{i}?tag=t")).collect();
+        let outcome = prewarm_blocking(&plain_agent(), urls, Some(&dir), (&AtomicU64::new(0), 0), PREWARM_LIMITS);
+        assert_eq!(outcome, PrewarmOutcome { fetched: 0, failed: PREWARM_GIVE_UP as usize, stopped: true }, "requests: {}", requests.load(SeqCst));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A prewarm stops between two fetches when a newer one started, or
+    /// the session closed: the server moves the number on from inside the
+    /// third request, as `prewarm` and `cancel_prewarm` do.
+    #[test]
+    fn a_prewarm_stops_when_it_is_superseded() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = cache_dir("cancel");
+        let current = Arc::new(AtomicU64::new(7));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (moved, body) = (current.clone(), png(2));
+        let server = std::thread::spawn(move || {
+            // Three requests, then the listener goes.
+            for (n, mut stream) in listener.incoming().flatten().take(3).enumerate() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                if n == 2 {
+                    moved.fetch_add(1, SeqCst);
+                }
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = stream.write_all(&body);
+            }
+        });
+        let urls: Vec<String> = (0..10).map(|i| format!("http://127.0.0.1:{port}/Items/i{i}/Images/Primary?tag=t1")).collect();
+        let outcome = prewarm_blocking(&plain_agent(), urls.clone(), Some(&dir), (&current, 7), PREWARM_LIMITS);
+        // The third image was on its way and is kept; the fourth is not asked for.
+        assert_eq!(outcome, PrewarmOutcome { fetched: 3, failed: 0, stopped: true });
+        assert_eq!(files_in(&dir), 3);
+        server.join().unwrap();
+        // The run with the old number does nothing more.
+        let outcome = prewarm_blocking(&plain_agent(), urls, Some(&dir), (&current, 7), PREWARM_LIMITS);
+        assert_eq!(outcome, PrewarmOutcome { fetched: 0, failed: 0, stopped: true });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `prewarm` and `cancel_prewarm` move the number of the app on: the
+    /// run before them is not the current one any more.
+    #[test]
+    fn a_new_prewarm_and_a_closed_session_move_the_number_on() {
+        let before = PREWARM_RUN.load(std::sync::atomic::Ordering::Relaxed);
+        cancel_prewarm();
+        assert!(PREWARM_RUN.load(std::sync::atomic::Ordering::Relaxed) > before);
+    }
+
+    /// A long prewarm trims the cache as it goes: the folder is never more
+    /// than one trim interval and one image over its limit, also before
+    /// the end of the run. The server looks at the folder at each request.
+    #[test]
+    fn a_long_prewarm_keeps_the_cache_near_its_limit_all_the_way() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = cache_dir("trimrun");
+        let body = png(64);
+        let size = body.len() as u64;
+        let limits = PrewarmLimits { max_urls: 100, trim_every: 3 * size, cache_max_bytes: 10 * size };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let largest = Arc::new(AtomicU64::new(0));
+        let (seen, folder, answer) = (largest.clone(), dir.clone(), body.clone());
+        let server = std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten().take(60) {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let total: u64 = std::fs::read_dir(&folder)
+                    .unwrap()
+                    .flatten()
+                    .filter_map(|e| e.metadata().ok())
+                    .map(|m| m.len())
+                    .sum();
+                seen.fetch_max(total, SeqCst);
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", answer.len());
+                let _ = stream.write_all(&answer);
+            }
+        });
+        let urls: Vec<String> = (0..60).map(|i| format!("http://127.0.0.1:{port}/Items/t{i}/Images/Primary?tag=t1")).collect();
+        let outcome = prewarm_blocking(&plain_agent(), urls, Some(&dir), (&AtomicU64::new(0), 0), limits);
+        server.join().unwrap();
+        assert_eq!(outcome, PrewarmOutcome { fetched: 60, failed: 0, stopped: false });
+        let largest = largest.load(SeqCst);
+        assert!(largest > 0);
+        assert!(
+            largest <= limits.cache_max_bytes + limits.trim_every,
+            "the folder reached {largest} bytes during the run; the limit is {}",
+            limits.cache_max_bytes
+        );
+        assert!(files_in(&dir) as u64 * size <= limits.cache_max_bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The artwork of a download goes to the cache under each URL the
+    /// pages ask for, as a copy of the one file (a clone on APFS), and a
+    /// page then gets it from the cache without a request.
+    #[test]
+    fn the_artwork_of_a_download_is_seeded_from_its_file() {
+        let dir = cache_dir("seed");
+        let poster = dir.join("poster-of-the-download");
+        std::fs::write(&poster, png(4)).unwrap();
+        let urls: Vec<String> = [240, 320, 400].iter().map(|w| format!("http://127.0.0.1:9/Items/s/Images/Primary?tag=t1&fillWidth={w}")).collect();
+        for url in &urls {
+            seed_file_in(Some(&dir), url, &poster);
+        }
+        assert_eq!(files_in(&dir), 4, "one file per width beside the poster, and no partial file");
+        for url in &urls {
+            // Nothing listens on the port: the image comes from the cache.
+            let image = download_in(&plain_agent(), url, Some(&dir)).expect("the seeded image");
+            assert_eq!(image.size(0).width.0, 4);
+        }
+        // A URL the cache does not keep (no tag) gets no file.
+        seed_file_in(Some(&dir), "http://127.0.0.1:9/Items/s/Images/Primary", &poster);
+        assert_eq!(files_in(&dir), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bytes for the Now Playing tile and the preload: a page under
+    /// the name of an image in the cache goes, and a page of the network
+    /// is not kept.
+    #[test]
+    fn the_bytes_of_an_image_do_not_come_from_a_poisoned_file() {
+        let dir = cache_dir("bytes");
+        let server = ImageServer::start(vec![
+            ("image/png", png(4)),
+            ("text/html", b"<html>Please sign in</html>".to_vec()),
+        ]);
+        let agent = plain_agent();
+        let url = server.url("d");
+        let file = disk_path_in(Some(&dir), &url).unwrap();
+        std::fs::write(&file, b"<html>Please sign in</html>").unwrap();
+        assert_eq!(fetch_bytes_in(&agent, &url, Some(&dir)).unwrap(), png(4));
+        assert_eq!(std::fs::read(&file).unwrap(), png(4));
+        assert_eq!(server.requests(), 1);
+        // A page of the network for another image is not kept.
+        let other = server.url("e");
+        let _ = fetch_bytes_in(&agent, &other, Some(&dir));
+        assert!(!disk_path_in(Some(&dir), &other).unwrap().exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A real picture of a format, big enough that its body is most of the
+    /// file: a gradient with some noise, so the encoder has data to keep.
+    fn picture(format: image::ImageFormat) -> Vec<u8> {
+        let image = image::RgbImage::from_fn(96, 96, |x, y| {
+            let noise = (x * 31 + y * 17) % 23;
+            image::Rgb([(x * 2 + noise) as u8, (y * 2) as u8, ((x ^ y) * 3) as u8])
+        });
+        let mut bytes = Vec::new();
+        image.write_to(&mut Cursor::new(&mut bytes), format).unwrap();
+        bytes
+    }
+
+    /// The same picture cut off after a third of its data: the header
+    /// parses (the old check passed it) and the body is not whole. A cut
+    /// is the damage of a lost connection, and the one every decoder here
+    /// can find (a JPEG by its missing end marker, see [`complete`]).
+    fn damaged(format: image::ImageFormat) -> Vec<u8> {
+        let mut bytes = picture(format);
+        bytes.truncate(bytes.len() / 3);
+        bytes
+    }
+
+    const FORMATS: [(&str, image::ImageFormat); 3] = [
+        ("png", image::ImageFormat::Png),
+        ("jpeg", image::ImageFormat::Jpeg),
+        ("webp", image::ImageFormat::WebP),
+    ];
+
+    /// The damaged pictures are what the test says they are: the header
+    /// parses (the old check passed them) and the decode fails.
+    #[test]
+    fn the_damaged_pictures_have_a_good_header_and_a_bad_body() {
+        for (name, format) in FORMATS {
+            let (good, bad) = (picture(format), damaged(format));
+            assert!(decodes(&good), "{name}: the good picture does not decode");
+            let kind = sniff(&bad).unwrap_or_else(|| panic!("{name}: no magic bytes"));
+            let reader = |bytes: &[u8]| image::ImageReader::with_format(Cursor::new(bytes.to_vec()), format);
+            assert!(reader(&bad).into_dimensions().is_ok(), "{name}: the header of the damaged picture does not parse");
+            // The decoder of JPEG is lenient and fills a cut file in; the
+            // others fail. Either way the picture is not whole.
+            assert_eq!(decode(kind, &bad).is_err(), name != "jpeg", "{name}");
+            assert!(!complete(kind, &bad) || name != "jpeg", "{name}: a cut JPEG counts as whole");
+            assert!(!decodes(&bad), "{name}: the damaged picture counts as whole");
+        }
+    }
+
+    /// A prewarm keeps no image whose body is damaged, and keeps a good
+    /// one. On 0.1.2 the header was the check and the damaged one stayed.
+    #[test]
+    fn a_prewarm_does_not_keep_an_image_with_a_damaged_body() {
+        for (name, format) in FORMATS {
+            let dir = cache_dir(&format!("prewarm-damaged-{name}"));
+            let server = ImageServer::start(vec![("image/x", damaged(format)), ("image/x", picture(format))]);
+            let urls = vec![server.url("bad"), server.url("good")];
+            let outcome =
+                prewarm_blocking(&plain_agent(), urls.clone(), Some(&dir), (&AtomicU64::new(0), 0), PREWARM_LIMITS);
+            assert_eq!(outcome, PrewarmOutcome { fetched: 1, failed: 1, stopped: false }, "{name}");
+            assert!(!disk_path_in(Some(&dir), &urls[0]).unwrap().exists(), "{name}: the damaged image was kept");
+            assert_eq!(
+                std::fs::read(disk_path_in(Some(&dir), &urls[1]).unwrap()).unwrap(),
+                picture(format),
+                "{name}: the good image is not in the cache"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The raw bytes of an image: a damaged one from the network is not
+    /// kept, and a good one is.
+    #[test]
+    fn the_raw_bytes_of_a_damaged_image_are_not_kept() {
+        for (name, format) in FORMATS {
+            let dir = cache_dir(&format!("raw-damaged-{name}"));
+            let server = ImageServer::start(vec![("image/x", damaged(format)), ("image/x", picture(format))]);
+            let agent = plain_agent();
+            let (bad, good) = (server.url("bad"), server.url("good"));
+            let _ = fetch_bytes_in(&agent, &bad, Some(&dir));
+            assert!(!disk_path_in(Some(&dir), &bad).unwrap().exists(), "{name}: the damaged image was kept");
+            assert_eq!(fetch_bytes_in(&agent, &good, Some(&dir)).unwrap(), picture(format), "{name}");
+            assert_eq!(
+                std::fs::read(disk_path_in(Some(&dir), &good).unwrap()).unwrap(),
+                picture(format),
+                "{name}: the good image is not in the cache"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A file of the cache with a good header and a damaged body (kept by
+    /// 0.1.2) is not given out by a raw read: it goes, and the image is
+    /// fetched once more and kept.
+    #[test]
+    fn a_damaged_file_of_the_cache_is_replaced_on_a_raw_read() {
+        for (name, format) in FORMATS {
+            let dir = cache_dir(&format!("raw-poisoned-{name}"));
+            let server = ImageServer::start(vec![("image/x", picture(format))]);
+            let url = server.url("p");
+            let file = disk_path_in(Some(&dir), &url).unwrap();
+            std::fs::write(&file, damaged(format)).unwrap();
+            let bytes = fetch_bytes_in(&plain_agent(), &url, Some(&dir)).unwrap();
+            assert_eq!(bytes, picture(format), "{name}: the raw read gave the damaged file");
+            assert_eq!(std::fs::read(&file).unwrap(), picture(format), "{name}: the file was not replaced");
+            assert_eq!(server.requests(), 1, "{name}");
+            // And now the file is good: no second request.
+            fetch_bytes_in(&plain_agent(), &url, Some(&dir)).unwrap();
+            assert_eq!(server.requests(), 1, "{name}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The path of the loader still replaces such a file (it did before).
+    #[test]
+    fn a_damaged_file_of_the_cache_is_replaced_on_a_decoding_read() {
+        for (name, format) in FORMATS {
+            let dir = cache_dir(&format!("decode-poisoned-{name}"));
+            let server = ImageServer::start(vec![("image/x", picture(format))]);
+            let url = server.url("q");
+            let file = disk_path_in(Some(&dir), &url).unwrap();
+            std::fs::write(&file, damaged(format)).unwrap();
+            download_in(&plain_agent(), &url, Some(&dir)).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            assert_eq!(std::fs::read(&file).unwrap(), picture(format), "{name}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// An SVG is kept when it draws and not when it does not parse.
+    /// A header can name a picture of gigabytes in a few bytes, and the
+    /// pixels are allocated from the header: such a picture is refused
+    /// before the allocation, on every path that decodes.
+    #[test]
+    fn a_picture_too_large_for_memory_is_not_decoded() {
+        assert!(fits_in_memory(3840, 2160));
+        assert!(fits_in_memory(6000, 6000));
+        assert!(!fits_in_memory(8000, 6000));
+        assert!(!fits_in_memory(u32::MAX, u32::MAX));
+        // A real file: one grey value, 48 megapixels, a few kilobytes.
+        let big = image::GrayImage::new(8000, 6000);
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageLuma8(big)
+            .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .unwrap();
+        assert!(bytes.len() < 1_000_000, "the test file is small next to its 48 MB of pixels: {}", bytes.len());
+        let err = decode(ImageFormat::Png, &bytes).err().expect("the picture was decoded");
+        assert!(format!("{err:#}").contains("too large"), "{err:#}");
+        assert!(!decodes(&bytes), "a picture that is not decoded is not kept");
+    }
+
+    /// A raster picture inside an SVG is decoded at its own size by the
+    /// SVG library, past the limit of `decode`: it is not loaded at all.
+    #[test]
+    fn a_picture_inside_an_svg_is_not_decoded() {
+        let big = image::GrayImage::new(8000, 6000);
+        let mut png = Vec::new();
+        image::DynamicImage::ImageLuma8(big).write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        use base64::Engine;
+        let data = base64::engine::general_purpose::STANDARD.encode(&png);
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="10" height="10"><rect width="10" height="10" fill="red"/><image width="10" height="10" xlink:href="data:image/png;base64,{data}"/></svg>"#
+        );
+        use resvg::usvg;
+        let tree = svg_tree(svg.as_bytes()).unwrap();
+        fn has_image(group: &usvg::Group) -> bool {
+            group.children().iter().any(|node| match node {
+                usvg::Node::Image(_) => true,
+                usvg::Node::Group(inner) => has_image(inner),
+                _ => false,
+            })
+        }
+        assert!(!has_image(tree.root()), "the picture inside the SVG was loaded");
+        // And the SVG itself still draws.
+        assert!(decode(ImageFormat::Svg, svg.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn an_svg_is_kept_when_it_draws() {
+        let good = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10"/></svg>"#;
+        let bad = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10""#;
+        assert!(decodes(good));
+        assert!(!decodes(bad), "a cut SVG was accepted");
+        assert!(!decodes(b"<html>Please sign in</html>"));
+    }
+
+    /// A prewarm takes the first `PREWARM_MAX_URLS` of its list and no
+    /// more; and the trim removes the least recently used files first.
+    #[test]
+    fn a_prewarm_is_capped_and_the_trim_takes_the_oldest_files() {
+        let dir = cache_dir("cap");
+        let server = ImageServer::start(vec![("image/png", png(2))]);
+        // The cap: one URL more than the cap, each with a cache file already
+        // there but the last one, which must not be fetched.
+        let urls: Vec<String> = (0..=PREWARM_MAX_URLS).map(|i| server.url(&format!("c{i}"))).collect();
+        for url in &urls[..PREWARM_MAX_URLS] {
+            std::fs::write(disk_path_in(Some(&dir), url).unwrap(), png(2)).unwrap();
+        }
+        let outcome = prewarm_blocking(&plain_agent(), urls, Some(&dir), (&AtomicU64::new(0), 0), PREWARM_LIMITS);
+        assert_eq!(outcome, PrewarmOutcome::default());
+        assert_eq!(server.requests(), 0);
+        // The trim: over the limit, the least recently used files go.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = disk_path_in(Some(&dir), &server.url("old")).unwrap();
+        std::fs::write(&old, vec![0u8; 1000]).unwrap();
+        let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&old).unwrap().set_modified(hour_ago).unwrap();
+        for i in 0..3 {
+            std::fs::write(disk_path_in(Some(&dir), &server.url(&format!("new{i}"))).unwrap(), vec![0u8; 400]).unwrap();
+        }
+        trim_disk_cache_in(Some(&dir), 1500);
+        assert!(!old.exists(), "the oldest file stayed");
+        assert_eq!(files_in(&dir), 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

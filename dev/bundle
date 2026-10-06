@@ -1,9 +1,13 @@
 #!/bin/sh
-# Builds target/<name>.app from the release binary (the name is in src/brand.rs), so the app has its icon
-# and name in the Dock, Launchpad and the menu bar. Run a release build first.
+# Builds target/<name>.app from the binary of the `ship` profile (the name
+# is in src/brand.rs), so the app has its icon and name in the Dock,
+# Launchpad and the menu bar. Build it first: `cargo build --profile ship`
+# (`BLOOM_BUNDLE_BIN` names another binary, such as target/release/bloom).
 # libmpv and its libraries come from vendor/mpv/lib (see dev/vendor-mpv) and
 # go into the bundle, so the app does not need the Nix store.
 dir=$(cd "$(dirname "$0")/.." && pwd)
+bin=${BLOOM_BUNDLE_BIN:-$dir/target/ship/bloom}
+[ -f "$bin" ] || { echo "no binary at $bin; run: cargo build --profile ship" >&2; exit 1; }
 name=$(sed -n 's/^pub const NAME: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
 folder=$(sed -n 's/^pub const FOLDER: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
 tagline=$(sed -n 's/^pub const TAGLINE: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
@@ -16,7 +20,7 @@ app="$dir/target/$name.app"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$dir/Cargo.toml" | head -1)
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$dir/target/release/bloom" "$app/Contents/MacOS/$name" || exit 1
+cp "$bin" "$app/Contents/MacOS/$name" || exit 1
 if [ -d "$dir/vendor/mpv/lib" ]; then
   mkdir -p "$app/Contents/Frameworks"
   cp -R "$dir/vendor/mpv/lib/." "$app/Contents/Frameworks/"

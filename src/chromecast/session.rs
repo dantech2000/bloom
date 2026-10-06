@@ -144,6 +144,7 @@ pub struct JellyfinLoad {
 
 type Reply = mpsc::Sender<Value>;
 
+#[derive(Clone)]
 enum Command {
     GetStatus(Option<Reply>),
     Availability(Vec<String>, Option<Reply>),
@@ -338,9 +339,41 @@ struct Worker {
     /// A seek waits for its answer; the one to send after it.
     seek_in_flight: Option<Instant>,
     seek_queued: Option<f64>,
-    /// The commands that came while the socket was down.
+    /// The commands that came while the socket was down, or after a
+    /// connect before the device said what it runs, in order; of the
+    /// controls only the latest of a kind (see `hold`). They go out one at
+    /// a time once the app and its media session are known again
+    /// (`replay_step`); a socket that dies meanwhile keeps the ones not
+    /// yet sent for the next one.
     held: Vec<Command>,
+    replay: Replay,
+    /// When the status the held commands wait for was asked, and how
+    /// often; after `REPLAY_ASKS` without an answer they are given up.
+    replay_asked: Instant,
+    replay_asks: u32,
+    /// The held command last sent, with its request; the next one waits
+    /// for its answer, so a socket that dies in between takes nothing with
+    /// it that was not written. A control that was written and not
+    /// answered when the socket died goes again over the next one (`run`).
+    replay_wait: Option<(u64, Command)>,
 }
+
+/// Where the held commands wait after a connect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Replay {
+    /// Nothing waits, or everything went out.
+    Done,
+    /// For the receiver status: which app runs, if any.
+    ReceiverStatus,
+    /// The app is joined; for its media status: the media session.
+    MediaStatus,
+    /// The device said what it runs; the held commands go out in turn.
+    Sending,
+}
+
+/// How often the status the held commands wait for is asked before they
+/// are given up: a device that answers the heartbeat but not a status.
+const REPLAY_ASKS: u32 = 3;
 
 impl Worker {
     fn new(
@@ -368,6 +401,10 @@ impl Worker {
             seek_in_flight: None,
             seek_queued: None,
             held: Vec::new(),
+            replay: Replay::Done,
+            replay_asked: Instant::now(),
+            replay_asks: 0,
+            replay_wait: None,
         }
     }
 
@@ -390,6 +427,18 @@ impl Worker {
                     }
                     again = true;
                     self.status.connected = false;
+                    // A held control written to the socket that died, with
+                    // no answer: nobody knows whether the device got it.
+                    // It goes again (to pause twice is to pause), unless a
+                    // newer one of its kind waits. A load or a launch does
+                    // not: twice is not the same as once.
+                    if let Some((id, command)) = self.replay_wait.take()
+                        && self.pending.contains_key(&id)
+                        && same_kind(&command, &command)
+                        && !self.held.iter().any(|held| same_kind(held, &command))
+                    {
+                        self.held.insert(0, command);
+                    }
                     self.pending.clear();
                     self.seek_in_flight = None;
                     // The new socket must connect to the app again; the
@@ -411,7 +460,7 @@ impl Worker {
                     if matches!(command, Command::Close) {
                         return;
                     }
-                    self.held.push(command);
+                    self.hold(command);
                 }
             }
             wait = (wait * 2).min(Duration::from_secs(15));
@@ -449,11 +498,13 @@ impl Worker {
         self.emit(Event::Connected { again });
         self.publish();
         // The app transport of before: ask again, and connect to it when
-        // the app still runs (see `on_receiver_status`).
+        // the app still runs (see `on_receiver_status`). The commands held
+        // meanwhile need that transport, and the media session after it.
         let (mut last_ping, mut last_heard) = (Instant::now(), Instant::now());
-        for command in std::mem::take(&mut self.held) {
-            self.command(stream, command)?;
-        }
+        self.replay = if self.held.is_empty() { Replay::Done } else { Replay::ReceiverStatus };
+        self.replay_asked = Instant::now();
+        self.replay_asks = 1;
+        self.replay_wait = None;
         loop {
             match inbox.fill(stream) {
                 Ok(true) => {}
@@ -469,16 +520,13 @@ impl Worker {
             while let Ok(command) = self.commands.try_recv() {
                 batch.push(command);
             }
-            // Of several seeks in one batch only the last matters.
-            let last_seek = batch.iter().rposition(|c| matches!(c, Command::Seek(_)));
-            for (n, command) in batch.into_iter().enumerate() {
-                if matches!(command, Command::Seek(_)) && last_seek != Some(n) {
-                    continue;
+            if self.replay != Replay::Done {
+                // Behind the ones that wait, so the order holds.
+                for command in batch {
+                    self.hold(command);
                 }
-                if matches!(command, Command::Close) {
-                    return Ok(());
-                }
-                self.command(stream, command)?;
+            } else if !self.batch(stream, batch)? {
+                return Ok(());
             }
             if self.stopped() {
                 return Ok(());
@@ -491,17 +539,113 @@ impl Worker {
                 return Err(anyhow!("no word of the device for {:?}", self.timing.silence));
             }
             self.expire(stream)?;
+            if !self.replay_step(stream)? {
+                return Ok(());
+            }
         }
     }
 
-    /// Gives up answers that do not come; a seek that waited lets the
-    /// next one go.
+    /// Runs a batch of commands. Of several seeks only the last matters.
+    /// False when the batch closes the session.
+    fn batch(&mut self, stream: &mut Stream, batch: Vec<Command>) -> Result<bool> {
+        let last_seek = batch.iter().rposition(|c| matches!(c, Command::Seek(_)));
+        for (n, command) in batch.into_iter().enumerate() {
+            if matches!(command, Command::Seek(_)) && last_seek != Some(n) {
+                continue;
+            }
+            if matches!(command, Command::Close) {
+                return Ok(false);
+            }
+            self.command(stream, command)?;
+        }
+        Ok(true)
+    }
+
+    /// Keeps a command for when the connection can carry it. Of the
+    /// controls the latest of a kind is what the user wants: a seek takes
+    /// the place of the seek before it, a pause of a play, a volume of a
+    /// volume. The rest keeps its order.
+    fn hold(&mut self, command: Command) {
+        self.held.retain(|held| !same_kind(held, &command));
+        self.held.push(command);
+    }
+
+    /// Moves the held commands on: asks the status again when it does not
+    /// come, gives them up with a word when it never does, and sends them
+    /// one at a time once the device said what it runs. A command that
+    /// needs an app or a media session that is gone fails for itself, as
+    /// it does on a live connection. False when a held close ends the
+    /// session.
+    fn replay_step(&mut self, stream: &mut Stream) -> Result<bool> {
+        match self.replay {
+            Replay::Done => {}
+            Replay::ReceiverStatus | Replay::MediaStatus => {
+                if self.replay_asked.elapsed() <= self.timing.answer {
+                    return Ok(true);
+                }
+                if self.replay_asks >= REPLAY_ASKS {
+                    let dropped = std::mem::take(&mut self.held).len();
+                    self.replay = Replay::Done;
+                    self.fail(format!("the device did not say what it runs; {dropped} commands dropped"));
+                    return Ok(true);
+                }
+                self.replay_asks += 1;
+                self.replay_asked = Instant::now();
+                log::info!("cast {}: no status yet; asking again", self.device.name);
+                match self.app_transport().filter(|_| self.replay == Replay::MediaStatus) {
+                    Some(transport) => {
+                        self.request(stream, &transport, NS_MEDIA, messages::media_status(0), Waiting::Quiet)?;
+                    }
+                    None => {
+                        self.request(stream, RECEIVER, NS_RECEIVER, messages::get_status(0), Waiting::Quiet)?;
+                    }
+                }
+            }
+            Replay::Sending => {
+                if self.replay_wait.as_ref().is_some_and(|(id, _)| self.pending.contains_key(id)) {
+                    return Ok(true);
+                }
+                self.replay_wait = None;
+                if self.held.is_empty() {
+                    self.replay = Replay::Done;
+                    return Ok(true);
+                }
+                let command = self.held.remove(0);
+                if matches!(command, Command::Close) {
+                    return Ok(false);
+                }
+                let before = self.next_id;
+                let again = command.clone();
+                if let Err(err) = self.command(stream, command) {
+                    // Not written: it goes over the next socket.
+                    self.held.insert(0, again);
+                    return Err(err);
+                }
+                if self.next_id > before {
+                    self.replay_wait = Some((self.next_id - 1, again));
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Gives up answers that do not come: a seek that waited lets the
+    /// next one go; a launch tries the next app, or fails the load.
     fn expire(&mut self, stream: &mut Stream) -> Result<()> {
         let answer = self.timing.answer;
         let late: Vec<u64> = self.pending.iter().filter(|(_, p)| p.sent.elapsed() > answer).map(|(id, _)| *id).collect();
         for id in late {
-            if let Some(Pending { waiting: Waiting::Seek, .. }) = self.pending.remove(&id) {
-                self.seek_in_flight = None;
+            match self.pending.remove(&id).map(|p| p.waiting) {
+                Some(Waiting::Seek) => self.seek_in_flight = None,
+                Some(Waiting::Launch { rest }) if !rest.is_empty() => {
+                    log::info!("cast {}: no answer to the launch; next app", self.device.name);
+                    self.launch(stream, rest)?;
+                }
+                Some(Waiting::Launch { .. }) => {
+                    self.pending_load = None;
+                    self.fail("the device did not answer the launch");
+                }
+                Some(Waiting::Reply(_) | Waiting::Quiet) | None => {}
             }
         }
         // The Jellyfin app answers a seek with a report that carries no
@@ -829,6 +973,11 @@ impl Worker {
             NS_MEDIA => {
                 if let Some(entries) = MediaStatus::parse(&payload) {
                     self.on_media_status(entries);
+                    // The media session is known, or there is none: either
+                    // way the held commands know what to do.
+                    if self.replay == Replay::MediaStatus {
+                        self.replay = Replay::Sending;
+                    }
                 }
             }
             jellyfin::NAMESPACE => {
@@ -906,6 +1055,12 @@ impl Worker {
                     self.status.app = Some(app.clone());
                     if speaks_media {
                         self.request(stream, &app.transport_id, NS_MEDIA, messages::media_status(0), Waiting::Quiet)?;
+                        // The held commands wait for the media session.
+                        if self.replay == Replay::ReceiverStatus {
+                            self.replay = Replay::MediaStatus;
+                            self.replay_asked = Instant::now();
+                            self.replay_asks = 1;
+                        }
                     }
                     // The Jellyfin app we know reports its state when asked.
                     if let Some(identity) = self.identity.clone().filter(|_| jellyfin::is_jellyfin_app(&app.app_id)) {
@@ -915,17 +1070,14 @@ impl Worker {
                     if let Some(request) = self.pending_load.take() {
                         self.load_now(stream, request)?;
                     }
-                } else if self.transport.is_some() {
-                    self.app_gone();
                 } else {
-                    self.status.app = None;
+                    // Another sender's app: what we knew of ours is gone
+                    // with it, also when the socket was lost in between.
+                    self.app_gone();
                 }
             }
             None => {
-                if self.transport.is_some() {
-                    self.app_gone();
-                }
-                self.status.app = None;
+                self.app_gone();
                 if launched {
                     self.pending_load = None;
                     self.fail("the app did not start");
@@ -934,6 +1086,12 @@ impl Worker {
             }
         }
         self.publish();
+        // No media session to wait for (no app of ours, or one with no
+        // media): the held commands go now, and each says for itself
+        // when nothing runs.
+        if self.replay == Replay::ReceiverStatus {
+            self.replay = Replay::Sending;
+        }
         Ok(())
     }
 
@@ -980,6 +1138,19 @@ impl Worker {
         }
         self.publish();
     }
+}
+
+/// Two controls of which the later takes the place of the earlier: two
+/// seeks, a pause and a play, two volumes, two mutes. A control is of a
+/// kind with itself; any other command is of no kind.
+fn same_kind(a: &Command, b: &Command) -> bool {
+    matches!(
+        (a, b),
+        (Command::Seek(_), Command::Seek(_))
+            | (Command::Play | Command::Pause, Command::Play | Command::Pause)
+            | (Command::SetVolume(_), Command::SetVolume(_))
+            | (Command::SetMuted(_), Command::SetMuted(_))
+    )
 }
 
 // ----- TLS -----------------------------------------------------------------
@@ -1335,5 +1506,255 @@ mod tests {
         until(&session, &events, &mut log, "third", 5., |s| s.connected);
         until(&session, &events, &mut log, "third counted", 3., |_| mock.state.lock().unwrap().connections >= 3);
         assert_eq!(mock.state.lock().unwrap().connections, 3);
+    }
+
+    /// Takes the events that came so far.
+    fn drain(events: &async_channel::Receiver<Event>, log: &mut Vec<Event>) {
+        while let Ok(event) = events.try_recv() {
+            log.push(event);
+        }
+    }
+
+    fn errors(log: &[Event]) -> Vec<&str> {
+        log.iter()
+            .filter_map(|e| match e {
+                Event::Error(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// How many messages of a type the media receiver got.
+    fn media_count(mock: &Mock, kind: &str) -> usize {
+        mock.payloads(NS_MEDIA).iter().filter(|p| p.1["type"] == kind).count()
+    }
+
+    /// The times of a reconnect test: a drop shows at once (the mock
+    /// closes the socket), and a status the device is slow with has time
+    /// to come before the silence counts.
+    fn reconnect_timing() -> Timing {
+        Timing {
+            ping: Duration::from_millis(50),
+            silence: Duration::from_secs(5),
+            read_wait: Duration::from_millis(10),
+            answer: Duration::from_secs(1),
+        }
+    }
+
+    /// The media receiver with an item, over a connection with short times.
+    fn media_receiver_playing(mock: &Mock, timing: Timing) -> (Session, async_channel::Receiver<Event>, Vec<Event>) {
+        mock.set(|m| m.fails = vec![jellyfin::APP_STABLE.into()]);
+        let (session, events) = Session::connect_with(mock.device(), timing);
+        let mut log = Vec::new();
+        until(&session, &events, &mut log, "connect", 5., |s| s.connected);
+        session.load(request());
+        until(&session, &events, &mut log, "media load", 5., |s| s.player_state == "PLAYING" && s.media_session_id == Some(1));
+        (session, events, log)
+    }
+
+    /// The socket is lost, and the user pauses and scrubs meanwhile. The
+    /// PAUSE and SEEK messages the device got, and the errors so far.
+    fn dropped_with_held_controls(mock: &Mock) -> (Session, async_channel::Receiver<Event>, Vec<Event>, usize, usize) {
+        let (session, events, mut log) = media_receiver_playing(mock, reconnect_timing());
+        mock.set(|m| m.drop_now = true);
+        until(&session, &events, &mut log, "dropped", 3., |s| !s.connected);
+        let sent_before = media_count(mock, "PAUSE") + media_count(mock, "SEEK");
+        session.pause();
+        for n in 0..200 {
+            session.seek(100. + f64::from(n));
+        }
+        let errors_before = errors(&log).len();
+        (session, events, log, sent_before, errors_before)
+    }
+
+    /// A pause and a burst of seeks sent while the socket is down reach
+    /// the app once the connection and the media session are back: one
+    /// PAUSE and one SEEK, with no error.
+    #[test]
+    fn controls_held_during_a_reconnect_reach_the_app() {
+        let mock = Mock::start();
+        let (session, events, mut log, sent_before, errors_before) = dropped_with_held_controls(&mock);
+        until(&session, &events, &mut log, "again", 5., |s| s.connected);
+        let status = until(&session, &events, &mut log, "paused at the last seek", 5., |s| {
+            s.player_state == "PAUSED" && s.media_session_id == Some(1) && s.position == 299.
+        });
+        // Nothing more goes out: the status at the end of the replay is
+        // the last word.
+        thread::sleep(Duration::from_millis(300));
+        drain(&events, &mut log);
+        let sent = media_count(&mock, "SEEK") + media_count(&mock, "PAUSE") - sent_before;
+        eprintln!("after the reconnect: {sent} media messages for a pause and 200 seeks");
+        assert_eq!(status.error, None);
+        assert_eq!(errors(&log).len(), errors_before, "{log:?}");
+        assert_eq!(sent, 2, "{:?}", mock.seen());
+        let device = mock.state.lock().unwrap().media.clone().unwrap();
+        assert_eq!((device.state.as_str(), device.position), ("PAUSED", 299.));
+    }
+
+    /// The socket dies again as the held commands go out, right after the
+    /// PAUSE was written and before the device did it: the SEEK that
+    /// waited behind it is still held, and the PAUSE, which got no answer,
+    /// is held again. Both reach the app over the third connection: the
+    /// device ends paused at the last seek, as the user asked.
+    #[test]
+    fn a_second_drop_during_the_replay_keeps_the_rest() {
+        let mock = Mock::start();
+        let (session, events, mut log, sent_before, errors_before) = dropped_with_held_controls(&mock);
+        mock.set(|m| m.drop_after = Some("PAUSE".into()));
+        // The second connection lives a few milliseconds: the third one
+        // is the evidence, with the two closes in the events.
+        until(&session, &events, &mut log, "third", 8., |_| mock.state.lock().unwrap().connections >= 3);
+        let status = until(&session, &events, &mut log, "paused at the last seek", 5., |s| {
+            s.connected && s.player_state == "PAUSED" && s.media_session_id == Some(1) && s.position == 299.
+        });
+        thread::sleep(Duration::from_millis(300));
+        drain(&events, &mut log);
+        assert_eq!(log.iter().filter(|e| matches!(e, Event::Closed)).count(), 2, "{log:?}");
+        assert_eq!(mock.state.lock().unwrap().connections, 3);
+        // One PAUSE into the socket that died, one PAUSE and one SEEK after.
+        assert_eq!(media_count(&mock, "PAUSE"), 2, "{:?}", mock.seen());
+        assert_eq!(media_count(&mock, "SEEK") - sent_before, 1, "{:?}", mock.seen());
+        assert_eq!(status.error, None);
+        assert_eq!(errors(&log).len(), errors_before, "{log:?}");
+        let device = mock.state.lock().unwrap().media.clone().unwrap();
+        assert_eq!((device.state.as_str(), device.position), ("PAUSED", 299.));
+    }
+
+    /// The media status after the join comes later than an answer is
+    /// waited for: the held commands wait for it all the same, and go
+    /// out when it comes.
+    #[test]
+    fn a_late_media_status_still_gets_the_held_controls() {
+        let mock = Mock::start();
+        let (session, events, mut log, sent_before, errors_before) = dropped_with_held_controls(&mock);
+        mock.set(|m| m.status_delay = Duration::from_millis(1500));
+        until(&session, &events, &mut log, "again", 5., |s| s.connected);
+        let connected = Instant::now();
+        let status = until(&session, &events, &mut log, "paused at the last seek", 6., |s| {
+            s.player_state == "PAUSED" && s.media_session_id == Some(1) && s.position == 299.
+        });
+        assert!(connected.elapsed() >= Duration::from_millis(1400), "the controls went before the status");
+        thread::sleep(Duration::from_millis(300));
+        drain(&events, &mut log);
+        assert_eq!(status.error, None);
+        assert_eq!(errors(&log).len(), errors_before, "{log:?}");
+        assert_eq!(media_count(&mock, "SEEK") + media_count(&mock, "PAUSE") - sent_before, 2, "{:?}", mock.seen());
+    }
+
+    /// The app lost its item while the socket was down: the media status
+    /// says so, and each held control fails for itself with a word for the
+    /// user instead of going out to nothing. The connection goes on.
+    #[test]
+    fn an_empty_media_status_fails_the_held_controls() {
+        let mock = Mock::start();
+        let (session, events, mut log, sent_before, errors_before) = dropped_with_held_controls(&mock);
+        mock.set(|m| m.media = None);
+        until(&session, &events, &mut log, "again", 5., |s| s.connected);
+        until(&session, &events, &mut log, "the controls failed", 5., |s| s.error.as_deref() == Some("nothing is loaded"));
+        thread::sleep(Duration::from_millis(300));
+        drain(&events, &mut log);
+        assert_eq!(&errors(&log)[errors_before..], ["nothing is loaded", "nothing is loaded"]);
+        assert_eq!(media_count(&mock, "SEEK") + media_count(&mock, "PAUSE") - sent_before, 0, "{:?}", mock.seen());
+        // Done with the held ones: a command goes at once again.
+        let answer = session.get_status().recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(answer["type"], "RECEIVER_STATUS");
+    }
+
+    /// Another sender started another app while the socket was down: the
+    /// held controls fail with a word, and a load starts our app again.
+    #[test]
+    fn an_app_replaced_during_the_outage_fails_the_held_controls() {
+        let mock = Mock::start();
+        let (session, events, mut log, sent_before, errors_before) = dropped_with_held_controls(&mock);
+        mock.set(|m| {
+            m.app = Some(("YOUTUBE".into(), "session-other".into(), "transport-other".into()));
+            m.media = None;
+        });
+        until(&session, &events, &mut log, "again", 5., |s| s.connected);
+        let status = until(&session, &events, &mut log, "the controls failed", 5., |s| s.error.as_deref() == Some("no app runs"));
+        thread::sleep(Duration::from_millis(300));
+        drain(&events, &mut log);
+        assert_eq!(&errors(&log)[errors_before..], ["no app runs", "no app runs"]);
+        // Nothing of the old app lingers in the status.
+        assert_eq!((status.app, status.media_session_id, status.player_state.as_str()), (None, None, ""), "{log:?}");
+        assert_eq!(media_count(&mock, "SEEK") + media_count(&mock, "PAUSE") - sent_before, 0, "{:?}", mock.seen());
+        session.load(request());
+        until(&session, &events, &mut log, "our app again", 5., |s| {
+            s.app.as_ref().is_some_and(|app| app.app_id == messages::APP_DEFAULT_MEDIA)
+                && s.player_state == "PLAYING"
+                && s.media_session_id == Some(1)
+        });
+    }
+
+    /// The device answers the heartbeat but no status after the connect:
+    /// the status is asked again, and after the last ask the held
+    /// controls are given up with one word, not sent into the dark. The
+    /// connection goes on and takes commands again.
+    #[test]
+    fn held_controls_are_given_up_when_the_device_says_not_what_it_runs() {
+        let mock = Mock::start();
+        let (session, events, mut log, sent_before, errors_before) = dropped_with_held_controls(&mock);
+        mock.set(|m| m.mute_status = true);
+        until(&session, &events, &mut log, "again", 5., |s| s.connected);
+        let connected = Instant::now();
+        until(&session, &events, &mut log, "given up", 8., |s| s.error.as_deref().is_some_and(|e| e.contains("did not say")));
+        thread::sleep(Duration::from_millis(300));
+        drain(&events, &mut log);
+        let asks = reconnect_timing().answer * (REPLAY_ASKS - 1);
+        assert!(connected.elapsed() >= asks, "given up after {:?}, before the asks", connected.elapsed());
+        let late = &errors(&log)[errors_before..];
+        assert_eq!(late.len(), 1, "{late:?}");
+        assert!(late[0].contains("did not say what it runs") && late[0].contains("2 commands"), "{late:?}");
+        assert_eq!(media_count(&mock, "SEEK") + media_count(&mock, "PAUSE") - sent_before, 0, "{:?}", mock.seen());
+        mock.set(|m| m.mute_status = false);
+        let answer = session.get_status().recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(answer["type"], "RECEIVER_STATUS");
+    }
+
+    /// A LAUNCH the device never answers: the next app is tried when the
+    /// answer is given up, and when none is left the load fails for the
+    /// user instead of waiting for ever.
+    #[test]
+    fn a_launch_without_an_answer_falls_back_then_fails() {
+        let mock = Mock::start();
+        let (session, events) = Session::connect_with(mock.device(), timing());
+        let mut log = Vec::new();
+        until(&session, &events, &mut log, "connect", 5., |s| s.connected);
+        // The Jellyfin app hangs; the media receiver takes the item.
+        mock.set(|m| m.ignores = vec![jellyfin::APP_STABLE.into()]);
+        let started = Instant::now();
+        session.load(request());
+        let status = until(&session, &events, &mut log, "fallback after the silence", 6., |s| {
+            s.player_state == "PLAYING" && s.media_session_id == Some(1)
+        });
+        assert_eq!(status.app.as_ref().unwrap().app_id, messages::APP_DEFAULT_MEDIA);
+        assert!(started.elapsed() >= timing().answer, "the fallback must wait for the answer time");
+        assert!(errors(&log).is_empty(), "{log:?}");
+
+        // Both apps hang: an error, and the pending load is gone.
+        session.stop_app();
+        until(&session, &events, &mut log, "stopped", 3., |s| s.app.is_none());
+        mock.set(|m| m.ignores = vec![jellyfin::APP_STABLE.into(), messages::APP_DEFAULT_MEDIA.into()]);
+        session.load(request());
+        until(&session, &events, &mut log, "error after the silence", 8., |s| s.error.is_some());
+        assert_eq!(errors(&log), ["the device did not answer the launch"]);
+    }
+
+    /// A seek while the media receiver is paused leaves it paused, as the
+    /// Cast protocol does when `resumeState` is not given.
+    #[test]
+    fn a_seek_while_paused_keeps_the_media_receiver_paused() {
+        let mock = Mock::start();
+        let (session, events, mut log) = media_receiver_playing(&mock, timing());
+        session.pause();
+        until(&session, &events, &mut log, "pause", 2., |s| s.player_state == "PAUSED");
+        session.seek(100.);
+        until(&session, &events, &mut log, "seek", 2., |_| media_count(&mock, "SEEK") == 1);
+        thread::sleep(Duration::from_millis(200));
+        session.media_status();
+        let status = until(&session, &events, &mut log, "status", 2., |s| s.position == 100.);
+        let device = mock.state.lock().unwrap().media.clone().unwrap();
+        assert_eq!(device.state, "PAUSED", "the device plays after a seek while paused");
+        assert_eq!(status.player_state, "PAUSED");
     }
 }

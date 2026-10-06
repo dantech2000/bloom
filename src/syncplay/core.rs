@@ -1047,6 +1047,7 @@ mod tests {
                 server_received: OFFSET + 5.,
                 server_sent: OFFSET + 5.,
                 received: 10.,
+                epoch: 0,
             });
             Self {
                 core: Core::default(),

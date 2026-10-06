@@ -58,11 +58,10 @@ impl Bloom {
                     [x, y, w, h] => [x, y, w, h],
                     _ => [24., 60., 44., 44.],
                 };
-                let player = self.airplay.player_id();
-                if player.is_null() {
+                let Some(player) = self.airplay.player() else {
                     return "error: no player".into();
-                }
-                if picker::show(window, player, place) {
+                };
+                if picker::show(window, player.id(), place) {
                     format!("picker at {place:?}")
                 } else {
                     "error: picker not shown".into()
@@ -87,6 +86,19 @@ impl Bloom {
                     },
                 );
                 "sending".into()
+            }
+            // "file <path>": a file on disk into the engine's player, with
+            // no server and no receiver, to watch the engine itself.
+            "file" => {
+                let path = std::path::Path::new(arg.trim());
+                if !path.is_file() {
+                    return "error: file <path to a video file>".into();
+                }
+                let Some(url) = file_url(path) else {
+                    return "error: no absolute path for the file".into();
+                };
+                let token = self.airplay.send_url(url);
+                format!("sent token={token}")
             }
             "play" => {
                 self.airplay.play();
@@ -154,11 +166,41 @@ impl Bloom {
                     .unwrap_or_else(|| "-".into());
                 format!("load={load} control={control} poll=250 ms")
             }
-            _ => "error: airplay routes|picker [x y w h|off]|send <item id> [seconds]|play|pause|seek <s>|stop|\
+            _ => "error: airplay routes|picker [x y w h|off]|send <item id> [seconds]|file <path>|play|pause|seek <s>|stop|\
                   disconnect|volume <0..1>|mute [off]|state|latency. \
                   Act on the receiver once a route is picked: send, play, pause, seek, volume, mute (and the \
                   picker's menu picks the route). Safe anywhere: routes, state, latency, stop, disconnect."
                 .into(),
         }
+    }
+}
+
+/// The `file://` URL of a path on disk: the path made absolute (from the
+/// working directory when it is relative), with every byte that is not
+/// unreserved (RFC 3986) or a `/` percent-encoded. None when the path is
+/// empty or there is no working directory to make it absolute from.
+fn file_url(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = std::path::absolute(path).ok()?;
+    let mut url = String::from("file://");
+    for byte in path.as_os_str().as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => url.push(*byte as char),
+            _ => url.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    Some(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_url_encodes_spaces_and_reserved_characters() {
+        let url = file_url(std::path::Path::new("/tmp/My Clip #1 [a&b]?.mp4")).unwrap();
+        assert_eq!(url, "file:///tmp/My%20Clip%20%231%20%5Ba%26b%5D%3F.mp4");
+        assert_eq!(file_url(std::path::Path::new("/tmp/Ünïcode.mp4")).unwrap(), "file:///tmp/%C3%9Cn%C3%AFcode.mp4");
+        assert!(file_url(std::path::Path::new("clip.mp4")).unwrap().starts_with("file:///"));
     }
 }

@@ -45,6 +45,12 @@ impl VideoFrame {
     pub fn height(&self) -> usize {
         self.0.get_height()
     }
+    /// A blank BGRA frame with no GL texture, for tests of the frame path.
+    #[cfg(test)]
+    pub fn blank(width: usize, height: usize) -> Self {
+        let buffer = CVPixelBuffer::new(kCVPixelFormatType_32BGRA, width, height, None).expect("a pixel buffer");
+        Self(buffer)
+    }
 }
 
 struct Target {

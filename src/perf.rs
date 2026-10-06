@@ -36,6 +36,22 @@ static MAIN_CPU_NS: AtomicU64 = AtomicU64::new(0);
 /// Named counters, such as cards built.
 static CARDS: AtomicU64 = AtomicU64::new(0);
 
+/// The threads of the players, for a count of their rounds: an idle thread
+/// must not spin (`dev/jctl perf` prints the rounds a second).
+#[derive(Clone, Copy)]
+pub enum Loop {
+    Worker,
+    Render,
+    Link,
+    Trailer,
+}
+static LOOPS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Counts one round of the loop of a thread.
+pub fn count_loop(which: Loop) {
+    LOOPS[which as usize].fetch_add(1, Ordering::Relaxed);
+}
+
 struct Mark {
     at: Instant,
     main_cpu_ns: u64,
@@ -95,6 +111,9 @@ pub fn thread_cpu_ns() -> u64 {
 pub fn record_draw(started: Instant, started_cpu: u64) {
     let draw = started.elapsed().as_nanos() as u64;
     let cpu = thread_cpu_ns().saturating_sub(started_cpu);
+    // For the pacing trace: what kept the main thread busy.
+    let now = crate::player::clock_ns();
+    crate::pacing::trace::main_job("draw", now.saturating_sub(draw), now);
     DRAW_CPU_NS.fetch_add(cpu, Ordering::Relaxed);
     DRAW_CPU_MAX_NS.fetch_max(cpu, Ordering::Relaxed);
     DRAWS.fetch_add(1, Ordering::Relaxed);
@@ -102,8 +121,10 @@ pub fn record_draw(started: Instant, started_cpu: u64) {
     DRAW_MAX_NS.fetch_max(draw, Ordering::Relaxed);
 }
 
-/// Times between the video frames that reached the screen, in
-/// microseconds; the last 4000.
+/// Times between the draw requests for the video frames, in microseconds;
+/// the last 4000. A draw request is not the frame on the glass: the
+/// `jumps` of `pacing_report` are a secondary figure, the ruler is
+/// `pacing::trace` (the time the display showed each frame).
 static VIDEO_GAPS: Mutex<(Option<Instant>, Vec<u32>)> = Mutex::new((None, Vec::new()));
 
 /// Waits from "mpv has a frame" to "the UI is told to draw it", in
@@ -159,7 +180,8 @@ fn waits_report() -> String {
     )
 }
 
-/// Records that a render showed a new video frame.
+/// Records that a render asked to draw a new video frame (the time of the
+/// request on the main thread, not of the picture on the glass).
 pub fn video_frame_shown() {
     let now = Instant::now();
     let mut gaps = VIDEO_GAPS.lock().unwrap();
@@ -172,10 +194,15 @@ pub fn video_frame_shown() {
     }
 }
 
-/// How even the video frames came since the last call: the gaps counted
-/// by how many refreshes of a 60 Hz display each one took. A 24 fps video
-/// on such a display is even when the gaps are 2 and 3 refreshes, in turn.
-pub fn pacing_report() -> String {
+/// How even the draw requests for the video frames came since the last
+/// call: the gaps counted by how many refreshes of the display (its period
+/// in nanoseconds) each one took. A 24 fps video on a 60 Hz display is even
+/// when the gaps are 2 and 3 refreshes, in turn. This times the request on
+/// the main thread, not the picture on the glass: a draw that the GPU
+/// finishes after the compositor's deadline is shown a refresh late with
+/// an even request gap. `pacing::trace` measures that; `jumps` stays as a
+/// secondary figure.
+pub fn pacing_report(period_ns: u64) -> String {
     let mut gaps = VIDEO_GAPS.lock().unwrap();
     let list = std::mem::take(&mut gaps.1);
     gaps.0 = None;
@@ -184,22 +211,22 @@ pub fn pacing_report() -> String {
     if list.is_empty() {
         return format!("pacing: no video frames drawn (hidden window?) | {} | {}", waits_report(), crate::pacing::report());
     }
-    const REFRESH_MS: f64 = 1000. / 60.;
+    let refresh_ms = if period_ns == 0 { 1000. / 60. } else { period_ns as f64 / 1e6 };
     let mut by_refreshes = [0usize; 7];
     for ms in &list {
-        let n = (ms / REFRESH_MS).round().clamp(1., 6.) as usize;
+        let n = (ms / refresh_ms).round().clamp(1., 6.) as usize;
         by_refreshes[n] += 1;
     }
     let mean = list.iter().sum::<f64>() / list.len() as f64;
-    // A change of the gap by two refreshes or more from one frame to the
-    // next is what the eye sees as a stutter.
+    // A change of the request gap by two refreshes or more from one frame
+    // to the next.
     let jumps = list
         .windows(2)
-        .filter(|pair| ((pair[0] - pair[1]).abs() / REFRESH_MS).round() >= 2.)
+        .filter(|pair| ((pair[0] - pair[1]).abs() / refresh_ms).round() >= 2.)
         .count();
     let max = list.iter().cloned().fold(0., f64::max);
     format!(
-        "pacing: frames={} mean={mean:.1}ms max={max:.0}ms jumps={jumps} ({:.1}%) | refreshes 1:{} 2:{} 3:{} 4:{} 5:{} 6+:{} | {}",
+        "pacing (draw requests): frames={} mean={mean:.1}ms max={max:.0}ms jumps={jumps} ({:.1}%) | refreshes 1:{} 2:{} 3:{} 4:{} 5:{} 6+:{} | {}",
         list.len() + 1,
         jumps as f64 * 100. / list.len() as f64,
         by_refreshes[1],
@@ -233,6 +260,7 @@ pub fn report() -> String {
     let draw_cpu_ns = DRAW_CPU_NS.swap(0, Ordering::Relaxed);
     let draw_cpu_max_ns = DRAW_CPU_MAX_NS.swap(0, Ordering::Relaxed);
     let cards = CARDS.swap(0, Ordering::Relaxed);
+    let loops: Vec<u64> = LOOPS.iter().map(|l| l.swap(0, Ordering::Relaxed)).collect();
     let previous = LAST.lock().unwrap().replace(Mark {
         at: now.at,
         main_cpu_ns: now.main_cpu_ns,
@@ -248,7 +276,7 @@ pub fn report() -> String {
     format!(
         "perf: {seconds:.1}s renders={renders} ({:.1}/s) build={:.2}ms/render (max {:.2}) \
          draw={:.2}ms/frame (max {:.2}) frame_cpu={:.2}ms/frame (max {:.2}) main={:.2}ms/render cards={:.0}/render \
-         main_cpu={:.1}% process_cpu={:.1}%",
+         main_cpu={:.1}% process_cpu={:.1}% loops/s worker={:.1} render={:.1} link={:.1} trailer={:.1}",
         renders as f64 / seconds,
         per(build_ns as f64 / 1e6),
         build_max_ns as f64 / 1e6,
@@ -260,5 +288,9 @@ pub fn report() -> String {
         per(cards as f64),
         main_ms / seconds / 10.,
         process_ms / seconds / 10.,
+        loops[0] as f64 / seconds,
+        loops[1] as f64 / seconds,
+        loops[2] as f64 / seconds,
+        loops[3] as f64 / seconds,
     )
 }

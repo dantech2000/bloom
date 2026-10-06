@@ -517,7 +517,7 @@ pub fn resolve(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let (url, play_method) = if source.supports_direct_play {
-        (client.stream_url(item_id), PlayMethod::DirectPlay)
+        (client.stream_url(item_id, &source.id), PlayMethod::DirectPlay)
     } else if let Some(path) = source
         .transcoding_url
         .as_deref()
@@ -671,7 +671,7 @@ pub fn start(player: &Player, client: Client, load: Load) {
     let generation = player.prepare(&load.title, load.start_secs, load.paused);
     // A downloaded item plays from its file on this Mac, with no question
     // to the server, so it also plays offline.
-    if let Some(path) = crate::downloads::local_source(player, &load.item_id) {
+    if let Some(path) = crate::downloads::local_source(player, client.server_id.as_deref(), &load.item_id) {
         *CURRENT.lock().unwrap() = None;
         player.play_prepared(
             generation,
@@ -726,20 +726,31 @@ pub fn start(player: &Player, client: Client, load: Load) {
                     media_source_id: resolved.media_source_id.clone(),
                     subtitles,
                 };
-                let mut current = CURRENT.lock().unwrap();
-                if player.play_prepared(generation, request) {
-                    *current = Some(resolved);
-                } else if resolved.play_method == PlayMethod::Transcode {
-                    // Another load came first; the server must not keep
-                    // this transcode for a player that never asks for it.
-                    let _ = resolved.client.stop_encoding(&resolved.play_session_id);
-                }
+                hand_over(&player, generation, resolved, request);
             }
             Err(err) => {
                 log::warn!("playback info for {}: {err:#}", load.item_id);
                 player.fail_load(generation, load.token, &format!("{err:#}"));
             }
         });
+}
+
+/// Hands the answer of the server to the player and remembers it, or ends
+/// a transcode that nobody will ask for because a later load came first.
+fn hand_over(player: &Player, generation: u64, resolved: Arc<Resolved>, request: PlayRequest) {
+    let accepted = {
+        let mut current = CURRENT.lock().unwrap();
+        let accepted = player.play_prepared(generation, request);
+        if accepted {
+            *current = Some(resolved.clone());
+        }
+        accepted
+    };
+    // The request to the server goes with `CURRENT` free: the UI reads it
+    // at every poll of the player, and a slow server must not hold it.
+    if !accepted && resolved.play_method == PlayMethod::Transcode {
+        let _ = resolved.client.stop_encoding(&resolved.play_session_id);
+    }
 }
 
 // ----- the app ---------------------------------------------------------------------
@@ -1114,6 +1125,8 @@ impl Bloom {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
 
     const DIRECT: &str = include_str!("../fixtures/playback-info-direct.json");
@@ -1219,6 +1232,74 @@ mod tests {
         // The user chose no subtitle.
         let none = resolve(&client(), ITEM, &info, Some(-1)).unwrap();
         assert_eq!(none.selected_external, None);
+    }
+
+    /// Finding 9 of the review: the URL of a direct play names the media
+    /// source the server resolved, also when its id is not the item id.
+    #[test]
+    fn direct_play_names_the_resolved_source() {
+        let mut info: PlaybackInfo = serde_json::from_str(DIRECT).unwrap();
+        info.media_sources[0].id = "ffeeddccbbaa99887766554433221100".into();
+        let resolved = resolve(&client(), ITEM, &info, None).unwrap();
+        assert_eq!(resolved.media_source_id, "ffeeddccbbaa99887766554433221100");
+        assert_eq!(
+            resolved.url,
+            format!("https://media.example.com/Videos/{ITEM}/stream?static=true&mediaSourceId=ffeeddccbbaa99887766554433221100")
+        );
+    }
+
+    /// Finding 4 of the review: ending the transcode of a load that lost to
+    /// a later one must not hold `CURRENT`, which the UI reads at each poll.
+    #[test]
+    fn a_stale_transcode_ends_without_holding_current() {
+        use std::io::{Read as _, Write as _};
+        // A server that says when the DELETE reached it, and answers it
+        // 1.5 s later.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (arrived_tx, arrived) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = socket.read(&mut buf).unwrap_or(0);
+            let _ = arrived_tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            std::thread::sleep(Duration::from_millis(1500));
+            let _ = socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+        });
+        let client = Client::new(&format!("http://127.0.0.1:{port}"), "device-1").with_session("tok", "user-1");
+        let info: PlaybackInfo = serde_json::from_str(TRANSCODE).unwrap();
+        let resolved = Arc::new(resolve(&client, ITEM, &info, None).unwrap());
+        assert_eq!(resolved.play_method, PlayMethod::Transcode);
+        let player = Player::default();
+        let stale = player.prepare("first", 0., false);
+        let _later = player.prepare("second", 0., false);
+        let request = PlayRequest {
+            client: client.clone(),
+            item_id: ITEM.into(),
+            url: resolved.url.clone(),
+            title: "first".into(),
+            start_secs: 0.,
+            paused: false,
+            token: 1,
+            play_session_id: Some(resolved.play_session_id.clone()),
+            play_method: "Transcode".into(),
+            media_source_id: ITEM.into(),
+            subtitles: Vec::new(),
+        };
+        let installer = {
+            let player = player.clone();
+            std::thread::spawn(move || hand_over(&player, stale, resolved, request))
+        };
+        // The DELETE is in flight (the server has it and waits), and the
+        // UI asks what plays.
+        let request_line = arrived.recv_timeout(Duration::from_secs(5)).expect("the DELETE reached the server");
+        assert!(request_line.starts_with("DELETE "), "not a DELETE: {request_line}");
+        let started = Instant::now();
+        let _ = current();
+        let waited = started.elapsed();
+        installer.join().unwrap();
+        server.join().unwrap();
+        assert!(waited < Duration::from_millis(500), "current() waited {waited:?} for the server");
     }
 
     #[test]

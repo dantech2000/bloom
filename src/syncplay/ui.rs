@@ -60,6 +60,9 @@ pub struct SyncState {
     news_owed: bool,
     /// What the news did, for the debug command `events`.
     pub news_stats: crate::news::NewsStats,
+    /// The load of the group's item whose answer is wanted, see
+    /// `sync_now_playing`.
+    now_playing_load: crate::app::Revision,
 }
 
 impl SyncState {
@@ -278,11 +281,18 @@ impl Bloom {
         self.queue.explicit_audio = true;
         self.segments.clear();
         self.episode_picker.open = false;
+        // The item of the player is not known until the server answers; a
+        // local play meanwhile sets its own (`begin`).
+        self.playing = None;
         self.player_status = self.player.status();
         self.player_open = true;
         self.sync.focus_player = true;
         self.show_controls();
         self.start_player_poll(cx);
+        // The answer is for this load: the group may load another item, or
+        // the player may close, before it comes.
+        let load = self.next_revision();
+        self.sync.now_playing_load = load;
         let wanted = item_id.clone();
         self.fetch(
             cx,
@@ -294,6 +304,9 @@ impl Bloom {
             move |this, result, cx| {
                 if let Ok((item, segments)) = result {
                     this.sync.titles.insert(wanted.clone(), item.display_title());
+                    if this.sync.now_playing_load != load || !this.player_open || this.playing.is_some() {
+                        return;
+                    }
                     this.playing = Some(item);
                     this.segments = segments;
                     this.load_timeline(wanted, cx);
@@ -857,5 +870,67 @@ impl Bloom {
             Some(top) => panel.top(px(top)),
             None => panel.bottom(px(134.)),
         })
+    }
+}
+
+/// The item of the group that answers late (review of 2026-10-05, devices
+/// finding 2). See `app::race_harness`.
+#[cfg(test)]
+mod race_tests {
+    use gpui_kit::TestAppContext;
+    use serde_json::json;
+
+    use crate::app::{Screen, race_harness::{MockServer, app, plain, session, tick_until}};
+
+    fn server() -> MockServer {
+        MockServer::start(|method, path, _| match (method, path) {
+            ("GET", p) if p.starts_with("/Items/") => {
+                let id = p.trim_start_matches("/Items/").split('?').next().unwrap_or_default();
+                (200, json!({"Id": id, "Name": format!("Title {id}"), "Type": "Movie"}).to_string())
+            }
+            _ => plain(method, path),
+        })
+    }
+
+    #[gpui_kit::test]
+    fn the_item_of_a_closed_player_does_not_come_back(cx: &mut TestAppContext) {
+        let server = server();
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            this.session = Some(session(&server.url, "u1"));
+            this.screen = Screen::Main;
+            this.sync_now_playing("x".into(), cx);
+        });
+        // The item is asked for; its answer waits while the user closes the player.
+        tick_until(cx, || server.count("GET", "/Items/x") == 1);
+        bloom.update(cx, |this, cx| this.close_player_view(cx));
+        cx.run_until_parked();
+        bloom.read_with(cx, |this, _| {
+            assert!(!this.player_open);
+            assert!(this.playing.is_none(), "the closed player got the item of the group");
+            assert_eq!(this.sync.titles.get("x").map(String::as_str), Some("Title x"), "the title is not cached");
+        });
+    }
+
+    /// The group loads another item before the first one answers.
+    #[gpui_kit::test(iterations = 20)]
+    fn the_player_shows_the_item_loaded_last(cx: &mut TestAppContext) {
+        let server = server();
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            this.session = Some(session(&server.url, "u1"));
+            this.screen = Screen::Main;
+            this.sync_now_playing("x".into(), cx);
+            this.sync_now_playing("y".into(), cx);
+        });
+        cx.run_until_parked();
+        bloom.read_with(cx, |this, _| {
+            assert!(this.player_open);
+            assert_eq!(
+                this.playing.as_ref().map(|i| i.id.as_str()),
+                Some("y"),
+                "the player shows the item the group loaded first"
+            );
+        });
     }
 }

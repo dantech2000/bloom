@@ -204,10 +204,12 @@ pub fn media_stop(id: u64, media_session_id: i64) -> Value {
     json!({ "type": "STOP", "requestId": id, "mediaSessionId": media_session_id })
 }
 
+/// Without `resumeState` the receiver keeps its state: a seek while paused
+/// stays paused, as a seek in the player does.
 pub fn seek(id: u64, media_session_id: i64, secs: f64) -> Value {
     json!({
         "type": "SEEK", "requestId": id, "mediaSessionId": media_session_id,
-        "currentTime": secs.max(0.), "resumeState": "PLAYBACK_START",
+        "currentTime": secs.max(0.),
     })
 }
 
@@ -285,7 +287,7 @@ mod tests {
             app_availability(12, &["A".into(), "B".into()]),
             json!({"type": "GET_APP_AVAILABILITY", "requestId": 12, "appId": ["A", "B"]})
         );
-        assert_eq!(seek(13, 4, -2.), json!({"type": "SEEK", "requestId": 13, "mediaSessionId": 4, "currentTime": 0.0, "resumeState": "PLAYBACK_START"}));
+        assert_eq!(seek(13, 4, -2.), json!({"type": "SEEK", "requestId": 13, "mediaSessionId": 4, "currentTime": 0.0}));
         assert_eq!(pause(14, 4)["type"], "PAUSE");
         assert_eq!(play(15, 4)["mediaSessionId"], 4);
         assert_eq!(media_stop(16, 4)["type"], "STOP");

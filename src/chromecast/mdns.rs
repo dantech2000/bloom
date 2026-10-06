@@ -56,15 +56,24 @@ impl Drop for Discovery {
 }
 
 impl Discovery {
-    /// The devices seen so far, in the order they were first seen.
+    /// The devices seen within `FORGET`, in the order they were first
+    /// seen. The thread prunes the list as well; this read does not wait
+    /// for it.
     pub fn devices(&self) -> Vec<Device> {
-        self.devices.lock().unwrap().iter().map(|(device, _)| device.clone()).collect()
+        let mut list = self.devices.lock().unwrap();
+        forget_silent(&mut list);
+        list.iter().map(|(device, _)| device.clone()).collect()
     }
 
     /// Asks again now.
     pub fn rescan(&self) {
         self.ask.store(true, Ordering::Release);
     }
+}
+
+/// Drops the devices that did not answer for `FORGET`.
+fn forget_silent(list: &mut Vec<(Device, Instant)>) {
+    list.retain(|(_, seen)| seen.elapsed() < FORGET);
 }
 
 /// Starts the thread that looks for devices.
@@ -123,11 +132,13 @@ pub fn discover() -> Discovery {
                                 }
                             }
                         }
-                        list.retain(|(_, seen)| seen.elapsed() < FORGET);
                     }
                 }
                 Err(_) => {}
             }
+            // A device that went away is forgotten whether or not another
+            // one answers in its place.
+            forget_silent(&mut shared.lock().unwrap());
         }
     });
     Discovery { devices, stop, ask }
@@ -365,6 +376,20 @@ mod tests {
         assert!(q.ends_with(&[0, 0, 12, 0x80, 0x01]));
         assert_eq!(q[12], 11);
         assert_eq!(&q[13..24], b"_googlecast");
+    }
+
+    /// A device that stopped answering is gone from the list after
+    /// `FORGET`, with no other device around to answer in its place.
+    #[test]
+    fn a_silent_device_is_forgotten_without_other_answers() {
+        let device = parse(&answer()).remove(0);
+        let stale = Instant::now() - FORGET - Duration::from_secs(1);
+        let discovery = Discovery {
+            devices: Arc::new(Mutex::new(vec![(device, stale)])),
+            stop: Arc::new(AtomicBool::new(false)),
+            ask: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(discovery.devices().is_empty(), "{:?}", discovery.devices());
     }
 
     #[test]

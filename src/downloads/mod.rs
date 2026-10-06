@@ -42,10 +42,11 @@ pub fn engine() -> &'static Engine {
     ENGINE.get_or_init(|| Engine::open(dir(), engine::Options::default()))
 }
 
-/// The complete local file of an item, when there is one. Cheap; it reads
-/// the index in memory and asks the disk once.
-pub fn local_path(item_id: &str) -> Option<PathBuf> {
-    ENGINE.get()?.local_path(item_id)
+/// The complete local file of an item of the server `server_id`, when
+/// there is one; the file of another server with the same item id does not
+/// count. Cheap; it reads the index in memory and asks the disk once.
+pub fn local_path(server_id: Option<&str>, item_id: &str) -> Option<PathBuf> {
+    ENGINE.get()?.local_path_of(server_id, item_id)
 }
 
 /// The artwork of a download for an image URL of the server; see
@@ -57,8 +58,8 @@ pub fn local_image(url: &str) -> Option<PathBuf> {
 /// The source the player loads for an item: its local file when the item
 /// is downloaded, with its external subtitles beside it, else `None` and
 /// the caller uses the stream. This is the one hook of playback.
-pub fn local_source(player: &Player, item_id: &str) -> Option<String> {
-    let path = local_path(item_id);
+pub fn local_source(player: &Player, server_id: Option<&str>, item_id: &str) -> Option<String> {
+    let path = local_path(server_id, item_id);
     let subtitles: Vec<String> = path
         .as_ref()
         .and_then(|p| p.parent())
@@ -81,8 +82,8 @@ pub fn local_source(player: &Player, item_id: &str) -> Option<String> {
 /// The intro and credits ranges that `meta.json` of a downloaded item
 /// holds. `None` when the item has no local file or the file has no range;
 /// the caller then asks the server.
-pub fn stored_segments(item_id: &str) -> Option<Vec<crate::jellyfin::MediaSegment>> {
-    local_path(item_id)?;
+pub fn stored_segments(server_id: Option<&str>, item_id: &str) -> Option<Vec<crate::jellyfin::MediaSegment>> {
+    local_path(server_id, item_id)?;
     segments_of_meta(&ENGINE.get()?.meta(item_id)?)
 }
 
@@ -121,6 +122,9 @@ impl DownloadsState {
 /// Progress reaches the UI this often at most.
 const POLL_EVERY: Duration = Duration::from_millis(250);
 
+/// The word when another instance holds the download folder.
+const NOT_OWNER_TEXT: &str = "Another window of the app holds the download folder; downloads are off in this one.";
+
 impl Bloom {
     /// Gives the engine the session and starts the poll. Called when a
     /// session opens.
@@ -143,6 +147,9 @@ impl Bloom {
         }
         let Some(session) = self.session.as_ref() else { return };
         engine.set_client(Some(session.client.clone()), &session.server_id);
+        if !engine.owns_storage() {
+            self.toast("Downloads", NOT_OWNER_TEXT, cx);
+        }
         self.load_download_policy(cx);
         self.start_downloads_poll(cx);
     }
@@ -220,6 +227,10 @@ impl Bloom {
             return;
         }
         let engine = engine();
+        if !engine.owns_storage() {
+            self.toast("Downloads", NOT_OWNER_TEXT, cx);
+            return;
+        }
         let fresh = engine.entry(&item.id).is_none();
         if let Err(err) = engine.add(item) {
             log::warn!("download refused: {err:#}");
@@ -239,6 +250,10 @@ impl Bloom {
             return;
         }
         let engine = engine();
+        if !engine.owns_storage() {
+            self.toast("Downloads", NOT_OWNER_TEXT, cx);
+            return;
+        }
         let mut added = 0;
         for episode in episodes.iter().filter(|e| e.is_playable()) {
             let state = engine.entry(&episode.id).map(|e| e.state);
@@ -303,6 +318,9 @@ impl Bloom {
                 (Some(token), Some(user)) => dead.with_session(token, user),
                 _ => dead,
             };
+            // The same identity: a position of an offline play is kept
+            // under the server and user of the session.
+            let dead = dead.with_server(&session.server_id);
             let real = std::mem::replace(&mut session.client, dead);
             self.downloads.online_client = Some(real);
             self.stop_sync();
@@ -380,9 +398,10 @@ impl Bloom {
             self.toast("Downloads", "The item is not downloaded.", cx);
             return;
         };
-        // An offline play left a position; it counts until the server
-        // takes it.
-        if let Some(ticks) = offline::position(item_id)
+        // An offline play of this profile left a position; it counts until
+        // the server takes it.
+        if let Some(who) = self.session.as_ref().and_then(|s| offline::Identity::of(&s.client))
+            && let Some(ticks) = offline::position(&who, item_id)
             && ticks > item.user_data.playback_position_ticks
         {
             item.user_data.playback_position_ticks = ticks;
@@ -397,7 +416,8 @@ impl Bloom {
         let Some(playing) = self.playing.as_ref() else {
             return "none".to_string();
         };
-        let source = match local_path(&playing.id) {
+        let server = self.session.as_ref().and_then(|s| s.client.server_id.clone());
+        let source = match local_path(server.as_deref(), &playing.id) {
             Some(path) => format!("local:{}", path.display()),
             None => "stream".to_string(),
         };
@@ -487,9 +507,10 @@ impl Bloom {
         cx.notify();
         let entries = engine.entries();
         format!(
-            "downloads offline={} allowed={:?} entries={} active={} done={} used={} free={} dir={} source={} segments=[{}]",
+            "downloads offline={} allowed={:?} owner={} entries={} active={} done={} used={} free={} dir={} source={} segments=[{}]",
             self.downloads.offline,
             self.downloads.allowed,
+            engine.owns_storage(),
             entries.len(),
             entries.iter().filter(|e| e.is_active()).count(),
             entries.iter().filter(|e| e.state == EntryState::Done).count(),

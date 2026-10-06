@@ -39,6 +39,11 @@ jiff = "0.2"
 raw-window-handle = "0.6"
 # Objective-C blocks, for the handlers of the media keys (src/nowplaying.rs).
 block = "0.1"
+# The two vendored GPUI crates (see [patch] and vendor/README.md), named
+# here so the app can call into them: the frame step on demand, and the
+# presented time of each draw.
+gpui-pre-apple = "=0.3.4"
+gpui-pre-macos = "=0.3.4"
 
 [dev-dependencies]
 gpui-kit = { version = "=0.6.1", default-features = false, features = ["test-support"] }
@@ -53,6 +58,21 @@ rustybuzz = { opt-level = 3 }
 taffy = { opt-level = 3 }
 ttf-parser = { opt-level = 3 }
 
-# The Metal renderer with a backdrop blur pass added (see vendor/gpui-pre-apple).
+# Two GPUI crates of version 0.3.4 with small local changes; vendor/README.md
+# lists them, so an upgrade can apply them again: the Metal renderer with a
+# backdrop blur pass and the presented time of each draw, and the macOS
+# platform with the frame step on demand (`gpui_macos::wake_frame_sources`).
 [patch.crates-io]
 gpui-pre-apple = { path = "vendor/gpui-pre-apple" }
+gpui-pre-macos = { path = "vendor/gpui-pre-macos" }
+
+# The build that ships (dev/bundle, dev/release): the whole program
+# optimised as one unit and stripped, a quarter smaller than `release`, at
+# about 2.5 times the build time. `cargo build --release` stays the quick
+# build for every day. A panic still unwinds: one on a worker thread must
+# not end the app.
+[profile.ship]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = true
