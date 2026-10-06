@@ -52,6 +52,9 @@ if [ -n "$BLOOM_UPDATE_KEY_FILE" ]; then
 else
   "$tools/generate_appcast" --download-url-prefix "$prefix" --maximum-deltas 0 "$dist" || exit 1
 fi
+# generate_appcast gives every archive in the folder the address of this
+# release; an older archive is in the release of its own version.
+/usr/bin/sed -i '' -E "s|/download/v$version/($name-([0-9]+\.[0-9]+\.[0-9]+)\.zip)|/download/v\2/\1|" "$dist/appcast.xml"
 echo
 echo "Made $archive and $dist/appcast.xml"
 echo "To publish (after a commit of the version and a push):"
