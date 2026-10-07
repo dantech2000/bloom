@@ -145,6 +145,24 @@ fn position_in(dir: &Path, who: &Identity, item_id: &str) -> Option<i64> {
         .filter(|t| *t > 0)
 }
 
+/// The download of an item of a server was removed: the positions of it
+/// that the server has go with it. Kept, a position would be the resume
+/// point of the item when it is downloaded again, however far the user got
+/// on another device since. A position the server has not got stays, for
+/// the next flush.
+pub fn forget(dir: &Path, server_id: &str, item_id: &str) {
+    let _guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entries = load(dir);
+    let kept: Vec<Kept> = entries
+        .iter()
+        .filter(|k| k.unsent || k.item_id != item_id || k.who.server_id != server_id)
+        .cloned()
+        .collect();
+    if kept.len() != entries.len() {
+        save(dir, &kept);
+    }
+}
+
 /// Items of `who` with a position the server has not got: the item, the
 /// position, and the revision of the entry.
 fn pending_in(dir: &Path, who: &Identity) -> Vec<(String, i64, u64)> {
@@ -411,6 +429,24 @@ mod tests {
         note_report_in(&dir, &b, &progress("item1", 5), false);
         assert_eq!(position_in(&dir, &a, "item1"), Some(40 * crate::jellyfin::TICKS_PER_SECOND));
         assert_eq!(position_in(&dir, &b, "item1"), Some(5 * crate::jellyfin::TICKS_PER_SECOND));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A removed download takes its sent positions with it, of every user
+    /// of that server; what the server has not got stays for the flush.
+    #[test]
+    fn a_removed_download_leaves_no_resume_point_but_keeps_what_is_unsent() {
+        let dir = temp("forget");
+        let (a, b, other) = (who("s", "a"), who("s", "b"), who("t", "a"));
+        note_report_in(&dir, &a, &progress("item1", 40), false);
+        note_report_in(&dir, &b, &progress("item1", 50), true);
+        note_report_in(&dir, &other, &progress("item1", 60), false);
+        note_report_in(&dir, &a, &progress("item2", 70), false);
+        forget(&dir, "s", "item1");
+        assert_eq!(position_in(&dir, &a, "item1"), None, "a sent position outlived its download");
+        assert_eq!(position_in(&dir, &b, "item1"), Some(50 * crate::jellyfin::TICKS_PER_SECOND), "an unsent position was dropped");
+        assert_eq!(position_in(&dir, &other, "item1"), Some(60 * crate::jellyfin::TICKS_PER_SECOND), "another server's item was touched");
+        assert_eq!(position_in(&dir, &a, "item2"), Some(70 * crate::jellyfin::TICKS_PER_SECOND), "another item was touched");
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -12,7 +12,11 @@ mod stall;
 pub mod offline;
 mod ui;
 
-use std::{path::PathBuf, sync::OnceLock, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 
 use gpui_kit::{Context, Task, Window};
 
@@ -106,6 +110,9 @@ pub struct DownloadsState {
     pub allowed: Option<bool>,
     poll: Option<Task<()>>,
     version_seen: u64,
+    /// What the notice "in the queue" counts: the items queued since the
+    /// notice came up, and when the last one came.
+    queued_notice: Option<(Instant, usize)>,
     /// The real client of the session while a test points the session at
     /// an address that answers nothing (`BLOOM_OFFLINE`, `downloads
     /// offline on`).
@@ -116,6 +123,18 @@ impl DownloadsState {
     /// True while a test points the session at a dead address.
     pub fn is_unreachable_simulated(&self) -> bool {
         self.online_client.is_some()
+    }
+}
+
+/// How long the notice "in the queue" stays, and so how long it counts on.
+const QUEUED_NOTICE: Duration = Duration::from_secs(6);
+
+/// The words of the notice: the title for one item, the count for more.
+fn queued_text(count: usize, title: Option<&str>) -> String {
+    match (count, title) {
+        (1, Some(title)) => format!("{title} is in the queue."),
+        (1, None) => "1 item is in the queue.".to_string(),
+        (count, _) => format!("{count} items are in the queue."),
     }
 }
 
@@ -238,9 +257,23 @@ impl Bloom {
             return;
         }
         if fresh {
-            self.toast("Download", format!("{} is in the queue.", item.display_title()), cx);
+            self.note_queued(1, Some(&item.display_title()), cx);
         }
         cx.notify();
+    }
+
+    /// Says that items went into the queue, in one notice: a second item
+    /// within the life of the notice adds to its count and does not put a
+    /// second card on top. The ring in the top bar shows the progress.
+    fn note_queued(&mut self, added: usize, title: Option<&str>, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let before = match self.downloads.queued_notice {
+            Some((at, count)) if now.duration_since(at) < QUEUED_NOTICE => count,
+            _ => 0,
+        };
+        let count = before + added;
+        self.downloads.queued_notice = Some((now, count));
+        self.toast_as("download-queued", "Download", queued_text(count, title), cx);
     }
 
     /// Queues the episodes of a season that are not downloaded.
@@ -265,7 +298,7 @@ impl Bloom {
             }
         }
         if added > 0 {
-            self.toast("Download", format!("{added} episode(s) are in the queue."), cx);
+            self.note_queued(added, None, cx);
         }
         cx.notify();
     }
@@ -524,6 +557,19 @@ impl Bloom {
                 .collect::<Vec<_>>()
                 .join(", "),
         )
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::queued_text;
+
+    #[test]
+    fn the_queue_notice_names_one_item_and_counts_more() {
+        assert_eq!(queued_text(1, Some("S2:E5 · Premature Death")), "S2:E5 · Premature Death is in the queue.");
+        assert_eq!(queued_text(1, None), "1 item is in the queue.");
+        assert_eq!(queued_text(3, Some("the third title")), "3 items are in the queue.");
+        assert_eq!(queued_text(12, None), "12 items are in the queue.");
     }
 }
 

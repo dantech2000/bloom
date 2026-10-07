@@ -848,6 +848,17 @@ impl Bloom {
         });
     }
 
+    /// A notice that replaces the one before it of the same `key`, where
+    /// several in a row say one thing (three downloads queued one after the
+    /// other): one card with the latest word, not a stack.
+    pub fn toast_as(&self, key: &str, title: impl Into<String>, description: impl Into<String>, cx: &mut App) {
+        let (title, description) = (title.into(), description.into());
+        let id = format!("toast-{key}");
+        self.toasts.update(cx, |toasts, cx| {
+            toasts.push(id, title, description, Some(Duration::from_secs(6)), cx);
+        });
+    }
+
     pub fn save_config(&self, cx: &mut App) {
         if sandboxed() {
             return;

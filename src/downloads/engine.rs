@@ -601,10 +601,13 @@ impl Engine {
             generation: entry.generation,
         });
         let folder = s.folder(&entry);
+        let dir = s.dir.clone();
         save_index(&s);
         self.inner.bump();
         self.inner.wake.notify_all();
         drop(s);
+        // The resume point kept on this Mac belongs to the file that goes.
+        super::offline::forget(&dir, &entry.server_id, &entry.item_id);
         // A worker in the folder deletes it when it is out (`work`). With
         // no worker the deletion goes on a thread of its own: unlinking a
         // large file takes tens of milliseconds, too long for the UI.

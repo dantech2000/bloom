@@ -86,8 +86,8 @@ the secret, and only a run on `main` can use that environment.
 
 Replace `x.y.z` with the new version.
 
-1. Run `dev/test` on your Mac. Every test must pass. This runs the 12 tests
-   that CI skips.
+1. Run `dev/test` on your Mac. Every test must pass. This runs the tests
+   with the real player, which CI skips (`dev/ci-test` prints how many).
 2. Write the notes in `docs/releases/x.y.z.md`. Say what is new in plain
    words. Do not write the install steps or the list of libraries: the
    workflow adds `docs/releases/_footer.md`. The release fails if the file is
@@ -149,10 +149,35 @@ branch other than `main` uses a throwaway key and cannot publish.
 
 1. Push the branch.
 2. Run `gh workflow run release.yml --repo dantech2000/bloom --ref <branch> -f version=x.y.z -f publish=false`.
+   GitHub starts a workflow by hand only when its file is on `main` too; the
+   run then uses the file of the branch.
 3. The branch must have the commit `Release x.y.z`.
 4. Download the artifact `dist-unsigned` of the run. It holds the zip and the
    feed. The job `Sign the feed` and the job `Make the GitHub release` do
    not run.
+
+## What CI proves, and what it does not
+
+Each push to `main` and each pull request runs `.github/workflows/ci.yml`.
+
+- The job `Build and test` is the gate. It builds libmpv with
+  `dev/build-mpv`, builds the app, compiles the icon, makes the bundle,
+  checks it with `dev/release-verify --bundle`, and runs the tests that need
+  no real player.
+- The job `Tests with the real player (trial)` runs all tests on the runner
+  and only reports. A runner is a virtual machine with no GPU: the picture
+  test gets a black frame, and the SyncPlay timing test is too uneven there.
+  The other tests with the real player pass. Its failure does not fail the
+  run.
+- So `dev/test` on a Mac stays the gate of a release for the picture and
+  for timing.
+- A build of libmpv from nothing downloads eleven source archives from
+  their own servers. A server that does not answer is tried again; when one
+  stays down, start the run again. With a cache nothing is downloaded: the
+  cache is keyed on `dev/build-mpv` and the version of Xcode, and a weekly
+  run keeps it alive.
+
+The first release made this way was 0.1.5.
 
 ## When a run fails
 

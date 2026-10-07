@@ -61,12 +61,13 @@ copies it to `/Applications`.
 
 A release build updates itself with [Sparkle](https://sparkle-project.org). It
 reads a feed from the newest GitHub release, checks the signature of the
-download, and asks before it installs. To make a release:
+download, and asks before it installs.
 
-```sh
-dev/release key        # once: prints the public key for UPDATE_PUBLIC_KEY in src/brand.rs
-dev/release 0.2.0      # builds target/dist/Bloom-0.2.0.zip and appcast.xml, then prints the upload command
-```
+A release is made by GitHub Actions: a commit `Release x.y.z` on `main`, one
+command to start the workflow, and an approval before the update is signed.
+[docs/RELEASING.md](docs/RELEASING.md) is the procedure, with the one-time
+set-up of the signing key, the dry run and the roll-back. The notes of each
+release are in [docs/releases](docs/releases).
 
 A build with no public key, and a build started with `dev/run`, has no updater.
 
