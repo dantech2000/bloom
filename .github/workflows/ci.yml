@@ -217,7 +217,8 @@ jobs:
           echo "### Tests with the real player (gate)" >> "$GITHUB_STEP_SUMMARY"
           grep '^test result' "$log" | tail -n 1 >> "$GITHUB_STEP_SUMMARY" || true
           echo "$skipped skipped here and tried in the next step." >> "$GITHUB_STEP_SUMMARY"
-          [ "$status" -eq 0 ] || { tail -n 80 "$log"; exit 1; }
+          # A failed test: its whole message, which the lines above cut.
+          [ "$status" -eq 0 ] || { grep -B 2 -A 40 'panicked at' "$log"; tail -n 40 "$log"; exit 1; }
           [ "$skipped" -eq 3 ] || { echo "expected 3 skipped tests, saw $skipped" >&2; exit 1; }
 
       - name: The three unstable tests (trial)
