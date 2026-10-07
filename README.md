@@ -1,4 +1,13 @@
-# Bloom
+<p align="center">
+  <img src="assets/icon/bloom.png" width="128" height="128" alt="The Bloom icon">
+</p>
+
+<h1 align="center">Bloom</h1>
+
+<p align="center">
+  <a href="https://github.com/dantech2000/bloom/actions/workflows/ci.yml"><img src="https://github.com/dantech2000/bloom/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/dantech2000/bloom/releases/latest"><img src="https://img.shields.io/github/v/release/dantech2000/bloom?label=release" alt="Latest release"></a>
+</p>
 
 A native [Jellyfin](https://jellyfin.org) client for macOS, written in Rust. The
 interface is drawn with [GPUI](https://www.gpui.rs/) and video plays inside the
