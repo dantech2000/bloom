@@ -706,8 +706,8 @@ impl Bloom {
             "episodes" => self.toggle_episode_picker(window, cx),
             "rows" => return self.debug_rows(),
             "perf" => return crate::perf::report(),
-            // What "Light appearance" of the profile menu does; a test
-            // instance does not save it (`BLOOM_CONFIG_READONLY`).
+            // The light theme, which has no switch in the app any more;
+            // a test instance does not save it (`BLOOM_CONFIG_READONLY`).
             "theme" => {
                 let dark = self.config.dark.unwrap_or(true);
                 match rest {

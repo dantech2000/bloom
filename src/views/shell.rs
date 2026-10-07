@@ -313,22 +313,6 @@ impl Bloom {
                 handle.update(cx, |this, cx| this.show_connect(cx)).ok();
             }),
         );
-        let dark = self.config.dark.unwrap_or(true);
-        let handle = this.clone();
-        items.push(
-            MenuItem::new(
-                "menu.theme",
-                if dark {
-                    "Light appearance"
-                } else {
-                    "Dark appearance"
-                },
-            )
-            .icon(if dark { LucideIcon::Sun } else { LucideIcon::Moon })
-            .on_click(move |_, _, cx| {
-                handle.update(cx, |this, cx| this.toggle_theme(cx)).ok();
-            }),
-        );
         let handle = this.clone();
         items.push(
             MenuItem::new("menu.trailers", "Trailer backdrops")

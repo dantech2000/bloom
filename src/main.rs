@@ -96,8 +96,11 @@ fn main() {
 
             // The folders of the name the app had before come along.
             brand::migrate_folders();
-            let config = Config::load();
-            UiTheme::set(cx, app::theme(config.dark.unwrap_or(true)));
+            let mut config = Config::load();
+            // Bloom is dark only: the light theme has no switch any more,
+            // and a choice of it that an older build saved is dropped.
+            config.dark = None;
+            UiTheme::set(cx, app::theme(true));
             // The parts AppKit draws follow the theme of the app, not the
             // appearance of the system, so they match the window in both
             // settings of the Mac. `BLOOM_APPEARANCE=light|dark|system`
@@ -106,7 +109,7 @@ fn main() {
                 Ok("light") => Some(false),
                 Ok("dark") => Some(true),
                 Ok(_) => None,
-                Err(_) => Some(config.dark.unwrap_or(true)),
+                Err(_) => Some(true),
             });
 
             let test_instance = std::env::var_os("BLOOM_TEST_NAME").is_some();
