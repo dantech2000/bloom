@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 
-use gpui_kit::{Context, SharedString, Window, px, size};
+use gpui_kit::{App, Context, SharedString, Window, px, size};
 
 use crate::app::{Bloom, Page};
 
@@ -538,6 +538,11 @@ impl Bloom {
             "type" => self.search_titles(rest.to_string(), cx),
             // Opens a menu of the player, as a click on its button does.
             "menu" => {
+                if rest == "close" {
+                    self.close_popups(None, window, cx);
+                    cx.notify();
+                    return self.debug_state(window);
+                }
                 let menu = match rest {
                     "profile" => self.profile_menu.clone(),
                     "sort" => self.sort_menu.clone(),
@@ -756,10 +761,65 @@ impl Bloom {
                     self.catalog.iter().take(3).map(|i| i.id.as_str()).collect::<Vec<_>>()
                 );
             }
+            // The menu bar as AppKit holds it, and whether this window
+            // would run each entry (what greys it out when the menu opens).
+            // A test instance is never the active app, so its menus are not
+            // on screen to look at.
+            "menubar" => return self.debug_menubar(window, cx),
+            // Runs what a menu entry does: `action Settings`, `action
+            // input::SelectAll`. It is dispatched after this command, the
+            // way a click on the entry would be.
+            "action" => {
+                let action = ["", "bloom::", "input::"]
+                    .iter()
+                    .find_map(|prefix| cx.build_action(&format!("{prefix}{rest}"), None).ok());
+                let Some(action) = action else {
+                    return format!("error: no action named {rest:?}");
+                };
+                let name = action.name().to_string();
+                window.defer(cx, move |window, cx| window.dispatch_action(action, cx));
+                return format!("dispatched {name}");
+            }
+            // The theme of the app: `theme light`, `theme dark`, `theme toggle`.
+            "theme" => {
+                if rest == "toggle" || self.config.dark.unwrap_or(true) != (rest != "light") {
+                    self.toggle_theme(cx);
+                }
+                return format!(
+                    "theme={} appearance={}",
+                    if self.config.dark.unwrap_or(true) { "dark" } else { "light" },
+                    crate::macos::app_appearance()
+                );
+            }
+            // The appearance of the app's windows and panels, as a test
+            // sets it: `appearance light|dark|system`; see `BLOOM_APPEARANCE`.
+            "appearance" => {
+                if !rest.is_empty() {
+                    crate::macos::set_app_appearance(match rest {
+                        "light" => Some(false),
+                        "dark" => Some(true),
+                        _ => None,
+                    });
+                }
+                return format!("appearance={}", crate::macos::app_appearance());
+            }
+            // Opens the window again after `reopen <seconds>` when it is
+            // closed by then, the way a click on the Dock icon does: the
+            // channel goes with the window, so the timer is set before.
+            "reopen" => {
+                let secs = rest.parse::<f32>().unwrap_or(2.);
+                cx.spawn(async move |_, cx| {
+                    cx.background_executor().timer(Duration::from_secs_f32(secs)).await;
+                    cx.update(crate::reopen_window);
+                })
+                .detach();
+                return format!("reopen in {secs}s");
+            }
             "state" => {}
             _ => {
                 return "error: commands: home, back, libraries, library <name>, item <id>, search <text>, type <text>, \
                         resize <w> <h>, scroll <y>, admin [section], admin-dialog <name>, admin-edit <key> <value>, admin-config, admin-discard, settings [section|password], meta <tab>, \
+                        menubar, action <name>, theme <light|dark|toggle>, appearance <light|dark|system>, reopen <secs>, menu close, \
                         connect [...], authorize, hero [previous], hover-card [card], tags, \
                         show <view>, play, stop, pause, pip, seek <s>, playall [shuffle], next, \
                         previous, queue, enqueue <id>, episodes, syncplay [...], quality [...], subs [...], downloads [...], events, socket-inject <type> <json>, menu <settings|subtitles|profile>, scrub <s|off>, hover <0..1|off>, state, perf"
@@ -768,6 +828,37 @@ impl Bloom {
         }
         cx.notify();
         self.debug_state(window)
+    }
+
+    /// The menu bar with, for each entry that runs an action, whether this
+    /// window would run it now (`available=`): the same question AppKit
+    /// asks when the menu opens, which greys the entry out.
+    fn debug_menubar(&self, window: &Window, cx: &mut App) -> String {
+        use gpui_kit::OwnedMenuItem;
+        let menus = cx.get_menus().unwrap_or_default();
+        let mut available: Vec<(String, bool)> = Vec::new();
+        for item in menus.into_iter().flat_map(|menu| menu.items) {
+            if let OwnedMenuItem::Action { name, action, .. } = item {
+                // The window, or an app-wide listener (`cx.on_action`); a
+                // test instance is never the active window, so the second
+                // question is asked of the app alone.
+                let yes = window.is_action_available(action.as_ref(), cx)
+                    || cx.is_action_available(action.as_ref());
+                available.push((name, yes));
+            }
+        }
+        let mut out = format!("appearance={}\n", crate::macos::app_appearance());
+        for entry in crate::macos::menu_bar() {
+            out.push_str(&"  ".repeat(entry.depth));
+            out.push_str(&entry.text);
+            if let Some(title) = &entry.title
+                && let Some((_, available)) = available.iter().find(|(name, _)| name == title)
+            {
+                out.push_str(&format!("  available={available}"));
+            }
+            out.push('\n');
+        }
+        out
     }
 
     fn debug_connect(&self) -> String {
@@ -854,8 +945,9 @@ impl Bloom {
         };
         let viewport = window.viewport_size();
         format!(
-            "{page} | history={} player={:?} pos={:.0} window={}x{} scroll={} source={}",
+            "{page} | history={} forward={} player={:?} pos={:.0} window={}x{} scroll={} source={}",
             self.history.len(),
+            self.forward.len(),
             self.player_status.state,
             self.player_status.position,
             f32::from(viewport.width),

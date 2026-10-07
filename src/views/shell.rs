@@ -62,10 +62,23 @@ impl Bloom {
         // pages start below it.
         let overlay = matches!(self.page, Page::Home(_) | Page::Detail(_));
         let scrolled = f32::from(self.page_scroll.offset().y) < -8.;
+        use gpui_kit::{MouseButton, NavigationDirection};
         div()
             .id("shell")
             .track_focus(&self.app_focus)
             .on_key_down(cx.listener(Self::shell_key))
+            // The back and forward buttons of a mouse, and a three-finger
+            // swipe (AppKit sends it as such a button).
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|this, _, _, cx| this.back(cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|this, _, _, cx| this.forward(cx)),
+            )
+            // A two-finger swipe comes as scroll events (`swipe.rs`).
+            .on_scroll_wheel(cx.listener(Self::shell_scroll))
             .flex()
             .flex_col()
             .size_full()
@@ -122,6 +135,34 @@ impl Bloom {
                     ),
             )
             .into_any_element()
+    }
+
+    /// A scroll over the page: a two-finger swipe between pages goes back
+    /// or forward, when the trackpad setting of the Mac turns pages with a
+    /// scroll. The decision is in `swipe.rs`; a row of cards that scrolls
+    /// sideways claims the gesture (`cards.rs`), and the player has no
+    /// page to turn (it is not in this tree).
+    fn shell_scroll(
+        &mut self,
+        event: &gpui_kit::ScrollWheelEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::swipe::{Direction, Swipe};
+        use gpui_kit::{ScrollDelta, TouchPhase};
+        // A mouse wheel scrolls by lines; only a trackpad swipes.
+        let ScrollDelta::Pixels(delta) = event.delta else {
+            return;
+        };
+        let phase = event.touch_phase;
+        let allowed = !self.player_open
+            && (phase != TouchPhase::Started || crate::macos::swipe_between_pages_with_scroll());
+        let turned = cx.default_global::<Swipe>().feed(phase, f32::from(delta.x), f32::from(delta.y), allowed);
+        match turned {
+            Some(Direction::Back) => self.back(cx),
+            Some(Direction::Forward) => self.forward(cx),
+            None => {}
+        }
     }
 
     /// Keyboard shortcuts of the main screen. They follow the web client

@@ -746,6 +746,9 @@ pub fn section_padded(
                 // scroll, and the page cannot be scrolled from a row.
                 .restrict_scroll_to_axis()
                 .track_scroll(&handle)
+                // A sideways gesture over the row scrolls it and never
+                // turns the page (`swipe.rs`).
+                .on_scroll_wheel(|_, _, cx| cx.default_global::<crate::swipe::Swipe>().claim())
                 .child(
                     div()
                         // The full width of all cards, so the row can scroll

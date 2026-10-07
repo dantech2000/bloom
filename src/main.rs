@@ -38,6 +38,7 @@ mod seasons;
 mod settings;
 mod stream;
 mod subtitles;
+mod swipe;
 mod syncplay;
 mod trailer;
 #[allow(dead_code, unused_imports)]
@@ -63,9 +64,11 @@ fn main() {
     perf::mark_start();
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("bloom=info"));
 
-    gpui_kit::platform::application()
-        .with_assets(icons::Assets)
-        .run(|cx: &mut App| {
+    let application = gpui_kit::platform::application().with_assets(icons::Assets);
+    // The red button and cmd-w close the window and the app stays, as in
+    // Music and TV: a click on the Dock icon opens it again.
+    application.on_reopen(reopen_window);
+    application.run(|cx: &mut App| {
             ui::theme::init(cx);
             cx.text_system()
                 .add_fonts(vec![
@@ -95,53 +98,28 @@ fn main() {
             brand::migrate_folders();
             let config = Config::load();
             UiTheme::set(cx, app::theme(config.dark.unwrap_or(true)));
-
-            // The window opens where the user left it. A saved place on a
-            // display that is gone falls back to the centred default.
-            let saved = config.window.map(|[x, y, w, h]| {
-                Bounds::new(point(px(x), px(y)), size(px(w.max(900.)), px(h.max(600.))))
+            // The parts AppKit draws follow the theme of the app, not the
+            // appearance of the system, so they match the window in both
+            // settings of the Mac. `BLOOM_APPEARANCE=light|dark|system`
+            // overrides it for a test.
+            macos::set_app_appearance(match std::env::var("BLOOM_APPEARANCE").as_deref() {
+                Ok("light") => Some(false),
+                Ok("dark") => Some(true),
+                Ok(_) => None,
+                Err(_) => Some(config.dark.unwrap_or(true)),
             });
-            let bounds = saved
-                .filter(|bounds| {
-                    cx.displays()
-                        .iter()
-                        .any(|display| display.bounds().intersects(bounds))
-                })
-                .unwrap_or_else(|| Bounds::centered(None, size(px(1280.), px(820.)), cx));
+
             let test_instance = std::env::var_os("BLOOM_TEST_NAME").is_some();
-            cx.open_window(
-                WindowOptions {
-                    titlebar: Some(TitlebarOptions {
-                        title: Some(brand::NAME.into()),
-                        appears_transparent: true,
-                        traffic_light_position: Some(point(
-                            px(pip::TRAFFIC_LIGHTS.0),
-                            px(pip::TRAFFIC_LIGHTS.1),
-                        )),
-                    }),
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(size(px(900.), px(600.))),
-                    window_background: WindowBackgroundAppearance::Opaque,
-                    // A test instance must not take the keyboard from the
-                    // person at the Mac: the keys he types would go to its
-                    // window, and macOS beeps for each one it cannot use.
-                    focus: !test_instance,
-                    ..Default::default()
-                },
-                move |window, cx| {
-                    window.set_window_title(brand::NAME);
-                    if test_instance {
-                        // On screen, so it draws and can be captured, but
-                        // the app does not become the active one.
-                        if let Some(ns_window) = pip::ns_window(window) {
-                            macos::send!((), ns_window, c"orderFrontRegardless");
-                        }
-                    }
-                    cx.new(|cx| Bloom::new(config, window, cx))
-                },
-            )
-            .expect("open application window");
+            open_main_window(cx, config);
             log::debug!("window open {} ms after start", perf::since_start_ms());
+            // Nothing may play from a window that is gone: the cores close
+            // with the last window (`player::shut_down_all`).
+            cx.on_window_closed(|cx, _| {
+                if cx.windows().is_empty() {
+                    player::shut_down_all();
+                }
+            })
+            .detach();
             // mpv is closed before the process exits: a core that runs at
             // exit can crash (see `player::shut_down_all`).
             cx.on_app_quit(|_| {
@@ -155,4 +133,62 @@ fn main() {
             // The updater, when this is a release build in its bundle.
             updates::start();
         });
+}
+
+/// Opens the one window of the app. The window opens where the user left
+/// it; a saved place on a display that is gone falls back to the centred
+/// default.
+fn open_main_window(cx: &mut App, config: Config) {
+    let saved = config.window.map(|[x, y, w, h]| {
+        Bounds::new(point(px(x), px(y)), size(px(w.max(900.)), px(h.max(600.))))
+    });
+    let bounds = saved
+        .filter(|bounds| {
+            cx.displays()
+                .iter()
+                .any(|display| display.bounds().intersects(bounds))
+        })
+        .unwrap_or_else(|| Bounds::centered(None, size(px(1280.), px(820.)), cx));
+    let test_instance = std::env::var_os("BLOOM_TEST_NAME").is_some();
+    cx.open_window(
+        WindowOptions {
+            titlebar: Some(TitlebarOptions {
+                title: Some(brand::NAME.into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(
+                    px(pip::TRAFFIC_LIGHTS.0),
+                    px(pip::TRAFFIC_LIGHTS.1),
+                )),
+            }),
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(900.), px(600.))),
+            window_background: WindowBackgroundAppearance::Opaque,
+            // A test instance must not take the keyboard from the
+            // person at the Mac: the keys he types would go to its
+            // window, and macOS beeps for each one it cannot use.
+            focus: !test_instance,
+            ..Default::default()
+        },
+        move |window, cx| {
+            window.set_window_title(brand::NAME);
+            if test_instance {
+                // On screen, so it draws and can be captured, but
+                // the app does not become the active one.
+                if let Some(ns_window) = pip::ns_window(window) {
+                    macos::send!((), ns_window, c"orderFrontRegardless");
+                }
+            }
+            cx.new(|cx| Bloom::new(config, window, cx))
+        },
+    )
+    .expect("open application window");
+}
+
+/// What a click on the Dock icon does while no window is open: the window
+/// comes back, with the session of the config as at a start.
+pub fn reopen_window(cx: &mut App) {
+    if cx.windows().is_empty() {
+        log::info!("window reopened");
+        open_main_window(cx, Config::load());
+    }
 }

@@ -321,6 +321,11 @@ pub struct Bloom {
     pub history: Vec<Page>,
     /// Scroll position of each page in `history`.
     history_scroll: Vec<gpui_kit::Point<gpui_kit::Pixels>>,
+    /// The pages Back left, nearest last, for Forward; a new page empties it.
+    pub forward: Vec<Page>,
+    forward_scroll: Vec<gpui_kit::Point<gpui_kit::Pixels>>,
+    /// Whether the menu bar reads "Exit Full Screen" now.
+    menus_fullscreen: bool,
     /// Focus of the main screen, so its keyboard shortcuts work.
     pub app_focus: FocusHandle,
     pub profile_menu: Entity<MenuState>,
@@ -563,6 +568,7 @@ impl Bloom {
         // Remember the window's place and size for the next launch. A resize
         // sends many changes, so the file is written once they stop.
         subscriptions.push(cx.observe_window_bounds(window, |this, window, cx| {
+            this.follow_fullscreen_menu(window, cx);
             if window.is_fullscreen() {
                 return;
             }
@@ -725,6 +731,9 @@ impl Bloom {
             page: Page::Home(HomeData::default()),
             history: Vec::new(),
             history_scroll: Vec::new(),
+            forward: Vec::new(),
+            forward_scroll: Vec::new(),
+            menus_fullscreen: false,
             app_focus: cx.focus_handle(),
             profile_menu,
             search_input,
@@ -834,6 +843,25 @@ impl Bloom {
         this.rebuild_menu(cx);
         this.start_debug_channel(window, cx);
         this.start_hero_tick(window, cx);
+        // The red button and cmd-w: playback stops the way the Stop button
+        // stops it (the position is reported) before the window goes; the
+        // cores close with the window (`main.rs`).
+        let weak = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| {
+            weak.update(cx, |this, cx| this.request_stop(cx)).ok();
+            true
+        });
+        // A field that had the focus and left the page (the search field
+        // after a result opens, a dialog that closed) would keep it: gpui
+        // then sends keys and menu actions to a node that is not there, and
+        // the shortcuts are dead until a click. The screen takes the focus
+        // back the moment the field goes.
+        this._subscriptions.push(cx.on_focus_lost(window, |this, window, cx| {
+            if this.screen == Screen::Main {
+                let target = if this.player_open { &this.player_focus } else { &this.app_focus };
+                window.focus(target, cx);
+            }
+        }));
         this
     }
 
@@ -1017,8 +1045,7 @@ impl Bloom {
         self.config.active = Some((server_id.to_string(), user_id.to_string()));
         self.save_config(cx);
         self.screen = Screen::Main;
-        self.history.clear();
-        self.history_scroll.clear();
+        self.clear_history();
         self.views.clear();
         self.page = Page::Home(HomeData::default());
         // The home page loads the libraries with its own data.
@@ -1041,8 +1068,7 @@ impl Bloom {
         self.config.active = None;
         self.save_config(cx);
         // The pages of the user who left must not show again.
-        self.history.clear();
-        self.history_scroll.clear();
+        self.clear_history();
         self.views.clear();
         self.page = Page::Home(HomeData::default());
         self.screen = Screen::Connect;
@@ -1070,8 +1096,20 @@ impl Bloom {
         self.config.dark = Some(dark);
         self.save_config(cx);
         UiTheme::set(cx, theme(dark));
+        // The parts AppKit draws follow the theme (see `main.rs`).
+        crate::macos::set_app_appearance(Some(dark));
         self.rebuild_menu(cx);
         cx.notify();
+    }
+
+    /// The View menu says "Exit Full Screen" while the window is full
+    /// screen. The menu bar is built again only when the state changes.
+    fn follow_fullscreen_menu(&mut self, window: &Window, cx: &mut App) {
+        let fullscreen = window.is_fullscreen();
+        if fullscreen != self.menus_fullscreen {
+            self.menus_fullscreen = fullscreen;
+            crate::menus::set_menus(cx, fullscreen);
+        }
     }
 
     /// Card and padding sizes for the current window width.
@@ -1168,6 +1206,8 @@ impl Bloom {
             self.history.remove(0);
             self.history_scroll.remove(0);
         }
+        self.forward.clear();
+        self.forward_scroll.clear();
         self.load_page(cx);
         cx.notify();
     }
@@ -1175,23 +1215,48 @@ impl Bloom {
     pub fn back(&mut self, cx: &mut Context<Self>) {
         if let Some(page) = self.history.pop() {
             let offset = self.history_scroll.pop().unwrap_or_default();
-            self.page_scroll.set_offset(offset);
-            self.page = page;
-            if matches!(self.page, Page::Library(_)) {
-                self.rebuild_library_menus(cx);
-            }
-            if matches!(self.page, Page::Admin(_)) {
-                self.start_admin_tick(cx);
-            }
-            if self.page_loading() {
-                // The user left before the answer came, and the answer was
-                // thrown away (`generation`); the page asks again.
-                self.load_page(cx);
-            } else {
-                self.next_generation();
-            }
-            cx.notify();
+            let (page, offset) = self.swap_page(page, offset, cx);
+            self.forward.push(page);
+            self.forward_scroll.push(offset);
         }
+    }
+
+    /// Returns to the page Back left, as cmd-] and the forward button do.
+    pub fn forward(&mut self, cx: &mut Context<Self>) {
+        if let Some(page) = self.forward.pop() {
+            let offset = self.forward_scroll.pop().unwrap_or_default();
+            let (page, offset) = self.swap_page(page, offset, cx);
+            self.history.push(page);
+            self.history_scroll.push(offset);
+        }
+    }
+
+    /// Shows `page` at `offset` and gives back the page it replaced with
+    /// its place.
+    fn swap_page(
+        &mut self,
+        page: Page,
+        offset: gpui_kit::Point<gpui_kit::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> (Page, gpui_kit::Point<gpui_kit::Pixels>) {
+        let left_offset = self.page_scroll.offset();
+        self.page_scroll.set_offset(offset);
+        let left = std::mem::replace(&mut self.page, page);
+        if matches!(self.page, Page::Library(_)) {
+            self.rebuild_library_menus(cx);
+        }
+        if matches!(self.page, Page::Admin(_)) {
+            self.start_admin_tick(cx);
+        }
+        if self.page_loading() {
+            // The user left before the answer came, and the answer was
+            // thrown away (`generation`); the page asks again.
+            self.load_page(cx);
+        } else {
+            self.next_generation();
+        }
+        cx.notify();
+        (left, left_offset)
     }
 
     /// True while the current page waits for its data.
@@ -1209,17 +1274,23 @@ impl Bloom {
 
     pub fn open_home(&mut self, cx: &mut Context<Self>) {
         self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
-        self.history.clear();
-        self.history_scroll.clear();
+        self.clear_history();
         self.page = Page::Home(HomeData::default());
         self.load_page(cx);
         cx.notify();
     }
 
-    pub fn open_library(&mut self, view: Item, cx: &mut Context<Self>) {
-        self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+    /// Forgets the pages Back and Forward would show.
+    fn clear_history(&mut self) {
         self.history.clear();
         self.history_scroll.clear();
+        self.forward.clear();
+        self.forward_scroll.clear();
+    }
+
+    pub fn open_library(&mut self, view: Item, cx: &mut Context<Self>) {
+        self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+        self.clear_history();
         self.page = Page::Library(LibraryData::new(view));
         self.rebuild_library_menus(cx);
         self.load_page(cx);
@@ -3179,7 +3250,7 @@ impl Render for Bloom {
         };
         crate::perf::record_render(started.elapsed());
         use crate::menus;
-        use gpui_kit::{Focusable as _, InteractiveElement as _};
+        use gpui_kit::{Focusable as _, InteractiveElement as _, prelude::FluentBuilder as _};
         div()
             .relative()
             .size_full()
@@ -3189,10 +3260,38 @@ impl Render for Bloom {
             .on_action(cx.listener(|_, _: &menus::ToggleFullScreen, window, _| {
                 window.toggle_fullscreen()
             }))
+            // cmd-[ and cmd-] are also outdent and indent in the text
+            // editor of the dashboard: there the keys stay with the field
+            // (gpui tries the field's binding next when this one passes).
             .on_action(cx.listener(|this, _: &menus::Back, _, cx| {
-                if !this.player_open {
+                if this.text_editor_open() {
+                    cx.propagate();
+                } else if !this.player_open {
                     this.back(cx)
                 }
+            }))
+            .on_action(cx.listener(|this, _: &menus::Forward, _, cx| {
+                if this.text_editor_open() {
+                    cx.propagate();
+                } else if !this.player_open {
+                    this.forward(cx)
+                }
+            }))
+            // Settings… is greyed out while no session is open: the entry
+            // has no listener then, which is what AppKit asks for.
+            .when(self.session.is_some() && self.screen == Screen::Main, |el| {
+                el.on_action(cx.listener(|this, _: &menus::Settings, _, cx| {
+                    if !this.player_open {
+                        this.open_settings(crate::settings::Section::Profile, cx)
+                    }
+                }))
+            })
+            // Close Window does what the red button does: playback stops,
+            // the window goes, the app stays. gpui closes the window; AppKit's
+            // `performClose:` would not, while the player hides the buttons.
+            .on_action(cx.listener(|this, _: &menus::CloseWindow, window, cx| {
+                this.request_stop(cx);
+                window.remove_window();
             }))
             .on_action(cx.listener(|this, _: &menus::About, _, cx| {
                 if !this.player_open && this.screen == Screen::Main {

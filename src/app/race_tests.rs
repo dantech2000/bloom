@@ -4,7 +4,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use gpui_kit::TestAppContext;
+use gpui_kit::{Focusable as _, TestAppContext};
 
 use super::race_harness::{MockServer, add_server, app, item, items_json, plain, session, tick_until};
 use super::{Page, Screen};
@@ -281,4 +281,75 @@ fn a_return_to_a_text_whose_search_failed_asks_again(cx: &mut TestAppContext) {
         Page::Search(data) => assert!(!data.loading, "the page waits after the second failure"),
         _ => panic!("not the search page"),
     });
+}
+
+#[gpui_kit::test]
+fn forward_returns_to_the_page_back_left_until_a_new_page_opens(cx: &mut TestAppContext) {
+    let (bloom, cx) = app(cx);
+    bloom.update(cx, |this, cx| {
+        this.screen = Screen::Main;
+        this.navigate(Page::Downloads, cx);
+        this.navigate(Page::Settings(crate::settings::Section::About), cx);
+        this.back(cx);
+        assert!(matches!(this.page, Page::Downloads));
+        assert_eq!((this.history.len(), this.forward.len()), (1, 1));
+        this.forward(cx);
+        assert!(matches!(this.page, Page::Settings(crate::settings::Section::About)));
+        assert_eq!((this.history.len(), this.forward.len()), (2, 0));
+        this.forward(cx);
+        assert!(matches!(this.page, Page::Settings(_)), "Forward with nothing ahead stays");
+        this.back(cx);
+        this.back(cx);
+        assert!(matches!(this.page, Page::Home(_)));
+        assert_eq!((this.history.len(), this.forward.len()), (0, 2));
+        this.forward(cx);
+        assert!(matches!(this.page, Page::Downloads));
+        // A new page forgets what was ahead.
+        this.navigate(Page::Settings(crate::settings::Section::Profile), cx);
+        assert_eq!(this.forward.len(), 0);
+        this.forward(cx);
+        assert!(matches!(this.page, Page::Settings(crate::settings::Section::Profile)));
+        // Home starts over.
+        this.open_home(cx);
+        assert_eq!((this.history.len(), this.forward.len()), (0, 0));
+    });
+}
+
+#[gpui_kit::test]
+fn the_screen_takes_the_focus_back_when_the_search_field_leaves_the_page(cx: &mut TestAppContext) {
+    let server = MockServer::start(|method, path, _| plain(method, path));
+    let (bloom, cx) = app(cx);
+    bloom.update(cx, |this, cx| {
+        this.session = Some(session(&server.url, "u1"));
+        this.screen = Screen::Main;
+        this.open_search("tro".into(), cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        bloom.update(cx, |this, cx| {
+            let field = this.search_input.read(cx).focus_handle(cx);
+            window.focus(&field, cx);
+        });
+    });
+    // A frame with the field in it, then one without: the test window
+    // draws only when asked.
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(bloom.read(cx).search_input.read(cx).focus_handle(cx).is_focused(window), "the field has the focus");
+    });
+    // Typing lands in the field: it is in the frame.
+    cx.simulate_input("x");
+    assert_eq!(bloom.read_with(cx, |this, cx| this.search_input.read(cx).value().to_string()), "x");
+    // The user opens a result: the search page, with its field, is gone.
+    bloom.update(cx, |this, cx| this.open_item(item("m9", "Nine", "Movie"), cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| {
+        let this = bloom.read(cx);
+        assert!(!this.search_input.read(cx).focus_handle(cx).is_focused(window), "the field kept the focus");
+        assert!(this.app_focus.is_focused(window), "the screen did not take the focus back");
+    });
+    // So Back by its key reaches the screen.
+    cx.simulate_keystrokes("cmd-[");
+    bloom.read_with(cx, |this, _| assert!(matches!(this.page, Page::Search(_)), "cmd-[ did not go back"));
 }

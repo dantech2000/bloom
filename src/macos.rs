@@ -77,6 +77,148 @@ pub fn set_app_icon(png: &'static [u8]) {
     send!((), app, c"setApplicationIconImage:", image => Id);
 }
 
+fn ns_string(text: &CStr) -> Id {
+    send!(Id, class(c"NSString"), c"stringWithUTF8String:", text.as_ptr() => *const std::ffi::c_char)
+}
+
+fn string_of(ns_string: Id) -> String {
+    if ns_string.is_null() {
+        return String::new();
+    }
+    let utf8 = send!(*const std::ffi::c_char, ns_string, c"UTF8String");
+    if utf8.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(utf8) }.to_string_lossy().into_owned()
+}
+
+/// Sets the appearance of the app's own windows and panels: dark, light,
+/// or the system's (`None`). The parts AppKit draws (the title bar and its
+/// buttons, the open panel, the windows of the updater) follow it.
+pub fn set_app_appearance(dark: Option<bool>) {
+    let app = send!(Id, class(c"NSApplication"), c"sharedApplication");
+    let appearance = match dark {
+        Some(true) => send!(Id, class(c"NSAppearance"), c"appearanceNamed:", ns_string(c"NSAppearanceNameDarkAqua") => Id),
+        Some(false) => send!(Id, class(c"NSAppearance"), c"appearanceNamed:", ns_string(c"NSAppearanceNameAqua") => Id),
+        None => std::ptr::null_mut(),
+    };
+    send!((), app, c"setAppearance:", appearance => Id);
+}
+
+/// The name of the appearance the app runs with, such as
+/// "NSAppearanceNameDarkAqua"; for the report of a test.
+pub fn app_appearance() -> String {
+    let app = send!(Id, class(c"NSApplication"), c"sharedApplication");
+    let appearance = send!(Id, app, c"effectiveAppearance");
+    if appearance.is_null() {
+        return "none".into();
+    }
+    string_of(send!(Id, appearance, c"name"))
+}
+
+/// Whether "Swipe between pages" of the trackpad settings turns pages with
+/// a two-finger scroll (the default), as opposed to three fingers only or
+/// off: then a sideways scroll is a swipe between pages (`swipe.rs`).
+pub fn swipe_between_pages_with_scroll() -> bool {
+    send!(bool, class(c"NSEvent"), c"isSwipeTrackingFromScrollEventsEnabled")
+}
+
+/// "Bring All to Front" of the Window menu.
+pub fn arrange_in_front() {
+    let app = send!(Id, class(c"NSApplication"), c"sharedApplication");
+    send!((), app, c"arrangeInFront:", std::ptr::null_mut::<c_void>() => Id);
+}
+
+/// One entry of the menu bar as AppKit holds it (`menu_bar`).
+pub struct MenuEntry {
+    /// 0 for a menu of the bar, 1 for its entries, 2 for a submenu's.
+    pub depth: usize,
+    /// The title of an entry that runs something; `None` for a menu, a
+    /// separator or a submenu.
+    pub title: Option<String>,
+    /// The line to print: title, key equivalent, enabled and checked state.
+    pub text: String,
+}
+
+/// The menu bar as AppKit holds it, one entry per line: the menu, then
+/// its entries with their key equivalents, or `---` for a separator. The
+/// Window and Help menus say when AppKit knows them as such (it adds the
+/// window list and the search field itself).
+pub fn menu_bar() -> Vec<MenuEntry> {
+    let app = send!(Id, class(c"NSApplication"), c"sharedApplication");
+    let main = send!(Id, app, c"mainMenu");
+    let mut out = Vec::new();
+    if main.is_null() {
+        return out;
+    }
+    let windows_menu = send!(Id, app, c"windowsMenu");
+    let help_menu = send!(Id, app, c"helpMenu");
+    let count = send!(isize, main, c"numberOfItems");
+    for index in 0..count {
+        let item = send!(Id, main, c"itemAtIndex:", index => isize);
+        let menu = send!(Id, item, c"submenu");
+        let mut text = string_of(send!(Id, item, c"title"));
+        if !menu.is_null() && menu == windows_menu {
+            text.push_str("  [windowsMenu]");
+        }
+        if !menu.is_null() && menu == help_menu {
+            text.push_str("  [helpMenu]");
+        }
+        out.push(MenuEntry { depth: 0, title: None, text });
+        if !menu.is_null() {
+            menu_entries(menu, 1, &mut out);
+        }
+    }
+    out
+}
+
+fn menu_entries(menu: Id, depth: usize, out: &mut Vec<MenuEntry>) {
+    let count = send!(isize, menu, c"numberOfItems");
+    for index in 0..count {
+        let item = send!(Id, menu, c"itemAtIndex:", index => isize);
+        if send!(bool, item, c"isSeparatorItem") {
+            out.push(MenuEntry { depth, title: None, text: "---".into() });
+            continue;
+        }
+        let title = string_of(send!(Id, item, c"title"));
+        let mut text = title.clone();
+        let key = string_of(send!(Id, item, c"keyEquivalent"));
+        if !key.is_empty() {
+            let mask = send!(usize, item, c"keyEquivalentModifierMask");
+            text.push_str("  ");
+            text.push_str(&key_equivalent_text(&key, mask));
+        }
+        if !send!(bool, item, c"isEnabled") {
+            text.push_str("  (disabled)");
+        }
+        if send!(isize, item, c"state") != 0 {
+            text.push_str("  (checked)");
+        }
+        let submenu = send!(Id, item, c"submenu");
+        out.push(MenuEntry { depth, title: submenu.is_null().then_some(title), text });
+        if !submenu.is_null() {
+            menu_entries(submenu, depth + 1, out);
+        }
+    }
+}
+
+/// "shift-cmd-z" for a key equivalent and its modifier mask, in the order
+/// the menu shows the symbols.
+fn key_equivalent_text(key: &str, mask: usize) -> String {
+    const SHIFT: usize = 1 << 17;
+    const CONTROL: usize = 1 << 18;
+    const OPTION: usize = 1 << 19;
+    const COMMAND: usize = 1 << 20;
+    let mut text = String::new();
+    for (bit, name) in [(CONTROL, "ctrl-"), (OPTION, "alt-"), (SHIFT, "shift-"), (COMMAND, "cmd-")] {
+        if mask & bit != 0 {
+            text.push_str(name);
+        }
+    }
+    text.push_str(key);
+    text
+}
+
 #[allow(non_upper_case_globals)]
 unsafe extern "C" {
     static _dispatch_main_q: c_void;
@@ -180,6 +322,15 @@ mod tests {
         ] {
             assert!(!is_web_url(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn key_equivalents_read_as_gpui_writes_them() {
+        assert_eq!(key_equivalent_text(",", 1 << 20), "cmd-,");
+        assert_eq!(key_equivalent_text("z", (1 << 20) | (1 << 17)), "shift-cmd-z");
+        assert_eq!(key_equivalent_text("f", (1 << 20) | (1 << 18)), "ctrl-cmd-f");
+        assert_eq!(key_equivalent_text("h", (1 << 20) | (1 << 19)), "alt-cmd-h");
+        assert_eq!(key_equivalent_text("w", 0), "w");
     }
 
     #[test]
