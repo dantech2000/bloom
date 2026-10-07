@@ -751,7 +751,7 @@ pub fn group(title: impl Into<SharedString>, cx: &Context<Bloom>) -> Div {
         .border_color(edge)
         .when(!liquid, |el| el.bg(rgba(0x2a2a2ab0)))
         .when(liquid, |el| {
-            el.relative().child(crate::ui::glass::glass(px(32.), crate::ui::glass::POPUP_TINT))
+            el.relative().child(crate::ui::glass::card_glass(px(32.), crate::ui::glass::POPUP_TINT))
         })
         .px(px(22.))
         .pt(px(18.))

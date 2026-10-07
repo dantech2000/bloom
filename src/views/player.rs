@@ -748,7 +748,7 @@ impl Bloom {
                 .p(px(12.))
                 .rounded(px(16.))
                 .border_1()
-                .border_color(rgba(0xffffff26))
+                .border_color(crate::ui::glass::ring(rgba(0xffffff26)))
                 .child(glass(px(16.), rgba(0x1c1c1cd9)))
                 .flex()
                 .gap(px(14.))

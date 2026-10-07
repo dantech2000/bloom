@@ -106,6 +106,10 @@ constant float LIQUID_BEZEL_SHARE = 0.6;
 // Saturation of the backdrop under the specular rim (kube.io's "specular
 // saturation", 4 to 9 in its components).
 constant float LIQUID_RIM_SATURATION = 6.0;
+// Over a bright picture a dark tint grows to this opacity, that of the
+// frosted popups, so light text on the glass stays readable; over a dark
+// or mid picture the tint is the light one asked for.
+constant float LIQUID_BRIGHT_ALPHA = 0.72;
 
 /// The colour of a liquid glass quad at `position`, before the corner is
 /// rounded. The quad's `border_color` and gradient background carry the
@@ -113,7 +117,8 @@ constant float LIQUID_RIM_SATURATION = 6.0;
 ///   border_color.h  width of the bezel, device pixels
 ///   border_color.s  thickness of the slab under the bezel, device pixels
 ///   border_color.l  source of the sharp sample: 0 the quarter-size copy,
-///                   1 the full-size copy
+///                   1 the full-size copy; 0.5 the quarter-size copy the
+///                   frame already has (a card of the page)
 ///   background      a linear gradient: the angle is the blur share in the
 ///                   bezel (0 sharp, 1 the full blur); stop 0 is the tint,
 ///                   its percentage the width of the specular rim in
@@ -141,7 +146,7 @@ float4 liquid_glass(Quad quad, float2 position, float4 tint,
   float asked_bezel = max(quad.border_color.h, 1.0);
   float bezel = min(asked_bezel, half_side * LIQUID_BEZEL_SHARE);
   float thickness = quad.border_color.s * bezel / asked_bezel;
-  bool full_source = quad.border_color.l >= 0.5;
+  bool full_source = quad.border_color.l >= 0.75;
   float bezel_blur = quad.background.gradient_angle_or_pattern_height;
   float rim_width = max(quad.background.colors[0].percentage, 0.5);
   float saturation = quad.background.colors[1].color.h;
@@ -212,7 +217,12 @@ float4 liquid_glass(Quad quad, float2 position, float4 tint,
   behind = mix(grey, behind, saturation);
   behind = mix(behind, saturate(mix(grey, behind, LIQUID_RIM_SATURATION)), lit);
 
-  float3 glass = mix(behind, tint.rgb, tint.a);
+  float tint_alpha = tint.a;
+  if (dot(tint.rgb, float3(0.2126, 0.7152, 0.0722)) < 0.5) {
+    float bright = smoothstep(0.3, 0.8, dot(soft, float3(0.2126, 0.7152, 0.0722)));
+    tint_alpha = max(tint_alpha, mix(tint_alpha, LIQUID_BRIGHT_ALPHA, bright));
+  }
+  float3 glass = mix(behind, tint.rgb, tint_alpha);
   glass = mix(glass, float3(1.0), saturate(lit * rim));
   return float4(glass, 1.0);
 }

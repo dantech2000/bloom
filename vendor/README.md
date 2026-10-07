@@ -22,7 +22,8 @@ is marked `Bloom` in the source.
   saturation. Its parameters ride in fields the blur path does not draw:
   `border_color` (h bezel width, s glass thickness, both in device
   pixels; l 1 for a full-size copy of the frame as the sharp source, 0
-  for the quarter-size copy) and a linear-gradient background (angle: the
+  for the quarter-size copy, 0.5 for a card of the page, which takes the
+  copy the frame already has) and a linear-gradient background (angle: the
   blur share in the bezel; stop 0: the tint, its percentage the width of
   the specular rim; stop 1's colour: h saturation, s rim, l counter-light,
   its percentage the blur share in the flat middle). The

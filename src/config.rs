@@ -29,6 +29,10 @@ pub struct Config {
     pub active: Option<(String, String)>,
     #[serde(default)]
     pub dark: Option<bool>,
+    /// Liquid glass for the panels and controls; on unless set to false,
+    /// which gives the frosted glass of before.
+    #[serde(default)]
+    pub liquid_glass: Option<bool>,
     /// Trailer video behind the home hero; on unless set to false.
     #[serde(default)]
     pub hero_video: Option<bool>,

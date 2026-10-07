@@ -252,10 +252,7 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
         grid = grid.child(
             div()
                 .w(px(card_w))
-                .rounded(px(24.))
-                .border_1()
-                .border_color(rgba(0xf5f5f733))
-                .bg(rgba(0x2a2a2ab0))
+                .map(super::surface)
                 .overflow_hidden()
                 .flex()
                 .flex_col()
@@ -265,8 +262,10 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                 .child(
                     div()
                         .relative()
-                        .w(px(card_w))
+                        .w_full()
                         .h(px(IMAGE_H))
+                        // The corners of the card, inside its 1 px edge.
+                        .rounded_t(px(23.))
                         .bg(rgba(0xffffff0f))
                         .flex()
                         .items_center()
@@ -280,12 +279,13 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                         )
                         .when_some(image, |el, url| {
                             el.child(
-                                crate::images::remote_with(url, px(0.), ObjectFit::Cover)
-                                    .absolute()
-                                    .top_0()
-                                    .left_0()
-                                    .w(px(card_w))
-                                    .h(px(IMAGE_H)),
+                                crate::images::remote_corners(
+                                    url,
+                                    gpui_kit::Corners { top_left: px(23.), top_right: px(23.), ..Default::default() },
+                                    ObjectFit::Cover,
+                                )
+                                .absolute()
+                                .inset_0(),
                             )
                         })
                         .child(

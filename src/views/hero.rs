@@ -157,6 +157,15 @@ impl Bloom {
     }
 
     /// Turns trailer backdrops on or off and keeps the choice.
+    /// Liquid glass or the frosted glass of before, for every panel.
+    pub fn toggle_liquid_glass(&mut self, cx: &mut Context<Self>) {
+        let on = !self.config.liquid_glass.unwrap_or(true);
+        self.config.liquid_glass = Some(on);
+        self.save_config(cx);
+        crate::ui::glass::set_liquid(on);
+        cx.refresh_windows();
+    }
+
     pub fn toggle_hero_video(&mut self, cx: &mut Context<Self>) {
         let enabled = !self.config.hero_video.unwrap_or(true);
         self.config.hero_video = Some(enabled);
@@ -484,12 +493,9 @@ impl Bloom {
                 .cursor_pointer()
                 .relative()
                 .rounded(px(radius))
-                // Liquid glass has its own lit edge and takes the colour of
-                // the picture: a white wash and a ring would grey it out.
-                .when(crate::ui::glass::liquid(), |el| el.child(frosted(px(radius), rgba(0xffffff0a))))
-                .when(!crate::ui::glass::liquid(), |el| {
-                    el.child(frosted(px(radius), rgba(0xffffff1f))).border_1().border_color(rgba(0xffffff33))
-                })
+                .child(frosted(px(radius), rgba(0xffffff1f)))
+                .border_1()
+                .border_color(crate::ui::glass::ring(rgba(0xffffff33)))
                 .hover(|s| s.opacity(0.8))
         };
         let (details_target, play_target) = (item.clone(), item.clone());

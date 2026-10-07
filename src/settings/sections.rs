@@ -729,6 +729,13 @@ impl Bloom {
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_hero_video(cx))),
             cx,
         ));
+        let glass = group("Glass", cx).child(field(
+            "Liquid glass",
+            "Panels and controls bend and take the colour of the picture behind them. Off gives the frosted glass of before.",
+            checkbox("settings.check.glass", crate::ui::glass::liquid(), cx)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_liquid_glass(cx))),
+            cx,
+        ));
         let cards = group("Cards", cx).child(field(
             "Quality tags",
             "The tags the plugin sets on the posters, such as 4K, Dolby Vision, HEVC and Atmos.",
@@ -756,6 +763,7 @@ impl Bloom {
             .flex_col()
             .gap(px(18.))
             .child(home)
+            .child(glass)
             .child(cards)
             .child(enhanced)
     }

@@ -4,14 +4,18 @@
 //! which treats a quad with a dashed border style and no border as a request
 //! to blur its backdrop.
 //!
-//! Liquid glass (a prototype, off by default): the same quad with a curved
-//! bezel at its edge that refracts what is behind it, a specular rim and
-//! more saturation under the glass, after Apple's Liquid Glass and kube.io's
-//! model of it. `BLOOM_GLASS=liquid` at start or the debug verb `glass`
-//! turn it on; the parameters ride in fields of the quad the blur path does
-//! not use (`encode`, and "liquid glass" in vendor/README.md).
+//! Liquid glass, the default (Settings > Display has the switch): the same
+//! quad with a curved bezel at its edge that refracts what is behind it, a
+//! lit rim and more saturation under the glass, after Apple's Liquid Glass
+//! and kube.io's model of it. `BLOOM_GLASS=liquid|frosted` at start forces
+//! a mode and the debug verb `glass` changes it live; the parameters ride
+//! in fields of the quad the blur path does not use (`encode`, and "liquid
+//! glass" in vendor/README.md).
 
-use std::sync::{LazyLock, RwLock};
+use std::sync::{
+    LazyLock, RwLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 use gpui_kit::{
     App, BorderStyle, Bounds, Canvas, Corners, Edges, Hsla, PaintQuad, Pixels, Rgba, Styled,
@@ -122,12 +126,36 @@ const LIGHT: Liquid = Liquid {
 };
 
 static SETTINGS: LazyLock<RwLock<Settings>> = LazyLock::new(|| {
-    let mode = match std::env::var("BLOOM_GLASS").as_deref() {
-        Ok("liquid") => Mode::Liquid,
-        _ => Mode::Frosted,
-    };
+    let mode = forced().unwrap_or(Mode::Liquid);
     RwLock::new(Settings { mode, dark: DARK, light: LIGHT, ground: None })
 });
+
+/// The mode `BLOOM_GLASS=liquid|frosted` asks for, which wins over the
+/// user's setting, for a test.
+pub fn forced() -> Option<Mode> {
+    match std::env::var("BLOOM_GLASS").as_deref() {
+        Ok("liquid") => Some(Mode::Liquid),
+        Ok("frosted") => Some(Mode::Frosted),
+        _ => None,
+    }
+}
+
+/// Sets the mode from the user's setting, unless the environment forces one.
+pub fn set_liquid(on: bool) {
+    let mode = forced().unwrap_or(if on { Mode::Liquid } else { Mode::Frosted });
+    SETTINGS.write().unwrap().mode = mode;
+}
+
+/// Whether the player is on the page. Its glass then takes the sharp
+/// sample from the quarter-size copy of the frame: the full-size copy is
+/// one more pass over the frame for each video frame, and with it 1.5% of
+/// the frames of a 24 fps film came late with a menu open (0.1% without).
+static OVER_VIDEO: AtomicBool = AtomicBool::new(false);
+
+/// The app says at each render whether the player is on the page.
+pub fn set_over_video(on: bool) {
+    OVER_VIDEO.store(on, Ordering::Relaxed);
+}
 
 /// The current settings.
 pub fn settings() -> Settings {
@@ -154,6 +182,17 @@ pub fn ground() -> Option<Rgba> {
 /// A layer that fills its parent with blurred backdrop, tinted by `tint`.
 /// Put it first in a `relative()` parent, under the panel's content.
 pub fn glass(radius: Pixels, tint: Rgba) -> Canvas<()> {
+    layer(radius, tint, false)
+}
+
+/// The glass of a card that is part of the page, as a group of Settings or
+/// a card of the dashboard: many are on screen at once and none lies over
+/// another, so in a frame they share one copy of the backdrop.
+pub fn card_glass(radius: Pixels, tint: Rgba) -> Canvas<()> {
+    layer(radius, tint, true)
+}
+
+fn layer(radius: Pixels, tint: Rgba, card: bool) -> Canvas<()> {
     canvas(
         |_, _, _| {},
         move |bounds: Bounds<Pixels>, _, window, cx| {
@@ -166,10 +205,16 @@ pub fn glass(radius: Pixels, tint: Rgba) -> Canvas<()> {
                 BorderStyle::Dashed
             };
             let settings = settings();
-            let liquid = (settings.mode == Mode::Liquid && style == BorderStyle::Dashed)
-                .then(|| *settings.for_mode(UiTheme::read(cx).mode));
+            // A quad with square corners is a scrim over the whole page,
+            // not a piece of glass: it has no edge to bend.
+            let liquid = (settings.mode == Mode::Liquid && style == BorderStyle::Dashed && radius > Pixels::ZERO)
+                .then(|| {
+                    let mut set = *settings.for_mode(UiTheme::read(cx).mode);
+                    set.full &= !OVER_VIDEO.load(Ordering::Relaxed);
+                    set
+                });
             let quad = match liquid {
-                Some(liquid) => encode(bounds, radius, tint, &liquid, window.scale_factor()),
+                Some(liquid) => encode(bounds, radius, tint, &liquid, card, window.scale_factor()),
                 None => PaintQuad {
                     bounds,
                     corner_radii: Corners::all(radius),
@@ -190,7 +235,8 @@ pub fn glass(radius: Pixels, tint: Rgba) -> Canvas<()> {
 /// quad stays (dashed border style, no border); the parameters go in fields
 /// that such a quad does not draw:
 /// - `border_color`: h the bezel width, s the glass thickness (both in
-///   device pixels), l 1 for the full-size source, 0 for the quarter-size.
+///   device pixels), l 1 for the full-size source, 0 for the quarter-size,
+///   0.5 for a card of the page, which shares the frame's copy.
 /// - `background`, a linear gradient: the angle is the blur share of the
 ///   bezel; stop 0 is the tint with the rim width (device pixels) as its
 ///   percentage; stop 1's colour is (h saturation, s rim, l counter-light),
@@ -198,8 +244,8 @@ pub fn glass(radius: Pixels, tint: Rgba) -> Canvas<()> {
 ///   of the flat middle as its percentage.
 /// Alpha fields carry no parameter: `paint_quad` scales them by the
 /// element's opacity.
-fn encode(bounds: Bounds<Pixels>, radius: Pixels, tint: Rgba, liquid: &Liquid, scale: f32) -> PaintQuad {
-    let tint = if tint == POPUP_TINT { liquid.tint } else { tint };
+fn encode(bounds: Bounds<Pixels>, radius: Pixels, tint: Rgba, liquid: &Liquid, card: bool, scale: f32) -> PaintQuad {
+    let tint = liquid_tint(tint, liquid);
     PaintQuad {
         bounds,
         corner_radii: Corners::all(radius),
@@ -215,11 +261,37 @@ fn encode(bounds: Bounds<Pixels>, radius: Pixels, tint: Rgba, liquid: &Liquid, s
         border_color: Hsla {
             h: (liquid.bezel * scale).max(0.5),
             s: liquid.thickness * scale,
-            l: if liquid.full { 1. } else { 0. },
+            l: if card {
+                0.5
+            } else if liquid.full {
+                1.
+            } else {
+                0.
+            },
             a: 0.,
         },
         border_style: BorderStyle::Dashed,
     }
+}
+
+/// The tint of a liquid quad for the tint its frosted form asks for. A
+/// popup takes the tint of the set. A dark fill of its own gets lighter by
+/// the same share as the popup's, so the glass takes the colour of the
+/// picture behind it; a white wash drops to a third, because white greys
+/// that colour out.
+fn liquid_tint(tint: Rgba, liquid: &Liquid) -> Rgba {
+    if tint == POPUP_TINT {
+        return liquid.tint;
+    }
+    let luma = 0.2126 * tint.r + 0.7152 * tint.g + 0.0722 * tint.b;
+    let share = if luma < 0.5 { liquid.tint.a / POPUP_TINT.a } else { 1. / 3. };
+    Rgba { a: tint.a * share.min(1.), ..tint }
+}
+
+/// The colour of the ring some glass controls draw around themselves:
+/// none on liquid glass, whose lit edge is the ring.
+pub fn ring(color: Rgba) -> Rgba {
+    if liquid() { Rgba { a: 0., ..color } } else { color }
 }
 
 /// The keys of the debug verb, with their ranges, for `glass help`.

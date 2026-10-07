@@ -753,15 +753,23 @@ pub fn panel(title: impl Into<SharedString>, cx: &Context<Bloom>) -> Div {
     )
 }
 
+/// The surface of every card of the dashboard: 24 px corners, the light
+/// edge, and the glass of the theme. With liquid glass it is a glass panel,
+/// as a group of the Settings page; with the frosted look it is the flat
+/// tint of before.
+pub fn surface<E: Styled + gpui_kit::ParentElement + gpui_kit::prelude::FluentBuilder>(el: E) -> E {
+    let liquid = crate::ui::glass::liquid();
+    el.rounded(px(24.))
+        .border_1()
+        .border_color(rgba(0xf5f5f733))
+        .when(!liquid, |el| el.bg(rgba(0x2a2a2ab0)))
+        .when(liquid, |el| el.relative().child(crate::ui::glass::card_glass(px(24.), crate::ui::glass::POPUP_TINT)))
+}
+
 /// A plain card surface: the glass group of the theme, as the Settings
 /// page draws it.
 pub fn card(_cx: &Context<Bloom>) -> Div {
-    div()
-        .rounded(px(24.))
-        .border_1()
-        .border_color(rgba(0xf5f5f733))
-        .bg(rgba(0x2a2a2ab0))
-        .p(px(20.))
+    surface(div()).p(px(20.))
         .flex()
         .flex_col()
 }

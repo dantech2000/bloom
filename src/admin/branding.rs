@@ -101,12 +101,10 @@ pub fn splash_block(branding: &Value, preview: &str, cx: &mut Context<Bloom>) ->
                 .text_color(t.colors.foreground.opacity(0.5))
                 .child("No image")
                 .child(
-                    crate::images::remote_with(url, px(0.), ObjectFit::Cover)
+                    // The corners of the box, inside its 1 px edge.
+                    crate::images::remote_with(url, px(11.), ObjectFit::Cover)
                         .absolute()
-                        .top_0()
-                        .left_0()
-                        .w(px(320.))
-                        .h(px(180.)),
+                        .inset_0(),
                 ),
         )
         .child(

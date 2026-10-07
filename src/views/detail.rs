@@ -534,7 +534,7 @@ impl Bloom {
                         .rounded(px(8.))
                         .child(glass(px(8.), rgba(0xffffff1f)))
                         .border_1()
-                        .border_color(rgba(0xffffff33))
+                        .border_color(crate::ui::glass::ring(rgba(0xffffff33)))
                         .flex()
                         .items_center()
                         .justify_between()

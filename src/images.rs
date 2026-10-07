@@ -508,6 +508,13 @@ fn schedule_refresh(cx: &mut App) {
 /// while part of the element is visible, so the off-screen cards of a long
 /// page are not downloaded and age out of the cache.
 pub fn remote_with(url: String, radius: Pixels, fit: ObjectFit) -> Canvas<()> {
+    remote_corners(url, Corners::all(radius), fit)
+}
+
+/// `remote_with` with a radius for each corner, for an image that fills
+/// the top of a card with round corners: `overflow_hidden` clips to the
+/// rectangle of the card, not to its corners.
+pub fn remote_corners(url: String, corners: Corners<Pixels>, fit: ObjectFit) -> Canvas<()> {
     canvas(
         |_, _, _| {},
         move |bounds: Bounds<Pixels>, _, window: &mut Window, cx: &mut App| {
@@ -523,7 +530,7 @@ pub fn remote_with(url: String, radius: Pixels, fit: ObjectFit) -> Canvas<()> {
                 return;
             };
             let target = fit.get_bounds(bounds, image.size(0));
-            let _ = window.paint_image(bounds, target, Corners::all(radius), image, 0, false);
+            let _ = window.paint_image(bounds, target, corners, image, 0, false);
         },
     )
 }

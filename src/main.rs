@@ -101,6 +101,7 @@ fn main() {
             // and a choice of it that an older build saved is dropped.
             config.dark = None;
             UiTheme::set(cx, app::theme(true));
+            ui::glass::set_liquid(config.liquid_glass.unwrap_or(true));
             // The parts AppKit draws follow the theme of the app, not the
             // appearance of the system, so they match the window in both
             // settings of the Mac. `BLOOM_APPEARANCE=light|dark|system`

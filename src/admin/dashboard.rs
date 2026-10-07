@@ -734,10 +734,7 @@ fn session_card(
         } else {
             IDLE_H
         }))
-        .rounded(px(24.))
-        .border_1()
-        .border_color(rgba(0xf5f5f733))
-        .bg(rgba(0x2a2a2ab0))
+        .map(super::surface)
         .overflow_hidden();
 
     let Some(item) = &session.now_playing_item else {
@@ -799,13 +796,13 @@ fn session_card(
         // The artwork at the size it is drawn on a 2x display.
         .when_some(item.wide_url(client, (width * 2.) as u32), |el, url| {
             el.child(
-                crate::images::remote_with(url, px(16.), ObjectFit::Cover)
+                crate::images::remote_with(url, px(23.), ObjectFit::Cover)
                     .absolute()
                     .inset_0(),
             )
         })
         // Dark from the bottom and a little from the top, so the text reads.
-        .child(div().absolute().inset_0().rounded(px(16.)).bg(linear_gradient(
+        .child(div().absolute().inset_0().rounded(px(23.)).bg(linear_gradient(
             180.,
             linear_color_stop(rgba(0x0a0a0ab3), 0.),
             linear_color_stop(rgba(0x0a0a0af2), 0.8),

@@ -245,10 +245,7 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
         grid = grid.child(
             div()
                 .w(px(card_w))
-                .rounded(px(24.))
-                .border_1()
-                .border_color(rgba(0xf5f5f733))
-                .bg(rgba(0x2a2a2ab0))
+                .map(super::surface)
                 .overflow_hidden()
                 .flex()
                 .flex_col()
@@ -256,8 +253,10 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                 .child(
                     div()
                         .relative()
-                        .w(px(card_w))
+                        .w_full()
                         .h(px(image_h))
+                        // The corners of the card, inside its 1 px edge.
+                        .rounded_t(px(23.))
                         .bg(t.colors.muted)
                         .flex()
                         .items_center()
@@ -265,12 +264,13 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                         .child(icon(glyph, 44., t.colors.muted_foreground))
                         .when_some(image, |el, url| {
                             el.child(
-                                crate::images::remote_with(url, px(0.), ObjectFit::Cover)
-                                    .absolute()
-                                    .top_0()
-                                    .left_0()
-                                    .w(px(card_w))
-                                    .h(px(image_h)),
+                                crate::images::remote_corners(
+                                    url,
+                                    gpui_kit::Corners { top_left: px(23.), top_right: px(23.), ..Default::default() },
+                                    ObjectFit::Cover,
+                                )
+                                .absolute()
+                                .inset_0(),
                             )
                         })
                         // Over the artwork the label needs a dark back.

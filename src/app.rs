@@ -3202,6 +3202,7 @@ impl Render for Bloom {
         let started_cpu = crate::perf::thread_cpu_ns();
         self.hero_only_frame = !std::mem::take(&mut self.content_dirty);
         self.sync_frame(window);
+        crate::ui::glass::set_over_video(self.player_open);
         self.viewport_w = f32::from(window.viewport_size().width);
         self.viewport_h = f32::from(window.viewport_size().height);
         // Picture in picture ends with the player.

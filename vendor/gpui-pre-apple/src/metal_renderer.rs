@@ -782,6 +782,9 @@ impl MetalRenderer {
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
         );
 
+        // Bloom: whether a copy of the backdrop was made in this frame, for
+        // the glass quads that can share one (`shares_backdrop`).
+        let mut backdrop_copied = false;
         for batch in scene.batches() {
             match batch {
                 PrimitiveBatch::Shadows(range) => {
@@ -799,8 +802,19 @@ impl MetalRenderer {
                     for index in range.clone() {
                         let is_blur = is_backdrop_blur_quad(&scene.quads[index]);
                         let is_liquid = is_blur && is_liquid_glass_quad(&scene.quads[index]);
+                        // A run of page cards takes the copy the frame
+                        // already has: each card on a page of twenty would
+                        // otherwise scale and blur the whole frame again.
+                        let reuse = is_blur
+                            && !previous_was_blur
+                            && backdrop_copied
+                            && scene.quads[index..range.end]
+                                .iter()
+                                .take_while(|quad| is_backdrop_blur_quad(quad))
+                                .all(shares_backdrop);
                         if is_blur
                             && !previous_was_blur
+                            && !reuse
                             && let Some(blurred) = self.backdrop_blur_texture.as_ref()
                             && let Some(small) = self.backdrop_small_texture.as_ref()
                         {
@@ -812,6 +826,7 @@ impl MetalRenderer {
                                 previous_was_liquid,
                             );
                             start = index;
+                            backdrop_copied = true;
                             command_encoder.end_encoding();
                             unsafe {
                                 let _: () = msg_send![
@@ -1502,7 +1517,14 @@ fn is_liquid_glass_quad(quad: &gpui::Quad) -> bool {
 /// A liquid glass quad whose sharp sample comes from the full-size copy of
 /// the frame (`border_color.l` 1) and not from the quarter-size one (0).
 fn wants_full_backdrop(quad: &gpui::Quad) -> bool {
-    quad.border_color.l >= 0.5
+    quad.border_color.l >= 0.75
+}
+
+/// A liquid glass quad that is a card of the page (`border_color.l` 0.5):
+/// cards do not lie over each other, so one copy of the backdrop in a frame
+/// serves them all. Its sharp sample is the quarter-size copy.
+fn shares_backdrop(quad: &gpui::Quad) -> bool {
+    is_liquid_glass_quad(quad) && quad.border_color.l >= 0.25 && quad.border_color.l < 0.75
 }
 
 fn new_command_encoder_for_texture<'a>(
