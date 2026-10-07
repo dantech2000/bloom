@@ -138,18 +138,19 @@ jobs:
           key: mpv-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.id }}-${{ hashFiles('dev/build-mpv') }}
 
   # The tests with the real player (libmpv, an OpenGL context, a display
-  # link, audio output). A hosted runner may have no display or audio, and
-  # nobody knows yet whether these tests run there. This job tries, and it
-  # may fail without failing the run: when it fails, the run summary says
-  # so, and the release still depends on `dev/test` on a Mac. When it
-  # passes on three runs in a row, remove `continue-on-error` to make it a
-  # gate.
+  # link, audio output). A hosted runner is a virtual machine with no GPU:
+  # the picture is drawn in software and the clock is uneven. The tests
+  # that hold there are a gate. The three named in UNSTABLE are not: one
+  # reads the picture back and two measure timing to a few milliseconds.
+  # They run in a step of their own that reports and never fails the run,
+  # and `dev/test` on a Mac stays the gate of a release for them.
   player-tests:
-    name: Tests with the real player (trial)
+    name: Tests with the real player
     if: github.event_name != 'pull_request'
     runs-on: macos-26
     timeout-minutes: 30
-    continue-on-error: true
+    env:
+      UNSTABLE: embedded_playback_roundtrip,precise_control_for_group_playback,follows_a_scripted_group_with_the_real_player
     permissions:
       contents: read
     steps:
@@ -203,12 +204,29 @@ jobs:
         # formula. The version is not pinned: the tests only make a clip.
         run: brew install ffmpeg
 
-      - name: Tests
-        id: tests
-        run: dev/test
+      - name: Tests (gate)
+        # Every test, the real player included, but for the three of
+        # UNSTABLE, which print "SKIPPED in CI". A count other than three
+        # fails: a name that no longer matches would run or hide a test.
+        run: |
+          log=$RUNNER_TEMP/player-tests.log
+          status=0
+          BLOOM_CI_SKIP_PLAYER_TESTS=$UNSTABLE dev/test -- --nocapture >"$log" 2>&1 || status=$?
+          grep -E '^test result|^SKIPPED in CI|\.\.\. FAILED|panicked at' "$log" || true
+          skipped=$(grep -c '^SKIPPED in CI' "$log" || true)
+          echo "### Tests with the real player (gate)" >> "$GITHUB_STEP_SUMMARY"
+          grep '^test result' "$log" | tail -n 1 >> "$GITHUB_STEP_SUMMARY" || true
+          echo "$skipped skipped here and tried in the next step." >> "$GITHUB_STEP_SUMMARY"
+          [ "$status" -eq 0 ] || { tail -n 80 "$log"; exit 1; }
+          [ "$skipped" -eq 3 ] || { echo "expected 3 skipped tests, saw $skipped" >&2; exit 1; }
+
+      - name: The three unstable tests (trial)
+        id: trial
+        continue-on-error: true
+        run: dev/test -- $(echo "$UNSTABLE" | tr ',' ' ')
 
       - name: Say it when the trial failed
-        if: failure()
+        if: steps.trial.outcome == 'failure'
         run: |
-          echo "::warning title=Tests with the real player failed::These tests did not pass on the hosted runner. The run is still green by design; run dev/test on a Mac before a release."
-          echo "### Tests with the real player: FAILED on the runner (trial, not a gate)" >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning title=Unstable player tests failed on the runner::The picture or timing tests did not pass on the virtual machine. The run is still green by design; run dev/test on a Mac before a release."
+          echo "### The three unstable tests: FAILED on the runner (trial, not a gate)" >> "$GITHUB_STEP_SUMMARY"

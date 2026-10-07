@@ -11,9 +11,10 @@ What the workflows do:
 - `release.yml` makes a DRAFT release unless you turn on `publish`. No
   installed app sees a draft.
 
-What CI cannot do: it cannot run the tests with the real player (libmpv,
-OpenGL, sound). Those 12 tests print `SKIPPED in CI`. You run `dev/test` on
-your Mac before each release. This is a step below.
+What CI cannot do: it cannot judge the picture or timing of the real
+player. Three tests need a real GPU and an even clock, and CI only tries
+them. You run `dev/test` on your Mac before each release. This is a step
+below.
 
 ## One-time set-up
 
@@ -86,8 +87,8 @@ the secret, and only a run on `main` can use that environment.
 
 Replace `x.y.z` with the new version.
 
-1. Run `dev/test` on your Mac. Every test must pass. This runs the tests
-   with the real player, which CI skips (`dev/ci-test` prints how many).
+1. Run `dev/test` on your Mac. Every test must pass. This runs the three
+   tests of picture and timing that CI only tries.
 2. Write the notes in `docs/releases/x.y.z.md`. Say what is new in plain
    words. Do not write the install steps or the list of libraries: the
    workflow adds `docs/releases/_footer.md`. The release fails if the file is
@@ -164,11 +165,11 @@ Each push to `main` and each pull request runs `.github/workflows/ci.yml`.
   `dev/build-mpv`, builds the app, compiles the icon, makes the bundle,
   checks it with `dev/release-verify --bundle`, and runs the tests that need
   no real player.
-- The job `Tests with the real player (trial)` runs all tests on the runner
-  and only reports. A runner is a virtual machine with no GPU: the picture
-  test gets a black frame, and the SyncPlay timing test is too uneven there.
-  The other tests with the real player pass. Its failure does not fail the
-  run.
+- The job `Tests with the real player` is a gate too, on a push. It runs
+  every test with libmpv, but for three. A runner is a virtual machine
+  with no GPU: the picture test can get a black frame, and the two timing
+  tests are too uneven there. Those three run in a step of their own that
+  only reports. The workflow names them in `UNSTABLE`.
 - So `dev/test` on a Mac stays the gate of a release for the picture and
   for timing.
 - A build of libmpv from nothing downloads eleven source archives from

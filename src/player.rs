@@ -2163,12 +2163,20 @@ pub(crate) static REAL_PLAYER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// display or audio, the test does not run: it prints one line that starts
 /// with `SKIPPED in CI` and returns `None`, and the workflow counts the lines
 /// (`dev/ci-test`), so a skipped test is never taken for a passed one.
+/// `BLOOM_CI_SKIP_PLAYER_TESTS` skips the same way only the tests it names
+/// (last part of the name, separated by commas): those whose timing or
+/// picture a virtual machine cannot hold, so the others can be a gate.
 #[cfg(test)]
 pub(crate) fn real_player_turn() -> Option<std::sync::MutexGuard<'static, ()>> {
+    let test = std::thread::current().name().unwrap_or("?").to_owned();
     if std::env::var_os("BLOOM_CI_NO_PLAYER").is_some_and(|v| !v.is_empty()) {
-        let test = std::thread::current().name().unwrap_or("?").to_owned();
         // The newline first: the test runner prints "test x ..." without one.
         eprintln!("\nSKIPPED in CI (BLOOM_CI_NO_PLAYER is set): {test}");
+        return None;
+    }
+    let short = test.rsplit("::").next().unwrap_or(&test);
+    if std::env::var("BLOOM_CI_SKIP_PLAYER_TESTS").is_ok_and(|names| names.split(',').any(|name| name.trim() == short)) {
+        eprintln!("\nSKIPPED in CI (BLOOM_CI_SKIP_PLAYER_TESTS names it): {test}");
         return None;
     }
     Some(REAL_PLAYER.lock().unwrap_or_else(|e| e.into_inner()))
@@ -2882,7 +2890,7 @@ mod tests {
             .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=s=720x576:r=50:d=10"])
             .args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"])
             .args(["-vf", "tinterlace=interleave_top,fieldorder=tff", "-flags", "+ilme+ildct"])
-            .args(["-c:v", "mpeg2video", "-q:v", "4", "-top", "1", "-c:a", "aac", "-shortest", "-t", "10"])
+            .args(["-c:v", "mpeg2video", "-q:v", "4", "-c:a", "aac", "-shortest", "-t", "10"])
             .arg(&media)
             .status();
         // No ffmpeg is a skip (`dev/test` refuses to start without it); an
