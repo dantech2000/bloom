@@ -741,11 +741,18 @@ impl Bloom {
 /// page (tinted glass, 32 px corners, thin light border).
 pub fn group(title: impl Into<SharedString>, cx: &Context<Bloom>) -> Div {
     let t = UiTheme::read(cx);
+    // Liquid glass prototype: the card is a glass panel with the ink of the
+    // theme; off, it is the flat tint of the dark theme as before.
+    let liquid = crate::ui::glass::liquid();
+    let edge = if crate::ui::glass::liquid_light(cx) { rgb(0x121212).opacity(0.2) } else { rgba(0xf5f5f733) };
     div()
         .rounded(px(32.))
         .border_1()
-        .border_color(rgba(0xf5f5f733))
-        .bg(rgba(0x2a2a2ab0))
+        .border_color(edge)
+        .when(!liquid, |el| el.bg(rgba(0x2a2a2ab0)))
+        .when(liquid, |el| {
+            el.relative().child(crate::ui::glass::glass(px(32.), crate::ui::glass::POPUP_TINT))
+        })
         .px(px(22.))
         .pt(px(18.))
         .pb(px(10.))

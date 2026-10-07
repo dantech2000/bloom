@@ -97,6 +97,126 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
+// Bloom: liquid glass, the refraction of the bezel of a backdrop quad
+// (see `liquid_glass` below). Refractive index of the glass; air is 1.
+constant float LIQUID_INDEX = 1.5;
+// The bezel takes at most this share of the shorter half of a quad, so a
+// small control keeps a flat middle; the glass gets thinner with it.
+constant float LIQUID_BEZEL_SHARE = 0.6;
+// Saturation of the backdrop under the specular rim (kube.io's "specular
+// saturation", 4 to 9 in its components).
+constant float LIQUID_RIM_SATURATION = 6.0;
+
+/// The colour of a liquid glass quad at `position`, before the corner is
+/// rounded. The quad's `border_color` and gradient background carry the
+/// parameters (vendor/README.md, "liquid glass"):
+///   border_color.h  width of the bezel, device pixels
+///   border_color.s  thickness of the slab under the bezel, device pixels
+///   border_color.l  source of the sharp sample: 0 the quarter-size copy,
+///                   1 the full-size copy
+///   background      a linear gradient: the angle is the blur share in the
+///                   bezel (0 sharp, 1 the full blur); stop 0 is the tint,
+///                   its percentage the width of the specular rim in
+///                   device pixels; stop 1's colour is (h: saturation,
+///                   s: rim strength, l: counter-light strength), its
+///                   percentage the blur share in the flat middle.
+/// The model is that of kube.io's "Liquid Glass in CSS and SVG", from its
+/// code: a slab of glass with a curved bezel at its edge. The height of the
+/// bezel is the convex squircle y = (1 - (1 - x)^4)^(1/4), x from 0 at the
+/// border to 1 where the glass is flat. A ray orthogonal to the background
+/// meets the surface at the angle t1 of the normal, with
+/// sin t1 = y' / sqrt(1 + y'^2); Snell's law gives sin t2 = sin t1 / n; the
+/// ray then crosses the bezel and the slab under it and lands
+/// (y * bezel + thickness) * tan(t1 - t2) further in, along the inward
+/// normal of the border. The slab is what bends the picture most at the
+/// very edge, where the surface is steepest.
+float4 liquid_glass(Quad quad, float2 position, float4 tint,
+                    float sdf, float2 corner_center_to_point,
+                    float2 center_to_point,
+                    texture2d<float> blurred, texture2d<float> small,
+                    texture2d<float> full) {
+  constexpr sampler backdrop_sampler(mag_filter::linear, min_filter::linear,
+                                     address::clamp_to_edge);
+  float half_side = min(quad.bounds.size.width, quad.bounds.size.height) / 2.0;
+  float asked_bezel = max(quad.border_color.h, 1.0);
+  float bezel = min(asked_bezel, half_side * LIQUID_BEZEL_SHARE);
+  float thickness = quad.border_color.s * bezel / asked_bezel;
+  bool full_source = quad.border_color.l >= 0.5;
+  float bezel_blur = quad.background.gradient_angle_or_pattern_height;
+  float rim_width = max(quad.background.colors[0].percentage, 0.5);
+  float saturation = quad.background.colors[1].color.h;
+  float rim = quad.background.colors[1].color.s;
+  float counter = quad.background.colors[1].color.l;
+  float middle_blur = quad.background.colors[1].percentage;
+
+  // Outward normal of the rounded rectangle at this point: radial in a
+  // corner, else the axis of the nearest side; back from the mirrored
+  // quadrant.
+  float2 q = corner_center_to_point;
+  float2 normal;
+  if (q.x > 0.0 && q.y > 0.0) {
+    normal = q / max(length(q), 1e-4);
+  } else {
+    normal = q.x > q.y ? float2(1.0, 0.0) : float2(0.0, 1.0);
+  }
+  normal *= float2(center_to_point.x < 0.0 ? -1.0 : 1.0,
+                   center_to_point.y < 0.0 ? -1.0 : 1.0);
+
+  // Position in the bezel: 0 at the border, 1 where the glass is flat.
+  float depth = max(-sdf, 0.0);
+  float x = saturate(depth / bezel);
+  float u = 1.0 - x;
+  float u3 = u * u * u;
+  float v = max(1.0 - u3 * u, 0.0);
+  float height = pow(v, 0.25);
+  // sin t1 = y' / sqrt(1 + y'^2) with y' = u^3 (1 - u^4)^(-3/4), written so
+  // that the border (y' infinite) gives 1 and not NaN.
+  float sin1 = u3 / sqrt(v * sqrt(v) + u3 * u3);
+  float t1 = asin(min(sin1, 1.0));
+  float t2 = asin(sin1 / LIQUID_INDEX);
+  float displacement = (height * bezel + thickness) * tan(t1 - t2);
+  // A convex bezel bends inwards; the ray never crosses the middle.
+  displacement = min(displacement, max(half_side - depth, 0.0));
+  float2 sample_at = position - normal * displacement;
+
+  // The blurred and the quarter-size copies are a quarter of the frame per
+  // side (BACKDROP_BLUR_DOWNSCALE in metal_renderer.rs).
+  float2 quarter_scale = 1.0 / (float2(blurred.get_width(), blurred.get_height()) * 4.0);
+  float3 soft = blurred.sample(backdrop_sampler, sample_at * quarter_scale).rgb;
+  float3 sharp;
+  if (full_source) {
+    float2 full_scale = 1.0 / float2(full.get_width(), full.get_height());
+    sharp = full.sample(backdrop_sampler, sample_at * full_scale).rgb;
+  } else {
+    sharp = small.sample(backdrop_sampler, sample_at * quarter_scale).rgb;
+  }
+  // A sharp lens in the bezel, more blur in the flat middle; both shares
+  // are parameters.
+  float blur_mix = mix(bezel_blur, middle_blur, smoothstep(0.3, 1.0, x));
+  float3 behind = mix(sharp, soft, blur_mix);
+
+  // Specular rim: a thin line on the border, a half circle in section,
+  // brightest where the border faces the light (top left) and, weaker, on
+  // the far side; none where the border runs along the light.
+  float2 light = float2(-0.5, -0.866);
+  float facing = dot(normal, light);
+  float across = 1.0 - depth / rim_width;
+  float line = sqrt(saturate(1.0 - across * across));
+  float specular = line * (max(facing, 0.0) + counter * max(-facing, 0.0));
+  float lit = specular * specular;
+
+  // More saturation under the glass (1 leaves it as it is), and much more
+  // under the rim, which is what gives the edge its colour.
+  float luma = dot(behind, float3(0.2126, 0.7152, 0.0722));
+  float3 grey = float3(luma);
+  behind = mix(grey, behind, saturation);
+  behind = mix(behind, saturate(mix(grey, behind, LIQUID_RIM_SATURATION)), lit);
+
+  float3 glass = mix(behind, tint.rgb, tint.a);
+  glass = mix(glass, float3(1.0), saturate(lit * rim));
+  return float4(glass, 1.0);
+}
+
 fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                               constant Quad *quads
                               [[buffer(QuadInputIndex_Quads)]],
@@ -422,6 +542,32 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   }
 
   return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
+}
+
+// Bloom: the fragment function of the liquid glass pipeline
+// (`liquid_quads_pipeline_state` in metal_renderer.rs), used for liquid
+// glass quads only: a backdrop quad (dashed border style, no border) with a
+// bezel width in its border colour. `quad_fragment` above is untouched, so
+// every other quad renders as before.
+fragment float4 quad_fragment_liquid(QuadFragmentInput input [[stage_in]],
+                              constant Quad *quads
+                              [[buffer(QuadInputIndex_Quads)]],
+                              texture2d<float> backdrop [[texture(0)]],
+                              texture2d<float> backdrop_small [[texture(1)]],
+                              texture2d<float> backdrop_full [[texture(2)]]) {
+  Quad quad = quads[input.quad_id];
+  float2 half_size =
+    float2(quad.bounds.size.width, quad.bounds.size.height) / 2.0;
+  float2 center_to_point = input.position.xy -
+    float2(quad.bounds.origin.x, quad.bounds.origin.y) - half_size;
+  float radius = pick_corner_radius(center_to_point, quad.corner_radii);
+  float2 corner_center_to_point = fabs(center_to_point) - half_size + radius;
+  float sdf = quad_sdf_impl(corner_center_to_point, radius);
+  // The tint is the first stop of the gradient background.
+  float4 liquid = liquid_glass(quad, input.position.xy, input.background_color0,
+                               sdf, corner_center_to_point, center_to_point,
+                               backdrop, backdrop_small, backdrop_full);
+  return float4(liquid.rgb, saturate(0.5 - sdf));
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two

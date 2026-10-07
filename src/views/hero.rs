@@ -484,9 +484,12 @@ impl Bloom {
                 .cursor_pointer()
                 .relative()
                 .rounded(px(radius))
-                .child(frosted(px(radius), rgba(0xffffff1f)))
-                .border_1()
-                .border_color(rgba(0xffffff33))
+                // Liquid glass has its own lit edge and takes the colour of
+                // the picture: a white wash and a ring would grey it out.
+                .when(crate::ui::glass::liquid(), |el| el.child(frosted(px(radius), rgba(0xffffff0a))))
+                .when(!crate::ui::glass::liquid(), |el| {
+                    el.child(frosted(px(radius), rgba(0xffffff1f))).border_1().border_color(rgba(0xffffff33))
+                })
                 .hover(|s| s.opacity(0.8))
         };
         let (details_target, play_target) = (item.clone(), item.clone());

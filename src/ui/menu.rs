@@ -170,6 +170,10 @@ impl MenuState {
     pub fn is_open(&self) -> bool {
         self.open
     }
+    /// Whether the menu has no entries (such a menu does not open).
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
     /// Replaces the menu entries and resets submenu navigation.
     pub fn set_items(&mut self, items: impl IntoIterator<Item = MenuItem>, cx: &mut Context<Self>) {
         self.items = items.into_iter().collect();
@@ -192,6 +196,12 @@ impl MenuState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A menu without entries has nothing to show. Opened anyway, it
+        // drew an empty card under its trigger (the player's settings
+        // button, before the entries of the menu were built).
+        if self.items.is_empty() {
+            return;
+        }
         self.pointer = point.is_some();
         self.return_focus = if self.pointer {
             window.focused(cx)
@@ -394,6 +404,21 @@ impl Focusable for MenuState {
 impl Render for MenuState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = UiTheme::read(cx).clone();
+        // Liquid glass prototype: in the light theme the ink inside the
+        // panel is the dark ink of the theme (`ui::glass::liquid_light`);
+        // otherwise the light ink, with the exact values of before (a
+        // share of 255 is not the same byte as a rounded fraction).
+        let (edge, faint, quiet, hover) = if super::glass::liquid_light(cx) {
+            let ink = gpui_kit::rgb(0x121212);
+            (ink.opacity(0.2), ink.opacity(0.12), ink.opacity(0.7), ink.opacity(0.12))
+        } else {
+            (
+                gpui_kit::rgba(0xf5f5f733),
+                gpui_kit::rgba(0xf5f5f71f),
+                gpui_kit::rgba(0xf5f5f7b3),
+                gpui_kit::rgba(0xffffff1f),
+            )
+        };
         // A menu is as tall as its entries, up to the room it has: under
         // its trigger or over it, whichever is more, so it does not cover
         // the trigger. A fixed limit cut the last entry of a long menu off.
@@ -454,7 +479,7 @@ impl Render for MenuState {
                 .p(gpui_kit::px(12.))
                 .rounded(gpui_kit::px(20.))
                 .border_1()
-                .border_color(gpui_kit::rgba(0xf5f5f733))
+                .border_color(edge)
                 .child(super::glass::glass(gpui_kit::px(20.), super::glass::POPUP_TINT))
                 .text_color(t.colors.popover_foreground)
                 .font_family(t.fonts.body.clone())
@@ -485,7 +510,7 @@ impl Render for MenuState {
                             .h(gpui_kit::px(1.))
                             .mx(gpui_kit::px(12.))
                             .my(gpui_kit::px(8.))
-                            .bg(gpui_kit::rgba(0xf5f5f71f)),
+                            .bg(faint),
                     );
                     continue;
                 }
@@ -497,7 +522,7 @@ impl Render for MenuState {
                             .pb(gpui_kit::px(6.))
                             .text_size(gpui_kit::px(12.))
                             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .text_color(gpui_kit::rgba(0xf5f5f7b3))
+                            .text_color(quiet)
                             .child(item.label),
                     );
                     continue;
@@ -529,7 +554,7 @@ impl Render for MenuState {
                     .px(gpui_kit::px(12.))
                     .rounded(gpui_kit::px(12.))
                     .when(selected, |b| {
-                        b.bg(gpui_kit::rgba(0xffffff1f)).aria_active_descendant()
+                        b.bg(hover).aria_active_descendant()
                     })
                     .when(item.disabled, |b| b.opacity(0.5))
                     .when_some(item.checked, |b, checked| {
@@ -581,7 +606,7 @@ impl Render for MenuState {
                                     .line_height(gpui_kit::px(15.))
                                     .text_size(gpui_kit::px(12.))
                                     .font_weight(gpui_kit::FontWeight::NORMAL)
-                                    .text_color(gpui_kit::rgba(0xf5f5f7b3))
+                                    .text_color(quiet)
                                     .child(detail)
                             })),
                     )

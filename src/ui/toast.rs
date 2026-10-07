@@ -10,7 +10,7 @@ use gpui_kit::base::{
 };
 use gpui_kit::{
     Anchor, Context, ElementId, FocusHandle, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, Styled, Task, Window, div, px,
+    ParentElement as _, Render, SharedString, Styled, Task, Window, div, prelude::FluentBuilder as _, px,
 };
 use std::time::Duration;
 use web_time::Instant;
@@ -138,7 +138,11 @@ impl Render for ToastState {
                 .rounded(theme.radius.two_xl)
                 .border_1()
                 .border_color(colors.border)
-                .bg(colors.popover)
+                // Liquid glass prototype: the toast is a glass panel too.
+                .when(!super::glass::liquid(), |el| el.bg(colors.popover))
+                .when(super::glass::liquid(), |el| {
+                    el.child(super::glass::glass(theme.radius.two_xl, super::glass::POPUP_TINT))
+                })
                 .text_color(colors.popover_foreground)
                 .font_family(theme.fonts.body.clone())
                 .p(theme.space(4.))

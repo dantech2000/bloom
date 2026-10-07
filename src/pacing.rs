@@ -861,6 +861,9 @@ impl Bloom {
                 self.player_status = self.player.status();
                 self.player_open = true;
                 self.start_player_poll(cx);
+                // The menus of the player, as a play through the app builds
+                // them; without this the settings menu had no entries.
+                self.rebuild_track_menus(cx);
                 cx.notify();
                 format!("playing {arg}")
             }

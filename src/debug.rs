@@ -552,8 +552,16 @@ impl Bloom {
                     "audio" => self.detail_audio_menu.clone(),
                     "subtitles" => self.subtitle_menu.clone(),
                     "detail-subtitles" => self.detail_subtitle_menu.clone(),
-                    _ => self.settings_menu.clone(),
+                    _ => {
+                        // The entries of the player's menus follow its
+                        // tracks; a menu opened before a rebuild was empty.
+                        self.rebuild_track_menus(cx);
+                        self.settings_menu.clone()
+                    }
                 };
+                if menu.read(cx).is_empty() {
+                    return "error: the menu has no entries".into();
+                }
                 menu.update(cx, |menu, cx| menu.open(window, cx));
             }
             // Opens a page of the settings; "password" opens that form.
@@ -698,6 +706,42 @@ impl Bloom {
             "episodes" => self.toggle_episode_picker(window, cx),
             "rows" => return self.debug_rows(),
             "perf" => return crate::perf::report(),
+            // What "Light appearance" of the profile menu does; a test
+            // instance does not save it (`BLOOM_CONFIG_READONLY`).
+            "theme" => {
+                let dark = self.config.dark.unwrap_or(true);
+                match rest {
+                    "light" if dark => self.toggle_theme(cx),
+                    "dark" if !dark => self.toggle_theme(cx),
+                    "toggle" => self.toggle_theme(cx),
+                    "light" | "dark" | "" => {}
+                    _ => return "error: theme [light|dark|toggle]".into(),
+                }
+                return format!(
+                    "theme={} appearance={}",
+                    if self.config.dark.unwrap_or(true) { "dark" } else { "light" },
+                    crate::macos::app_appearance()
+                );
+            }
+            // Liquid glass prototype: `glass [frosted|liquid] [key=value ...]`
+            // changes the mode and the parameters of the current theme's
+            // set live (`ui::glass::apply`); `ground=#rrggbb` dims the
+            // light theme's page.
+            "glass" => {
+                let mode = crate::ui::theme::UiTheme::read(cx).mode;
+                let before = crate::ui::glass::settings();
+                let settings = match crate::ui::glass::apply(rest, mode) {
+                    Ok(settings) => settings,
+                    Err(error) => return error,
+                };
+                if settings.ground != before.ground {
+                    crate::ui::theme::UiTheme::set(cx, crate::app::theme(self.config.dark.unwrap_or(true)));
+                }
+                cx.notify();
+                // Without arguments: the values and, after them, the keys
+                // and their ranges.
+                return crate::ui::glass::describe(&settings, mode, rest.is_empty());
+            }
             // An mpv property as the worker sees it (`mpv mute`).
             "mpv" => {
                 return self.player.probe(rest).unwrap_or_else(|| "error: no worker, or no answer".into());
@@ -779,17 +823,6 @@ impl Bloom {
                 let name = action.name().to_string();
                 window.defer(cx, move |window, cx| window.dispatch_action(action, cx));
                 return format!("dispatched {name}");
-            }
-            // The theme of the app: `theme light`, `theme dark`, `theme toggle`.
-            "theme" => {
-                if rest == "toggle" || self.config.dark.unwrap_or(true) != (rest != "light") {
-                    self.toggle_theme(cx);
-                }
-                return format!(
-                    "theme={} appearance={}",
-                    if self.config.dark.unwrap_or(true) { "dark" } else { "light" },
-                    crate::macos::app_appearance()
-                );
             }
             // The appearance of the app's windows and panels, as a test
             // sets it: `appearance light|dark|system`; see `BLOOM_APPEARANCE`.

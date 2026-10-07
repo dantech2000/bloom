@@ -15,6 +15,21 @@ is marked `Bloom` in the source.
 - `src/metal_renderer.rs`, `src/shaders.metal`: a backdrop blur pass for
   the frosted glass of the popups (`ui::glass`): the frame so far is scaled
   down and blurred into a texture that backdrop-blur quads sample.
+- Liquid glass (`liquid_glass` in `src/shaders.metal`, a prototype that
+  `ui::glass` turns on with `BLOOM_GLASS=liquid` or the `glass` debug
+  verb): a backdrop-blur quad whose border colour has `h > 0` refracts its
+  backdrop in a bezel at its edge, with a specular rim and more
+  saturation. Its parameters ride in fields the blur path does not draw:
+  `border_color` (h bezel width, s glass thickness, both in device
+  pixels; l 1 for a full-size copy of the frame as the sharp source, 0
+  for the quarter-size copy) and a linear-gradient background (angle: the
+  blur share in the bezel; stop 0: the tint, its percentage the width of
+  the specular rim; stop 1's colour: h saturation, s rim, l counter-light,
+  its percentage the blur share in the flat middle). The
+  quad fragment shader binds the quarter-size copy at texture 1 and the
+  full-size copy at texture 2; the full copy is a blit made only when a
+  quad of the glass run asks for it (`wants_full_backdrop`) and is not
+  allocated before. A quad without the marker renders as before.
 - `src/metal_renderer.rs` (`draw`), `src/present_trace.rs`,
   `src/gpui_apple.rs`: the time the display showed each draw, from the
   drawable's presented handler, with the GPU start and end times of its

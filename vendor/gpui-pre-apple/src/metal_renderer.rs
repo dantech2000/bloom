@@ -122,6 +122,10 @@ pub struct MetalRenderer {
     path_sprites_pipeline_state: metal::RenderPipelineState,
     shadows_pipeline_state: metal::RenderPipelineState,
     quads_pipeline_state: metal::RenderPipelineState,
+    /// Bloom: the quad pipeline with the liquid glass fragment function,
+    /// for liquid glass quads only; `quads_pipeline_state` and its shader
+    /// stay as they were, so every other quad renders as before.
+    liquid_quads_pipeline_state: metal::RenderPipelineState,
     underlines_pipeline_state: metal::RenderPipelineState,
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
@@ -146,6 +150,10 @@ pub struct MetalRenderer {
     backdrop_scale_filter: *mut objc::runtime::Object,
     /// `MPSImageGaussianBlur` that fills `backdrop_blur_texture`.
     backdrop_blur_filter: *mut objc::runtime::Object,
+    /// A full-size copy of the frame so far, for the sharp refraction of
+    /// liquid glass quads that ask for it (`wants_full_backdrop`). Made
+    /// when the first such quad appears, never before.
+    backdrop_full_texture: Option<metal::Texture>,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -303,6 +311,14 @@ impl MetalRenderer {
             "quad_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let liquid_quads_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "liquid_quads",
+            "quad_vertex",
+            "quad_fragment_liquid",
+            MTLPixelFormat::BGRA8Unorm,
+        );
         let underlines_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -364,6 +380,7 @@ impl MetalRenderer {
             path_sprites_pipeline_state,
             shadows_pipeline_state,
             quads_pipeline_state,
+            liquid_quads_pipeline_state,
             underlines_pipeline_state,
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
@@ -380,6 +397,7 @@ impl MetalRenderer {
             backdrop_small_texture: None,
             backdrop_scale_filter,
             backdrop_blur_filter,
+            backdrop_full_texture: None,
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
         }
@@ -423,6 +441,27 @@ impl MetalRenderer {
         self.update_path_intermediate_textures(size);
     }
 
+    /// The full-size copy of the frame for liquid glass, made at the first
+    /// use and after a resize (`update_path_intermediate_textures` drops it).
+    fn backdrop_full_texture(&mut self, size: Size<DevicePixels>) -> metal::Texture {
+        let (width, height) = (size.width.0.max(1) as u64, size.height.0.max(1) as u64);
+        if let Some(texture) = &self.backdrop_full_texture
+            && texture.width() == width
+            && texture.height() == height
+        {
+            return texture.clone();
+        }
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(width);
+        descriptor.set_height(height);
+        descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+        let texture = self.device.new_texture(&descriptor);
+        self.backdrop_full_texture = Some(texture.clone());
+        texture
+    }
+
     fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
         // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
@@ -432,8 +471,11 @@ impl MetalRenderer {
             self.path_intermediate_msaa_texture = None;
             self.backdrop_blur_texture = None;
             self.backdrop_small_texture = None;
+            self.backdrop_full_texture = None;
             return;
         }
+        // Made again at the new size when a liquid glass quad asks for it.
+        self.backdrop_full_texture = None;
 
         let blur_descriptor = metal::TextureDescriptor::new();
         blur_descriptor.set_width((size.width.0 as u64).div_ceil(BACKDROP_BLUR_DOWNSCALE));
@@ -749,10 +791,14 @@ impl MetalRenderer {
                     // A quad that asks for a backdrop blur samples a blurred
                     // copy of everything drawn before it. The batch is split
                     // there, so the copy holds the quads under the glass too.
+                    // Bloom: liquid glass quads are drawn by their own
+                    // pipeline, so the batch is split where that changes too.
                     let mut start = range.start;
                     let mut previous_was_blur = false;
+                    let mut previous_was_liquid = false;
                     for index in range.clone() {
                         let is_blur = is_backdrop_blur_quad(&scene.quads[index]);
+                        let is_liquid = is_blur && is_liquid_glass_quad(&scene.quads[index]);
                         if is_blur
                             && !previous_was_blur
                             && let Some(blurred) = self.backdrop_blur_texture.as_ref()
@@ -763,6 +809,7 @@ impl MetalRenderer {
                                 instance_bindings,
                                 viewport_size,
                                 command_encoder,
+                                previous_was_liquid,
                             );
                             start = index;
                             command_encoder.end_encoding();
@@ -780,6 +827,33 @@ impl MetalRenderer {
                                     destinationTexture: blurred.as_ptr()
                                 ];
                             }
+                            // Liquid glass with a sharp bezel: a full-size
+                            // copy as well, only when a quad of this run
+                            // asks for it.
+                            let full_wanted = scene.quads[index..range.end]
+                                .iter()
+                                .take_while(|quad| is_backdrop_blur_quad(quad))
+                                .any(|quad| is_liquid_glass_quad(quad) && wants_full_backdrop(quad));
+                            if full_wanted {
+                                let full = self.backdrop_full_texture(viewport_size);
+                                let blit = command_buffer.new_blit_command_encoder();
+                                blit.copy_from_texture(
+                                    texture,
+                                    0,
+                                    0,
+                                    metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                                    metal::MTLSize {
+                                        width: full.width().min(texture.width()),
+                                        height: full.height().min(texture.height()),
+                                        depth: 1,
+                                    },
+                                    &full,
+                                    0,
+                                    0,
+                                    metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                                );
+                                blit.end_encoding();
+                            }
                             command_encoder = new_command_encoder_for_texture(
                                 command_buffer,
                                 texture,
@@ -787,13 +861,25 @@ impl MetalRenderer {
                                 None,
                             );
                         }
+                        else if is_liquid != previous_was_liquid {
+                            self.draw_quads(
+                                start..index,
+                                instance_bindings,
+                                viewport_size,
+                                command_encoder,
+                                previous_was_liquid,
+                            );
+                            start = index;
+                        }
                         previous_was_blur = is_blur;
+                        previous_was_liquid = is_liquid;
                     }
                     self.draw_quads(
                         start..range.end,
                         instance_bindings,
                         viewport_size,
                         command_encoder,
+                        previous_was_liquid,
                     )
                 }
                 PrimitiveBatch::Paths(range) => {
@@ -979,12 +1065,21 @@ impl MetalRenderer {
         instance_bindings: &InstanceBindings,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
+        liquid: bool,
     ) {
         if quads.is_empty() {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.quads_pipeline_state);
+        // Bloom: liquid glass quads take the pipeline with the liquid
+        // fragment function and the sharp copies of the frame.
+        if liquid {
+            command_encoder.set_render_pipeline_state(&self.liquid_quads_pipeline_state);
+            command_encoder.set_fragment_texture(1, self.backdrop_small_texture.as_deref());
+            command_encoder.set_fragment_texture(2, self.backdrop_full_texture.as_deref());
+        } else {
+            command_encoder.set_render_pipeline_state(&self.quads_pipeline_state);
+        }
         command_encoder.set_vertex_buffer(
             QuadInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1396,6 +1491,18 @@ fn is_backdrop_blur_quad(quad: &gpui::Quad) -> bool {
         && quad.border_widths.right.0 == 0.
         && quad.border_widths.bottom.0 == 0.
         && quad.border_widths.left.0 == 0.
+}
+
+/// A backdrop-blur quad whose (unused) border colour carries the parameters
+/// of liquid glass (`liquid_glass` in shaders.metal): a bezel width in `h`.
+fn is_liquid_glass_quad(quad: &gpui::Quad) -> bool {
+    quad.border_color.h > 0.
+}
+
+/// A liquid glass quad whose sharp sample comes from the full-size copy of
+/// the frame (`border_color.l` 1) and not from the quarter-size one (0).
+fn wants_full_backdrop(quad: &gpui::Quad) -> bool {
+    quad.border_color.l >= 0.5
 }
 
 fn new_command_encoder_for_texture<'a>(

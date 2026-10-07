@@ -77,6 +77,10 @@ pub fn theme(dark: bool) -> UiTheme {
         t.colors.destructive = rgb(0xf92672);
     } else {
         t.colors.background = rgb(0xfafafa);
+        // Liquid glass prototype: a dimmer ground for the screenshots.
+        if let Some(ground) = crate::ui::glass::ground() {
+            t.colors.background = ground;
+        }
         t.colors.sidebar = rgb(0xf3f3f6);
         t.colors.primary = ink;
         t.colors.primary_foreground = accent;
