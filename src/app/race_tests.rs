@@ -353,3 +353,36 @@ fn the_screen_takes_the_focus_back_when_the_search_field_leaves_the_page(cx: &mu
     cx.simulate_keystrokes("cmd-[");
     bloom.read_with(cx, |this, _| assert!(matches!(this.page, Page::Search(_)), "cmd-[ did not go back"));
 }
+
+#[gpui_kit::test]
+fn escape_closes_an_open_panel_before_it_goes_back(cx: &mut TestAppContext) {
+    let server = MockServer::start(|method, path, _| plain(method, path));
+    let (bloom, cx) = app(cx);
+    bloom.update(cx, |this, cx| {
+        this.session = Some(session(&server.url, "u1"));
+        this.screen = Screen::Main;
+        this.open_search("tro".into(), cx);
+        this.open_item(item("m9", "Nine", "Movie"), cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        let focus = bloom.read(cx).app_focus.clone();
+        window.focus(&focus, cx);
+    });
+    for cast in [false, true] {
+        bloom.update(cx, |this, cx| {
+            if cast { this.cast.panel_open = true } else { this.sync.panel_open = true }
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_keystrokes("escape");
+        bloom.read_with(cx, |this, _| {
+            assert!(!this.sync.panel_open && !this.cast.panel_open, "Escape left the panel open");
+            assert!(matches!(this.page, Page::Detail(_)), "Escape went back with a panel open");
+        });
+    }
+    // With no panel open Escape goes back, as before.
+    cx.simulate_keystrokes("escape");
+    bloom.read_with(cx, |this, _| assert!(matches!(this.page, Page::Search(_)), "Escape did not go back"));
+}

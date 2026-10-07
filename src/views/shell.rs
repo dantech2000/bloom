@@ -208,6 +208,8 @@ impl Bloom {
         }
         match keystroke.key.as_str() {
             "[" if modifiers.platform => self.back(cx),
+            // Escape closes an open panel first; the page stays.
+            "escape" if self.sync.panel_open || self.cast.panel_open => self.close_popups(None, window, cx),
             "escape" | "backspace" if !self.history.is_empty() => self.back(cx),
             "/" => {
                 let query = self.search_input.read(cx).value().to_string();
