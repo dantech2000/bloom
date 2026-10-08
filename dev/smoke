@@ -40,7 +40,9 @@ fail() {
 start() {
   stop
   : > "$log"
-  env "$@" BLOOM_NO_REPORT=1 BLOOM_NO_SOCKET=1 BLOOM_DEBUG_SOCK=$sock RUST_LOG=bloom=info RUST_BACKTRACE=1 \
+  # With BLOOM_TEST_NAME the window does not take the keyboard from the
+  # person at the Mac, and BLOOM_MUTED keeps the instance silent.
+  env "$@" BLOOM_TEST_NAME=$name BLOOM_MUTED=1 BLOOM_NO_REPORT=1 BLOOM_NO_SOCKET=1 BLOOM_DEBUG_SOCK=$sock RUST_LOG=bloom=info RUST_BACKTRACE=1 \
     BLOOM_DOWNLOAD_DIR="${BLOOM_DOWNLOAD_DIR:-/tmp/bloom-$name-downloads}" \
     nohup "$dir/target/release/bloom" >> "$log" 2>&1 &
   echo $! > "$pid_file"
@@ -80,23 +82,23 @@ settle() {
 
 # page <name> <debug command...>: opens a page and checks it.
 page() {
-  name=$1
+  page=$1
   shift
   answer=$(ctl "$@")
-  case $answer in error:*) fail "$name: $answer"; return ;; esac
+  case $answer in error:*) fail "$page: $answer"; return ;; esac
   expect=
   [ "$1" = item ] && expect="id=$2"
-  state=$(settle "$expect") || fail "$name: the load did not finish"
+  state=$(settle "$expect") || fail "$page: the load did not finish"
   case $state in
-    *error=Some*) fail "$name: $state" ;;
+    *error=Some*) fail "$page: $state" ;;
   esac
   if ! kill -0 "$(cat "$pid_file")" 2>/dev/null || grep -q "panicked at" "$log"; then
-    fail "$name: the app panicked; see $log"
+    fail "$page: the app panicked; see $log"
     return
   fi
   sleep 0.5
-  BLOOM_PID_FILE=$pid_file "$dir/dev/shot" "$out/$name.png" >/dev/null 2>&1 ||
-    echo "note  $name: no screenshot (Screen Recording permission?)"
+  BLOOM_PID_FILE=$pid_file "$dir/dev/shot" "$out/$page.png" >/dev/null 2>&1 ||
+    echo "note  $page: no screenshot (Screen Recording permission?)"
   # The cost of a redraw, from a short scroll down and back.
   ctl perf >/dev/null
   for y in 150 300 450 600 450 300 150 0; do
@@ -112,7 +114,7 @@ page() {
     warnings=$((warnings + 1))
     mark="SLOW "
   fi
-  echo "$mark $name: $(echo "$perf" | sed 's/^perf: //; s/ main_cpu.*//')"
+  echo "$mark $page: $(echo "$perf" | sed 's/^perf: //; s/ main_cpu.*//')"
 }
 
 start BLOOM_CONFIG_READONLY=1 || exit 1

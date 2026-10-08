@@ -20,6 +20,10 @@ sleep 1
 export BLOOM_DOWNLOAD_DIR=${BLOOM_DOWNLOAD_DIR:-/tmp/bloom-$name-downloads}
 # A test instance starts muted and stays muted; the user may be at the Mac.
 export BLOOM_MUTED=1
+# No playback report goes to the server: on the config of the user the
+# instance is his session, and a test play would move his positions.
+# BLOOM_TEST_REPORT=1 lets the reports through for a test of them.
+[ -n "$BLOOM_TEST_REPORT" ] || export BLOOM_NO_REPORT=1
 # The window shows "TEST INSTANCE" with this name.
 export BLOOM_TEST_NAME=$name
 BLOOM_DEBUG_SOCK=/tmp/bloom-$name.sock RUST_LOG=${RUST_LOG:-bloom=info} RUST_BACKTRACE=1 \
