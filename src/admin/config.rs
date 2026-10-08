@@ -85,7 +85,8 @@ pub struct Options {
 /// why it refused the others.
 #[derive(Default)]
 struct Sent {
-    taken: Vec<(usize, Value)>,
+    /// The source, the object the server took, and the edits it was made from.
+    taken: Vec<(usize, Value, Value)>,
     refused: Vec<anyhow::Error>,
 }
 
@@ -758,12 +759,14 @@ impl Bloom {
             return;
         };
         // Each object that changed goes back whole: the object the server
-        // gave, with the edited values in it.
-        let posts: Vec<(usize, String, Value)> = sources(admin.section)
+        // has at the save, with the edited values in it. The object this
+        // page read can be old by then: another page, or another client,
+        // saved the same object since, and its values must stay.
+        let posts: Vec<(usize, String, Value, Value)> = sources(admin.section)
             .into_iter()
             .enumerate()
             .filter(|(n, _)| data.values[*n] != data.edited[*n])
-            .map(|(n, source)| (n, endpoint(source), data.edited[n].clone()))
+            .map(|(n, source)| (n, endpoint(source), data.values[n].clone(), data.edited[n].clone()))
             .collect();
         if posts.is_empty() {
             return;
@@ -777,9 +780,13 @@ impl Bloom {
             cx,
             move |client| -> Result<Sent> {
                 let mut sent = Sent::default();
-                for (n, path, body) in posts {
-                    match client.post(&path, &body) {
-                        Ok(_) => sent.taken.push((n, body)),
+                for (n, path, original, edited) in posts {
+                    let result = client.get::<Value>(&path, &[]).and_then(|fresh| {
+                        let body = super::with_changes(&fresh, &original, &edited);
+                        client.post(&path, &body).map(|_| body)
+                    });
+                    match result {
+                        Ok(body) => sent.taken.push((n, body, edited)),
                         Err(err) => sent.refused.push(err),
                     }
                 }
@@ -797,7 +804,12 @@ impl Bloom {
                 if let Page::Admin(admin) = &mut this.page
                     && let Some(data) = admin.config.get_mut(&section)
                 {
-                    for (n, body) in sent.taken {
+                    for (n, body, edited) in sent.taken {
+                        // What the user changed since the save went out
+                        // stays an edit, on top of what the server took.
+                        if let Some(now) = data.edited.get_mut(n) {
+                            *now = super::with_changes(&body, &edited, now);
+                        }
                         if let Some(value) = data.values.get_mut(n) {
                             *value = body;
                         }

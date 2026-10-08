@@ -678,7 +678,7 @@ impl Worker {
     }
 
     fn send(&mut self, stream: &mut Stream, destination: &str, namespace: &str, payload: Value) -> Result<()> {
-        log::trace!("cast > {destination} {namespace} {payload}");
+        log::trace!("cast > {destination} {namespace} {}", without_secrets(&payload));
         stream.write_all(&self.frame(destination, namespace, payload).frame()).context("send")?;
         Ok(())
     }
@@ -924,7 +924,7 @@ impl Worker {
                 return Ok(());
             }
         };
-        log::trace!("cast < {} {} {payload}", message.source, message.namespace);
+        log::trace!("cast < {} {} {}", message.source, message.namespace, without_secrets(&payload));
         // The answer to a request of ours.
         let pending = messages::request_id(&payload).and_then(|id| self.pending.remove(&id));
         if let Some(pending) = &pending {
@@ -1137,6 +1137,29 @@ impl Worker {
             }
         }
         self.publish();
+    }
+}
+
+/// A message for the log, with the access token of the server taken out:
+/// the Jellyfin receiver gets it as `accessToken`, and a stream address
+/// carries it as `ApiKey`.
+fn without_secrets(payload: &Value) -> Value {
+    match payload {
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| {
+                let value = if key.eq_ignore_ascii_case("accessToken") {
+                    Value::from("***")
+                } else {
+                    without_secrets(value)
+                };
+                (key.clone(), value)
+            })
+            .collect::<serde_json::Map<_, _>>()
+            .into(),
+        Value::Array(items) => items.iter().map(without_secrets).collect::<Vec<_>>().into(),
+        Value::String(text) => crate::airplay::stream::redact(text).into(),
+        other => other.clone(),
     }
 }
 
@@ -1756,5 +1779,25 @@ mod tests {
         let device = mock.state.lock().unwrap().media.clone().unwrap();
         assert_eq!(device.state, "PAUSED", "the device plays after a seek while paused");
         assert_eq!(status.player_state, "PAUSED");
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    /// A trace line of a cast message does not show the access token.
+    #[test]
+    fn a_logged_message_has_no_token() {
+        let message = serde_json::json!({
+            "type": "LOAD",
+            "accessToken": "fake-token",
+            "media": { "contentId": "https://jellyfin.example/Videos/i1/master.m3u8?ApiKey=fake-token&b=1" },
+            "items": [{ "AccessToken": "fake-token" }],
+        });
+        let logged = without_secrets(&message).to_string();
+        assert!(!logged.contains("fake-token"), "{logged}");
+        assert!(logged.contains("master.m3u8?ApiKey=***&b=1"), "{logged}");
+        assert!(logged.contains("LOAD"));
     }
 }

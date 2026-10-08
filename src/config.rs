@@ -279,7 +279,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Copies an unreadable config to `<name>.broken`. An existing copy with the
 /// same content stays; one with other content is replaced (the latest
 /// failure is the one worth looking at).
-fn keep_broken_copy(path: &Path, bytes: &[u8]) {
+pub(crate) fn keep_broken_copy(path: &Path, bytes: &[u8]) {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".broken");
     let copy = path.with_file_name(name);
@@ -287,7 +287,7 @@ fn keep_broken_copy(path: &Path, bytes: &[u8]) {
         return;
     }
     if let Err(err) = write_private(&copy, bytes) {
-        log::warn!("cannot keep a copy of the broken config: {err:#}");
+        log::warn!("cannot keep a copy of the broken file {}: {err:#}", path.display());
     }
 }
 

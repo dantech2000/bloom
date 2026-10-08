@@ -114,6 +114,15 @@ impl Bloom {
             .unwrap_or_else(|| self.hero_since.elapsed())
     }
 
+    /// Forgets the slides: they are those of one user on one server, and
+    /// the next session loads its own.
+    pub fn clear_hero(&mut self) {
+        self.hero_video.stop();
+        self.hero.clear();
+        self.hero_index = 0;
+        self.hero_previous = None;
+    }
+
     pub fn show_hero_slide(&mut self, index: usize) {
         if self.hero.is_empty() {
             return;

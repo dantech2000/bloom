@@ -947,6 +947,10 @@ impl Bloom {
         self.session_epoch.0 += 1;
         // The posters of the session before are of no use to the next one.
         crate::images::cancel_prewarm();
+        // Nor are its hero slides, and a question it left open must not
+        // run against the next one.
+        self.clear_hero();
+        self.forget_admin_dialogs();
     }
 
     /// Ends the session in the app (the server and the config are the
@@ -1201,6 +1205,7 @@ impl Bloom {
     }
 
     pub fn navigate(&mut self, page: Page, cx: &mut Context<Self>) {
+        self.forget_admin_dialogs();
         // Keep the place in the page, so Back returns to it.
         self.history_scroll.push(self.page_scroll.offset());
         self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
@@ -1243,6 +1248,7 @@ impl Bloom {
         offset: gpui_kit::Point<gpui_kit::Pixels>,
         cx: &mut Context<Self>,
     ) -> (Page, gpui_kit::Point<gpui_kit::Pixels>) {
+        self.forget_admin_dialogs();
         let left_offset = self.page_scroll.offset();
         self.page_scroll.set_offset(offset);
         let left = std::mem::replace(&mut self.page, page);
@@ -1251,6 +1257,11 @@ impl Bloom {
         }
         if matches!(self.page, Page::Admin(_)) {
             self.start_admin_tick(cx);
+        }
+        // The menus of the detail page are those of the item shown last;
+        // a page that comes back with its data is not loaded again.
+        if matches!(self.page, Page::Detail(_)) {
+            self.rebuild_detail_menus(cx);
         }
         if self.page_loading() {
             // The user left before the answer came, and the answer was
@@ -1278,6 +1289,7 @@ impl Bloom {
 
     pub fn open_home(&mut self, cx: &mut Context<Self>) {
         self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+        self.forget_admin_dialogs();
         self.clear_history();
         self.page = Page::Home(HomeData::default());
         self.load_page(cx);
@@ -1294,6 +1306,7 @@ impl Bloom {
 
     pub fn open_library(&mut self, view: Item, cx: &mut Context<Self>) {
         self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+        self.forget_admin_dialogs();
         self.clear_history();
         self.page = Page::Library(LibraryData::new(view));
         self.rebuild_library_menus(cx);
@@ -3065,6 +3078,10 @@ impl Bloom {
                             if let Some(err) = this.player_status.error.clone() {
                                 this.toast("Playback stopped", err, cx);
                             }
+                            // Nothing may play behind the closed view: an
+                            // item that still plays after a load failed,
+                            // or a load whose answer is on its way.
+                            this.player.stop();
                             this.player.acknowledge_end();
                             this.player_status = this.player.status();
                             this.load_page(cx);

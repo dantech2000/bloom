@@ -2117,7 +2117,9 @@ fn progress_of(session: &Session, status: &PlayerStatus, worker: &Worker) -> Pro
     Progress {
         item_id: session.item_id.clone(),
         play_session_id: session.play_session_id.clone(),
-        position_ticks: (status.position * TICKS_PER_SECOND as f64) as i64,
+        // The position of this item: the status can be of the load that
+        // replaces it, or cleared by the app that closed the player.
+        position_ticks: (session.position * TICKS_PER_SECOND as f64) as i64,
         paused: status.paused,
         volume: worker.volume as i64,
         muted: worker.muted,
@@ -2148,7 +2150,11 @@ fn finish(shared: &Shared, session: &mut Option<Session>, worker: &mut Worker) {
         shared.emit(PlayerEvent::Ended);
     }
     let mut status = shared.status.lock().unwrap();
-    status.state = PlayState::Ended;
+    // The app closed the player and took the end already
+    // (`acknowledge_end`): the status stays at rest.
+    if status.state != PlayState::Idle {
+        status.state = PlayState::Ended;
+    }
     drop(status);
     rest(shared);
 }
@@ -2857,6 +2863,43 @@ mod tests {
         let status = player.status();
         assert_eq!(status.state, PlayState::Ended, "{status:?}");
         assert_eq!(player.probe("path").as_deref(), Some(""), "a file is still loaded after the stop");
+    }
+
+    /// A load fails at the server while an item still plays (a change of
+    /// the quality on a bad connection): the status says `Ended`, and the
+    /// core plays on. The app then closes the player, stops it and takes
+    /// the end, as the poll of `app.rs` does. Nothing plays after that, and
+    /// the end of the old item, which comes after the app took the end,
+    /// does not put `Ended` back into a status at rest.
+    #[test]
+    fn a_failed_load_over_a_playing_item_ends_with_the_stop_of_the_app() {
+        let Some(_one) = real_player_turn() else { return };
+        let Some(media) = silent_clip("bloom-failed-reload-test.mp4") else {
+            return;
+        };
+        let player = Player::default();
+        let _closer = Closer(player.clone());
+        player.set_target_size(320, 240);
+        player.set_muted(true);
+        let generation = player.prepare("First", 0., false);
+        assert!(player.play_prepared(generation, request(&media.display().to_string(), "First", 61)));
+        expect(&player, "first loaded", |e| *e == PlayerEvent::Loaded { token: 61 });
+        let generation = player.prepare("Again", 0., false);
+        player.fail_load(generation, 62, "the server did not answer");
+        assert_eq!(player.status().state, PlayState::Ended);
+        assert_eq!(player.probe("idle-active").as_deref(), Some("no"), "the item should still play here");
+        // What the app does when it closes the player.
+        player.stop();
+        player.acknowledge_end();
+        let end = Instant::now() + Duration::from_secs(5);
+        while player.probe("idle-active").as_deref() != Some("yes") && Instant::now() < end {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(player.probe("idle-active").as_deref(), Some("yes"), "the item plays on behind the closed player");
+        // The end of the file has reached the worker by now.
+        thread::sleep(Duration::from_millis(200));
+        let status = player.status();
+        assert_eq!(status.state, PlayState::Idle, "the end of the old item came back: {status:?}");
     }
 
     /// Finding P1: a stop and a new start back to back (SyncPlay does

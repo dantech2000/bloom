@@ -7,7 +7,7 @@
 
 use std::{
     collections::HashMap,
-    net::{Ipv4Addr, SocketAddrV4, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -113,25 +113,10 @@ pub fn discover() -> Discovery {
                 }
             }
             match socket.recv_from(&mut buffer) {
-                Ok((n, _)) => {
-                    let found = parse(&buffer[..n]);
+                Ok((n, source)) => {
+                    let found = parse_from(&buffer[..n], Some(source.ip()));
                     if !found.is_empty() {
-                        let mut list = shared.lock().unwrap();
-                        for device in found {
-                            match list.iter_mut().find(|(known, _)| known.id == device.id) {
-                                Some(entry) => *entry = (device, Instant::now()),
-                                None => {
-                                    log::info!(
-                                        "cast device: {:?} ({}) at {}:{}",
-                                        device.name,
-                                        device.model,
-                                        device.address,
-                                        device.port
-                                    );
-                                    list.push((device, Instant::now()));
-                                }
-                            }
-                        }
+                        take(&mut shared.lock().unwrap(), found, source.ip());
                     }
                 }
                 Err(_) => {}
@@ -142,6 +127,54 @@ pub fn discover() -> Discovery {
         }
     });
     Discovery { devices, stop, ask }
+}
+
+/// An answer counts when the device speaks for itself from this network:
+/// the address it names is the one the packet came from, and a private or
+/// link-local one. The app sends the access token of the server to the
+/// address of the device the user picks, so an answer must not point at
+/// another host, and not at one outside the network.
+fn speaks_for_itself(device: &Device, source: IpAddr) -> bool {
+    let address = device.address;
+    IpAddr::V4(address) == source
+        && (address.is_private() || address.is_link_local())
+}
+
+/// Puts the devices of one answer into the list. A device that is in the
+/// list keeps its address while it still answers from there: a second host
+/// that answers with its id does not take its place.
+fn take(list: &mut Vec<(Device, Instant)>, found: Vec<Device>, source: IpAddr) {
+    for device in found {
+        if !speaks_for_itself(&device, source) {
+            log::warn!(
+                "cast discovery: an answer of {source} names {:?} at {}; ignored",
+                device.name,
+                device.address
+            );
+            continue;
+        }
+        match list.iter_mut().find(|(known, _)| known.id == device.id) {
+            Some((known, seen)) if known.address == device.address || seen.elapsed() >= FORGET => {
+                (*known, *seen) = (device, Instant::now());
+            }
+            Some((known, _)) => log::warn!(
+                "cast discovery: {} answers as {:?}, which is at {}; ignored",
+                device.address,
+                known.name,
+                known.address
+            ),
+            None => {
+                log::info!("cast device: {:?} ({}) at {}:{}", device.name, device.model, device.address, device.port);
+                list.push((device, Instant::now()));
+            }
+        }
+    }
+}
+
+/// A text of a device without control characters. The name is shown, is
+/// logged and names a thread, and a thread name with a NUL in it is a panic.
+fn plain(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// One question: PTR for the service, with the QU bit.
@@ -159,13 +192,20 @@ fn query() -> Vec<u8> {
 
 /// The devices in one answer packet.
 pub fn parse(packet: &[u8]) -> Vec<Device> {
+    parse_from(packet, None)
+}
+
+/// The devices in one answer packet that came from `source`. A host with
+/// several addresses names them all: the device is at the one the packet
+/// came from when that is among them, else at the last one named.
+fn parse_from(packet: &[u8], source: Option<IpAddr>) -> Vec<Device> {
     let Some(records) = records(packet) else {
         return Vec::new();
     };
     let mut instances = Vec::new();
     let mut srv: HashMap<String, (u16, String)> = HashMap::new();
     let mut txt: HashMap<String, HashMap<String, String>> = HashMap::new();
-    let mut hosts: HashMap<String, Ipv4Addr> = HashMap::new();
+    let mut hosts: HashMap<String, Vec<Ipv4Addr>> = HashMap::new();
     for record in &records {
         match record.kind {
             TYPE_PTR if record.name.eq_ignore_ascii_case(SERVICE) => {
@@ -189,7 +229,7 @@ pub fn parse(packet: &[u8]) -> Vec<Device> {
             TYPE_A => {
                 let data = &packet[record.data_at..record.data_at + record.data_len];
                 if let [a, b, c, d] = data {
-                    hosts.insert(record.name.to_lowercase(), Ipv4Addr::new(*a, *b, *c, *d));
+                    hosts.entry(record.name.to_lowercase()).or_default().push(Ipv4Addr::new(*a, *b, *c, *d));
                 }
             }
             _ => {}
@@ -205,16 +245,23 @@ pub fn parse(packet: &[u8]) -> Vec<Device> {
     for instance in instances {
         let key = instance.to_lowercase();
         let Some((port, target)) = srv.get(&key) else { continue };
-        let Some(address) = hosts.get(&target.to_lowercase()) else { continue };
+        let Some(addresses) = hosts.get(&target.to_lowercase()) else { continue };
+        let Some(address) = addresses
+            .iter()
+            .find(|address| Some(IpAddr::V4(**address)) == source)
+            .or(addresses.last())
+        else {
+            continue;
+        };
         let fields = txt.get(&key).cloned().unwrap_or_default();
         let short = instance.strip_suffix(&format!(".{SERVICE}")).unwrap_or(&instance).to_string();
         devices.push(Device {
-            id: fields.get("id").cloned().unwrap_or_else(|| short.clone()),
-            name: fields.get("fn").cloned().unwrap_or_else(|| short.clone()),
-            model: fields.get("md").cloned().unwrap_or_default(),
+            id: plain(fields.get("id").unwrap_or(&short)),
+            name: plain(fields.get("fn").unwrap_or(&short)),
+            model: plain(fields.get("md").map_or("", String::as_str)),
             address: *address,
             port: *port,
-            instance: short,
+            instance: plain(&short),
         });
     }
     devices
@@ -390,6 +437,60 @@ mod tests {
             ask: Arc::new(AtomicBool::new(false)),
         };
         assert!(discovery.devices().is_empty(), "{:?}", discovery.devices());
+    }
+
+    /// An answer counts only from the address it names, on this network.
+    /// The access token goes to the device the user picks: a host that
+    /// names another address, or one outside the network, is not listed,
+    /// and a second host does not take the place of a device that answers.
+    #[test]
+    fn an_answer_counts_only_from_its_own_private_address() {
+        let device = parse(&answer()).remove(0);
+        let own = IpAddr::V4(device.address);
+        let mut list = Vec::new();
+        take(&mut list, vec![device.clone()], IpAddr::V4(Ipv4Addr::new(192, 168, 1, 66)));
+        assert!(list.is_empty(), "an answer from another host was listed");
+        let outside = Device { address: Ipv4Addr::new(203, 0, 113, 9), ..device.clone() };
+        take(&mut list, vec![outside.clone()], IpAddr::V4(outside.address));
+        assert!(list.is_empty(), "an address outside the network was listed");
+        take(&mut list, vec![device.clone()], own);
+        assert_eq!(list.len(), 1);
+        // Another host of the network answers with the id of the device.
+        let other = Device { address: Ipv4Addr::new(192, 168, 1, 66), ..device.clone() };
+        take(&mut list, vec![other.clone()], IpAddr::V4(other.address));
+        assert_eq!(list[0].0.address, device.address, "the device lost its place");
+        // The device is silent for `FORGET`: the id is free again.
+        list[0].1 = Instant::now() - FORGET - Duration::from_secs(1);
+        take(&mut list, vec![other.clone()], IpAddr::V4(other.address));
+        assert_eq!(list[0].0.address, other.address);
+    }
+
+    /// A device with two addresses names both; it is listed at the one its
+    /// answer came from, whatever their order in the packet.
+    #[test]
+    fn a_device_with_two_addresses_is_listed_at_the_one_it_answers_from() {
+        let mut packet = answer();
+        // One more record, in the additional section: a second address.
+        packet[11] += 1;
+        let mut host = Vec::new();
+        name(&mut host, "abc123.local");
+        record(&mut packet, &host, TYPE_A, &[192, 168, 7, 7]);
+        let first = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 40));
+        let second = IpAddr::V4(Ipv4Addr::new(192, 168, 7, 7));
+        for source in [first, second] {
+            let mut list = Vec::new();
+            take(&mut list, parse_from(&packet, Some(source)), source);
+            assert_eq!(list.len(), 1, "not listed for an answer from {source}");
+            assert_eq!(IpAddr::V4(list[0].0.address), source);
+        }
+    }
+
+    #[test]
+    fn a_name_loses_its_control_characters() {
+        assert_eq!(plain("Living\0 Room\n"), "Living Room");
+        // `thread::Builder::name` panics on a NUL.
+        let name = format!("cast-{}", plain("TV\0"));
+        assert!(std::thread::Builder::new().name(name).spawn(|| {}).is_ok());
     }
 
     #[test]

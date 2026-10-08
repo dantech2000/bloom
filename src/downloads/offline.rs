@@ -164,13 +164,13 @@ pub fn forget(dir: &Path, server_id: &str, item_id: &str) {
 }
 
 /// Items of `who` with a position the server has not got: the item, the
-/// position, and the revision of the entry.
-fn pending_in(dir: &Path, who: &Identity) -> Vec<(String, i64, u64)> {
+/// position, the revision of the entry, and when it was played here.
+fn pending_in(dir: &Path, who: &Identity) -> Vec<(String, i64, u64, i64)> {
     let _guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     load(dir)
         .into_iter()
         .filter(|k| k.unsent && k.who == *who)
-        .map(|k| (k.item_id, k.ticks, k.rev))
+        .map(|k| (k.item_id, k.ticks, k.rev, k.at))
         .collect()
 }
 
@@ -179,6 +179,20 @@ fn pending_in(dir: &Path, who: &Identity) -> Vec<(String, i64, u64)> {
 /// nothing for a client without a server id.
 pub fn flush(client: &Client) -> Result<usize> {
     flush_in(&super::dir(), client, crate::jellyfin::no_report())
+}
+
+/// The position the server has for an item, when the server saw a play
+/// of it after `at` (Unix seconds on this Mac). None when the play here is
+/// the newer one, and when the server does not say: the position then
+/// goes to the server as before.
+fn newer_on_server(client: &Client, who: &Identity, item_id: &str, at: i64) -> Option<i64> {
+    let data: serde_json::Value = client
+        .get(&format!("/UserItems/{item_id}/UserData"), &[("userId", who.user_id.clone())])
+        .ok()?;
+    let played = crate::syncplay::protocol::parse_time(data.get("LastPlayedDate")?.as_str()?)? / 1000.;
+    // `at` is in whole seconds, cut off: a play of the server counts as
+    // newer from the next second on.
+    (played >= (at + 1) as f64).then(|| data.get("PlaybackPositionTicks").and_then(serde_json::Value::as_i64).unwrap_or(0))
 }
 
 fn flush_in(dir: &Path, client: &Client, no_report: bool) -> Result<usize> {
@@ -196,7 +210,23 @@ fn flush_in(dir: &Path, client: &Client, no_report: bool) -> Result<usize> {
         return Ok(0);
     }
     let mut sent = 0;
-    for (item_id, ticks, rev) in waiting {
+    for (item_id, ticks, rev, at) in waiting {
+        // The item was played on another device since the play here: the
+        // position of the server is the newer one, and it stands. This
+        // entry takes it, so the next play here goes on from there.
+        if let Some(theirs) = newer_on_server(client, &who, &item_id, at) {
+            log::info!("offline position of {item_id} not sent: the server has a newer play");
+            let _guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut entries = load(dir);
+            if let Some(entry) = find(&mut entries, &who, &item_id)
+                && entry.rev == rev
+            {
+                entry.unsent = false;
+                entry.ticks = theirs;
+            }
+            save(dir, &entries);
+            continue;
+        }
         let body = serde_json::json!({ "PlaybackPositionTicks": ticks });
         let result = client
             .post(&format!("/UserItems/{item_id}/UserData?userId={}", who.user_id), &body)
@@ -260,7 +290,7 @@ mod tests {
     }
 
     fn pending(dir: &Path, who: &Identity) -> Vec<(String, i64)> {
-        pending_in(dir, who).into_iter().map(|(id, ticks, _)| (id, ticks)).collect()
+        pending_in(dir, who).into_iter().map(|(id, ticks, ..)| (id, ticks)).collect()
     }
 
     /// A server that records the request line and the body of each request
@@ -303,7 +333,11 @@ mod tests {
         }
         let line = head.lines().next().unwrap_or_default().to_string();
         let body = String::from_utf8_lossy(&data[body_start..]).to_string();
-        kept.lock().unwrap().push((line, body));
+        // What a flush sends is the subject; before each position it
+        // asks what the server has (`newer_on_server`), and that is not.
+        if !line.starts_with("GET") {
+            kept.lock().unwrap().push((line, body));
+        }
         thread::sleep(delay);
         let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     }
@@ -351,6 +385,81 @@ mod tests {
                 let _ = thread.join();
             }
         }
+    }
+
+    /// A server that answers a GET with `user_data` and records the
+    /// request line of every request. It ends with the process.
+    fn server_with(user_data: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let kept = seen.clone();
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut data = Vec::new();
+                let mut buffer = [0u8; 4096];
+                while !data.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buffer) {
+                        Ok(n) if n > 0 => data.extend_from_slice(&buffer[..n]),
+                        _ => break,
+                    }
+                }
+                // The body is read to its end: an answer sent over unread
+                // bytes can reset the connection under the client.
+                let head_end = data.windows(4).position(|w| w == b"\r\n\r\n").map_or(data.len(), |at| at + 4);
+                let head = String::from_utf8_lossy(&data[..head_end]).to_string();
+                let length: usize = head
+                    .lines()
+                    .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("content-length")))
+                    .and_then(|(_, v)| v.trim().parse().ok())
+                    .unwrap_or(0);
+                while data.len() < head_end + length {
+                    match stream.read(&mut buffer) {
+                        Ok(n) if n > 0 => data.extend_from_slice(&buffer[..n]),
+                        _ => break,
+                    }
+                }
+                let line = head.lines().next().unwrap_or_default().to_string();
+                let body = if line.starts_with("GET") { user_data } else { "" };
+                kept.lock().unwrap().push(line);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (port, seen)
+    }
+
+    /// The item was played on another device after the offline play: the
+    /// position of the server is the newer one and stays. Before, the
+    /// flush sent the older position of this Mac over it.
+    #[test]
+    fn a_newer_play_on_the_server_is_not_written_over() {
+        let dir = temp("newer-on-server");
+        let u = who("s", "u");
+        note_report_in(&dir, &u, &progress("a", 1200), true);
+        // The server: played to the end, a year after this test runs.
+        let (port, seen) = server_with(
+            r#"{"PlaybackPositionTicks":0,"Played":true,"LastPlayedDate":"2099-01-01T00:00:00.0000000Z"}"#,
+        );
+        let client = Client::new(&format!("http://127.0.0.1:{port}"), "d").with_session("t", "u").with_server("s");
+        assert_eq!(flush_in(&dir, &client, false).unwrap(), 0, "the old position was sent");
+        let posts: Vec<String> = seen.lock().unwrap().iter().filter(|line| line.starts_with("POST")).cloned().collect();
+        assert!(posts.is_empty(), "{posts:?}");
+        // The entry waits no more, and the resume point is the server's.
+        assert!(pending(&dir, &u).is_empty());
+        assert_eq!(position_in(&dir, &u, "a"), None);
+        // A play on the server from before the offline one does not count.
+        note_report_in(&dir, &u, &progress("b", 300), true);
+        let (port, seen) = server_with(
+            r#"{"PlaybackPositionTicks":50,"Played":false,"LastPlayedDate":"2001-01-01T00:00:00.0000000Z"}"#,
+        );
+        let client = Client::new(&format!("http://127.0.0.1:{port}"), "d").with_session("t", "u").with_server("s");
+        assert_eq!(flush_in(&dir, &client, false).unwrap(), 1);
+        assert_eq!(seen.lock().unwrap().iter().filter(|line| line.starts_with("POST")).count(), 1);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

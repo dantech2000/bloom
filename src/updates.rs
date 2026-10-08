@@ -47,7 +47,35 @@ static STATUS: Mutex<Status> = Mutex::new(Status::Idle);
 /// The block of Sparkle that installs the update and starts the app again,
 /// as a number.
 static INSTALL: Mutex<Option<usize>> = Mutex::new(None);
-static CHANGES: OnceLock<(async_channel::Sender<()>, async_channel::Receiver<()>)> = OnceLock::new();
+/// A signal with a queue for each reader: every reader gets every signal.
+/// With one queue for all, the task of a window that closed took the
+/// signal meant for the window that is open.
+struct Signal {
+    readers: Mutex<Vec<async_channel::Sender<()>>>,
+}
+
+impl Signal {
+    const fn new() -> Self {
+        Self { readers: Mutex::new(Vec::new()) }
+    }
+
+    fn reader(&self) -> async_channel::Receiver<()> {
+        let (tx, rx) = async_channel::bounded(4);
+        self.readers.lock().unwrap().push(tx);
+        rx
+    }
+
+    /// A reader that is gone is dropped from the list; a full queue has
+    /// signals enough.
+    fn send(&self) {
+        self.readers.lock().unwrap().retain(|reader| {
+            let _ = reader.try_send(());
+            !reader.is_closed()
+        });
+    }
+}
+
+static CHANGES: Signal = Signal::new();
 
 pub fn status() -> Status {
     STATUS.lock().unwrap().clone()
@@ -55,12 +83,12 @@ pub fn status() -> Status {
 
 /// A signal for each change of [`status`].
 pub fn changes() -> async_channel::Receiver<()> {
-    CHANGES.get_or_init(|| async_channel::bounded(4)).1.clone()
+    CHANGES.reader()
 }
 
 fn set_status(status: Status) {
     *STATUS.lock().unwrap() = status;
-    let _ = CHANGES.get_or_init(|| async_channel::bounded(4)).0.try_send(());
+    CHANGES.send();
 }
 
 #[link(name = "objc")]
@@ -432,5 +460,25 @@ impl Bloom {
             }
             _ => "error: updates [state | check | background | restart | auto on|off]".into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each reader hears of a change: the task of a window that closed
+    /// must not take the signal of the window that is open.
+    #[test]
+    fn every_reader_gets_the_signal_of_a_change() {
+        let signal = Signal::new();
+        let (first, second) = (signal.reader(), signal.reader());
+        signal.send();
+        assert!(first.try_recv().is_ok(), "the first reader got no signal");
+        assert!(second.try_recv().is_ok(), "the second reader got no signal");
+        // A reader that is gone leaves the list at the next signal.
+        drop(first);
+        signal.send();
+        assert_eq!(signal.readers.lock().unwrap().len(), 1);
     }
 }

@@ -534,7 +534,8 @@ impl Bloom {
         cx.notify();
     }
 
-    /// Sends the whole edited object, then reads it back: the editor then
+    /// Sends the object of the server with the edits in it (see
+    /// `with_changes`), then reads it back: the editor then
     /// shows what the server holds.
     fn plugin_save(&mut self, cx: &mut Context<Self>) {
         self.plugin_send(false, cx)
@@ -551,6 +552,7 @@ impl Bloom {
         }
         editor.saving = true;
         let (path, body) = (format!("/Plugins/{}/Configuration", editor.id), editor.edited.clone());
+        let original = editor.original.clone();
         // The answer is for this instance of the editor: the user may have
         // left it and opened another one (of this plugin or another, on
         // this server or another) meanwhile.
@@ -560,7 +562,10 @@ impl Bloom {
         self.fetch(
             cx,
             move |client| -> Result<Value> {
-                client.post(&path, &body)?;
+                // The object of the server now, with the edits in it: what
+                // changed there since the editor opened stays.
+                let fresh = client.get::<Value>(&path, &[])?;
+                client.post(&path, &super::with_changes(&fresh, &original, &body))?;
                 client.get::<Value>(&path, &[])
             },
             move |this, result, cx| {

@@ -70,6 +70,18 @@ impl Bloom {
                 || self.text_editor_open())
     }
 
+    /// Drops a question, a form or a shown secret that is still open when
+    /// the page or the session changes. Each holds an action for the page
+    /// it was asked on ("Delete user X", "Shut down the server"): left
+    /// open, it showed again on the next page that draws dialogs, and
+    /// after a switch of the server its action ran against the new one.
+    pub fn forget_admin_dialogs(&mut self) {
+        self.admin_confirm = None;
+        self.admin_prompt = None;
+        self.admin_prompt_fresh = false;
+        self.admin_secret = None;
+    }
+
     /// Closes the open dialog without an action.
     pub fn close_admin_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.admin_confirm = None;
@@ -286,6 +298,10 @@ fn backdrop(id: &'static str, card: Stateful<Div>, cx: &mut Context<Bloom>) -> S
         .items_center()
         .justify_center()
         .bg(rgba(0x00000099))
+        // The page behind takes no click while the dialog is open: a
+        // hitbox does not block by itself, and the click that closes the
+        // dialog also pressed the button under the pointer.
+        .occlude()
         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
             this.close_admin_dialog(window, cx)
         }))

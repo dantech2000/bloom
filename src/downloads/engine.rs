@@ -486,13 +486,19 @@ impl Engine {
         let mut s = self.inner.lock();
         // The server answers again: the downloads that gave up try again.
         if client.is_some() && s.owner.is_some() {
+            let mut changed = false;
             for entry in s.entries.iter_mut().filter(|e| e.server_id == server_id) {
                 if entry.state == EntryState::Failed {
                     entry.state = EntryState::Queued;
                     entry.error = None;
+                    changed = true;
                 }
             }
-            save_index(&s);
+            // A session opens on the UI thread, at the start before the
+            // first frame: no write of an index that is as it was.
+            if changed {
+                save_index(&s);
+            }
         }
         s.client = client;
         s.server_id = server_id.to_string();
@@ -889,6 +895,12 @@ fn agent(stall: Duration, cancel: Arc<AtomicBool>) -> ureq::Agent {
 }
 
 fn download(inner: &Arc<Inner>, job: &Job) -> Result<(), Stop> {
+    download_run(inner, job, false)
+}
+
+/// One run of a download. `again` says the item was read from the server
+/// again in this download already (see the size check below).
+fn download_run(inner: &Arc<Inner>, job: &Job, again: bool) -> Result<(), Stop> {
     let Job { client, folder, cancel, options, server_id, item_id, .. } = job;
     let failed = |err: anyhow::Error| Stop::Failed(format!("{err:#}"));
     // A job whose entry is gone writes nothing, not even its folder.
@@ -961,9 +973,48 @@ fn download(inner: &Arc<Inner>, job: &Job) -> Result<(), Stop> {
         job.check(inner)?;
         let start = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
         set_done(inner, job, start, 0.);
+        // The part file is the whole file already (a cancel or an error
+        // came between the last byte and the rename): nothing to ask for.
+        // A request for the bytes after the end is a 416, which would
+        // throw the file away.
+        // The length alone does not say it is the file the server has
+        // now, so the item is read again first (once in a download).
+        if start > 0 && total == Some(start) {
+            if !again {
+                let fresh = fetch_meta(client, item_id, server_id).map_err(failed)?;
+                if size_of(&fresh) != total {
+                    job.check(inner)?;
+                    start_over(folder, &part, false);
+                    write_json(&meta_path, &fresh).map_err(failed)?;
+                    return download_run(inner, job, true);
+                }
+            }
+            job.check(inner)?;
+            fs::rename(&part, &final_path).map_err(|e| failed(e.into()))?;
+            let _ = fs::remove_file(tag_file(&part));
+            set_done(inner, job, start, 0.);
+            return Ok(());
+        }
         match fetch_media(&agent, job, &url, &part, start, inner, total.is_some()) {
             Ok(got) => {
                 let want = total.unwrap_or(got);
+                // Not the size `meta.json` says: the file on the server
+                // may be another one by now (a release that replaced the
+                // first). The item is read again, once; with the size it
+                // has now the download starts over. A part file that came
+                // whole in this request is the new file and stays.
+                if got != want && !again {
+                    let fresh = fetch_meta(client, item_id, server_id).map_err(failed)?;
+                    let size = size_of(&fresh);
+                    if size != total {
+                        job.check(inner)?;
+                        log::info!("download of {item_id}: the file on the server changed ({want} to {size:?} bytes)");
+                        let whole = start == 0 && size == Some(got) && fresh["File"].as_str() == Some(file.as_str());
+                        start_over(folder, &part, whole);
+                        write_json(&meta_path, &fresh).map_err(failed)?;
+                        return download_run(inner, job, true);
+                    }
+                }
                 if got != want {
                     // The file is not what the server said; a retry gets
                     // the rest, or finds that there is none.
@@ -978,6 +1029,7 @@ fn download(inner: &Arc<Inner>, job: &Job) -> Result<(), Stop> {
                 } else {
                     job.check(inner)?;
                     fs::rename(&part, &final_path).map_err(|e| failed(e.into()))?;
+                    let _ = fs::remove_file(tag_file(&part));
                     set_done(inner, job, got, 0.);
                     return Ok(());
                 }
@@ -1000,6 +1052,36 @@ fn download(inner: &Arc<Inner>, job: &Job) -> Result<(), Stop> {
             thread::sleep(Duration::from_millis(20));
         }
         wait = (wait * 2).min(Duration::from_secs(30));
+    }
+}
+
+/// The size of the media file in a `meta.json`; none when the server did
+/// not say.
+fn size_of(meta: &Value) -> Option<u64> {
+    meta["Item"]["MediaSources"][0]["Size"].as_u64().filter(|n| *n > 0)
+}
+
+/// Where the validator of a part file is kept (see `fetch_media`).
+fn tag_file(part: &Path) -> PathBuf {
+    let mut name = part.as_os_str().to_os_string();
+    name.push(".tag");
+    PathBuf::from(name)
+}
+
+/// The file on the server is another one than the folder was made for:
+/// what was fetched for the old one goes. The part file stays when it is
+/// the new file, whole (`keep_part`). The subtitle files go in every case:
+/// they are fetched by their place in the item, and a file of the old
+/// release would be kept under the name of the new one.
+fn start_over(folder: &Path, part: &Path, keep_part: bool) {
+    if !keep_part {
+        let _ = fs::remove_file(part);
+        let _ = fs::remove_file(tag_file(part));
+    }
+    for entry in fs::read_dir(folder).into_iter().flatten().flatten() {
+        if entry.file_name().to_string_lossy().starts_with("sub-") {
+            let _ = fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -1096,8 +1178,17 @@ fn fetch_media(
     let Job { client, cancel, options, item_id, .. } = job;
     let failed = |err: String| Stop::Failed(err);
     let mut request = agent.get(url).header("Authorization", client.auth_header());
+    // A part file goes on only as the file it was started from: the
+    // validator of that answer (its `ETag`, or else its date) goes with
+    // the range, and a server that has another file by now sends the whole
+    // file (a 200), which starts the part file over. Without it, the bytes
+    // of two files would end up in one.
+    let tag_path = tag_file(part);
     if start > 0 {
         request = request.header("Range", format!("bytes={start}-"));
+        if let Ok(tag) = fs::read_to_string(&tag_path) {
+            request = request.header("If-Range", tag.trim());
+        }
     }
     let mut response = match request.call() {
         Ok(response) => response,
@@ -1142,6 +1233,19 @@ fn fetch_media(
                 log::info!("download of {item_id}: the server ignored the range; starting over");
             }
             start = 0;
+            // The validator of the file this part file is now of. A weak
+            // tag cannot go with a range.
+            let tag = header("etag")
+                .filter(|tag| !tag.starts_with("W/"))
+                .or_else(|| header("last-modified"));
+            match tag {
+                Some(tag) => {
+                    let _ = fs::write(&tag_path, tag);
+                }
+                None => {
+                    let _ = fs::remove_file(&tag_path);
+                }
+            }
             fs::File::create(part)
         }
         code => return Err(failed(format!("HTTP {code}"))),
@@ -1435,10 +1539,33 @@ fn get_bytes(agent: &ureq::Agent, url: &str, auth: Option<&Client>) -> Result<Ve
 // ----- index on disk -------------------------------------------------------------
 
 fn load_index(dir: &Path) -> Vec<Entry> {
-    let entries: Vec<Entry> = fs::read(dir.join(INDEX_FILE))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
+    // A file that does not read as the index, whole or at one entry, is
+    // kept as `<name>.broken` before the next save writes over it: the
+    // folders of its downloads are still on the disk. An entry this build
+    // cannot read (a state of a newer one) costs that entry, not the list.
+    let path = dir.join(INDEX_FILE);
+    let Ok(bytes) = fs::read(&path) else {
+        return Vec::new();
+    };
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+        log::warn!("downloads index does not parse ({err}); a copy is kept");
+        crate::config::keep_broken_copy(&path, &bytes);
+        Vec::new()
+    });
+    let count = listed.len();
+    let entries: Vec<Entry> = listed
+        .into_iter()
+        .filter_map(|entry| match serde_json::from_value(entry) {
+            Ok(entry) => Some(entry),
+            Err(err) => {
+                log::warn!("download entry not read: {err}");
+                None
+            }
+        })
+        .collect();
+    if entries.len() != count {
+        crate::config::keep_broken_copy(&path, &bytes);
+    }
     // An entry with an unsafe id or file name is refused, not repaired. Its
     // folder is left alone.
     entries
@@ -1695,8 +1822,13 @@ mod tests {
         if path.ends_with("/Download") {
             let range = header("range");
             ranges.lock().unwrap().push(range.clone());
+            // The file has a validator; a range that names another one
+            // gets the whole file, as a server answers `If-Range`.
+            let tag = format!("\"file-{}\"", file.len());
+            let same = header("if-range").is_none_or(|named| named == tag);
             let start: usize = range
                 .as_deref()
+                .filter(|_| same)
                 .and_then(|r| r.strip_prefix("bytes="))
                 .and_then(|r| r.split('-').next())
                 .and_then(|s| s.parse().ok())
@@ -1728,13 +1860,13 @@ mod tests {
                     if start > 0 {
                         let _ = write!(
                             stream,
-                            "HTTP/1.1 206 Partial Content\r\nConnection: close\r\nContent-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\n\r\n",
+                            "HTTP/1.1 206 Partial Content\r\nConnection: close\r\nETag: {tag}\r\nContent-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\n\r\n",
                             file.len() - 1,
                             file.len(),
                             body.len()
                         );
                     } else {
-                        let _ = write!(stream, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n", body.len());
+                        let _ = write!(stream, "HTTP/1.1 200 OK\r\nConnection: close\r\nETag: {tag}\r\nContent-Length: {}\r\n\r\n", body.len());
                     }
                     match current {
                         Mode::CutAfter(n) => {
@@ -2198,6 +2330,123 @@ mod tests {
         wait_state(&again, "ep11", EntryState::Done);
         assert_eq!(mock.ranges().last().unwrap().as_deref(), Some(format!("bytes={}-", entry.done).as_str()));
         assert_eq!(fs::read(again.local_path("ep11").unwrap()).unwrap(), *mock.file);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The file on the server was replaced by another one (a better
+    /// release) after `meta.json` was written. The download reads the item
+    /// again and ends with the file the server has now. Before, it held
+    /// the size of the old file, fetched the new one again and again
+    /// against it, and failed, at each start and each reconnect.
+    #[test]
+    fn a_file_replaced_on_the_server_downloads_with_its_new_size() {
+        let mock = Mock::start(5_000);
+        let dir = temp_dir("replaced-file");
+        let engine = engine(&mock, dir.clone(), options());
+        engine.add(&item("ep85")).unwrap();
+        wait_state(&engine, "ep85", EntryState::Done);
+        wait_idle(&engine);
+        // As after a download of the old file that did not end: the folder
+        // has the item of the old file, which was larger, and no media.
+        let folder = engine.folder("ep85").unwrap();
+        let media = engine.local_path("ep85").unwrap();
+        fs::remove_file(&media).unwrap();
+        let mut meta = engine.meta("ep85").unwrap();
+        meta["Item"]["MediaSources"][0]["Size"] = serde_json::json!(9_000);
+        fs::write(folder.join(META_FILE), serde_json::to_vec(&meta).unwrap()).unwrap();
+        let before = mock.ranges().len();
+        engine.inner.lock().entry_mut("ep85").unwrap().state = EntryState::Failed;
+        engine.set_client(Some(mock.client()), "server1");
+        let entry = wait_state(&engine, "ep85", EntryState::Done);
+        wait_idle(&engine);
+        assert_eq!(fs::metadata(&media).unwrap().len(), 5_000);
+        assert_eq!(entry.total, Some(5_000), "the entry keeps the size of the old file");
+        assert_eq!(mock.ranges().len() - before, 1, "the file came more than once: {:?}", mock.ranges());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A part file of another file than the server has now (same length
+    /// of the whole, so the sizes say nothing) does not go on: the range
+    /// names the file it was started from, the server sends its file
+    /// whole, and the download is that file, byte for byte. Before, the
+    /// rest of the new file was put behind the start of the old one.
+    #[test]
+    fn a_part_of_another_file_is_not_gone_on_with() {
+        let mock = Mock::start(5_000);
+        let dir = temp_dir("part-of-another-file");
+        let engine = engine(&mock, dir.clone(), options());
+        engine.add(&item("ep86")).unwrap();
+        wait_state(&engine, "ep86", EntryState::Done);
+        wait_idle(&engine);
+        let media = engine.local_path("ep86").unwrap();
+        let part = PathBuf::from(format!("{}.part", media.display()));
+        fs::remove_file(&media).unwrap();
+        // 3,000 bytes of the file the server had before, with its validator.
+        fs::write(&part, vec![0xEE; 3_000]).unwrap();
+        fs::write(tag_file(&part), "\"file-of-before\"").unwrap();
+        engine.inner.lock().entry_mut("ep86").unwrap().state = EntryState::Failed;
+        engine.set_client(Some(mock.client()), "server1");
+        wait_state(&engine, "ep86", EntryState::Done);
+        wait_idle(&engine);
+        assert_eq!(fs::read(&media).unwrap(), *mock.file, "the download is not the file of the server");
+        assert!(!tag_file(&part).exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// An index that does not read is kept as a copy, and one entry that
+    /// does not read costs that entry alone. Before, either made the list
+    /// empty, and the next save wrote the empty list over the file.
+    #[test]
+    fn a_broken_index_is_kept_and_a_broken_entry_costs_one_entry() {
+        let mock = Mock::start(5_000);
+        let dir = temp_dir("broken-index");
+        let engine = engine(&mock, dir.clone(), options());
+        engine.add(&item("ep80")).unwrap();
+        engine.add(&item("ep81")).unwrap();
+        wait_state(&engine, "ep80", EntryState::Done);
+        wait_state(&engine, "ep81", EntryState::Done);
+        wait_idle(&engine);
+        drop(engine);
+        let path = dir.join(INDEX_FILE);
+        let broken = dir.join(format!("{INDEX_FILE}.broken"));
+        // One entry in a state this build does not know.
+        let mut listed: Vec<serde_json::Value> = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        listed[0]["state"] = serde_json::json!("FromALaterBuild");
+        let odd = serde_json::to_vec(&listed).unwrap();
+        fs::write(&path, &odd).unwrap();
+        let read = load_index(&dir);
+        assert_eq!(read.len(), 1, "the entry that reads was lost with the other");
+        assert_eq!(fs::read(&broken).unwrap(), odd);
+        // A file cut short.
+        let cut = &odd[..odd.len() / 2];
+        fs::write(&path, cut).unwrap();
+        assert!(load_index(&dir).is_empty());
+        assert_eq!(fs::read(&broken).unwrap(), cut);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A session opens on the UI thread. With no download to queue again it
+    /// leaves the index on the disk alone; with one it writes the index.
+    #[test]
+    fn a_session_that_changes_no_entry_does_not_write_the_index() {
+        use std::os::unix::fs::MetadataExt as _;
+        let mock = Mock::start(5_000);
+        let dir = temp_dir("session-no-write");
+        let engine = engine(&mock, dir.clone(), options());
+        engine.add(&item("ep70")).unwrap();
+        // The worker writes the index for the last time as it sets this.
+        wait_state(&engine, "ep70", EntryState::Done);
+        // A write puts a new file in the place of the index.
+        let file = || fs::metadata(dir.join(INDEX_FILE)).unwrap().ino();
+        let before = file();
+        engine.set_client(Some(mock.client()), "server1");
+        engine.set_client(None, "server1");
+        assert_eq!(file(), before, "the index was written again");
+        engine.inner.lock().entry_mut("ep70").unwrap().state = EntryState::Failed;
+        engine.set_client(Some(mock.client()), "server1");
+        assert_ne!(file(), before, "the entry queued again was not written");
+        wait_state(&engine, "ep70", EntryState::Done);
+        wait_idle(&engine);
         let _ = fs::remove_dir_all(dir);
     }
 

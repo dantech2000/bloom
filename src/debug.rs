@@ -744,7 +744,16 @@ impl Bloom {
             }
             // An mpv property as the worker sees it (`mpv mute`).
             "mpv" => {
-                return self.player.probe(rest).unwrap_or_else(|| "error: no worker, or no answer".into());
+                // The header mpv sends to the server is the access token,
+                // and an address can carry it as `ApiKey`.
+                if rest.to_ascii_lowercase().contains("header") {
+                    return "error: this property holds the access token".into();
+                }
+                return self
+                    .player
+                    .probe(rest)
+                    .map(|value| crate::airplay::stream::redact(&value))
+                    .unwrap_or_else(|| "error: no worker, or no answer".into());
             }
             // `mpv-set <property> <value>`: an mpv option for a test, such
             // as `deinterlace yes` or `hwdec no`; the next read shows it.
@@ -752,6 +761,18 @@ impl Bloom {
                 let Some((name, value)) = rest.split_once(' ') else {
                     return "error: mpv-set <property> <value>".into();
                 };
+                // An option that prints a text can print the header mpv
+                // sends, and with it the access token (`${http-header-fields}`
+                // in a message or a title, a log or a dump to a file); so can
+                // a value that names a property. A test needs none of these.
+                const PRINTS: [&str; 12] = [
+                    "msg", "title", "header", "term", "log", "dump", "record", "script", "include", "config",
+                    "status", "input",
+                ];
+                let lower = name.to_ascii_lowercase();
+                if PRINTS.iter().any(|part| lower.contains(part)) || value.contains("${") {
+                    return "error: this option can show the access token".into();
+                }
                 self.player.set_property(name, value);
                 return format!("set {name}");
             }

@@ -330,6 +330,23 @@ impl Client {
         })
     }
 
+    /// One document as the server has it now, for a save: the save sends
+    /// this with the changes of the user in it, so a value another client
+    /// set since the settings were read stays.
+    fn fresh_doc(&self, doc: Doc) -> Result<Value> {
+        let user = self.user()?.to_string();
+        match doc {
+            Doc::Configuration => {
+                let me = self.get::<Value>("/Users/Me", &[])?;
+                me.get("Configuration").cloned().ok_or_else(|| anyhow::anyhow!("the user has no configuration"))
+            }
+            Doc::Display => self.get::<Value>(
+                "/DisplayPreferences/usersettings",
+                &[("userId", user), ("client", "emby".to_string())],
+            ),
+        }
+    }
+
     fn save_user_configuration(&self, configuration: &Value) -> Result<()> {
         let user = self.user()?;
         self.post(&format!("/Users/Configuration?userId={user}"), configuration)
@@ -426,6 +443,7 @@ impl Bloom {
         match &mut self.page {
             Page::Settings(open) => {
                 *open = section;
+                self.forget_admin_dialogs();
                 self.page_scroll
                     .set_offset(gpui_kit::point(px(0.), px(0.)));
                 cx.notify();
@@ -484,29 +502,45 @@ impl Bloom {
             return;
         }
         let body = current.clone();
+        let known = save.acknowledged.clone();
         save.sent = Some(body.clone());
         self.pref_lanes.busy.insert(id.clone());
         let epoch = self.session_epoch;
         self.fetch_with(
             client,
             cx,
-            move |client| match doc {
-                Doc::Configuration => client.save_user_configuration(&body),
-                Doc::Display => client.save_display_preferences(&body),
+            move |client| {
+                // The document of the server now, with the changes of the
+                // user in it: the one this app read can be old.
+                let merged = crate::admin::with_changes(&client.fresh_doc(doc)?, &known, &body);
+                match doc {
+                    Doc::Configuration => client.save_user_configuration(&merged),
+                    Doc::Display => client.save_display_preferences(&merged),
+                }?;
+                Ok(merged)
             },
             move |this, result, cx| {
                 // The save ended for the server, whatever session is open.
                 this.pref_lanes.busy.remove(&id);
-                let failed = result.err();
+                let (taken, failed) = match result {
+                    Ok(taken) => (Some(taken), None),
+                    Err(err) => (None, Some(err)),
+                };
                 // Its answer is for the session that asked: after a switch
                 // of the profile it must not put values back, and the save
                 // state there is another session's.
                 if this.session_epoch == epoch {
                     let (current, save) = this.prefs.doc_mut(doc);
                     if let Some(sent) = save.sent.take() {
-                        match &failed {
-                            None => save.acknowledged = sent,
-                            Some(_) => revert_failed(current, &sent, &save.acknowledged),
+                        match taken {
+                            // The server has `taken`: what another client
+                            // changed shows now, and a change made here
+                            // since the save went out stays on top.
+                            Some(taken) => {
+                                *current = crate::admin::with_changes(&taken, &sent, current);
+                                save.acknowledged = taken;
+                            }
+                            None => revert_failed(current, &sent, &save.acknowledged),
                         }
                     }
                 }
@@ -697,7 +731,13 @@ impl Bloom {
             Section::About => self.render_settings_about(cx),
         };
 
-        let content = div().flex_1().min_w_0().h_full().child(
+        // Beside the list the page takes the width the list leaves. It is
+        // set as the least and the most width: the layout engine measures
+        // each flex item at its smallest width before it lays it out (taffy
+        // does so also when a least width is set), and an equal least and
+        // most width answers that without a layout of the whole page.
+        let page_w = px((self.viewport_w - NAV_W).max(0.));
+        let content = div().flex_1().min_w_0().when(!narrow, |el| el.min_w(page_w).max_w(page_w)).h_full().child(
             ScrollArea::new("settings.scroll")
                 .track(&self.page_scroll)
                 .size_full()
@@ -1041,21 +1081,17 @@ mod race_tests {
     use super::Prefs;
     use crate::app::race_harness::{MockServer, add_server, app, plain, session};
 
-    /// A server that takes a configuration unless `refuse(document)` says no.
-    fn server(refuse: impl Fn(&Value) -> bool + Send + Sync + 'static) -> MockServer {
-        MockServer::start(move |method, path, body| match (method, path) {
-            ("POST", p) if p.starts_with("/Users/Configuration") => {
-                let document = serde_json::from_str(body).unwrap_or(Value::Null);
-                if refuse(&document) { (500, "refused".to_string()) } else { (204, String::new()) }
-            }
-            _ => plain(method, path),
-        })
+    /// A server that has `first` as the configuration of its user and
+    /// takes another unless `refuse(document)` says no. A save reads the
+    /// configuration before it sends one.
+    fn server(first: Value, refuse: impl Fn(&Value) -> bool + Send + Sync + 'static) -> MockServer {
+        account(first, refuse).0
     }
 
     #[gpui_kit::test]
     fn a_failed_save_throws_away_a_later_setting(cx: &mut TestAppContext) {
         // The save of A fails; the save with B, sent right after it, succeeds.
-        let server = server(|document| document["B"] != json!(true));
+        let server = server(json!({"A": false, "B": false}), |document| document["B"] != json!(true));
         let (bloom, cx) = app(cx);
         bloom.update(cx, |this, cx| {
             this.session = Some(session(&server.url, "u1"));
@@ -1083,7 +1119,7 @@ mod race_tests {
     /// other on the way, and the server ends with the newest.
     #[gpui_kit::test]
     fn changes_during_a_save_go_as_one_save_behind_it(cx: &mut TestAppContext) {
-        let server = server(|_| false);
+        let server = server(json!({"A": 0, "B": 0, "C": 0}), |_| false);
         let (bloom, cx) = app(cx);
         bloom.update(cx, |this, cx| {
             this.session = Some(session(&server.url, "u1"));
@@ -1107,7 +1143,7 @@ mod race_tests {
     /// touch the settings of the new profile, nor send the old ones again.
     #[gpui_kit::test(iterations = 20)]
     fn a_save_of_the_profile_before_leaves_the_new_profile_alone(cx: &mut TestAppContext) {
-        let one = server(|_| true);
+        let one = server(json!({"A": false}), |_| true);
         let two = MockServer::start(|method, path, _| match (method, path) {
             ("GET", "/Users/Me") => (200, r#"{"Configuration":{"Z":1},"HasPassword":true}"#.into()),
             _ => plain(method, path),
@@ -1211,14 +1247,38 @@ mod race_tests {
         let (bloom, cx) = app(cx);
         switch_away_and_back_during_a_save(&bloom, cx, &one, &two);
         change_b_on_a_page_from_before_the_save(&bloom, cx);
+        // The second save sends the change of the user (B) in the document
+        // the server has then, and D1 left A on in it: the page from before
+        // D1 does not put A back to off.
+        let both = json!({"A": true, "B": true});
         assert_eq!(
             one.bodies("POST", "/Users/Configuration"),
-            vec![D1(), D2()],
-            "the newer document D2 did not wait for D1, the save of the session before"
+            vec![D1(), both.clone()],
+            "the save of B did not wait for D1, the save of the session before, or it put A back"
         );
-        assert_eq!(document(), D2(), "the server ends with the older document");
+        assert_eq!(document(), both, "the server lost a setting");
         assert_eq!(two.count("POST", "/Users/Configuration"), 0);
-        bloom.read_with(cx, |this, _| assert_eq!(this.prefs.configuration, D2()));
+        bloom.read_with(cx, |this, _| assert_eq!(this.prefs.configuration, both));
+    }
+
+    /// Another client changes a setting after this app read the settings.
+    /// A change here goes into the document the server has now: the save
+    /// sent the whole document of the read before, and put the setting of
+    /// the other client back.
+    #[gpui_kit::test]
+    fn a_save_keeps_what_another_client_changed(cx: &mut TestAppContext) {
+        // The server has B on; the app read the settings while it was off.
+        let (one, document) = account(json!({"A": false, "B": true}), |_| false);
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            this.session = Some(session(&one.url, "u1"));
+            this.prefs = Prefs::from_server(json!({"A": false, "B": false}), json!({}), true, None);
+            this.set_user_config("A", json!(true), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(document(), json!({"A": true, "B": true}), "the save put back the B of the old read");
+        // The page shows what the server has now.
+        bloom.read_with(cx, |this, _| assert_eq!(this.prefs.configuration, json!({"A": true, "B": true})));
     }
 
     /// The same, and the server refuses D1: nothing of it is put back into

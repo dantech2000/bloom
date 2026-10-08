@@ -207,6 +207,8 @@ pub struct Core {
     /// The server waits for a `Ready` of this member.
     owes_ready: bool,
     ready_sent: Option<f64>,
+    /// The position the last `Ready` said the player is at.
+    ready_position: Option<f64>,
     buffering_sent: Option<f64>,
     stalled: bool,
     /// A pause of the user that the server has not confirmed yet.
@@ -244,6 +246,7 @@ impl Default for Core {
             phase: Phase::Idle,
             owes_ready: false,
             ready_sent: None,
+            ready_position: None,
             buffering_sent: None,
             stalled: false,
             provisional_pause: None,
@@ -382,6 +385,7 @@ impl Core {
         self.held = None;
         self.owes_ready = false;
         self.ready_sent = None;
+        self.ready_position = None;
         self.provisional_pause = None;
         self.stalled = false;
         self.drift.reset();
@@ -526,6 +530,7 @@ impl Core {
         self.drift.reset();
         self.owes_ready = true;
         self.ready_sent = None;
+        self.ready_position = None;
         self.provisional_pause = None;
         if loaded {
             // The group starts the item again: go to its place and report.
@@ -569,13 +574,21 @@ impl Core {
         }
         let duplicate = self.command.as_ref().is_some_and(|last| last.same_as(&command));
         // The seek loop: the server sends a seek to one member whose `Ready`
-        // was too far from the group.
+        // was too far from the group. A seek to the same place counts only
+        // as such an answer: this member said `Ready` from another place
+        // since the seek before. A member of the group who seeks to one
+        // place again and again (the arrow key at the start or the end of
+        // an item) sends the same command, and so does a second delivery;
+        // the player reached the place then, and neither is a loop.
         if command.command == CommandKind::Seek {
             let ticks = command.position_ticks.unwrap_or(0);
-            self.seek_loop = if self.seek_loop.0 == ticks {
-                (ticks, self.seek_loop.1 + 1)
-            } else {
-                (ticks, 1)
+            let missed = self
+                .ready_position
+                .is_some_and(|said| (said - command.position_ms()).abs() > AT_POSITION_MS);
+            self.seek_loop = match () {
+                () if duplicate => self.seek_loop,
+                () if self.seek_loop.0 == ticks && self.seek_loop.1 > 0 && missed => (ticks, self.seek_loop.1 + 1),
+                () => (ticks, 1),
             };
         } else {
             self.seek_loop = (0, 0);
@@ -655,6 +668,7 @@ impl Core {
                 let token = self.token();
                 self.owes_ready = true;
                 self.ready_sent = None;
+        self.ready_position = None;
                 self.phase = Phase::Seeking { token, asked: now, start: None };
                 out.push(Action::SeekPaused { position: command.position_ms(), token });
             }
@@ -685,6 +699,7 @@ impl Core {
     fn send_ready(&mut self, now: f64, clock: &ServerClock, view: &PlayerView, out: &mut Vec<Action>) {
         if let Some(report) = self.report(now, clock, view) {
             self.ready_sent = Some(now);
+            self.ready_position = Some(view.position_at(now));
             out.push(Action::Send(Request::Ready(report)));
         }
     }
@@ -772,6 +787,7 @@ impl Core {
                         self.buffering_sent = Some(now);
                         self.owes_ready = true;
                         self.ready_sent = None;
+        self.ready_position = None;
                         out.push(Action::Send(Request::Buffering(report)));
                     }
                 }
@@ -1586,12 +1602,32 @@ mod tests {
             let out = rig.command(CommandKind::Seek, "p1", 30_000., 0.);
             let (_, token) = seek_of(&out).unwrap();
             rig.pass(100.);
+            // The player does not get there, and its `Ready` says so.
+            rig.view.position = 26_000.;
             rig.player(PlayerEvent::Settled { token });
             rig.pass(100.);
         }
         let out = rig.command(CommandKind::Seek, "p1", 30_000., 0.);
         assert!(sent(&out).contains(&&Request::SetIgnoreWait(true)));
         assert!(!rig.core.following());
+    }
+
+    /// A member of the group seeks to one place three times (the arrow
+    /// key at the start of an item, where each press is a seek to 0). The
+    /// player reaches the place each time and says so: that is no seek
+    /// loop, and this member stays with the group.
+    #[test]
+    fn three_seeks_of_a_user_to_one_place_keep_the_member_in_the_group() {
+        let mut rig = Rig::parked(30_000.);
+        for _ in 0..3 {
+            let out = rig.command(CommandKind::Seek, "p1", 0., 0.);
+            assert!(rig.core.following(), "stepped aside at a seek of a user: {out:?}");
+            let (_, token) = seek_of(&out).unwrap();
+            rig.pass(100.);
+            rig.player(PlayerEvent::Settled { token });
+            rig.pass(100.);
+        }
+        assert!(rig.core.following());
     }
 
     #[test]

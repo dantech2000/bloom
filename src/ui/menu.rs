@@ -148,6 +148,12 @@ pub struct MenuState {
     typed_at: Option<web_time::Instant>,
 }
 impl MenuState {
+    /// The labels of the entries, for a test of what a menu holds.
+    #[cfg(test)]
+    pub fn labels(&self) -> Vec<String> {
+        self.items.iter().filter_map(MenuItem::debug_label).collect()
+    }
+
     /// Creates a closed menu with the supplied entries and new focus handles.
     pub fn new(items: impl IntoIterator<Item = MenuItem>, cx: &mut Context<Self>) -> Self {
         Self {
@@ -792,6 +798,8 @@ impl RenderOnce for Menu {
 mod tests {
     use super::*;
     use gpui_kit::AppContext as _;
+
+    #[gpui_kit::test]
     fn check_actions_toggle_and_radio_actions_select_one(cx: &mut gpui_kit::TestAppContext) {
         cx.update(super::super::theme::init);
         let window = cx.add_window(|_, cx| {

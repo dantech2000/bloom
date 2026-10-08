@@ -386,3 +386,100 @@ fn escape_closes_an_open_panel_before_it_goes_back(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("escape");
     bloom.read_with(cx, |this, _| assert!(matches!(this.page, Page::Search(_)), "Escape did not go back"));
 }
+
+// ----- review of 2026-10-07 --------------------------------------------------
+
+/// The item of a detail page with one audio track of the name, as the
+/// server sends it.
+fn json_with_audio(id: &str, track: &str) -> serde_json::Value {
+    serde_json::json!({
+        "Id": id, "Name": id, "Type": "Movie",
+        "MediaSources": [{ "MediaStreams": [{ "Type": "Audio", "Index": 1, "DisplayTitle": track }] }],
+    })
+}
+
+fn item_with_audio(id: &str, track: &str) -> crate::jellyfin::Item {
+    serde_json::from_value(json_with_audio(id, track)).unwrap()
+}
+
+/// The menus of the detail page are one set for the app. A page that Back
+/// brings up again has its data and loads nothing, so its menus must be
+/// built again for it: they held the entries of the item opened after it,
+/// and "Edit metadata" there opened that other item.
+#[gpui_kit::test]
+fn back_to_a_detail_page_brings_its_own_menus(cx: &mut TestAppContext) {
+    let server = MockServer::start(|method, path, _| match (method, path) {
+        ("GET", p) if p.starts_with("/Items/b") && !p.contains("/Similar") => (200, json_with_audio("b", "Track of B").to_string()),
+        _ => plain(method, path),
+    });
+    let (bloom, cx) = app(cx);
+    let detail = |item| Page::Detail(super::DetailData { item, ..Default::default() });
+    bloom.update(cx, |this, cx| {
+        this.session = Some(session(&server.url, "u1"));
+        this.screen = Screen::Main;
+        this.page = detail(item_with_audio("a", "Track of A"));
+        this.rebuild_detail_menus(cx);
+        assert_eq!(this.detail_audio_menu.read(cx).labels(), ["Track of A"]);
+        this.navigate(detail(item_with_audio("b", "")), cx);
+    });
+    cx.run_until_parked();
+    bloom.update(cx, |this, cx| {
+        assert_eq!(this.detail_audio_menu.read(cx).labels(), ["Track of B"]);
+        this.back(cx);
+    });
+    cx.run_until_parked();
+    bloom.read_with(cx, |this, cx| {
+        assert_eq!(this.detail_audio_menu.read(cx).labels(), ["Track of A"], "the menu of the page is the one of the item after it");
+    });
+}
+
+/// A question of the dashboard holds an action for the page and the server
+/// it was asked on. It goes when the page or the session changes: left
+/// open, it showed again on the next page with dialogs, and its action ran
+/// against the server opened since.
+#[gpui_kit::test]
+fn a_question_does_not_outlive_its_page_or_its_session(cx: &mut TestAppContext) {
+    let server = MockServer::start(|method, path, _| plain(method, path));
+    let (bloom, cx) = app(cx);
+    let ask = |this: &mut super::Bloom| {
+        this.admin_confirm = Some(crate::admin::Confirm {
+            title: "Shut down the server?".into(),
+            message: String::new(),
+            action: "Shut down".into(),
+            danger: true,
+            run: std::rc::Rc::new(|_, _| {}),
+        });
+    };
+    bloom.update(cx, |this, cx| {
+        add_server(this, "one", &server.url, "u1");
+        add_server(this, "two", &server.url, "u2");
+        assert!(this.open_session("one", "u1", cx));
+        ask(this);
+        this.open_item(item("m1", "One", "Movie"), cx);
+        assert!(this.admin_confirm.is_none(), "the question is open on the next page");
+        ask(this);
+        this.back(cx);
+        assert!(this.admin_confirm.is_none(), "the question is open after Back");
+        ask(this);
+        assert!(this.open_session("two", "u2", cx));
+        assert!(this.admin_confirm.is_none(), "the question is open for the next session");
+    });
+    cx.run_until_parked();
+}
+
+/// The hero slides are those of one user: the next session loads its own.
+#[gpui_kit::test]
+fn the_hero_slides_of_one_profile_do_not_show_for_the_next(cx: &mut TestAppContext) {
+    let server = MockServer::start(|method, path, _| plain(method, path));
+    let (bloom, cx) = app(cx);
+    bloom.update(cx, |this, cx| {
+        add_server(this, "one", &server.url, "u1");
+        add_server(this, "two", &server.url, "u2");
+        assert!(this.open_session("one", "u1", cx));
+        this.hero = vec![item("m1", "Of user one", "Movie")];
+        this.hero_index = 0;
+        assert!(this.open_session("two", "u2", cx));
+        assert!(this.hero.is_empty(), "the slides of the profile before are still there");
+    });
+    cx.run_until_parked();
+}

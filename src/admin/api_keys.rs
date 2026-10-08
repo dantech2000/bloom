@@ -258,6 +258,9 @@ pub(crate) fn ask_new(app: &mut Bloom, cx: &mut Context<Bloom>) {
 /// Makes the key on the server, then shows it once.
 fn create(app: &mut Bloom, name: String, cx: &mut Context<Bloom>) {
     let shown = name.clone();
+    // The key is shown on the page that asked, in the session that
+    // asked: after a switch of the server it is not this server's key.
+    let epoch = app.session_epoch;
     app.fetch(
         cx,
         move |client| -> Result<Option<String>> {
@@ -276,15 +279,20 @@ fn create(app: &mut Bloom, name: String, cx: &mut Context<Bloom>) {
                 .map(|k| k.access_token))
         },
         move |this, result, cx| {
+            if this.session_epoch != epoch {
+                return;
+            }
             match result {
-                Ok(Some(value)) => {
+                Ok(Some(value)) if matches!(this.page, crate::app::Page::Admin(_)) => {
                     this.admin_secret = Some(Secret {
                         title: format!("API key for {shown}"),
                         message: "Copy the key now and keep it in a safe place.".to_string(),
                         value,
                     });
                 }
-                Ok(None) => this.toast("API key created", "", cx),
+                // The user left the dashboard: the key exists, and the
+                // list of the keys has it.
+                Ok(_) => this.toast("API key created", "", cx),
                 Err(err) => this.toast("The server refused the change", format!("{err:#}"), cx),
             }
             if matches!(this.page, crate::app::Page::Admin(_)) {
