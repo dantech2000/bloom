@@ -45,10 +45,6 @@ mod trailer;
 mod ui;
 mod updates;
 mod video_surface;
-
-/// The installed gpuicn component tests expect `crate::init`.
-#[cfg(test)]
-pub use ui::theme::init;
 mod views;
 
 use std::borrow::Cow;

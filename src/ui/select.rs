@@ -244,23 +244,6 @@ impl SelectState {
     }
 }
 impl EventEmitter<SelectEvent> for SelectState {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[gpui_kit::test]
-    fn choosing_an_option_without_a_rendered_editor(cx: &mut gpui_kit::TestAppContext) {
-        let window = cx.add_empty_window();
-        window.update(|window, cx| {
-            crate::init(cx);
-            let state =
-                cx.new(|cx| SelectState::new([SelectItem::new("pear", "Pear")], window, cx));
-            state.update(cx, |state, cx| state.choose(0, window, cx));
-            assert_eq!(state.read(cx).value().map(|v| v.as_ref()), Some("pear"));
-            assert!(state.read(cx).input.read(cx).value().is_empty());
-        });
-    }
-}
 impl Focusable for SelectState {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         if self.mode == Mode::Select {

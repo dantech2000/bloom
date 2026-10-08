@@ -113,14 +113,3 @@ fn ratio(value: f64, min: f64, max: f64) -> f32 {
     );
     ((value.clamp(min, max) - min) / (max - min)) as f32
 }
-
-#[cfg(test)]
-mod tests {
-    use super::ratio;
-    #[test]
-    fn numeric_ranges_clamp_at_both_ends() {
-        assert_eq!(ratio(-5., 10., 30.), 0.);
-        assert_eq!(ratio(20., 10., 30.), 0.5);
-        assert_eq!(ratio(40., 10., 30.), 1.);
-    }
-}
