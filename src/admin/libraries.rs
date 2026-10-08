@@ -245,6 +245,9 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
         grid = grid.child(
             div()
                 .w(px(card_w))
+                // A set least and most width spares a layout pass (`Bloom::render_settings`).
+                .min_w(px(card_w))
+                .max_w(px(card_w))
                 .map(super::surface)
                 .overflow_hidden()
                 .flex()

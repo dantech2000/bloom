@@ -343,9 +343,11 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                 .gap(px(GAP))
                 // Set widths, not shares of the row: with shares the layout
                 // engine measures each card several times, and that was
-                // most of the cost of a frame of this page.
-                .child(left.w(px(half)).flex_none())
-                .child(right.w(px(half)).flex_none())
+                // most of the cost of a frame of this page. The least
+                // and the most width spare one more pass
+                // (`Bloom::render_settings`).
+                .child(left.w(px(half)).min_w(px(half)).max_w(px(half)).flex_none())
+                .child(right.w(px(half)).min_w(px(half)).max_w(px(half)).flex_none())
         } else {
             div().flex().flex_col().gap(px(GAP)).child(left).child(right)
         }
@@ -575,6 +577,9 @@ fn count_tiles(data: &Data, width: f32, cx: &mut Context<Bloom>) -> Div {
         .children(tiles.into_iter().map(|(glyph, label, count, _, _)| {
             card(cx)
                 .w(px(tile_w))
+                // A set least and most width spares a layout pass (`Bloom::render_settings`).
+                .min_w(px(tile_w))
+                .max_w(px(tile_w))
                 .flex_row()
                 .items_center()
                 .gap(px(14.))
@@ -729,6 +734,9 @@ fn session_card(
         .id(SharedString::from(format!("admin.dash.session.{}", session.id)))
         .relative()
         .w(px(width))
+        // A set least and most width spares a layout pass (`Bloom::render_settings`).
+        .min_w(px(width))
+        .max_w(px(width))
         .h(px(if session.now_playing_item.is_some() {
             SESSION_H
         } else {

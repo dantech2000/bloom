@@ -900,6 +900,9 @@ fn person_card(
     div()
         .id(SharedString::from(format!("person.{}.{role}", person.id)))
         .w(px(w))
+        // A set least and most width spares a layout pass (`Bloom::render_settings`).
+        .min_w(px(w))
+        .max_w(px(w))
         .flex_shrink_0()
         .flex()
         .flex_col()

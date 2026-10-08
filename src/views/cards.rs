@@ -349,6 +349,9 @@ fn card(
     div()
         .id(ElementId::from(key.clone()))
         .w(px(w))
+        // A set least and most width spares a layout pass (`Bloom::render_settings`).
+        .min_w(px(w))
+        .max_w(px(w))
         .flex_shrink_0()
         .flex()
         .flex_col()
@@ -539,6 +542,9 @@ pub fn library_tile(
     div()
         .id(card_id("tile", view))
         .w(px(w))
+        // A set least and most width spares a layout pass (`Bloom::render_settings`).
+        .min_w(px(w))
+        .max_w(px(w))
         .flex_shrink_0()
         .cursor_pointer()
         .child(

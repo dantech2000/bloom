@@ -215,6 +215,9 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
         grid = grid.child(
             card(cx)
                 .w(px(card_w))
+                // A set least and most width spares a layout pass (`Bloom::render_settings`).
+                .min_w(px(card_w))
+                .max_w(px(card_w))
                 .gap(px(14.))
                 .when(user.is_disabled(), |el| el.opacity(0.62))
                 .child(

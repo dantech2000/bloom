@@ -949,12 +949,7 @@ fn hostname() -> &'static str {
     NAME.get_or_init(|| {
         std::env::var("HOSTNAME")
             .ok()
-            .or_else(|| {
-                std::process::Command::new("hostname")
-                    .output()
-                    .ok()
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            })
+            .or_else(host_name)
             .map(|name| {
                 name.chars()
                     .map(|c| if c.is_ascii_graphic() && c != '"' && c != ',' { c } else { '-' })
@@ -963,6 +958,25 @@ fn hostname() -> &'static str {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "Mac".to_string())
     })
+}
+
+/// The name the `hostname` tool prints, asked of the system directly. The
+/// first sign-in asks for it on the UI thread before the first frame, and
+/// the tool is a process to start and to wait for.
+fn host_name() -> Option<String> {
+    unsafe extern "C" {
+        fn gethostname(name: *mut std::ffi::c_char, len: usize) -> std::ffi::c_int;
+    }
+    let mut buffer = [0u8; 256];
+    // SAFETY: the call writes at most `len` bytes to `buffer`, which lives
+    // for the whole call.
+    let code = unsafe { gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if code != 0 {
+        return None;
+    }
+    // A name that fills the buffer has no end mark.
+    let end = buffer.iter().position(|byte| *byte == 0).unwrap_or(buffer.len());
+    Some(String::from_utf8_lossy(&buffer[..end]).trim().to_string())
 }
 
 // ----- Types -----------------------------------------------------------------
@@ -1607,6 +1621,28 @@ mod tests {
         assert_eq!(classify(&err), Verdict::Answered, "{err:#}");
         let err = server.client().send::<serde_json::Value>("POST", "/Items", &[]).unwrap_err();
         assert_eq!(classify(&err), Verdict::Answered, "{err:#}");
+    }
+
+    /// The name is the one the `hostname` tool gave (the server lists the
+    /// device under it), without the process.
+    #[test]
+    fn the_host_name_is_the_one_of_the_tool_without_its_process() {
+        let tool = || {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        };
+        let started = std::time::Instant::now();
+        let before = tool();
+        let tool_took = started.elapsed();
+        let started = std::time::Instant::now();
+        let now = host_name();
+        let call_took = started.elapsed();
+        println!("host name: {tool_took:?} with the tool, {call_took:?} with the call");
+        assert!(now.as_deref().is_some_and(|name| !name.is_empty()));
+        assert_eq!(now, before);
+        // The times are printed, not asserted: a loaded machine can turn them.
     }
 
     #[test]

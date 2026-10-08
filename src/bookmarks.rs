@@ -264,8 +264,12 @@ impl Client {
 /// State of the bookmarks in the app.
 #[derive(Default)]
 pub struct BookmarkState {
-    /// `bookmark.json` as the server has it.
-    pub file: Option<Value>,
+    /// `bookmark.json` as the server has it; [`Self::edit`] changes it.
+    file: Option<Value>,
+    /// The entries of `file`, by time. They are read out of the file once
+    /// for each change of it: the seek bar of the player asks for them at
+    /// each of its frames.
+    all: Vec<Bookmark>,
     pub panel_open: bool,
     pub panel_closed: Option<Instant>,
     /// The label field of the panel.
@@ -274,8 +278,14 @@ pub struct BookmarkState {
 }
 
 impl BookmarkState {
-    pub fn all(&self) -> Vec<Bookmark> {
-        self.file.as_ref().map(parse).unwrap_or_default()
+    pub fn all(&self) -> &[Bookmark] {
+        &self.all
+    }
+
+    /// Changes the file, and reads its entries again.
+    fn edit(&mut self, change: impl FnOnce(&mut Option<Value>)) {
+        change(&mut self.file);
+        self.all = self.file.as_ref().map(parse).unwrap_or_default();
     }
 }
 
@@ -301,7 +311,7 @@ impl Bloom {
                 }
                 match result {
                     Ok(file) => {
-                        this.enhanced.bookmarks.file = Some(file);
+                        this.enhanced.bookmarks.edit(|kept| *kept = Some(file));
                         cx.notify();
                     }
                     Err(err) => log::warn!("bookmarks: {err:#}"),
@@ -327,7 +337,7 @@ impl Bloom {
     /// The bookmarks of an item, by time.
     pub fn bookmarks_of(&self, item: &Item) -> Vec<Bookmark> {
         let series = None;
-        for_item(&self.enhanced.bookmarks.all(), &Target::of(item, series))
+        for_item(self.enhanced.bookmarks.all(), &Target::of(item, series))
     }
 
     /// Adds a bookmark at `secs` of the item. The plugin builds the entry; the
@@ -349,8 +359,9 @@ impl Bloom {
             move |this, result, cx| match result {
                 Ok((key, body)) => {
                     let now = jiff::Timestamp::now().to_string();
-                    let file = this.enhanced.bookmarks.file.get_or_insert_with(|| json!({}));
-                    insert(file, &key, &body, &now);
+                    this.enhanced.bookmarks.edit(|file| {
+                        insert(file.get_or_insert_with(|| json!({})), &key, &body, &now);
+                    });
                     this.toast("Bookmark added", format_duration(secs as i64), cx);
                     cx.notify();
                 }
@@ -366,9 +377,11 @@ impl Bloom {
             move |client| client.bookmark_remove(&key),
             move |this, result, cx| match result {
                 Ok(()) => {
-                    if let Some(file) = this.enhanced.bookmarks.file.as_mut() {
-                        remove(file, &id);
-                    }
+                    this.enhanced.bookmarks.edit(|file| {
+                        if let Some(file) = file {
+                            remove(file, &id);
+                        }
+                    });
                     cx.notify();
                 }
                 Err(err) => this.toast("Could not remove the bookmark", format!("{err:#}"), cx),
@@ -787,7 +800,7 @@ impl Bloom {
             Ok(target) => target,
             Err(err) => return format!("error: {err:#}"),
         };
-        let local = for_item(&self.enhanced.bookmarks.all(), &target);
+        let local = for_item(self.enhanced.bookmarks.all(), &target);
         let server = client
             .bookmarks_file()
             .map(|file| for_item(&parse(&file), &target))
@@ -879,6 +892,53 @@ mod tests {
         let camel = json!({ "bookmarks": { "x": { "itemId": "z", "timestamp": 3 } } });
         let one = &parse(&camel)[0];
         assert_eq!((one.item_id.as_str(), one.timestamp), ("z", 3.0));
+    }
+
+    /// The entries the state keeps are those of its file after each kind
+    /// of change, and to ask for them reads nothing: the player asks at
+    /// each frame of its seek bar.
+    #[test]
+    fn the_kept_entries_follow_the_file_and_cost_no_parse() {
+        let mut state = BookmarkState::default();
+        assert!(state.all().is_empty());
+        state.edit(|kept| *kept = Some(file()));
+        assert_eq!(state.all(), parse(&file()));
+        let body = json!({ "ItemId": "c3", "Timestamp": 40.0, "Label": "New" });
+        state.edit(|kept| insert(kept.get_or_insert_with(|| json!({})), "Bm_9", &body, "2026-10-07T00:00:00Z"));
+        assert_eq!(state.all().len(), 4);
+        assert_eq!(state.all(), parse(state.file.as_ref().unwrap()));
+        state.edit(|kept| {
+            remove(kept.as_mut().unwrap(), "Bm_1");
+        });
+        assert_eq!(state.all().iter().map(|b| b.id.as_str()).collect::<Vec<_>>(), ["Bm_3", "Bm_2", "Bm_9"]);
+        state.edit(|kept| *kept = None);
+        assert!(state.all().is_empty());
+
+        // What one frame paid before: the parse of a file of 100 bookmarks.
+        let mut large = json!({});
+        for n in 0..100 {
+            let body = json!({ "ItemId": format!("item{}", n % 20), "TmdbId": "10", "MediaType": "movie",
+                "Name": "Some Film", "Timestamp": n as f64 * 31.5, "Label": "A scene" });
+            insert(&mut large, &format!("Bm_{n}"), &body, "2026-10-07T00:00:00Z");
+        }
+        state.edit(|kept| *kept = Some(large.clone()));
+        const RUNS: u32 = 2000;
+        let time = |ask: &dyn Fn() -> usize| {
+            (0..5)
+                .map(|_| {
+                    let started = Instant::now();
+                    for _ in 0..RUNS {
+                        std::hint::black_box(ask());
+                    }
+                    started.elapsed() / RUNS
+                })
+                .min()
+                .unwrap()
+        };
+        let before = time(&|| parse(std::hint::black_box(&large)).len());
+        let now = time(&|| state.all().len());
+        println!("the bookmarks of a file of 100, for one frame: {before:?} before, {now:?} now");
+        // The times are printed, not asserted: a loaded machine can turn them.
     }
 
     #[test]

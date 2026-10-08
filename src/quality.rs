@@ -480,9 +480,10 @@ fn audio(audio: &[&MediaStream]) -> Option<String> {
 fn is_imax(text: &str) -> bool {
     let text = text.to_lowercase();
     let chars: Vec<char> = text.chars().collect();
+    // No list per call: this runs twice for each character of the text.
     let at = |i: usize, s: &str| {
-        let s: Vec<char> = s.chars().collect();
-        chars.len() >= i + s.len() && chars[i..i + s.len()] == s[..]
+        let len = s.chars().count();
+        chars.len() >= i + len && chars[i..i + len].iter().copied().eq(s.chars())
     };
     let left = |i: usize| i == 0 || !word(chars[i - 1]);
     let sep = |c: char| matches!(c, ' ' | '.' | '_' | '-');
@@ -873,6 +874,107 @@ mod tests {
         // A stub tag needs the .disc file; a WEB-DL name gives no source tag.
         let plain = detect_with("Film", "/m/Film.WEB-DL.REMUX.mkv");
         assert_eq!(plain, ["1080p", "H264"]);
+    }
+
+    /// `is_imax` as it was: a list of characters for each compare.
+    fn is_imax_before(text: &str) -> bool {
+        let text = text.to_lowercase();
+        let chars: Vec<char> = text.chars().collect();
+        let at = |i: usize, s: &str| {
+            let s: Vec<char> = s.chars().collect();
+            chars.len() >= i + s.len() && chars[i..i + s.len()] == s[..]
+        };
+        let left = |i: usize| i == 0 || !word(chars[i - 1]);
+        let sep = |c: char| matches!(c, ' ' | '.' | '_' | '-');
+        let (mut imax, mut non_imax) = (false, false);
+        for i in 0..chars.len() {
+            if at(i, "imax") && left(i) {
+                let end = i + 4;
+                let plain = chars.get(end).is_none_or(|c| !word(*c));
+                let enhanced = (at(end, "enhanced") && chars.get(end + 8).is_none_or(|c| !word(*c)))
+                    || (chars.get(end).is_some_and(|c| sep(*c))
+                        && at(end + 1, "enhanced")
+                        && chars.get(end + 9).is_none_or(|c| !word(*c)));
+                if plain || enhanced {
+                    imax = true;
+                }
+            }
+            if at(i, "non") && left(i) {
+                let mut j = i + 3;
+                if chars.get(j).is_some_and(|c| sep(*c)) {
+                    j += 1;
+                }
+                if at(j, "imax") && chars.get(j + 4).is_none_or(|c| !word(*c)) {
+                    non_imax = true;
+                }
+            }
+        }
+        imax && !non_imax
+    }
+
+    /// The IMAX check gives the answers it gave, and costs less. The text
+    /// is what a card with quality tags gives it: the names, and the titles
+    /// of the streams of a film with a few sound and subtitle tracks.
+    #[test]
+    fn the_imax_check_is_the_same_and_cheaper() {
+        let texts = [
+            "", "imax", "IMAX", "nonimax", "NON IMAX", "non-imax", "Dune.IMAX", "Dune.IMAXX",
+            "IMAX Enhanced", "IMAX.ENHANCED", "IMAXENHANCED", "IMAX_ENHANCEDX", "imax non_imax",
+            "a non", "non", "ima", "Élan IMAX", "İMAX", "x imax enhance", "NONIMAX IMAX",
+        ];
+        for text in texts {
+            assert_eq!(is_imax(text), is_imax_before(text), "{text:?}");
+            // Each text also at the end and in the middle of a longer one.
+            for wrapped in [format!("Film | {text}"), format!("{text} | English - AAC"), format!("a{text}b")] {
+                assert_eq!(is_imax(&wrapped), is_imax_before(&wrapped), "{wrapped:?}");
+            }
+        }
+
+        let mut streams = vec![video("4K HEVC HDR10", "hevc", "HDR10", 3840, 2160)];
+        for language in ["English", "German", "French"] {
+            streams.push(sound(&format!("{language} - Dolby TrueHD Atmos - 7.1 - Default"), "truehd", "", 8, "7.1"));
+        }
+        for language in ["English", "English (SDH)", "German", "French", "Spanish", "Italian"] {
+            streams.push(MediaStream {
+                kind: "Subtitle".into(),
+                display_title: Some(format!("{language} - SUBRIP - External")),
+                ..Default::default()
+            });
+        }
+        let input = Input {
+            streams: streams.iter().collect(),
+            sources: &[],
+            name: "The Lord of the Rings: The Return of the King",
+            original_title: "The Lord of the Rings: The Return of the King",
+        };
+        let context = std::iter::once(input.name)
+            .chain(std::iter::once(input.original_title))
+            .chain(streams.iter().filter_map(|s| s.display_title.as_deref()))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        const RUNS: u32 = 2000;
+        let time = |check: &dyn Fn(&str) -> bool| {
+            let started = std::time::Instant::now();
+            for _ in 0..RUNS {
+                std::hint::black_box(check(std::hint::black_box(&context)));
+            }
+            started.elapsed() / RUNS
+        };
+        // The best of a few rounds: other tests run at the same time.
+        let before = (0..5).map(|_| time(&is_imax_before)).min().unwrap();
+        let after = (0..5).map(|_| time(&is_imax)).min().unwrap();
+        let whole = {
+            let started = std::time::Instant::now();
+            for _ in 0..RUNS {
+                std::hint::black_box(detect(std::hint::black_box(&input)));
+            }
+            started.elapsed() / RUNS
+        };
+        println!(
+            "IMAX check of {} characters: {before:?} before, {after:?} now; all tags of the item: {whole:?}",
+            context.chars().count()
+        );
+        // The times are printed, not asserted: a loaded machine can turn them.
     }
 
     #[test]
