@@ -7,8 +7,8 @@
 local changes, wired in by `[patch.crates-io]` in `Cargo.toml`. An upgrade
 of GPUI copies the new crate from the registry
 (`~/.cargo/registry/src/*/gpui-pre-<name>-<version>/`: `Cargo.toml`,
-`LICENSE-APACHE`, `src/`) and applies the changes below again. Each change
-is marked `Bloom` in the source.
+`LICENSE-APACHE`, `src/`) and applies the changes below again. Most changes
+are marked `Bloom` in the source; the list says where one is not.
 
 ## gpui-pre-apple 0.3.4
 
@@ -31,6 +31,15 @@ is marked `Bloom` in the source.
   full-size copy at texture 2; the full copy is a blit made only when a
   quad of the glass run asks for it (`wants_full_backdrop`) and is not
   allocated before. A quad without the marker renders as before.
+- `src/metal_renderer.rs` (`surfaces_bgra_pipeline_state`, the choice of
+  the pipeline in the surface draw, `set_vertex_bytes` moved ahead of it),
+  `src/shaders.metal` (`surface_bgra_fragment`): a surface in BGRA is drawn
+  as it is. The frames of the player are BGRA (mpv renders them on the
+  GPU); the published crate takes only the two-plane YCbCr format of the
+  camera and stops at an `assert_eq!` on any other. These lines are not
+  marked `Bloom` in the source, and neither are those of the blur pass
+  above (`new_backdrop_blur_filters`, `is_backdrop_blur_quad`,
+  `BACKDROP_BLUR_*`): look for the names.
 - `src/metal_renderer.rs` (`draw`), `src/present_trace.rs`,
   `src/gpui_apple.rs`: the time the display showed each draw, from the
   drawable's presented handler, with the GPU start and end times of its
@@ -51,3 +60,15 @@ is marked `Bloom` in the source.
 - `Cargo.toml`: `[lints.rust] deprecated = "allow"`, as the published
   crate lost the workspace lints of Zed and a path dependency is not
   built with `--cap-lints` as a registry crate is.
+
+## taffy 0.13.0
+
+The layout engine of GPUI (crates.io, MIT), with one line changed.
+
+- `src/compute/flexbox.rs` (`determine_flex_base_size`): `unwrap_or_else`
+  for `unwrap_or` at `resolved_minimum_main_size`. The published line
+  measures every flex item at its smallest width, a second layout of its
+  subtree, and throws the result away when the style has a least size.
+  Measured on 2026-10-07: 19% less `frame_cpu` on the server dashboard, 5
+  to 9% on the settings and admin pages, the layout unchanged.
+

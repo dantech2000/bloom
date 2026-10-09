@@ -65,6 +65,7 @@ ttf-parser = { opt-level = 3 }
 [patch.crates-io]
 gpui-pre-apple = { path = "vendor/gpui-pre-apple" }
 gpui-pre-macos = { path = "vendor/gpui-pre-macos" }
+taffy = { path = "vendor/taffy" }
 
 # The build that ships (dev/bundle, dev/release): the whole program
 # optimised as one unit and stripped, a quarter smaller than `release`, at
