@@ -137,17 +137,18 @@ impl Bloom {
 pub(crate) fn seerr_card(item: &SeerrItem, w: f32, cx: &mut Context<Bloom>) -> Stateful<Div> {
     let t = UiTheme::read(cx).clone();
     let h = (w * 1.5).round();
-    let (type_label, type_color) = if item.media_type == "tv" {
-        ("SERIES", rgba(0xf333d6e6))
-    } else {
-        ("MOVIE", rgba(0x3b82f6e6))
-    };
+    // One ink: the kind of a title is a word on a quiet pill, not a
+    // colour. A colour says a state: green for there or on its way,
+    // amber for a request that waits for a person.
+    let type_label = if item.media_type == "tv" { "SERIES" } else { "MOVIE" };
+    let type_color = rgba(0x2a2a2ad9);
+    let (green, amber) = (rgba(0x2e9d5bcc), rgba(0xc98a1bcc));
     // Seerr states: 2 pending, 3 processing, 4 partly available, 5 available.
     let status = match item.status() {
-        Some(5) => Some((LucideIcon::Check, rgba(0x22c55eb3))),
-        Some(4) => Some((LucideIcon::Minus, rgba(0x22c55eb3))),
-        Some(3) => Some((LucideIcon::Clock, rgba(0x6366f1b3))),
-        Some(2) => Some((LucideIcon::Bell, rgba(0xfb923cb3))),
+        Some(5) => Some((LucideIcon::Check, green)),
+        Some(4) => Some((LucideIcon::Minus, green)),
+        Some(3) => Some((LucideIcon::Clock, green)),
+        Some(2) => Some((LucideIcon::Bell, amber)),
         _ => None,
     };
     let mut details: Vec<String> = item.year().into_iter().collect();

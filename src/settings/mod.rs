@@ -429,7 +429,14 @@ impl Bloom {
                             loaded.last_login,
                         );
                     }
-                    Err(err) => log::warn!("user settings failed: {err:#}"),
+                    // The page says so: it showed "Loading…" with no word
+                    // of the failure. It asks again when it opens next.
+                    Err(err) => {
+                        log::warn!("user settings failed: {err:#}");
+                        if matches!(this.page, Page::Settings(_)) {
+                            this.toast("Could not load your settings", format!("{err:#}"), cx);
+                        }
+                    }
                 }
                 cx.notify();
             },
@@ -579,7 +586,7 @@ impl Bloom {
         cx: &mut Context<Self>,
     ) {
         change(&mut self.config.subtitle_look);
-        self.save_config(cx);
+        self.save_config_soon(cx);
         self.apply_subtitle_style();
         cx.notify();
     }
@@ -605,8 +612,9 @@ impl Bloom {
                     field("New password", true),
                 ],
                 run: Rc::new(|this, values, cx| {
-                    let (current, new) = (values[0].clone(), values[1].clone());
-                    this.fetch(
+                    let value = |n: usize| values.get(n).cloned().unwrap_or_default();
+                    let (current, new) = (value(0), value(1));
+                    this.fetch_in_session(
                         cx,
                         move |client| client.change_password(&current, &new),
                         |this, result, cx| match result {
@@ -987,7 +995,7 @@ impl Bloom {
                 return;
             }
         };
-        self.fetch(
+        self.fetch_in_session(
             cx,
             move |client| {
                 let bytes = std::fs::read(&path)?;
@@ -1000,7 +1008,7 @@ impl Bloom {
     }
 
     pub fn remove_profile_picture(&mut self, cx: &mut Context<Self>) {
-        self.fetch(
+        self.fetch_in_session(
             cx,
             |client| {
                 client.delete_user_image()?;

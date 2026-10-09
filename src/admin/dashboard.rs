@@ -1136,12 +1136,13 @@ fn storage(storage: &Storage, cx: &mut Context<Bloom>) -> Div {
     for library in &storage.libraries {
         for folder in &library.folders {
             // The collections library is a folder of the server's own data.
-            if !folder.path.starts_with(
-                storage
-                    .program_data_folder
-                    .as_ref()
-                    .map_or("\0", |f| f.path.as_str()),
-            ) {
+            // By whole folder names: `/var/lib/jellyfin-media` is not
+            // inside `/var/lib/jellyfin`.
+            let inside_data = storage
+                .program_data_folder
+                .as_ref()
+                .is_some_and(|data| std::path::Path::new(&folder.path).starts_with(&data.path));
+            if !inside_data {
                 add(&library.name, folder);
             }
         }

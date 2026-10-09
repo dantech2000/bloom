@@ -14,7 +14,7 @@ use serde::Deserialize;
 use super::{
     ago, badge, card, parse_date,
     rows::rows,
-    users::{AMBER, BLUE, GREEN, GREY, RED, avatar, content_width, icon_disc, local, stat},
+    users::{AMBER, GREEN, GREY, RED, avatar, content_width, icon_disc, local, stat},
 };
 use crate::{app::Bloom, jellyfin::Client, ui::theme::UiTheme};
 
@@ -114,15 +114,17 @@ impl Entry {
         let (glyph, color) = match self.kind.as_str() {
             "VideoPlayback" | "AudioPlayback" | PLAYED => (LucideIcon::Play, GREEN),
             "VideoPlaybackStopped" | "AudioPlaybackStopped" => (LucideIcon::Square, GREY),
-            "SessionStarted" => (LucideIcon::LogIn, BLUE),
+            "SessionStarted" => (LucideIcon::LogIn, GREY),
             "SessionEnded" => (LucideIcon::LogOut, GREY),
-            "AuthenticationSucceeded" => (LucideIcon::KeyRound, BLUE),
+            "AuthenticationSucceeded" => (LucideIcon::KeyRound, GREY),
             "AuthenticationFailed" | "UserLockedOut" => (LucideIcon::TriangleAlert, RED),
-            "UserCreated" => (LucideIcon::UserPlus, GREEN),
-            "UserDeleted" => (LucideIcon::UserMinus, RED),
-            "UserPasswordChanged" | "UserPolicyUpdated" => (LucideIcon::Lock, AMBER),
+            // A kind of event has an icon; a colour is for a state
+            // (playback that runs, a sign-in that failed).
+            "UserCreated" => (LucideIcon::UserPlus, GREY),
+            "UserDeleted" => (LucideIcon::UserMinus, GREY),
+            "UserPasswordChanged" | "UserPolicyUpdated" => (LucideIcon::Lock, GREY),
             kind if kind.starts_with("Plugin") || kind.starts_with("Package") => {
-                (LucideIcon::Boxes, AMBER)
+                (LucideIcon::Boxes, GREY)
             }
             kind if kind.contains("Task") => (LucideIcon::Clock, GREY),
             kind if kind.contains("Subtitle") => (LucideIcon::TriangleAlert, AMBER),

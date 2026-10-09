@@ -176,6 +176,10 @@ fn status(text: &str) -> String {
 
 impl Bloom {
     pub fn select_server(&mut self, server_id: String, cx: &mut Context<Self>) {
+        // A password typed for the server before must not go to this one.
+        if self.connect.selected_server.as_deref() != Some(server_id.as_str()) {
+            self.connect.clear_password = true;
+        }
         self.connect.selected_server = Some(server_id.clone());
         self.connect.choosing_server = false;
         self.connect.confirm = None;
@@ -272,7 +276,7 @@ impl Bloom {
             return;
         }
         let client = Client::new(url, &self.config.device_id)
-            .with_session(&profile.token, &profile.user_id);
+            .with_token(&profile.token, &profile.user_id);
         self.fetch_with(
             client,
             cx,
@@ -555,7 +559,11 @@ impl Bloom {
             |this, result, cx| {
                 match result {
                     Ok(()) => {
-                        this.connect.authorize = None;
+                        // The dialog that asked waits for this answer; one
+                        // opened since does not, and stays.
+                        if this.connect.authorize.as_ref().is_some_and(|dialog| dialog.busy) {
+                            this.connect.authorize = None;
+                        }
                         this.toast(
                             "Device signed in",
                             "The other device can continue now.",
@@ -1394,8 +1402,6 @@ fn link(id: &'static str, text: &'static str) -> Stateful<Div> {
 
 /// A user as a round picture with the name under it.
 fn person(id: SharedString, name: &str, image: Option<String>) -> Stateful<Div> {
-    // A colour of the name, so users without a picture differ.
-    let hue = name.bytes().fold(0u32, |sum, b| sum.wrapping_mul(31) + b as u32) % 360;
     let initial: String = name
         .chars()
         .next()
@@ -1418,7 +1424,11 @@ fn person(id: SharedString, name: &str, image: Option<String>) -> Stateful<Div> 
                 .relative()
                 .size(px(72.))
                 .rounded(px(36.))
-                .bg(gpui_kit::hsla(hue as f32 / 360., 0.45, 0.42, 1.))
+                // One ink: the initial on the quiet disc, as in the
+                // navigation. A colour for each name was a colour for a
+                // kind of thing, not for a state.
+                .bg(rgba(crate::admin::DISC))
+                .text_color(rgb(0xf5f5f7))
                 .flex()
                 .items_center()
                 .justify_center()

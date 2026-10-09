@@ -426,7 +426,7 @@ impl Bloom {
     /// Sets how much later than the group this player plays.
     pub fn set_sync_offset(&mut self, ms: f64, cx: &mut Context<Self>) {
         self.config.sync_offset_ms = ms;
-        self.save_config(cx);
+        self.save_config_soon(cx);
         // A later player sees the clock of the server behind by that much.
         if let Some(session) = &mut self.sync.session {
             session.clock.extra_offset = -ms;

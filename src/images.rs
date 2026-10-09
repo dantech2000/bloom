@@ -839,12 +839,29 @@ const PREWARM_LIMITS: PrewarmLimits = PrewarmLimits {
 
 /// Counts the prewarms started. A run checks it between two fetches and
 /// stops when a newer one was started, or [`cancel_prewarm`] was called.
-static PREWARM_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PREWARM_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The counter of the prewarms. The app has one. A test has one for its
+/// own thread: the tests run side by side, each with an app of its own,
+/// and a session that closes in one stopped the prewarm of another.
+fn prewarm_run() -> &'static std::sync::atomic::AtomicU64 {
+    #[cfg(test)]
+    {
+        thread_local! {
+            static OWN: &'static std::sync::atomic::AtomicU64 =
+                Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0)));
+        }
+        let _ = &PREWARM_COUNT;
+        OWN.with(|own| *own)
+    }
+    #[cfg(not(test))]
+    &PREWARM_COUNT
+}
 
 /// Stops the prewarm under way, at its next fetch: the session it was for
 /// is gone. For the place a session closes without a new one.
 pub fn cancel_prewarm() {
-    PREWARM_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    prewarm_run().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Fetches images to the cache on disk, so a page that shows them later has
@@ -856,12 +873,12 @@ pub fn prewarm(urls: Vec<String>, cx: &mut App) {
         cx.set_global(ImageStore::new());
     }
     let agent = cx.global_mut::<ImageStore>().agent();
-    let run = PREWARM_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let run = prewarm_run().fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     cx.background_executor()
         .spawn(async move {
             let started = Instant::now();
             let wanted = urls.len();
-            let outcome = prewarm_blocking(&agent, urls, disk_dir(), (&PREWARM_RUN, run), PREWARM_LIMITS);
+            let outcome = prewarm_blocking(&agent, urls, disk_dir(), (prewarm_run(), run), PREWARM_LIMITS);
             log::info!(
                 "image prewarm: {} of {wanted} fetched in {} ms{}{}",
                 outcome.fetched,
@@ -1572,9 +1589,9 @@ mod tests {
     /// run before them is not the current one any more.
     #[test]
     fn a_new_prewarm_and_a_closed_session_move_the_number_on() {
-        let before = PREWARM_RUN.load(std::sync::atomic::Ordering::Relaxed);
+        let before = prewarm_run().load(std::sync::atomic::Ordering::Relaxed);
         cancel_prewarm();
-        assert!(PREWARM_RUN.load(std::sync::atomic::Ordering::Relaxed) > before);
+        assert!(prewarm_run().load(std::sync::atomic::Ordering::Relaxed) > before);
     }
 
     /// A long prewarm trims the cache as it goes: the folder is never more

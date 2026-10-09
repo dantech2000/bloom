@@ -684,7 +684,7 @@ impl Engine {
             Cmd::Send(request, token) => self.send(request, token),
             Cmd::SendUrl(url, token) => {
                 // No server: the reports go to a port with nobody on it.
-                let client = Client::new("http://127.0.0.1:9", "airplay-url").with_session("none", "none");
+                let client = Client::new("http://127.0.0.1:9", "airplay-url").with_token("none", "none");
                 let stream = stream::Stream { url, play_session_id: "url".into() };
                 self.send_stream(client, "url".into(), "A URL".into(), 0., stream, token);
             }
@@ -982,7 +982,7 @@ impl Engine {
                 for wait in [Duration::ZERO, ENCODING_STOP_AGAIN] {
                     thread::sleep(wait);
                     match client.stop_encoding(&id) {
-                        Ok(()) => log::debug!("airplay: encoding of session {} stopped", &id[..8]),
+                        Ok(()) => log::debug!("airplay: encoding of session {} stopped", &id[..id.len().min(8)]),
                         Err(err) => log::warn!("airplay: stop encoding failed: {err:#}"),
                     }
                 }

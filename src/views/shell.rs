@@ -174,7 +174,11 @@ impl Bloom {
         cx: &mut Context<Self>,
     ) {
         let keystroke = &event.keystroke;
-        log::debug!("shell key: {keystroke:?}");
+        // No log of the key while a dialog is open: its keys are the text
+        // of its fields, and one of them can be a password.
+        if !self.admin_dialog_open() {
+            log::debug!("shell key: {keystroke:?}");
+        }
         let modifiers = keystroke.modifiers;
         // A dialog of the dashboard takes the keys: Escape closes it, Tab
         // goes to its next field, and the rest is text for a field.
@@ -190,6 +194,15 @@ impl Bloom {
         // Keys typed into the search field are text, not shortcuts. Only
         // Escape acts there: it takes the focus off the field.
         if self.search_input.read(cx).focus_handle(cx).contains_focused(window, cx) {
+            if keystroke.key == "escape" {
+                window.focus(&self.app_focus, cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
+        // The same for the filter field of a plugin's settings: "r" there
+        // is a letter, not "open a random title".
+        if self.plugin_filter_focused(window, cx) {
             if keystroke.key == "escape" {
                 window.focus(&self.app_focus, cx);
                 cx.stop_propagation();

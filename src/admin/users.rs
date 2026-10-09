@@ -303,12 +303,10 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
 
 fn ask_set_disabled(app: &mut Bloom, user: &User, disable: bool, cx: &mut Context<Bloom>) {
     let (id, name) = (user.id.clone(), user.name.clone());
-    let mut policy = user.policy.clone();
-    let Some(fields) = policy.as_object_mut() else {
+    if !user.policy.is_object() {
         app.toast("The server sent no policy for this user", "", cx);
         return;
-    };
-    fields.insert("IsDisabled".to_string(), Value::Bool(disable));
+    }
     let confirm = Confirm {
         title: if disable {
             format!("Disable {name}?")
@@ -323,9 +321,18 @@ fn ask_set_disabled(app: &mut Bloom, user: &User, disable: bool, cx: &mut Contex
         action: if disable { "Disable" } else { "Enable" }.to_string(),
         danger: disable,
         run: Rc::new(move |this, cx| {
-            let (id, policy) = (id.clone(), policy.clone());
+            let id = id.clone();
             let done = if disable { "User disabled" } else { "User enabled" };
             this.admin_action(done, cx, move |client| {
+                // The policy the server has now, with the one key changed:
+                // the list of the users can be older than a change of the
+                // access of this user, and its policy would put that back.
+                let user: Value = client.get(&format!("/Users/{id}"), &[])?;
+                let mut policy = user.get("Policy").cloned().unwrap_or(Value::Null);
+                let Some(fields) = policy.as_object_mut() else {
+                    anyhow::bail!("the server sent no policy for this user");
+                };
+                fields.insert("IsDisabled".to_string(), Value::Bool(disable));
                 client
                     .post(&format!("/Users/{id}/Policy"), &policy)
                     .map(|_| ())
@@ -335,7 +342,6 @@ fn ask_set_disabled(app: &mut Bloom, user: &User, disable: bool, cx: &mut Contex
     app.ask_confirm(confirm, cx);
 }
 
-/// Asks to delete a user, by name. For the debug channel.
 /// Opens the password form for the user with this name. For the debug channel.
 pub(crate) fn ask_password_named(app: &mut Bloom, name: &str, cx: &mut Context<Bloom>) -> bool {
     let crate::app::Page::Admin(data) = &app.page else {
@@ -354,6 +360,7 @@ pub(crate) fn ask_password_named(app: &mut Bloom, name: &str, cx: &mut Context<B
     }
 }
 
+/// Asks to delete a user, by name. For the debug channel.
 pub(crate) fn ask_delete_named(app: &mut Bloom, name: &str, cx: &mut Context<Bloom>) -> bool {
     let crate::app::Page::Admin(data) = &app.page else {
         return false;

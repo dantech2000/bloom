@@ -55,6 +55,8 @@ const POLLIN: i16 = 0x1;
 #[derive(Default)]
 pub struct Routes {
     names: Mutex<Vec<String>>,
+    /// How often each name was added and not yet removed.
+    seen: Mutex<std::collections::HashMap<String, u32>>,
     /// Set when the browse could not start, with the reason.
     error: Mutex<Option<String>>,
 }
@@ -84,13 +86,24 @@ unsafe extern "C" fn on_reply(
     }
     let routes = unsafe { &*(context as *const Routes) };
     let name = unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned();
+    // A receiver seen on two interfaces is added twice and removed once
+    // for each: it is gone when the last one is.
     let mut names = routes.names.lock().unwrap();
+    let mut seen = routes.seen.lock().unwrap();
     if flags & FLAG_ADD != 0 {
+        *seen.entry(name.clone()).or_insert(0) += 1;
         if !names.contains(&name) {
             names.push(name);
         }
     } else {
-        names.retain(|n| *n != name);
+        let left = seen.get_mut(&name).map_or(0, |count| {
+            *count = count.saturating_sub(1);
+            *count
+        });
+        if left == 0 {
+            seen.remove(&name);
+            names.retain(|n| *n != name);
+        }
     }
 }
 

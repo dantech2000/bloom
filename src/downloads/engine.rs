@@ -44,6 +44,8 @@ pub const MIN_FREE_BYTES: u64 = 5_000_000_000;
 const CHUNK: usize = 256 * 1024;
 /// Tries of one download before it counts as failed.
 const ATTEMPTS: u32 = 6;
+/// Failed tries of one download in all, with or without new bytes.
+const TRIES_AT_MOST: u32 = 60;
 const INDEX_FILE: &str = "index.json";
 /// The lock of the folder: one process downloads at a time.
 const LOCK_FILE: &str = "lock";
@@ -306,12 +308,23 @@ struct State {
 }
 
 impl State {
+    /// The place of an entry. Two servers can hold one item id, so the
+    /// server counts: the one named, or else the server of the session
+    /// (an item of a page is an item of that server). With no session, as
+    /// offline, the id alone decides.
+    fn at(&self, server_id: Option<&str>, item_id: &str) -> Option<usize> {
+        let server = server_id.or(Some(self.server_id.as_str())).filter(|server| !server.is_empty());
+        self.entries
+            .iter()
+            .position(|e| e.item_id == item_id && server.is_none_or(|server| e.server_id == server))
+    }
+
     fn entry_mut(&mut self, item_id: &str) -> Option<&mut Entry> {
-        self.entries.iter_mut().find(|e| e.item_id == item_id)
+        self.at(None, item_id).map(|at| &mut self.entries[at])
     }
 
     fn entry(&self, item_id: &str) -> Option<&Entry> {
-        self.entries.iter().find(|e| e.item_id == item_id)
+        self.at(None, item_id).map(|at| &self.entries[at])
     }
 
     fn next_generation(&mut self) -> Generation {
@@ -554,11 +567,18 @@ impl Engine {
 
     /// Stops a download; its part file stays for a resume.
     pub fn cancel(&self, item_id: &str) {
+        self.cancel_of(None, item_id)
+    }
+
+    /// The same for the entry of a server by name: the Downloads page
+    /// lists the entries of every server.
+    pub fn cancel_of(&self, server_id: Option<&str>, item_id: &str) {
         let mut s = self.inner.lock();
         if s.owner.is_none() {
             return;
         }
-        if let Some(entry) = s.entry_mut(item_id) {
+        if let Some(at) = s.at(server_id, item_id) {
+            let entry = &mut s.entries[at];
             match entry.state {
                 EntryState::Queued => entry.state = EntryState::Paused,
                 EntryState::Downloading => entry.cancel.store(true, Ordering::Release),
@@ -572,15 +592,19 @@ impl Engine {
 
     /// Queues a paused or failed download again.
     pub fn resume(&self, item_id: &str) {
+        self.resume_of(None, item_id)
+    }
+
+    pub fn resume_of(&self, server_id: Option<&str>, item_id: &str) {
         let mut s = self.inner.lock();
         if s.owner.is_none() {
             return;
         }
-        if let Some(entry) = s.entry_mut(item_id)
-            && matches!(entry.state, EntryState::Paused | EntryState::Failed)
+        if let Some(at) = s.at(server_id, item_id)
+            && matches!(s.entries[at].state, EntryState::Paused | EntryState::Failed)
         {
-            entry.state = EntryState::Queued;
-            entry.error = None;
+            s.entries[at].state = EntryState::Queued;
+            s.entries[at].error = None;
         }
         save_index(&s);
         self.inner.bump();
@@ -592,11 +616,15 @@ impl Engine {
     /// of the folder. Until then the folder has a tombstone: a download of
     /// the same item added again waits for it.
     pub fn remove(&self, item_id: &str) {
+        self.remove_of(None, item_id)
+    }
+
+    pub fn remove_of(&self, server_id: Option<&str>, item_id: &str) {
         let mut s = self.inner.lock();
         if s.owner.is_none() {
             return;
         }
-        let Some(at) = s.entries.iter().position(|e| e.item_id == item_id) else {
+        let Some(at) = s.at(server_id, item_id) else {
             return;
         };
         let entry = s.entries.remove(at);
@@ -630,9 +658,8 @@ impl Engine {
     }
 
     pub fn remove_all(&self) {
-        let ids: Vec<String> = self.entries().into_iter().map(|e| e.item_id).collect();
-        for id in ids {
-            self.remove(&id);
+        for entry in self.entries() {
+            self.remove_of(Some(&entry.server_id), &entry.item_id);
         }
     }
 
@@ -641,7 +668,12 @@ impl Engine {
     }
 
     pub fn entry(&self, item_id: &str) -> Option<Entry> {
-        self.inner.lock().entry(item_id).cloned()
+        self.entry_of(None, item_id)
+    }
+
+    pub fn entry_of(&self, server_id: Option<&str>, item_id: &str) -> Option<Entry> {
+        let s = self.inner.lock();
+        s.at(server_id, item_id).map(|at| s.entries[at].clone())
     }
 
     /// Bytes of all downloads on the disk.
@@ -657,8 +689,12 @@ impl Engine {
 
     /// The folder of an item's files.
     pub fn folder(&self, item_id: &str) -> Option<PathBuf> {
+        self.folder_of(None, item_id)
+    }
+
+    pub fn folder_of(&self, server_id: Option<&str>, item_id: &str) -> Option<PathBuf> {
         let s = self.inner.lock();
-        s.entry(item_id).map(|e| s.folder(e))
+        s.at(server_id, item_id).map(|at| s.folder(&s.entries[at]))
     }
 
     /// The complete media file of an item, when it is there.
@@ -674,10 +710,7 @@ impl Engine {
     /// counts. `None` for the server is a caller with no session.
     pub fn local_path_of(&self, server_id: Option<&str>, item_id: &str) -> Option<PathBuf> {
         let s = self.inner.lock();
-        let entry = s.entry(item_id)?;
-        if server_id.is_some_and(|server| entry.server_id != server) {
-            return None;
-        }
+        let entry = &s.entries[s.at(server_id, item_id)?];
         if entry.state != EntryState::Done {
             return None;
         }
@@ -702,21 +735,36 @@ impl Engine {
             ("Backdrop", None) => BACKDROP_FILE,
             _ => return None,
         };
-        let entry = own.or_else(|| s.entries.iter().find(|e| e.series_id.as_deref() == Some(id)))?;
+        // The series of a download of this server: another server can
+        // have a series under the same id, with other artwork.
+        let entry = own.or_else(|| {
+            s.entries
+                .iter()
+                .find(|e| e.series_id.as_deref() == Some(id) && (s.server_id.is_empty() || e.server_id == s.server_id))
+        })?;
         let path = s.folder(entry).join(name);
         path.is_file().then_some(path)
     }
 
     /// The `meta.json` of an item, parsed.
     pub fn meta(&self, item_id: &str) -> Option<Value> {
-        let folder = self.folder(item_id)?;
+        self.meta_of(None, item_id)
+    }
+
+    pub fn meta_of(&self, server_id: Option<&str>, item_id: &str) -> Option<Value> {
+        let folder = self.folder_of(server_id, item_id)?;
         let bytes = fs::read(folder.join(META_FILE)).ok()?;
         serde_json::from_slice(&bytes).ok()
     }
 
     /// The item of `meta.json`, as the app's `Item`.
     pub fn item(&self, item_id: &str) -> Option<Item> {
-        let meta = self.meta(item_id)?;
+        self.item_of(None, item_id)
+    }
+
+    /// The same for the entry of a server by name (see `cancel_of`).
+    pub fn item_of(&self, server_id: Option<&str>, item_id: &str) -> Option<Item> {
+        let meta = self.meta_of(server_id, item_id)?;
         serde_json::from_value(meta.get("Item")?.clone()).ok()
     }
 
@@ -809,9 +857,20 @@ fn schedule(weak: Weak<Inner>) {
             s.running += 1;
             inner.bump();
             let worker = inner.clone();
-            let _ = thread::Builder::new()
+            let spawned = thread::Builder::new()
                 .name(format!("download-{}", &job.item_id[..job.item_id.len().min(8)]))
                 .spawn(move || work(worker, job));
+            // No thread: the entry waits again. Left as it was, it counted
+            // as a running download for good and held the others back.
+            if spawned.is_err() {
+                s.running -= 1;
+                if let Some(entry) = s.entries.iter_mut().find(|e| e.generation == generation) {
+                    entry.state = EntryState::Queued;
+                }
+                // To the wait below, with the lock given up: the next try
+                // comes at the next round, not at once and for ever.
+                break;
+            }
         }
         let _ = inner
             .wake
@@ -945,8 +1004,17 @@ fn download_run(inner: &Arc<Inner>, job: &Job, again: bool) -> Result<(), Stop> 
     // Artwork and subtitles are small and optional: the item plays
     // without them.
     fetch_images(&agent, client, &item, folder, &live);
-    if meta.get("Subtitles").is_none() {
+    // Once, unless one of them did not come: then the next run of the
+    // download asks again (a file that is there is not fetched twice).
+    if meta.get("Subtitles").is_none() || meta["SubtitlesMissing"].as_bool() == Some(true) {
+        let wanted = source["MediaStreams"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|s| s["Type"].as_str() == Some("Subtitle") && s["IsExternal"].as_bool() == Some(true))
+            .count();
         let subtitles = fetch_subtitles(&agent, client, item_id, &source, folder, &live);
+        meta["SubtitlesMissing"] = Value::Bool(subtitles.len() < wanted);
         meta["Subtitles"] = Value::Array(subtitles);
         if live() {
             let _ = write_json(&meta_path, &meta);
@@ -969,6 +1037,10 @@ fn download_run(inner: &Arc<Inner>, job: &Job, again: bool) -> Result<(), Stop> 
     let url = client.url(&format!("/Items/{item_id}/Download"), &[]);
     let mut attempt = 0;
     let mut wait = options.retry_wait;
+    // The longest the part file has been in this download.
+    let mut farthest = part_len;
+    // Every failed try, also those that brought new bytes.
+    let mut tries = 0;
     loop {
         job.check(inner)?;
         let start = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
@@ -995,9 +1067,17 @@ fn download_run(inner: &Arc<Inner>, job: &Job, again: bool) -> Result<(), Stop> 
             set_done(inner, job, start, 0.);
             return Ok(());
         }
-        match fetch_media(&agent, job, &url, &part, start, inner, total.is_some()) {
+        match fetch_media(&agent, job, &url, &part, start, inner, total) {
             Ok(got) => {
                 let want = total.unwrap_or(got);
+                // More than the size: `fetch_media` stopped at the size
+                // and wrote no further, so the part file is the start of
+                // a longer file. It goes: with the length of the size it
+                // would pass for the whole file at the next try.
+                if got > want {
+                    let _ = fs::remove_file(&part);
+                    let _ = fs::remove_file(tag_file(&part));
+                }
                 // Not the size `meta.json` says: the file on the server
                 // may be another one by now (a release that replaced the
                 // first). The item is read again, once; with the size it
@@ -1035,6 +1115,23 @@ fn download_run(inner: &Arc<Inner>, job: &Job, again: bool) -> Result<(), Stop> 
                 }
             }
             Err(Stop::Failed(why)) => {
+                // A try that brought bytes is no failed try: a large file
+                // over a line that cuts now and then still gets there.
+                // Farther than any try before, that is: a part file that
+                // is thrown away and fetched again to the same place (a
+                // server that sends less than it says) does not count.
+                // And not for ever: a server that sends a little more at
+                // each try and then cuts could hold a download for good.
+                tries += 1;
+                if tries >= TRIES_AT_MOST {
+                    return Err(Stop::Failed(why));
+                }
+                let reached = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+                if reached > farthest {
+                    farthest = reached;
+                    attempt = 0;
+                    wait = options.retry_wait;
+                }
                 attempt += 1;
                 log::info!("download of {item_id}: try {attempt} failed: {why}");
                 if attempt >= ATTEMPTS {
@@ -1099,7 +1196,7 @@ fn check_space(inner: &Arc<Inner>, job: &Job, total: Option<u64>, part_len: u64)
     let used = s.used_except(&job.item_id) + part_len;
     let promised = s.promised_except(&job.item_id);
     if let Some(free) = free
-        && free < need + promised + MIN_FREE_BYTES
+        && free < need.saturating_add(promised).saturating_add(MIN_FREE_BYTES)
     {
         return Err(Stop::Refused(format!(
             "Not enough free space: {} needed, {} free, and {} must stay free",
@@ -1109,7 +1206,7 @@ fn check_space(inner: &Arc<Inner>, job: &Job, total: Option<u64>, part_len: u64)
         )));
     }
     if let Some(limit) = options.limit_bytes
-        && used + need > limit
+        && used.saturating_add(need) > limit
     {
         return Err(Stop::Refused(format!(
             "Over the storage limit of {} ({} in use)",
@@ -1131,7 +1228,7 @@ fn check_budget(inner: &Arc<Inner>, job: &Job, done: u64, more: u64) -> Result<(
     let s = inner.lock();
     if let Some(limit) = options.limit_bytes {
         let used = s.used_except(&job.item_id);
-        if used + done + more > limit {
+        if used.saturating_add(done).saturating_add(more) > limit {
             return Err(Stop::Refused(format!(
                 "Over the storage limit of {} ({} in use)",
                 format_bytes(limit),
@@ -1142,7 +1239,7 @@ fn check_budget(inner: &Arc<Inner>, job: &Job, done: u64, more: u64) -> Result<(
     let free = options.free_override.or_else(|| free_space(&s.dir));
     let promised = s.promised_except(&job.item_id);
     if let Some(free) = free
-        && free < more + promised + MIN_FREE_BYTES
+        && free < more.saturating_add(promised).saturating_add(MIN_FREE_BYTES)
     {
         return Err(Stop::Refused(format!(
             "Not enough free space: {} free, and {} must stay free",
@@ -1173,8 +1270,9 @@ fn fetch_media(
     part: &Path,
     start: u64,
     inner: &Arc<Inner>,
-    known_size: bool,
+    total: Option<u64>,
 ) -> Result<u64, Stop> {
+    let known_size = total.is_some();
     let Job { client, cancel, options, item_id, .. } = job;
     let failed = |err: String| Stop::Failed(err);
     let mut request = agent.get(url).header("Authorization", client.auth_header());
@@ -1283,6 +1381,16 @@ fn fetch_media(
         {
             let _ = file.flush();
             return Err(stop);
+        }
+        // Not past the size the download was admitted on: the space was
+        // checked for that size, and a server that sends more is sending
+        // another file.
+        // The length that comes back says so (it is over the size), and
+        // the caller reads the item again: the file may have been
+        // replaced by a larger one.
+        if total.is_some_and(|total| done + n as u64 > total) {
+            let _ = file.flush();
+            return Ok(done + n as u64);
         }
         file.write_all(&buffer[..n])
             .map_err(|e| failed(format!("Write failed: {e}")))?;
@@ -1414,7 +1522,7 @@ fn fetch_images(agent: &ureq::Agent, client: &Client, item: &Value, folder: &Pat
             if !crate::images::looks_like_image(&bytes) || !live() {
                 continue;
             }
-            if fs::write(&path, &bytes).is_err() {
+            if write_whole(&path, &bytes).is_err() {
                 continue;
             }
         }
@@ -1478,7 +1586,7 @@ fn fetch_subtitles(
                 log::info!("subtitle {index} of {item_id} not fetched");
                 continue;
             };
-            if !live() || fs::write(&file, &bytes).is_err() {
+            if !live() || write_whole(&file, &bytes).is_err() {
                 continue;
             }
         }
@@ -1527,13 +1635,31 @@ fn get_bytes(agent: &ureq::Agent, url: &str, auth: Option<&Client>) -> Result<Ve
         request = request.header("Authorization", client.auth_header());
     }
     let mut response = request.call().context("get")?;
+    // An image or a subtitle: small. The address of a subtitle can name
+    // any host, and its answer must not fill the memory.
+    const MOST: u64 = 64 * 1024 * 1024;
     let mut bytes = Vec::new();
     response
         .body_mut()
         .as_reader()
+        .take(MOST + 1)
         .read_to_end(&mut bytes)
         .context("read")?;
+    if bytes.len() as u64 > MOST {
+        return Err(anyhow!("the answer is over {} MB", MOST / (1024 * 1024)));
+    }
     Ok(bytes)
+}
+
+/// Writes a small file whole: to a name beside it, then into its place. A
+/// crash leaves the file as it was or not there, never cut short, which
+/// an image that the app then reads from the disk must not be.
+fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".tmp");
+    let partial = PathBuf::from(name);
+    fs::write(&partial, bytes)?;
+    fs::rename(&partial, path)
 }
 
 // ----- index on disk -------------------------------------------------------------
@@ -1745,6 +1871,9 @@ mod tests {
         StallOnce(usize, Duration),
         /// The item says no size: the download is of unknown size.
         NoSize,
+        /// The item says 1000 bytes less than the file the server sends,
+        /// every time.
+        Oversend,
     }
 
     struct Mock {
@@ -1903,6 +2032,7 @@ mod tests {
             let size = match *mode.lock().unwrap() {
                 Mode::WrongSize => file.len() + 100,
                 Mode::NoSize => 0,
+                Mode::Oversend => file.len() - 1000,
                 _ => file.len(),
             };
             let body = serde_json::json!({
@@ -2001,7 +2131,12 @@ mod tests {
     fn wait_state(engine: &Engine, id: &str, state: EntryState) -> Entry {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let entry = engine.entry(id).expect("entry");
+            // The entry of the session's server, or else (after a switch
+            // of the session) the one of that id.
+            let entry = engine
+                .entry(id)
+                .or_else(|| engine.entries().into_iter().find(|e| e.item_id == id))
+                .expect("entry");
             if entry.state == state {
                 return entry;
             }
@@ -2365,6 +2500,64 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// The same when the file of the server is larger than the one the
+    /// folder was made for: nothing is written past the old size, the item
+    /// is read again, and the download is the new file, whole.
+    #[test]
+    fn a_larger_file_on_the_server_downloads_with_its_new_size() {
+        let mock = Mock::start(5_000);
+        let dir = temp_dir("larger-file");
+        let engine = engine(&mock, dir.clone(), options());
+        engine.add(&item("ep87")).unwrap();
+        wait_state(&engine, "ep87", EntryState::Done);
+        wait_idle(&engine);
+        let folder = engine.folder("ep87").unwrap();
+        let media = engine.local_path("ep87").unwrap();
+        fs::remove_file(&media).unwrap();
+        let mut meta = engine.meta("ep87").unwrap();
+        meta["Item"]["MediaSources"][0]["Size"] = serde_json::json!(2_000);
+        fs::write(folder.join(META_FILE), serde_json::to_vec(&meta).unwrap()).unwrap();
+        engine.inner.lock().entry_mut("ep87").unwrap().state = EntryState::Failed;
+        engine.set_client(Some(mock.client()), "server1");
+        let entry = wait_state(&engine, "ep87", EntryState::Done);
+        wait_idle(&engine);
+        assert_eq!(entry.total, Some(5_000));
+        assert_eq!(fs::read(&media).unwrap(), *mock.file, "the download is not the file of the server");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A server that sends more than the size it gives, every time: the
+    /// download fails. Nothing past the size is written, and no file of
+    /// the size, cut out of a longer one, is left to pass for the whole
+    /// at a later try, as it did.
+    #[test]
+    fn a_server_that_sends_more_than_it_says_leaves_no_cut_file() {
+        let mock = Mock::start(5_000);
+        mock.set(Mode::Oversend);
+        let dir = temp_dir("oversend");
+        let engine = engine(&mock, dir.clone(), options());
+        engine.add(&item("ep89")).unwrap();
+        let entry = wait_state(&engine, "ep89", EntryState::Failed);
+        wait_idle(&engine);
+        assert_eq!(entry.total, Some(4_000));
+        let folder = engine.folder("ep89").unwrap();
+        let files: Vec<String> = fs::read_dir(&folder)
+            .unwrap()
+            .flatten()
+            .map(|f| f.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("video"))
+            .collect();
+        assert!(files.is_empty(), "a media or part file is left: {files:?}");
+        // The same at the next start of the download: failed again, and
+        // never done with the first 4000 bytes.
+        engine.resume("ep89");
+        wait_state(&engine, "ep89", EntryState::Downloading);
+        let entry = wait_state(&engine, "ep89", EntryState::Failed);
+        wait_idle(&engine);
+        assert!(engine.local_path("ep89").is_none(), "{entry:?}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// A part file of another file than the server has now (same length
     /// of the whole, so the sizes say nothing) does not go on: the range
     /// names the file it was started from, the server sends its file
@@ -2390,6 +2583,38 @@ mod tests {
         wait_idle(&engine);
         assert_eq!(fs::read(&media).unwrap(), *mock.file, "the download is not the file of the server");
         assert!(!tag_file(&part).exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Two servers hold an item with one id. The page of the item on the
+    /// second server does not show the download of the first, a download
+    /// there is its own, and removing one leaves the other. Before, the
+    /// entry was found by the id alone: "Downloaded" showed for the file
+    /// of the other server, and a click removed that file.
+    #[test]
+    fn an_item_id_on_two_servers_is_two_downloads() {
+        let mock = Mock::start(5_000);
+        let dir = temp_dir("two-servers");
+        let engine = engine(&mock, dir.clone(), options());
+        engine.add(&item("ep88")).unwrap();
+        wait_state(&engine, "ep88", EntryState::Done);
+        wait_idle(&engine);
+        let first = engine.folder("ep88").unwrap();
+        engine.set_client(Some(mock.client()), "server2");
+        assert!(engine.entry("ep88").is_none(), "the download of another server shows for this one");
+        engine.add(&item("ep88")).unwrap();
+        wait_state(&engine, "ep88", EntryState::Done);
+        wait_idle(&engine);
+        let second = engine.folder("ep88").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(engine.entries().len(), 2);
+        engine.remove("ep88");
+        wait_idle(&engine);
+        let left = engine.entries();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].server_id, "server1", "the download of the other server was removed");
+        assert_eq!(engine.folder_of(Some("server1"), "ep88"), Some(first.clone()));
+        assert!(first.join(META_FILE).is_file());
         let _ = fs::remove_dir_all(dir);
     }
 

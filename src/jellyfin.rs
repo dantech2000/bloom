@@ -44,12 +44,61 @@ impl Client {
         }
     }
 
-    pub fn with_session(mut self, token: &str, user_id: &str) -> Self {
+    pub fn with_session(self, token: &str, user_id: &str) -> Self {
+        let client = self.with_token(token, user_id);
+        // The image loader sends this header to this server only.
+        register_image_auth(&client.base, client.auth_header());
+        client
+    }
+
+    /// A client of a token that is not the open session's: one request for
+    /// another profile (its sign-out), or a stand-in. The image loader
+    /// keeps the header of the session that is open; `with_session` would
+    /// put this token in its place for the whole server.
+    pub fn with_token(mut self, token: &str, user_id: &str) -> Self {
         self.token = Some(token.into());
         self.user_id = Some(user_id.into());
-        // The image loader sends this header to this server only.
-        register_image_auth(&self.base, self.auth_header());
         self
+    }
+
+    /// The user of the session as the server has it (`/Users/Me`), from one
+    /// request for all who ask within a moment: a session that opens asks
+    /// four times (the admin flag, the download right, the list rights,
+    /// the subtitle rights). Not for a caller that must see a change it
+    /// just made; the settings read the user themselves.
+    pub fn me(&self) -> Result<serde_json::Value> {
+        const FRESH: std::time::Duration = std::time::Duration::from_secs(10);
+        type Answer = std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>>>;
+        static KEPT: std::sync::Mutex<Vec<(String, Answer)>> = std::sync::Mutex::new(Vec::new());
+        let key = format!("{}\n{}", self.base, self.token.as_deref().unwrap_or_default());
+        // One place for each session. Its lock is held over the request,
+        // so those who ask for the same user at the same time wait for the
+        // one answer; a slow server holds up no other server's callers.
+        let place = {
+            let mut kept = KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Places nobody waits at, with no fresh answer, go.
+            kept.retain(|(_, place)| {
+                std::sync::Arc::strong_count(place) > 1
+                    || place.try_lock().is_ok_and(|answer| answer.as_ref().is_some_and(|(at, _)| at.elapsed() < FRESH))
+            });
+            match kept.iter().find(|(of, _)| *of == key) {
+                Some((_, place)) => place.clone(),
+                None => {
+                    let place = Answer::default();
+                    kept.push((key, place.clone()));
+                    place
+                }
+            }
+        };
+        let mut answer = place.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((at, me)) = &*answer
+            && at.elapsed() < FRESH
+        {
+            return Ok(me.clone());
+        }
+        let me: serde_json::Value = self.get("/Users/Me", &[])?;
+        *answer = Some((std::time::Instant::now(), me.clone()));
+        Ok(me)
     }
 
     pub fn with_server(mut self, server_id: &str) -> Self {
@@ -216,7 +265,7 @@ impl Client {
             #[serde(default)]
             audio_language_preference: Option<String>,
         }
-        let me: Me = self.get("/Users/Me", &[])?;
+        let me: Me = serde_json::from_value(self.me()?).context("decode the user")?;
         let language = me
             .configuration
             .audio_language_preference

@@ -40,6 +40,28 @@ pub struct TrailerStatus {
     pub failed: bool,
 }
 
+/// How a trailer ended.
+#[derive(Clone, Copy)]
+enum End {
+    Played,
+    Failed,
+}
+
+/// Notes the end of the trailer the worker played (`active`) in the
+/// status, when the status is still that trailer's. `play` writes the
+/// status of the next load before its command reaches the worker: the end
+/// of the trailer that still runs then is not the end of the next one,
+/// and must not mark it as played or failed.
+fn note_end(status: &mut TrailerStatus, active: Option<u64>, end: End) {
+    if active != Some(status.load) {
+        return;
+    }
+    match end {
+        End::Played => status.ended = true,
+        End::Failed => status.failed = true,
+    }
+}
+
 enum Cmd {
     Load { url: String, load: u64 },
     Stop,
@@ -331,8 +353,12 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Cmd>, ytdl: PathBuf) -> Result<()
         while let Some(event) = mpv.wait_event(0.0) {
             let mut status = shared.status.lock().unwrap();
             restarted |= matches!(event, Ok(Event::PlaybackRestart));
+            // The status can be of a newer load already (`play` writes it
+            // before its command gets here): an event of the trailer that
+            // still runs is not for it.
+            let ours = active == Some(status.load);
             match event {
-                Ok(Event::PropertyChange { name, change, .. }) if active.is_some() => {
+                Ok(Event::PropertyChange { name, change, .. }) if active.is_some() && ours => {
                     match (name, change) {
                         // The search for bars plays a later part, unseen.
                         ("time-pos", PropertyData::Double(v)) if crop.shown() => {
@@ -348,11 +374,9 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Cmd>, ytdl: PathBuf) -> Result<()
                 // or a failure of the active trailer counts.
                 Ok(Event::EndFile(reason)) if active.is_some() => {
                     if reason == mpv_end_file_reason::Eof {
-                        status.ended = true;
-                        active = None;
+                        note_end(&mut status, active.take(), End::Played);
                     } else if reason == mpv_end_file_reason::Error {
-                        status.failed = true;
-                        active = None;
+                        note_end(&mut status, active.take(), End::Failed);
                     }
                 }
                 // The trailer is back at its start after the search for
@@ -372,9 +396,7 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Cmd>, ytdl: PathBuf) -> Result<()
                 // The wrapper reports a failed end-file as `Err`.
                 Err(err) => {
                     log::debug!("trailer event error: {err}");
-                    if active.take().is_some() {
-                        status.failed = true;
-                    }
+                    note_end(&mut status, active.take(), End::Failed);
                 }
             }
         }
@@ -738,10 +760,14 @@ pub fn best_trailer(trailers: &[crate::jellyfin::NamedRef]) -> Option<String> {
             .any(|word| name.contains(word));
         if special { base - 0.5 } else { base }
     };
+    // The link comes from the server and goes to mpv: a web address only.
+    // mpv also opens files, devices and lists of its own (`file://`,
+    // `av://`, `edl://`), and an item must not name one of those.
+    let web = |url: &&str| url.starts_with("https://") || url.starts_with("http://");
     let is_youtube = |url: &str| url.contains("youtube.com") || url.contains("youtu.be");
     let mut best: Option<(f64, &str)> = None;
     for trailer in trailers {
-        let Some(url) = trailer.url.as_deref().filter(|url| is_youtube(url)) else {
+        let Some(url) = trailer.url.as_deref().filter(web).filter(|url| is_youtube(url)) else {
             continue;
         };
         let rank = score(trailer.name.as_deref().unwrap_or_default());
@@ -750,12 +776,29 @@ pub fn best_trailer(trailers: &[crate::jellyfin::NamedRef]) -> Option<String> {
         }
     }
     best.map(|(_, url)| url.to_string())
-        .or_else(|| trailers.iter().find_map(|t| t.url.clone()))
+        .or_else(|| trailers.iter().filter_map(|t| t.url.as_deref()).find(web).map(str::to_string))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The end of a trailer goes into its own status only: not into the
+    /// status of the load that `play` has written since, and not when the
+    /// worker plays nothing.
+    #[test]
+    fn the_end_of_the_old_trailer_does_not_mark_the_next_load() {
+        let mut status = TrailerStatus { load: 7, ..Default::default() };
+        note_end(&mut status, Some(6), End::Failed);
+        note_end(&mut status, Some(6), End::Played);
+        note_end(&mut status, None, End::Failed);
+        assert!(!status.failed && !status.ended, "{status:?}");
+        note_end(&mut status, Some(7), End::Played);
+        assert!(status.ended && !status.failed);
+        let mut status = TrailerStatus { load: 8, ..Default::default() };
+        note_end(&mut status, Some(8), End::Failed);
+        assert!(status.failed && !status.ended);
+    }
     use crate::jellyfin::NamedRef;
 
     fn entry(name: &str, url: &str) -> NamedRef {
@@ -787,5 +830,15 @@ mod tests {
             Some("https://example.com/d.mp4")
         );
         assert_eq!(best_trailer(&[]), None);
+    }
+
+    /// A link that is no web address does not reach the player.
+    #[test]
+    fn takes_web_links_only() {
+        for link in ["file:///etc/passwd", "edl://x", "av://lavfi:x", "/Users/x/a.mp4", "memory://youtube.com"] {
+            assert_eq!(best_trailer(&[entry("Official Trailer", link)]), None, "{link}");
+        }
+        let both = [entry("Official Trailer", "file:///youtube.com/x"), entry("Clip", "https://example.com/d.mp4")];
+        assert_eq!(best_trailer(&both).as_deref(), Some("https://example.com/d.mp4"));
     }
 }

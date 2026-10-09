@@ -266,8 +266,20 @@ impl Stepper {
         self.stalls.push((at, length));
     }
 
+    /// The stall that began at `at` ended, with its whole length. A long
+    /// one was counted early, at the length it had then (`STALLED_DOWN`):
+    /// that entry takes the whole length, so a stall of twenty seconds
+    /// counts as one.
+    pub fn stall_ended(&mut self, at: Instant, length: Duration) {
+        self.stalls.retain(|(began, _)| *began != at);
+        self.stalls.push((at, length));
+    }
+
+    /// A stall counts for `WINDOW` after its end: one that lasts longer
+    /// than the window is still there when playback goes on, which is
+    /// when the step is decided.
     fn prune(&mut self, now: Instant) {
-        self.stalls.retain(|(at, _)| now.saturating_duration_since(*at) < WINDOW);
+        self.stalls.retain(|(at, length)| now.saturating_duration_since(*at + *length) < WINDOW);
     }
 
     pub fn count(&mut self, now: Instant) -> usize {
@@ -628,7 +640,9 @@ impl Bloom {
             }
             (false, Some((since, counted))) => {
                 let length = now.duration_since(since);
-                if !counted && length >= MIN_STALL {
+                if counted {
+                    state.stepper.stall_ended(since, length);
+                } else if length >= MIN_STALL {
                     state.on_stall(since, length);
                 }
                 state.buffering_since = None;
@@ -790,6 +804,21 @@ impl Bloom {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stall is counted early, while it lasts, and at its end it takes
+    /// its whole length: twenty seconds in one stall are two steps, and a
+    /// stall longer than the window still counts when playback goes on.
+    #[test]
+    fn a_long_stall_counts_whole_and_after_its_end() {
+        let mut stepper = Stepper::new();
+        let began = Instant::now();
+        stepper.stall(began, STALLED_DOWN);
+        stepper.stall_ended(began, Duration::from_secs(90));
+        let end = began + Duration::from_secs(90);
+        assert_eq!(stepper.count(end), 1, "the stall was counted twice, or dropped as old");
+        assert_eq!(stepper.stalled(end), Duration::from_secs(90));
+        assert_eq!(stepper.step(end, false), 2);
+    }
 
     const M: u64 = 1_000_000;
 

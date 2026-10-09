@@ -44,9 +44,14 @@ impl Listener {
                 return None;
             }
         };
+        // For the owner only, or not at all: the channel drives the app.
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            if let Err(err) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+                log::warn!("debug channel: cannot make {path} private ({err}); not listening");
+                let _ = std::fs::remove_file(&path);
+                return None;
+            }
         }
         log::info!("debug channel listening on {path}");
         let stop = Arc::new(AtomicBool::new(false));
@@ -54,10 +59,19 @@ impl Listener {
         thread::Builder::new()
             .name("debug".into())
             .spawn(move || {
-                for stream in listener.incoming().flatten() {
+                for stream in listener.incoming() {
                     if stopped.load(Ordering::Acquire) {
                         return;
                     }
+                    // An error that stays (no file handles left) would turn
+                    // this loop into a spin.
+                    let Ok(stream) = stream else {
+                        thread::sleep(Duration::from_millis(200));
+                        continue;
+                    };
+                    // A caller that connects and sends no line must not
+                    // hold the one thread of the channel for good.
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                     let mut line = String::new();
                     if BufReader::new(&stream).read_line(&mut line).is_err() {
                         continue;
@@ -127,7 +141,7 @@ impl Bloom {
             while let Ok(request) = rx.recv().await {
                 let answer = this
                     .update_in(cx, |this, window, cx| {
-                        this.run_debug_command(&request.line, window, cx)
+                        this.run_debug_command_noting_dialogs(&request.line, window, cx)
                     })
                     .unwrap_or_else(|_| "error: app closed".into());
                 let _ = request.reply.send(answer);
@@ -160,6 +174,48 @@ impl Bloom {
         self.config.debug_channel = Some(self.debug_listener.is_some());
         self.save_config(cx);
         cx.notify();
+    }
+
+    /// The address of the action of the open question and of the open
+    /// form; 0 for none.
+    fn open_dialogs(&self) -> (usize, usize) {
+        (
+            self.admin_confirm.as_ref().map_or(0, |c| std::rc::Rc::as_ptr(&c.run) as *const () as usize),
+            self.admin_prompt.as_ref().map_or(0, |p| std::rc::Rc::as_ptr(&p.run) as *const () as usize),
+        )
+    }
+
+    /// True when the open question is the one a debug command opened.
+    pub(crate) fn debug_opened_confirm(&self) -> bool {
+        match (&self.admin_confirm, &self.debug_dialogs.0) {
+            (Some(open), Some(noted)) => noted.upgrade().is_some_and(|run| std::rc::Rc::ptr_eq(&run, &open.run)),
+            _ => false,
+        }
+    }
+
+    /// The same for the open form.
+    fn debug_opened_prompt(&self) -> bool {
+        match (&self.admin_prompt, &self.debug_dialogs.1) {
+            (Some(open), Some(noted)) => noted.upgrade().is_some_and(|run| std::rc::Rc::ptr_eq(&run, &open.run)),
+            _ => false,
+        }
+    }
+
+    /// Runs a command, and notes the question or the form it opened.
+    fn run_debug_command_noting_dialogs(&mut self, line: &str, window: &mut Window, cx: &mut Context<Self>) -> String {
+        let before = self.open_dialogs();
+        let answer = self.run_debug_command(line, window, cx);
+        let after = self.open_dialogs();
+        // A weak hold on the action: it names the dialog for as long as
+        // any dialog can be compared with it, and its place in memory is
+        // not given to another dialog meanwhile.
+        if after.0 != before.0 {
+            self.debug_dialogs.0 = self.admin_confirm.as_ref().map(|c| std::rc::Rc::downgrade(&c.run));
+        }
+        if after.1 != before.1 {
+            self.debug_dialogs.1 = self.admin_prompt.as_ref().map(|p| std::rc::Rc::downgrade(&p.run));
+        }
+        answer
     }
 
     fn run_debug_command(
@@ -363,6 +419,15 @@ impl Bloom {
                 let (verb, arg) = rest.split_once(' ').unwrap_or((rest, ""));
                 match verb {
                     // "Yes" on the open question of the dashboard.
+                    // Only a question a debug command opened: one a person
+                    // opened (restart, shut down, delete a user) is not
+                    // for this channel to answer.
+                    "confirm" if self.admin_confirm.is_some() && !self.debug_opened_confirm() => {
+                        return "error: the open question was not opened by a debug command".into();
+                    }
+                    "submit" if self.admin_prompt.is_some() && !self.debug_opened_prompt() => {
+                        return "error: the open form was not opened by a debug command".into();
+                    }
                     "confirm" => match self.admin_confirm.take() {
                         Some(confirm) => (confirm.run)(self, cx),
                         None => return "error: no question is open".into(),
@@ -861,7 +926,7 @@ impl Bloom {
             // closed by then, the way a click on the Dock icon does: the
             // channel goes with the window, so the timer is set before.
             "reopen" => {
-                let secs = rest.parse::<f32>().unwrap_or(2.);
+                let secs = rest.parse::<f32>().ok().filter(|s| s.is_finite()).unwrap_or(2.).clamp(0., 600.);
                 cx.spawn(async move |_, cx| {
                     cx.background_executor().timer(Duration::from_secs_f32(secs)).await;
                     cx.update(crate::reopen_window);

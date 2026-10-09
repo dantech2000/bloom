@@ -405,9 +405,22 @@ impl Bloom {
             return;
         };
         // The poll waits while the server is offline; recovery loads the page.
-        if data.loading || crate::connection::is_offline() {
+        if data.loading || crate::connection::is_offline() || self.admin_live_busy {
             return;
         }
+        // The sections with a live part; each of their loads below ends
+        // the wait when its answer comes.
+        let live = match data.section {
+            Section::Dashboard => data.dashboard.is_some(),
+            Section::Tasks | Section::Libraries => true,
+            _ => false,
+        };
+        if !live || self.session.is_none() {
+            return;
+        }
+        self.admin_live_busy = true;
+        self.admin_live_load += 1;
+        let load = self.admin_live_load;
         let generation = self.generation;
         // A load that brings the same data back causes no redraw; see
         // `AdminData::redraw_due`.
@@ -419,6 +432,9 @@ impl Bloom {
                     cx,
                     |client| tasks::load(&client),
                     move |this, result, cx| {
+                        if this.admin_live_load == load {
+                    this.admin_live_busy = false;
+                }
                         if let (Page::Admin(data), Ok(tasks)) = (&mut this.page, result)
                             && this.generation == generation
                         {
@@ -441,6 +457,9 @@ impl Bloom {
                     cx,
                     move |client| libraries::refresh(&client, &previous),
                     move |this, result, cx| {
+                        if this.admin_live_load == load {
+                    this.admin_live_busy = false;
+                }
                         if let (Page::Admin(data), Ok(libraries)) = (&mut this.page, result)
                             && this.generation == generation
                         {
@@ -459,6 +478,9 @@ impl Bloom {
             cx,
             |client| dashboard::refresh(&client),
             move |this, result, cx| {
+                if this.admin_live_load == load {
+                    this.admin_live_busy = false;
+                }
                 if this.generation != generation {
                     return;
                 }
@@ -477,6 +499,8 @@ impl Bloom {
 
     /// Shows a question; the action runs only when the user agrees.
     pub fn ask_confirm(&mut self, confirm: Confirm, cx: &mut Context<Self>) {
+        // One popup at a time: a panel does not stay beside the question.
+        self.close_panels();
         self.admin_confirm = Some(confirm);
         cx.notify();
     }
@@ -1016,3 +1040,43 @@ mod with_changes_tests {
         assert_eq!(with_changes(&json!({ "P": 7 }), &original, &edited), json!({ "P": { "A": 3 } }));
     }
 }
+
+#[cfg(test)]
+mod live_tests {
+    use gpui_kit::TestAppContext;
+
+    use super::{AdminData, Section};
+    use crate::app::{Page, race_harness::{MockServer, app, plain, session}};
+
+    /// The timer of the live part starts no load behind one that is still
+    /// on its way: a slow server got a new request at each tick.
+    #[gpui_kit::test]
+    fn one_live_load_at_a_time(cx: &mut TestAppContext) {
+        let server = MockServer::start(|method, path, _| match (method, path) {
+            ("GET", p) if p.starts_with("/ScheduledTasks") => (200, "[]".to_string()),
+            _ => plain(method, path),
+        });
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            this.session = Some(session(&server.url, "u1"));
+            let mut admin = AdminData::new(Section::Tasks);
+            admin.loading = false;
+            this.page = Page::Admin(admin);
+            // Three ticks before the first answer.
+            this.refresh_admin(cx);
+            this.refresh_admin(cx);
+            this.refresh_admin(cx);
+            assert!(this.admin_live_busy);
+        });
+        cx.run_until_parked();
+        assert_eq!(server.count("GET", "/ScheduledTasks"), 1);
+        // The answer is in: the next tick loads again.
+        bloom.update(cx, |this, cx| {
+            assert!(!this.admin_live_busy);
+            this.refresh_admin(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(server.count("GET", "/ScheduledTasks"), 2);
+    }
+}
+

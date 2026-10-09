@@ -101,15 +101,24 @@ fn ring_with_label(progress: f32, ink: Rgba) -> Div {
 }
 
 /// Bytes done and the size of a set of entries, as one progress.
+/// How far a set of downloads is, each file counting the same: a file
+/// that is done counts whole, and one that waits (its size is not known
+/// until its worker starts) counts as not begun. By bytes, the waiting
+/// files were left out, and the ring ran from 0 to 100 for each file.
 fn sum_progress(entries: &[&Entry]) -> f32 {
-    let done: u64 = entries.iter().map(|e| e.done).sum();
-    let total: u64 = entries.iter().map(|e| e.total.unwrap_or(0)).sum();
-    if total == 0 { 0. } else { (done as f64 / total as f64) as f32 }
+    if entries.is_empty() {
+        return 0.;
+    }
+    let part = |entry: &&Entry| match entry.state {
+        EntryState::Done => 1.,
+        _ => entry.progress().unwrap_or(0.).clamp(0., 1.),
+    };
+    entries.iter().map(part).sum::<f32>() / entries.len() as f32
 }
 
 /// Address of a file of an item's folder for the image loader.
-fn file_url(item_id: &str, name: &str) -> Option<String> {
-    let path = engine().folder(item_id)?.join(name);
+fn file_url(entry: &Entry, name: &str) -> Option<String> {
+    let path = engine().folder_of(Some(&entry.server_id), &entry.item_id)?.join(name);
     path.is_file().then(|| format!("file://{}", path.display()))
 }
 
@@ -145,7 +154,13 @@ impl Bloom {
             let entries: Vec<Option<Entry>> = episodes.iter().map(|e| engine.entry(&e.id)).collect();
             let active: Vec<&Entry> = entries.iter().flatten().filter(|e| e.is_active()).collect();
             if !active.is_empty() {
-                let progress = sum_progress(&active);
+                // The episodes of the season that are done count too.
+                let batch: Vec<&Entry> = entries
+                    .iter()
+                    .flatten()
+                    .filter(|e| e.is_active() || e.state == EntryState::Done)
+                    .collect();
+                let progress = sum_progress(&batch);
                 let ids: Vec<String> = active.iter().map(|e| e.item_id.clone()).collect();
                 return Some(
                     button()
@@ -529,7 +544,7 @@ impl Bloom {
             .items_center()
             .justify_center()
             .child(icon(if episode { LucideIcon::Tv } else { LucideIcon::Clapperboard }, 20., t.colors.muted_foreground))
-            .when_some(file_url(&entry.item_id, super::engine::POSTER_FILE), |el, url| {
+            .when_some(file_url(entry, super::engine::POSTER_FILE), |el, url| {
                 el.child(
                     crate::images::remote_with(url, px(8.), ObjectFit::Cover)
                         .absolute()
@@ -588,32 +603,34 @@ impl Bloom {
 
         let mut buttons = div().flex().items_center().gap(px(2.)).flex_shrink_0();
         let button_id = |what: &str| SharedString::from(format!("downloads.{what}.{}", entry.item_id));
+        // The row is of one server; the actions name it.
+        let server = entry.server_id.clone();
         match entry.state {
             EntryState::Done => {
-                let play = id.clone();
+                let (play, server) = (id.clone(), server.clone());
                 buttons = buttons.child(
                     icon_button(button_id("play"), LucideIcon::Play, true, cx)
                         .tooltip(tip("Play from this Mac"))
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             cx.stop_propagation();
-                            this.play_download(&play, window, cx);
+                            this.play_download(Some(&server), &play, window, cx);
                         })),
                 );
             }
             EntryState::Queued | EntryState::Downloading => {
-                let pause = id.clone();
+                let (pause, server) = (id.clone(), server.clone());
                 buttons = buttons.child(
                     icon_button(button_id("pause"), LucideIcon::Pause, true, cx)
                         .tooltip(tip("Pause"))
                         .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
                             cx.stop_propagation();
-                            super::engine().cancel(&pause);
+                            super::engine().cancel_of(Some(&server), &pause);
                             cx.notify();
                         })),
                 );
             }
             EntryState::Paused | EntryState::Failed => {
-                let resume = id.clone();
+                let (resume, server) = (id.clone(), server.clone());
                 buttons = buttons.child(
                     icon_button(button_id("resume"), LucideIcon::RefreshCw, !self.downloads.offline, cx)
                         .tooltip(tip(if entry.state == EntryState::Failed { "Try again" } else { "Resume" }))
@@ -622,7 +639,7 @@ impl Bloom {
                             if this.downloads.offline {
                                 return;
                             }
-                            super::engine().resume(&resume);
+                            super::engine().resume_of(Some(&server), &resume);
                             cx.notify();
                         })),
                 );
@@ -634,12 +651,12 @@ impl Bloom {
                 .tooltip(tip("Remove from this Mac"))
                 .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
                     cx.stop_propagation();
-                    super::engine().remove(&remove);
+                    super::engine().remove_of(Some(&server), &remove);
                     cx.notify();
                 })),
         );
 
-        let open = id.clone();
+        let (open, open_server) = (id.clone(), entry.server_id.clone());
         div()
             .id(button_id("row"))
             .min_h(px(44.))
@@ -654,7 +671,7 @@ impl Bloom {
             .child(art)
             .child(text)
             .child(buttons)
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_download(&open, cx)))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_download(Some(&open_server), &open, cx)))
     }
 
     /// The Downloads section of the settings: where the files are, the
@@ -741,7 +758,7 @@ impl Bloom {
     pub fn set_download_limit(&mut self, gb: Option<u64>, cx: &mut Context<Self>) {
         self.config.download_limit_gb = gb;
         self.save_config(cx);
-        engine().set_options(move |o| o.limit_bytes = gb.map(|gb| gb * 1_000_000_000));
+        engine().set_options(move |o| o.limit_bytes = gb.map(|gb| gb.saturating_mul(1_000_000_000)));
         cx.notify();
     }
 

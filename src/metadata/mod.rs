@@ -245,6 +245,9 @@ pub struct Manager {
     pub apply_images: bool,
     /// A change is on its way to the server.
     pub busy: bool,
+    /// The next load keeps the text of the fields: an action on an image
+    /// changed none of them, and the user may have typed in them.
+    keep_texts: bool,
     /// Question that waits for an answer.
     pub confirm: Option<Confirm>,
 }
@@ -333,6 +336,38 @@ fn names(item: &Value, key: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The same, for a list whose names can have a comma in them ("Lucasfilm,
+/// Ltd."): the names the item has now (`known`) stay whole where the text
+/// still has them, and the rest splits at the commas.
+fn split_keeping(text: &str, known: &[String]) -> Vec<String> {
+    let whole = |name: &str| split(name).join(", ");
+    let known: Vec<String> = known.iter().map(|name| whole(name)).collect();
+    let parts = split(text);
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < parts.len() {
+        // The longest run of parts that is one of the known names.
+        let run = (1..=parts.len() - at)
+            .rev()
+            .find(|len| *len > 1 && known.contains(&parts[at..at + len].join(", ")))
+            .unwrap_or(1);
+        out.push(parts[at..at + run].join(", "));
+        at += run;
+    }
+    out
+}
+
+/// The names of a list of the item, one by one.
+fn name_list(item: &Value, key: &str) -> Vec<String> {
+    item[key]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().or_else(|| v["Name"].as_str()))
+        .map(str::to_string)
+        .collect()
+}
+
 /// "Drama, Mystery" as its parts.
 fn split(text: &str) -> Vec<String> {
     text.split(',')
@@ -380,10 +415,13 @@ fn apply_field(item: &mut Value, index: usize, value: &str) -> Result<()> {
         if v.is_empty() {
             return Ok(Value::Null);
         }
+        // "nan" parses as a number, and would clear the value as null.
         let n: f64 = v
             .replace(',', ".")
             .parse()
-            .map_err(|_| anyhow::anyhow!("{label} must be a number"))?;
+            .ok()
+            .filter(|n: &f64| n.is_finite())
+            .ok_or_else(|| anyhow::anyhow!("{label} must be a number"))?;
         Ok(json!(n))
     };
     let date = |v: &str, label: &str| -> Result<Value> {
@@ -428,10 +466,10 @@ fn apply_field(item: &mut Value, index: usize, value: &str) -> Result<()> {
         COMMUNITY_RATING => item["CommunityRating"] = number(value, "The community rating")?,
         CRITIC_RATING => item["CriticRating"] = number(value, "The critic rating")?,
         OFFICIAL_RATING => item["OfficialRating"] = string(value),
-        GENRES => item["Genres"] = json!(split(value)),
-        TAGS => item["Tags"] = json!(split(value)),
+        GENRES => item["Genres"] = json!(split_keeping(value, &name_list(item, "Genres"))),
+        TAGS => item["Tags"] = json!(split_keeping(value, &name_list(item, "Tags"))),
         STUDIOS => {
-            item["Studios"] = split(value)
+            item["Studios"] = split_keeping(value, &name_list(item, "Studios"))
                 .into_iter()
                 .map(|name| json!({ "Name": name }))
                 .collect()
@@ -505,6 +543,7 @@ impl Bloom {
             results: None,
             apply_images: true,
             busy: false,
+            keep_texts: false,
             confirm: None,
         });
         self.metadata.fresh = true;
@@ -562,6 +601,7 @@ impl Bloom {
                 if manager.id != wanted {
                     return;
                 }
+                manager.reload_in();
                 match result {
                     Ok((item, images)) => {
                         manager.error = None;
@@ -577,12 +617,20 @@ impl Bloom {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        manager.initial = field_texts(&item);
+                        if !std::mem::take(&mut manager.keep_texts) {
+                            manager.initial = field_texts(&item);
+                            this.metadata.fill = true;
+                        }
                         manager.item = Some(item);
                         manager.images = Some(images);
-                        this.metadata.fill = true;
                     }
-                    Err(err) => manager.error = Some(format!("{err:#}")),
+                    // No list of the images: the one on the screen is of
+                    // before the change, and its numbers are not those
+                    // of the server any more.
+                    Err(err) => {
+                        manager.error = Some(format!("{err:#}"));
+                        manager.images = None;
+                    }
                 }
                 cx.notify();
             },
@@ -660,16 +708,36 @@ impl Bloom {
         let Some(manager) = &mut self.metadata.open else {
             return;
         };
-        manager.busy = true;
+        // One action at a time: the next one is for the item as the first
+        // one leaves it (the images are numbered again after a delete).
+        if !manager.action_starts() {
+            return;
+        }
         manager.confirm = None;
+        // An action on an image leaves the text of the fields alone.
+        let on_image = done.starts_with("Image");
+        let id = manager.id.clone();
         self.fetch(cx, work, move |this, result, cx| {
-            if let Some(manager) = &mut this.metadata.open {
-                manager.busy = false;
-            }
+            // The answer is for the dialog that asked: another item may be
+            // open in it by now.
+            // The dialog stays busy through the load that follows a change:
+            // the images are numbered again by then, and an action before
+            // it would name one by its old number.
+            // With no session the load does not start, and nothing would
+            // end the busy state.
+            let reloads = result.is_ok() && this.session.is_some();
+            let same = this
+                .metadata
+                .open
+                .as_mut()
+                .filter(|manager| manager.id == id)
+                .map(|manager| manager.action_answered(reloads, on_image));
             match result {
                 Ok(()) => {
                     this.toast(done, "", cx);
-                    this.load_metadata(cx);
+                    if same.is_some() {
+                        this.load_metadata(cx);
+                    }
                     this.load_page(cx);
                 }
                 Err(err) => this.toast("The server refused the change", format!("{err:#}"), cx),
@@ -855,6 +923,11 @@ impl Bloom {
         let Some(manager) = &mut self.metadata.open else {
             return;
         };
+        // Not while an action or the load after it is under way: the
+        // number of the image is of the list on the screen.
+        if manager.busy {
+            return;
+        }
         let (id, kind) = (manager.id.clone(), image.image_type.clone());
         let index = image.image_index.unwrap_or(0);
         manager.confirm = Some(Confirm {
@@ -1019,6 +1092,17 @@ impl Bloom {
 mod tests {
     use super::*;
 
+    /// A name with a comma in it stays one name when the list is edited
+    /// around it; a name the item did not have splits at its commas.
+    #[test]
+    fn a_name_with_a_comma_stays_whole() {
+        let known = vec!["Lucasfilm, Ltd.".to_string(), "Fox".to_string()];
+        assert_eq!(split_keeping("Lucasfilm, Ltd., Fox, Disney", &known), ["Lucasfilm, Ltd.", "Fox", "Disney"]);
+        assert_eq!(split_keeping("Fox,  Lucasfilm,Ltd.", &known), ["Fox", "Lucasfilm, Ltd."]);
+        assert_eq!(split_keeping("A, B", &[]), ["A", "B"]);
+        assert!(split_keeping(" , ", &known).is_empty());
+    }
+
     fn item() -> Value {
         json!({
             "Name": "Example Show",
@@ -1086,3 +1170,118 @@ mod tests {
         assert_eq!(changed, item());
     }
 }
+
+impl Manager {
+    /// An action starts, when none is under way: one at a time. False
+    /// when the dialog is busy, and the action must not go.
+    fn action_starts(&mut self) -> bool {
+        !std::mem::replace(&mut self.busy, true)
+    }
+
+    /// The server answered an action. `reloads` says the dialog loads
+    /// again now (the action went through, and there is a session): it
+    /// stays busy until that load is in, as the images have their old
+    /// numbers on the screen until then. `on_image` keeps the text of the
+    /// fields over that load.
+    fn action_answered(&mut self, reloads: bool, on_image: bool) {
+        self.busy = reloads;
+        self.keep_texts = on_image;
+    }
+
+    /// The load of the dialog is in: the next action can go. A question
+    /// asked before it goes: it names an image by the number it had in
+    /// the list of before, and the load numbered the images again.
+    fn reload_in(&mut self) {
+        self.busy = false;
+        self.confirm = None;
+    }
+}
+
+#[cfg(test)]
+mod dialog_tests {
+    use gpui_kit::TestAppContext;
+
+    use super::Tab;
+    use crate::app::race_harness::{MockServer, app, plain, session};
+
+    /// The dialog is busy from the start of an action until the load after
+    /// it is in, not only until the action is answered: between the two
+    /// the images on the screen have the numbers of before, and a delete
+    /// then would name the wrong one. An action that failed, or one with no
+    /// load to follow, frees the dialog at its answer.
+    #[gpui_kit::test]
+    fn the_dialog_is_busy_until_the_load_after_an_action_is_in(cx: &mut TestAppContext) {
+        let server = MockServer::start(|method, path, _| plain(method, path));
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            let mut account = session(&server.url, "u1");
+            account.is_admin = true;
+            this.session = Some(account);
+            this.open_metadata("m1", "One", "Movie", Tab::Images, cx);
+            let manager = this.metadata.open.as_mut().unwrap();
+            assert!(manager.action_starts());
+            assert!(!manager.action_starts(), "a second action started beside the first");
+            // The action went through; the load is on its way.
+            manager.action_answered(true, true);
+            assert!(!manager.action_starts(), "an action started before the load was in");
+            assert!(manager.keep_texts);
+            // A question asked meanwhile goes with the load.
+            manager.confirm = Some(super::Confirm {
+                title: String::new(),
+                message: String::new(),
+                action: String::new(),
+                danger: true,
+                run: std::rc::Rc::new(|_, _| {}),
+            });
+            manager.reload_in();
+            assert!(manager.confirm.is_none(), "a question of before the load is still open");
+            assert!(manager.action_starts());
+            // A failed action, or no session to load with: free at once.
+            manager.action_answered(false, true);
+            assert!(manager.action_starts());
+        });
+        cx.run_until_parked();
+    }
+
+    /// Two image deletes in a row: the second waits until the first one
+    /// and the load after it are in (the images are numbered again by
+    /// then), and the text of the fields is not read again for an action
+    /// on an image. Before, the second delete went out with the number of
+    /// the old list, and every action wrote the fields over.
+    #[gpui_kit::test]
+    fn an_image_action_runs_alone_and_keeps_the_text(cx: &mut TestAppContext) {
+        let server = MockServer::start(|method, path, _| match (method, path) {
+            ("GET", p) if p.starts_with("/Items/m1/Images") => (200, "[]".to_string()),
+            ("GET", p) if p.starts_with("/Items/m1") => (200, r#"{"Id":"m1","Name":"One","Type":"Movie"}"#.to_string()),
+            _ => plain(method, path),
+        });
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            let mut account = session(&server.url, "u1");
+            account.is_admin = true;
+            this.session = Some(account);
+            this.open_metadata("m1", "One", "Movie", Tab::Images, cx);
+        });
+        cx.run_until_parked();
+        let delete = |this: &mut crate::app::Bloom, cx: &mut gpui_kit::Context<crate::app::Bloom>| {
+            this.metadata_action("Image deleted", cx, |client| client.call("DELETE", "/Items/m1/Images/Backdrop/0", &[]));
+        };
+        bloom.update(cx, |this, cx| {
+            // The fields were filled at the first load; the user types.
+            this.metadata.fill = false;
+            delete(this, cx);
+            delete(this, cx);
+            assert!(this.metadata.open.as_ref().unwrap().busy);
+        });
+        cx.run_until_parked();
+        assert_eq!(server.count("DELETE", "/Items/m1/Images"), 1, "the second delete did not wait");
+        bloom.update(cx, |this, cx| {
+            assert!(!this.metadata.open.as_ref().unwrap().busy, "the dialog stays busy after the load");
+            assert!(!this.metadata.fill, "the action on an image wrote the fields over");
+            delete(this, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(server.count("DELETE", "/Items/m1/Images"), 2);
+    }
+}
+

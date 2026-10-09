@@ -200,16 +200,17 @@ pub fn parse_report(payload: &Value) -> Option<Report> {
 /// The HLS stream of an item for the Default Media Receiver: H.264 up to
 /// 1080p and stereo AAC, which every cast device plays. The server
 /// transcodes only what the file is not already. The token is in the
-/// query, as the device fetches the stream itself.
-pub fn stream_url(client: &Client, item_id: &str, start_secs: f64, play_session_id: &str) -> Option<String> {
+/// query, as the device fetches the stream itself. The stream is the
+/// whole item: the place to start at goes in the load (`LoadMedia`), so
+/// the positions the device reports are positions in the item.
+pub fn stream_url(client: &Client, item_id: &str, play_session_id: &str) -> Option<String> {
     let token = client.token.as_deref()?;
-    let start_ticks = (start_secs.max(0.) * TICKS_PER_SECOND as f64) as i64;
     Some(format!(
         "{}/Videos/{item_id}/master.m3u8?MediaSourceId={item_id}&DeviceId={}&PlaySessionId={play_session_id}\
          &VideoCodec=h264&AudioCodec=aac&MaxAudioChannels=2&VideoBitrate=8000000&AudioBitrate=192000\
          &MaxWidth=1920&MaxHeight=1080&Level=41&Profile=high&TranscodingProtocol=hls&SegmentContainer=ts\
          &TranscodeReasons=ContainerNotSupported&SubtitleMethod=Encode&EnableAdaptiveBitrateStreaming=false\
-         &StartTimeTicks={start_ticks}&ApiKey={token}",
+         &ApiKey={token}",
         client.base, client.device_id,
     ))
 }
@@ -300,11 +301,11 @@ mod tests {
     #[test]
     fn the_stream_url_asks_for_the_cast_profile() {
         let client = Client::new("https://jellyfin.example/", "dev-1").with_session("fake-token", "u1");
-        let url = stream_url(&client, "i1", 30., "ps1").unwrap();
+        let url = stream_url(&client, "i1", "ps1").unwrap();
         assert!(url.starts_with("https://jellyfin.example/Videos/i1/master.m3u8?MediaSourceId=i1&DeviceId=dev-1&PlaySessionId=ps1"));
-        for part in ["VideoCodec=h264", "AudioCodec=aac", "MaxWidth=1920", "TranscodingProtocol=hls", "StartTimeTicks=300000000", "ApiKey=fake-token"] {
+        for part in ["VideoCodec=h264", "AudioCodec=aac", "MaxWidth=1920", "TranscodingProtocol=hls", "ApiKey=fake-token"] {
             assert!(url.contains(part), "{part} missing in {url}");
         }
-        assert!(stream_url(&Client::new("https://x", "d"), "i1", 0., "p").is_none(), "no token, no URL");
+        assert!(stream_url(&Client::new("https://x", "d"), "i1", "p").is_none(), "no token, no URL");
     }
 }

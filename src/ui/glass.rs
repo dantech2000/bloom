@@ -32,9 +32,10 @@ pub const POPUP_TINT: Rgba = Rgba { r: 0.165, g: 0.165, b: 0.165, a: 0.72 };
 /// How a glass quad is drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// Today's look: the blurred backdrop under a flat tint.
+    /// The look of before, a choice in Settings > Display: the blurred
+    /// backdrop under a flat tint.
     Frosted,
-    /// The prototype: a refracting bezel, a rim light, saturation.
+    /// The default: a refracting bezel, a rim light, saturation.
     Liquid,
 }
 
@@ -296,7 +297,7 @@ pub fn ring(color: Rgba) -> Rgba {
 
 /// The keys of the debug verb, with their ranges, for `glass help`.
 pub const HELP: &str = "glass [frosted|liquid] [subtle|medium|strong] [key=value ...]\n\
-  modes:   frosted (today's look), liquid (the prototype)\n\
+  modes:   frosted (the look of before), liquid (the default)\n\
   presets: subtle, medium, strong (liquid; bezel, thickness, rim, frost)\n\
   keys of the current theme's set (a number unless said):\n\
     bezel=px        width of the curved edge, 0 to 40 (16)\n\

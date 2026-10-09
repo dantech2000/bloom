@@ -276,7 +276,7 @@ pub fn parse(kind: &str, data: &Value) -> Option<RemoteCommand> {
             };
             let text = |key: &str| args[key].as_str().unwrap_or_default().to_string();
             Some(match name {
-                "SetVolume" => RemoteCommand::SetVolume(number("Volume")?.clamp(0., 100.) as f32),
+                "SetVolume" => RemoteCommand::SetVolume(number("Volume").filter(|v| v.is_finite())?.clamp(0., 100.) as f32),
                 "VolumeUp" => RemoteCommand::VolumeUp,
                 "VolumeDown" => RemoteCommand::VolumeDown,
                 "Mute" => RemoteCommand::Mute,

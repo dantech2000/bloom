@@ -118,7 +118,21 @@ pub fn rows(tv: &Value, library: Option<&HashSet<i64>>, has_library_id: bool, sp
                 season.get("seasonNumber").and_then(Value::as_i64),
                 season.get("status").and_then(Value::as_i64),
             ) {
-                status.insert(n, s);
+                // The status of a season in a request is the status of
+                // the request (Seerr's `MediaRequestStatus`: 1 waits for
+                // approval, 2 approved, 3 declined), not that of the media
+                // (2 pending, 3 processing). A declined or failed request
+                // says nothing; the others raise a season that is not
+                // there yet, and never lower one that is.
+                let as_media = match s {
+                    1 => 2,
+                    2 => 3,
+                    _ => continue,
+                };
+                let now = status.get(&n).copied().unwrap_or(1);
+                if now < 4 && as_media > now {
+                    status.insert(n, as_media);
+                }
             }
         }
     }
@@ -681,7 +695,10 @@ mod tests {
                     { "seasonNumber": 6, "status": 4 },
                 ],
                 "requests": [
-                    { "is4k": false, "seasons": [{ "seasonNumber": 7, "status": 2 }] },
+                    // A request that waits for approval (1), and one for
+                    // season 4 that was declined (3): that season stays
+                    // as the media has it.
+                    { "is4k": false, "seasons": [{ "seasonNumber": 7, "status": 1 }, { "seasonNumber": 4, "status": 3 }] },
                     { "is4k": true, "seasons": [{ "seasonNumber": 4, "status": 5 }] },
                 ]
             }

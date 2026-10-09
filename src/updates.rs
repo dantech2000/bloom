@@ -141,6 +141,28 @@ extern "C" fn did_abort(_this: Id, _sel: Sel, _updater: Id, error: Id) {
     }
 }
 
+/// The status after an update cycle of Sparkle ended: a version that is
+/// ready stays ready; "on its way" is over, whatever ended the cycle.
+fn after_cycle(status: Status) -> Status {
+    match status {
+        Status::Downloading(_) => Status::Idle,
+        other => other,
+    }
+}
+
+/// `updater:didFinishUpdateCycleForUpdateCheck:error:`. Every cycle ends
+/// here, also one the user sent away in Sparkle's window ("Remind me
+/// later", "Skip this version"), which `didAbortWithError` does not hear
+/// of: the page said "is downloading" until the app quit.
+extern "C" fn did_finish_cycle(_this: Id, _sel: Sel, _updater: Id, _check: isize, _error: Id) {
+    let now = status();
+    let then = after_cycle(now.clone());
+    if then != now {
+        log::debug!("updates: the cycle ended with no version ready");
+        set_status(then);
+    }
+}
+
 /// The delegate object of the updater, of a class made at run time.
 fn delegate() -> Id {
     let class = unsafe { objc_allocateClassPair(class(c"NSObject"), c"BloomUpdaterDelegate".as_ptr(), 0) };
@@ -166,6 +188,12 @@ fn delegate() -> Id {
             did_abort as *const c_void,
             c"v@:@@".as_ptr(),
         );
+        class_addMethod(
+            class,
+            sel(c"updater:didFinishUpdateCycleForUpdateCheck:error:"),
+            did_finish_cycle as *const c_void,
+            c"v@:@q@".as_ptr(),
+        );
         objc_registerClassPair(class);
     }
     let object = send!(Id, class, c"alloc");
@@ -175,7 +203,10 @@ fn delegate() -> Id {
 /// Installs the downloaded update and starts the app again. False when no
 /// update is ready. Call on the main thread.
 pub fn restart_to_update() -> bool {
-    let Some(block) = INSTALL.lock().unwrap().take() else {
+    // The block stays for a second try: Sparkle keeps it valid until the
+    // app quits, and an install that did not go through left a button
+    // that did nothing.
+    let Some(block) = *INSTALL.lock().unwrap() else {
         return false;
     };
     log::info!("updates: installing, then the app starts again");
@@ -412,7 +443,7 @@ impl Bloom {
         // The debug channel is a tool for tests and for a look at a
         // problem while it happens; it is off unless someone needs it.
         let on = self.debug_channel_on();
-        card.child(field(
+        let card = card.child(field(
             "Debug channel",
             if on {
                 format!("On. A tool on this Mac can drive the app and read its state through {}.", crate::debug::setting_socket())
@@ -423,7 +454,8 @@ impl Bloom {
                 move |this, _: &ClickEvent, _, cx| this.set_debug_channel(!on, cx),
             )),
             cx,
-        ))
+        ));
+        card
     }
 
     pub fn debug_updates(&mut self, rest: &str, cx: &mut Context<Self>) -> String {
@@ -466,6 +498,34 @@ impl Bloom {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The delegate has the methods Sparkle calls, under the names
+    /// Sparkle calls them by, and the one for the end of a cycle can be
+    /// called (with nothing on its way it changes nothing).
+    #[test]
+    fn the_delegate_answers_to_the_methods_of_sparkle() {
+        let object = delegate();
+        assert!(!object.is_null(), "no delegate object");
+        for name in [
+            c"updater:didFindValidUpdate:",
+            c"updater:willInstallUpdateOnQuit:immediateInstallationBlock:",
+            c"updater:didAbortWithError:",
+            c"updater:didFinishUpdateCycleForUpdateCheck:error:",
+        ] {
+            assert!(send!(bool, object, c"respondsToSelector:", sel(name) => Sel), "{name:?}");
+        }
+        let nothing: Id = std::ptr::null_mut();
+        let before = status();
+        send!((), object, c"updater:didFinishUpdateCycleForUpdateCheck:error:", nothing => Id, 0isize => isize, nothing => Id);
+        assert_eq!(status(), before);
+    }
+
+    #[test]
+    fn the_end_of_a_cycle_ends_on_its_way_and_keeps_ready() {
+        assert_eq!(after_cycle(Status::Downloading("1.0".into())), Status::Idle);
+        assert_eq!(after_cycle(Status::Ready("1.0".into())), Status::Ready("1.0".into()));
+        assert_eq!(after_cycle(Status::Idle), Status::Idle);
+    }
 
     /// Each reader hears of a change: the task of a window that closed
     /// must not take the signal of the window that is open.

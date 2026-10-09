@@ -612,7 +612,9 @@ impl Bloom {
         let run_kind = field.kind.clone();
         let label = field.label.clone();
         match field.kind {
-            Kind::LongText => self.open_text_editor(
+            // A secret is typed into the masked field of the form, also
+            // when it is long: the large editor shows its text in clear.
+            Kind::LongText if !field.secret => self.open_text_editor(
                 TextEdit {
                     title: field.label.clone(),
                     message: "The text as the plugin stores it.".to_string(),
@@ -624,7 +626,7 @@ impl Bloom {
                 window,
                 cx,
             ),
-            Kind::Int | Kind::Float | Kind::Text | Kind::List { .. } => {
+            Kind::Int | Kind::Float | Kind::Text | Kind::LongText | Kind::List { .. } => {
                 let message = match &field.kind {
                     Kind::List { .. } => "Put a comma between two values.",
                     Kind::Int => "A whole number.",
@@ -658,9 +660,20 @@ impl Bloom {
         }
     }
 
+    /// True while the filter field of the plugin editor has the focus:
+    /// what is typed there is text, not a shortcut of the page.
+    pub fn plugin_filter_focused(&self, window: &Window, cx: &gpui_kit::App) -> bool {
+        use gpui_kit::Focusable as _;
+        self.plugin_editor()
+            .is_some_and(|editor| editor.filter_input.read(cx).focus_handle(cx).contains_focused(window, cx))
+    }
+
     /// The bar with Save and Discard, while the editor has changes.
     pub fn render_plugin_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let editor = self.plugin_editor().filter(|e| e.dirty())?;
+        // The bar is the editor's: on another section its Save would send
+        // the plugin settings from a page that does not show them.
+        let on_plugins = matches!(&self.page, Page::Admin(admin) if admin.section == super::Section::Plugins);
+        let editor = self.plugin_editor().filter(|e| e.dirty() && on_plugins)?;
         let changes = editor.changed().len().max(1);
         Some(bar_shell(
             changes,

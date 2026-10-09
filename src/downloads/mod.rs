@@ -155,7 +155,7 @@ impl Bloom {
         let (parallel, limit) = (self.config.download_parallel, self.config.download_limit_gb);
         engine.set_options(move |o| {
             o.parallel = parallel.unwrap_or(1).clamp(1, 2) as usize;
-            o.limit_bytes = limit.map(|gb| gb * 1_000_000_000);
+            o.limit_bytes = limit.map(|gb| gb.saturating_mul(1_000_000_000));
         });
         self.downloads.allowed = None;
         self.downloads.offline = false;
@@ -182,7 +182,7 @@ impl Bloom {
         self.fetch(
             cx,
             |client| {
-                let me: serde_json::Value = client.get("/Users/Me", &[])?;
+                let me = client.me()?;
                 let allowed = me["Policy"]["EnableContentDownloading"].as_bool().unwrap_or(false);
                 let sent = offline::flush(&client).unwrap_or_else(|err| {
                     log::warn!("offline positions not sent: {err:#}");
@@ -404,11 +404,39 @@ impl Bloom {
         }
     }
 
+    /// True, with a notice, for a download that is of another server than
+    /// the session's: the Downloads page lists them all, but a page or a
+    /// play of the item would go through this session, whose server knows
+    /// the id as another item or not at all.
+    fn download_of_another_server(&mut self, of: Option<&str>, item_id: &str, cx: &mut Context<Self>) -> bool {
+        let Some(server) = self.session.as_ref().map(|s| s.server_id.clone()) else {
+            return false;
+        };
+        // The row names its server; a caller without one (the debug
+        // channel) means the download of this session when there is one.
+        let other = match of {
+            Some(of) => of != server,
+            None => {
+                let entries = engine().entries();
+                !entries.iter().any(|e| e.item_id == item_id && e.server_id == server)
+                    && entries.iter().any(|e| e.item_id == item_id)
+            }
+        };
+        if !other {
+            return false;
+        }
+        self.toast("Downloads", "This download is of another server. Sign in to that server to open it.", cx);
+        true
+    }
+
     /// Opens the page of a downloaded item: from `meta.json`, so it works
     /// offline too.
-    pub fn open_download(&mut self, item_id: &str, cx: &mut Context<Self>) {
-        let item = engine().item(item_id).or_else(|| {
-            engine().entry(item_id).map(|e| Item {
+    pub fn open_download(&mut self, server_id: Option<&str>, item_id: &str, cx: &mut Context<Self>) {
+        if self.download_of_another_server(server_id, item_id, cx) {
+            return;
+        }
+        let item = engine().item_of(server_id, item_id).or_else(|| {
+            engine().entry_of(server_id, item_id).map(|e| Item {
                 id: e.item_id.clone(),
                 name: e.name.clone(),
                 kind: e.kind.clone(),
@@ -426,8 +454,11 @@ impl Bloom {
     }
 
     /// Plays a downloaded item, from its local resume point when it has one.
-    pub fn play_download(&mut self, item_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(mut item) = engine().item(item_id) else {
+    pub fn play_download(&mut self, server_id: Option<&str>, item_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.download_of_another_server(server_id, item_id, cx) {
+            return;
+        }
+        let Some(mut item) = engine().item_of(server_id, item_id) else {
             self.toast("Downloads", "The item is not downloaded.", cx);
             return;
         };
@@ -503,7 +534,7 @@ impl Bloom {
             "remove-all" => engine.remove_all(),
             "page" => self.open_downloads(cx),
             // The page of a downloaded item, from its `meta.json`.
-            "open" => self.open_download(arg, cx),
+            "open" => self.open_download(None, arg, cx),
             // The entries the card menu of an item gets, by their ids.
             "menu" => {
                 let item = engine.item(arg).or_else(|| {
@@ -530,7 +561,7 @@ impl Bloom {
             },
             "play" => {
                 self.muted = true;
-                self.play_download(arg, window, cx);
+                self.play_download(None, arg, window, cx);
             }
             "state" | "" => {}
             _ => {

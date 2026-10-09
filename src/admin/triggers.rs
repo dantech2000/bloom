@@ -51,7 +51,9 @@ pub fn parse_time(text: &str) -> Option<i64> {
 /// A number of hours ("12", "1.5") as whole minutes, at least one.
 pub fn parse_hours(text: &str) -> Option<i64> {
     let hours: f64 = text.trim().parse().ok()?;
-    (hours.is_finite() && hours > 0.).then(|| ((hours * 60.).round() as i64).max(1))
+    // Up to a year: the ticks of a larger number do not fit the server's
+    // time span, and the product would overflow.
+    (hours.is_finite() && hours > 0. && hours <= 8760.).then(|| ((hours * 60.).round() as i64).max(1))
 }
 
 /// A length of time in words: "2 hours", "1 hour 30 minutes", "45 minutes".
@@ -620,7 +622,21 @@ pub fn render(editor: &Editor, cx: &mut Context<Bloom>) -> Div {
                 .child(
                     action(format!("triggers.remove.{n}"), LucideIcon::Trash, "Remove", true, cx).on_click(
                         cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.triggers_apply(Change::Remove(target.clone()), cx)
+                            // The trigger goes from the server at once: a
+                            // question first, as for every removal here.
+                            let target = target.clone();
+                            this.ask_confirm(
+                                super::Confirm {
+                                    title: "Remove this trigger?".to_string(),
+                                    message: format!("{}. The task no longer runs at this time.", describe(&target)),
+                                    action: "Remove".to_string(),
+                                    danger: true,
+                                    run: std::rc::Rc::new(move |this, cx| {
+                                        this.triggers_apply(Change::Remove(target.clone()), cx)
+                                    }),
+                                },
+                                cx,
+                            )
                         }),
                     ),
                 ),

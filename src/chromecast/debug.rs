@@ -257,13 +257,13 @@ impl Bloom {
             subtitle_index: None,
         });
         let play_session_id = uuid::Uuid::new_v4().simple().to_string();
-        let media = jellyfin::stream_url(client, &item.id, start_secs, &play_session_id).map(|url| LoadMedia {
+        let media = jellyfin::stream_url(client, &item.id, &play_session_id).map(|url| LoadMedia {
             url,
             content_type: jellyfin::STREAM_CONTENT_TYPE.into(),
             title: item.display_title(),
             subtitle: item.series_name.clone().unwrap_or_default(),
             image_url: Some(client.image_url(&item.id, "Primary", None, 480)),
-            start_secs: 0.,
+            start_secs,
             duration: item.run_time_ticks.map(|t| t as f64 / crate::jellyfin::TICKS_PER_SECOND as f64),
             tracks: Vec::new(),
             active_tracks: Vec::new(),

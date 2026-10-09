@@ -1,6 +1,6 @@
 //! Single-value slider using Kit state and pointer primitives.
 use super::theme::{UiTheme, apply_style};
-pub use gpui_kit::base::slider::{SliderEvent, SliderState, SliderValue};
+pub use gpui_kit::base::slider::{SliderEvent, SliderState};
 use gpui_kit::base::{SliderIndicator, SliderThumb, SliderTrack};
 use gpui_kit::{
     AccessibleAction, App, ElementId, Entity, InteractiveElement as _, IntoElement, MouseButton,

@@ -285,7 +285,13 @@ fn parse_number(row: &Row, text: &str) -> Result<i64> {
     let Kind::Number { scale, min, .. } = row.kind else {
         bail!("{} is not a number", row.key);
     };
-    let value: f64 = text.trim().parse().map_err(|_| anyhow::anyhow!("{text:?} is not a number"))?;
+    // "nan" and "inf" parse as numbers; neither is one for a setting.
+    let value: f64 = text
+        .trim()
+        .parse()
+        .ok()
+        .filter(|value: &f64| value.is_finite())
+        .ok_or_else(|| anyhow::anyhow!("{text:?} is not a number"))?;
     let raw = (value * scale).round() as i64;
     if raw < min {
         bail!("the lowest value is {}", min as f64 / scale);

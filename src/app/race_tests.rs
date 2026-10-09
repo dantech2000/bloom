@@ -483,3 +483,219 @@ fn the_hero_slides_of_one_profile_do_not_show_for_the_next(cx: &mut TestAppConte
     });
     cx.run_until_parked();
 }
+
+/// The debug channel answers a question only when a debug command opened
+/// it: not one a person opened, also when that one took the place in
+/// memory of a question the channel opened before.
+#[gpui_kit::test]
+fn the_debug_channel_knows_its_own_question(cx: &mut TestAppContext) {
+    let (bloom, cx) = app(cx);
+    let question = || crate::admin::Confirm {
+        title: "Shut down the server?".into(),
+        message: String::new(),
+        action: "Shut down".into(),
+        danger: true,
+        run: std::rc::Rc::new(|_, _| {}),
+    };
+    bloom.update(cx, |this, _| {
+        // A person opened it.
+        this.admin_confirm = Some(question());
+        assert!(!this.debug_opened_confirm());
+        // A debug command opened this one, and the channel noted it.
+        let own = question();
+        this.debug_dialogs.0 = Some(std::rc::Rc::downgrade(&own.run));
+        this.admin_confirm = Some(own);
+        assert!(this.debug_opened_confirm());
+        // It is closed, and a person opens another: not the channel's.
+        this.admin_confirm = None;
+        this.admin_confirm = Some(question());
+        assert!(!this.debug_opened_confirm(), "a question of a person counts as the channel's");
+    });
+}
+
+/// A session that opens asks for its user four times within a moment (the
+/// admin flag, the download right, the list rights, the subtitle rights):
+/// one request answers them all. Another session has its own answer.
+#[gpui_kit::test]
+fn the_user_is_asked_for_once_for_those_who_ask_together(_cx: &mut TestAppContext) {
+    let server = MockServer::start(|method, path, _| match (method, path) {
+        ("GET", p) if p.starts_with("/Users/Me") => (200, r#"{"Name":"u","Policy":{"IsAdministrator":true}}"#.into()),
+        _ => plain(method, path),
+    });
+    let client = session(&server.url, "u1").client;
+    for _ in 0..4 {
+        assert_eq!(client.me().unwrap()["Policy"]["IsAdministrator"], true);
+    }
+    assert_eq!(server.count("GET", "/Users/Me"), 1);
+    let other = crate::jellyfin::Client::new(&server.url, "device").with_token("another-token", "u2");
+    other.me().unwrap();
+    assert_eq!(server.count("GET", "/Users/Me"), 2, "another session got the user of the first");
+}
+
+/// A reload of the detail page keeps the tracks the user picked on it.
+#[gpui_kit::test]
+fn a_reload_of_the_detail_page_keeps_the_picked_tracks(cx: &mut TestAppContext) {
+    let server = MockServer::start(|method, path, _| match (method, path) {
+        ("GET", p) if p.starts_with("/Items/a") && !p.contains("/Similar") => {
+            (200, json_with_audio("a", "Track of A").to_string())
+        }
+        _ => plain(method, path),
+    });
+    let (bloom, cx) = app(cx);
+    bloom.update(cx, |this, cx| {
+        this.session = Some(session(&server.url, "u1"));
+        this.screen = Screen::Main;
+        this.page = Page::Detail(super::DetailData {
+            item: item_with_audio("a", "Track of A"),
+            audio: Some(0),
+            subtitle: Some(None),
+            ..Default::default()
+        });
+        this.load_page(cx);
+    });
+    cx.run_until_parked();
+    bloom.read_with(cx, |this, _| match &this.page {
+        Page::Detail(data) => {
+            assert!(!data.loading);
+            assert_eq!((data.audio, data.subtitle), (Some(0), Some(None)), "the reload dropped the picked tracks");
+        }
+        _ => panic!("not the detail page"),
+    });
+}
+
+/// "Open a random title" answers after the user switched the profile: the
+/// title of the session before does not open in the new one.
+#[gpui_kit::test]
+fn an_answer_for_the_session_before_opens_no_page(cx: &mut TestAppContext) {
+    let server = MockServer::start(|method, path, _| match (method, path) {
+        ("GET", p) if p.starts_with("/Items?") && p.contains("Random") => (200, items_json(&["m7"], "Movie")),
+        _ => plain(method, path),
+    });
+    let (bloom, cx) = app(cx);
+    bloom.update(cx, |this, cx| {
+        add_server(this, "one", &server.url, "u1");
+        add_server(this, "two", &server.url, "u2");
+        assert!(this.open_session("one", "u1", cx));
+        this.open_random(cx);
+        assert!(this.open_session("two", "u2", cx));
+    });
+    cx.run_until_parked();
+    bloom.read_with(cx, |this, _| {
+        assert!(matches!(this.page, Page::Home(_)), "the random title of the session before opened");
+    });
+}
+
+/// The keys list is a popup like the panels: it closes with them, and a
+/// question of the dashboard does not open beside a panel.
+#[gpui_kit::test]
+fn the_keys_list_and_the_panels_close_together(cx: &mut TestAppContext) {
+    let (bloom, cx) = app(cx);
+    bloom.update(cx, |this, cx| {
+        this.enhanced.help_open = true;
+        this.sync.panel_open = true;
+        assert!(this.panel_open());
+        assert!(this.close_panels());
+        assert!(!this.enhanced.help_open && !this.sync.panel_open && !this.panel_open());
+        assert!(!this.close_panels());
+        this.cast.panel_open = true;
+        this.ask_confirm(
+            crate::admin::Confirm {
+                title: String::new(),
+                message: String::new(),
+                action: String::new(),
+                danger: false,
+                run: std::rc::Rc::new(|_, _| {}),
+            },
+            cx,
+        );
+        assert!(!this.cast.panel_open, "a panel stays open beside the question");
+    });
+}
+
+/// A password typed for one server is cleared when another server is
+/// picked: Enter must not send it there.
+#[gpui_kit::test]
+fn a_change_of_the_server_clears_the_typed_password(cx: &mut TestAppContext) {
+    let server = MockServer::start(|method, path, _| plain(method, path));
+    let (bloom, cx) = app(cx);
+    bloom.update(cx, |this, cx| {
+        add_server(this, "one", &server.url, "u1");
+        add_server(this, "two", &server.url, "u2");
+        this.select_server("one".into(), cx);
+        this.connect.clear_password = false;
+        this.select_server("one".into(), cx);
+        assert!(!this.connect.clear_password, "the same server again clears what the user types");
+        this.select_server("two".into(), cx);
+        assert!(this.connect.clear_password);
+    });
+    cx.run_until_parked();
+}
+
+/// A setting that changes many times in a row is saved once, when the
+/// changes stop; and a save that still waits is written at once on the way
+/// out of the window, as its task ends with the window.
+#[gpui_kit::test]
+fn a_save_that_waits_is_written_once_and_on_the_way_out(cx: &mut TestAppContext) {
+    let (bloom, cx) = app(cx);
+    let saves = |bloom: &gpui_kit::Entity<super::Bloom>, cx: &mut gpui_kit::VisualTestContext| {
+        bloom.read_with(cx, |this, _| this.config_saves.get())
+    };
+    cx.run_until_parked();
+    let before = saves(&bloom, cx);
+    bloom.update(cx, |this, cx| {
+        // A slider that is dragged.
+        for _ in 0..20 {
+            this.save_config_soon(cx);
+        }
+    });
+    assert_eq!(saves(&bloom, cx), before, "a save went out at each step");
+    cx.executor().advance_clock(std::time::Duration::from_millis(500));
+    cx.run_until_parked();
+    assert_eq!(saves(&bloom, cx), before + 1, "the changes were not saved once they stopped");
+    // A change, and the window goes before the wait is over.
+    bloom.update(cx, |this, cx| {
+        this.save_config_soon(cx);
+        assert!(this.flush_config_save(cx), "no save waited");
+        assert!(!this.flush_config_save(cx), "the save went out twice");
+    });
+    assert_eq!(saves(&bloom, cx), before + 2);
+    cx.executor().advance_clock(std::time::Duration::from_millis(500));
+    cx.run_until_parked();
+    assert_eq!(saves(&bloom, cx), before + 2, "the task that waited saved again");
+}
+
+/// Four callers ask for the user at the same time, as at the start of a
+/// session: one request answers them all. A server that is slow holds up
+/// no caller of another server.
+#[test]
+fn the_user_is_asked_for_once_by_callers_at_the_same_time() {
+    use std::{thread, time::{Duration, Instant}};
+    let slow = MockServer::start(|method, path, _| match (method, path) {
+        ("GET", p) if p.starts_with("/Users/Me") => {
+            thread::sleep(Duration::from_millis(400));
+            (200, r#"{"Name":"slow"}"#.into())
+        }
+        _ => plain(method, path),
+    });
+    let fast = MockServer::start(|method, path, _| match (method, path) {
+        ("GET", p) if p.starts_with("/Users/Me") => (200, r#"{"Name":"fast"}"#.into()),
+        _ => plain(method, path),
+    });
+    let client = crate::jellyfin::Client::new(&slow.url, "device").with_token("token-of-the-slow-one", "u1");
+    let callers: Vec<_> = (0..4)
+        .map(|_| {
+            let client = client.clone();
+            thread::spawn(move || client.me().unwrap()["Name"].as_str().map(str::to_string))
+        })
+        .collect();
+    // While the slow server still works on its answer.
+    thread::sleep(Duration::from_millis(100));
+    let other = crate::jellyfin::Client::new(&fast.url, "device").with_token("token-of-the-fast-one", "u2");
+    let started = Instant::now();
+    assert_eq!(other.me().unwrap()["Name"], "fast");
+    assert!(started.elapsed() < Duration::from_millis(250), "the slow server held up the other: {:?}", started.elapsed());
+    for caller in callers {
+        assert_eq!(caller.join().unwrap().as_deref(), Some("slow"));
+    }
+    assert_eq!(slow.count("GET", "/Users/Me"), 1, "each caller sent a request of its own");
+}

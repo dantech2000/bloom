@@ -201,7 +201,12 @@ pub fn parse(message_type: &str, data: Value) -> Option<ServerMessage> {
                     reason: inner.get("Reason")?.as_str()?.to_string(),
                 },
                 "PlayQueue" => GroupUpdate::Queue(serde_json::from_value(inner).ok()?),
-                _ => GroupUpdate::Denied(kind),
+                // The refusals the server has. A type this app does not
+                // know (one of a newer server) is no refusal: it is left
+                // out, and shows no "the server refused" notice.
+                "GroupDoesNotExist" | "LibraryAccessDenied" | "CreateGroupDenied" | "JoinGroupDenied"
+                | "SyncPlayIsDisabled" => GroupUpdate::Denied(kind),
+                _ => return None,
             };
             Some(ServerMessage::Group { group_id, update })
         }
@@ -402,6 +407,9 @@ mod tests {
         };
         assert_eq!(queue.current().unwrap().playlist_item_id, "p2");
         assert!(parse("LibraryChanged", json!({})).is_none());
+        // A type of a newer server is not read as a refusal.
+        let unknown = json!({ "GroupId": "abc", "Type": "SomethingNew", "Data": "" });
+        assert!(parse("SyncPlayGroupUpdate", unknown).is_none());
     }
 
     #[test]

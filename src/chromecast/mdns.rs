@@ -191,6 +191,7 @@ fn query() -> Vec<u8> {
 }
 
 /// The devices in one answer packet.
+#[cfg(test)]
 pub fn parse(packet: &[u8]) -> Vec<Device> {
     parse_from(packet, None)
 }

@@ -347,6 +347,9 @@ pub struct Bloom {
     /// Time shown on the current slide before the user paused the hero.
     pub hero_paused: Option<Duration>,
     pub hero_tick: Option<Task<()>>,
+    /// How often a save of the config was asked for; a test reads it (a
+    /// test writes no config file).
+    pub(crate) config_saves: std::cell::Cell<u64>,
     /// Pending write of the window place to the config file.
     window_save: Option<Task<()>>,
     /// Pending search for the text in the search field.
@@ -430,6 +433,12 @@ pub struct Bloom {
     pub admin_inputs: [Entity<InputState>; 3],
     /// Value the dashboard shows once, such as a new API key.
     pub admin_secret: Option<crate::admin::Secret>,
+    /// A load of the live part is on its way: the timer starts no second
+    /// one behind it, so a slow server does not collect requests.
+    pub(crate) admin_live_busy: bool,
+    /// Names the live load on its way: only its own answer ends the wait,
+    /// not a late one of a session or a page before.
+    pub(crate) admin_live_load: u64,
     /// Timer that loads the live part of the dashboard again.
     pub admin_tick: Option<Task<()>>,
     /// SyncPlay: the session with the server and the panel of the groups.
@@ -477,6 +486,13 @@ pub struct Bloom {
     /// listener that the setting turned on.
     pub debug_requests: Option<async_channel::Sender<crate::debug::Request>>,
     pub debug_listener: Option<crate::debug::Listener>,
+    /// The question and the form a debug command opened, by the address
+    /// of their action; 0 for none. `write confirm` and `write submit`
+    /// run these only, never a dialog a person opened.
+    pub(crate) debug_dialogs: (
+        Option<std::rc::Weak<dyn Fn(&mut Bloom, &mut Context<Bloom>)>>,
+        Option<std::rc::Weak<dyn Fn(&mut Bloom, Vec<String>, &mut Context<Bloom>)>>,
+    ),
     /// The paused player shows the item's details in place of the controls.
     pub pause_screen: bool,
     /// Frame of the normal window while the player is in picture in
@@ -716,6 +732,11 @@ impl Bloom {
         .detach();
         // The media keys, and the end of the Now Playing tile at quit.
         subscriptions.push(crate::nowplaying::install(cx));
+        // A save of the config that still waits goes at the quit.
+        subscriptions.push(cx.on_app_quit(|this: &mut Self, cx| {
+            this.flush_config_save(cx);
+            async {}
+        }));
         let app = cx.weak_entity();
         let rows_view = cx.new(|_| crate::views::home::HomeRows { app });
 
@@ -749,6 +770,7 @@ impl Bloom {
             hero_since: std::time::Instant::now(),
             hero_paused: None,
             hero_tick: None,
+            config_saves: std::cell::Cell::new(0),
             window_save: None,
             search_debounce: None,
             catalog: Vec::new(),
@@ -796,6 +818,8 @@ impl Bloom {
             admin_prompt_fresh: false,
             admin_inputs,
             admin_secret: None,
+            admin_live_busy: false,
+            admin_live_load: 0,
             admin_tick: None,
             sync: Default::default(),
             cast: Default::default(),
@@ -820,6 +844,7 @@ impl Bloom {
             update_said: None,
             debug_requests: None,
             debug_listener: None,
+            debug_dialogs: (None, None),
             pause_screen: false,
             pip: None,
             last_pointer_activity: std::time::Instant::now(),
@@ -852,7 +877,13 @@ impl Bloom {
         // cores close with the window (`main.rs`).
         let weak = cx.weak_entity();
         window.on_window_should_close(cx, move |_, cx| {
-            weak.update(cx, |this, cx| this.request_stop(cx)).ok();
+            weak.update(cx, |this, cx| {
+                this.request_stop(cx);
+                // A save that still waits (`save_config_soon`, the window
+                // place) goes now: its task ends with the window.
+                this.flush_config_save(cx);
+            })
+            .ok();
             true
         });
         // A field that had the focus and left the page (the search field
@@ -892,6 +923,7 @@ impl Bloom {
     }
 
     pub fn save_config(&self, cx: &mut App) {
+        self.config_saves.set(self.config_saves.get() + 1);
         if sandboxed() {
             return;
         }
@@ -899,6 +931,34 @@ impl Bloom {
             log::error!("saving config failed: {err:#}");
             self.toast("Could not save settings", format!("{err:#}"), cx);
         }
+    }
+
+    /// Saves the config once the changes stop, for a value that changes
+    /// many times in a row (a slider that is dragged): each save is a write
+    /// with a full sync of the disk, some milliseconds on the UI thread.
+    /// The window place waits the same way; one write takes both. The quit
+    /// of the app writes what still waits.
+    pub fn save_config_soon(&mut self, cx: &mut Context<Self>) {
+        self.window_save = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(400)).await;
+            this.update(cx, |this, cx| {
+                this.window_save = None;
+                this.save_config(cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Writes a save of the config that still waits, at once: every way
+    /// out of the window calls this (the red button, Close Window, the
+    /// quit), as the task that waits ends with the window. True when a
+    /// save waited.
+    pub(crate) fn flush_config_save(&mut self, cx: &mut Context<Self>) -> bool {
+        let waited = self.window_save.take().is_some();
+        if waited {
+            self.save_config(cx);
+        }
+        waited
     }
 
     /// Runs blocking work with a client on a background thread and hands the
@@ -931,6 +991,23 @@ impl Bloom {
         self.fetch_with(client, cx, work, done);
     }
 
+    /// As [`Bloom::fetch`], for an answer that only the session that asked
+    /// may take: it is dropped when another profile or server is open by
+    /// the time it comes (a picture, a password, a page to open).
+    pub fn fetch_in_session<T, W, D>(&self, cx: &mut Context<Self>, work: W, done: D)
+    where
+        T: Send + 'static,
+        W: FnOnce(Client) -> Result<T> + Send + 'static,
+        D: FnOnce(&mut Self, Result<T>, &mut Context<Self>) + 'static,
+    {
+        let epoch = self.session_epoch;
+        self.fetch(cx, work, move |this, result, cx| {
+            if this.session_epoch == epoch {
+                done(this, result, cx);
+            }
+        });
+    }
+
     fn next_generation(&mut self) -> u64 {
         self.generation += 1;
         self.generation
@@ -951,6 +1028,10 @@ impl Bloom {
         // run against the next one.
         self.clear_hero();
         self.forget_admin_dialogs();
+        // A live load of the dashboard of the session before has no answer
+        // to wait for here.
+        self.admin_live_busy = false;
+        self.admin_live_load += 1;
     }
 
     /// Ends the session in the app (the server and the config are the
@@ -1206,6 +1287,9 @@ impl Bloom {
 
     pub fn navigate(&mut self, page: Page, cx: &mut Context<Self>) {
         self.forget_admin_dialogs();
+        // The rows of a detail page have one name on every detail page:
+        // the next one starts at the left, not where the last one was.
+        self.row_scrolls.borrow_mut().retain(|id, _| !id.starts_with("detail."));
         // Keep the place in the page, so Back returns to it.
         self.history_scroll.push(self.page_scroll.offset());
         self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
@@ -1335,7 +1419,7 @@ impl Bloom {
             limit: Some(1),
             ..Default::default()
         };
-        self.fetch(
+        self.fetch_in_session(
             cx,
             move |client| client.items(&query),
             |this, result, cx| match result {
@@ -1556,7 +1640,7 @@ impl Bloom {
     /// Opens the library item of an id (used by Seerr cards in the library).
     pub fn open_item_id(&mut self, id: &str, cx: &mut Context<Self>) {
         let id = id.to_string();
-        self.fetch(
+        self.fetch_in_session(
             cx,
             move |client| client.item(&id),
             |this, result, cx| match result {
@@ -1814,8 +1898,6 @@ impl Bloom {
         cx.notify();
     }
 
-    /// Loads the title index, when there is none or it is older than ten
-    /// minutes, and fetches the posters of its titles to the disk.
     /// Every menu of the app. A new menu must be added here (and to the
     /// observers in `new`), or it can be open next to another popup.
     fn menus(&self) -> [&Entity<MenuState>; 11] {
@@ -1853,16 +1935,31 @@ impl Bloom {
         for menu in open {
             menu.update(cx, |menu, cx| menu.close(false, window, cx));
         }
-        if std::mem::take(&mut self.episode_picker.open)
+        if self.close_panels() {
+            cx.notify();
+        }
+    }
+
+    /// True while a panel that is not a menu is open. The panels are named
+    /// here and in `close_panels`, and nowhere else: a new one goes into
+    /// these two, and every place that asks or closes has it.
+    pub fn panel_open(&self) -> bool {
+        self.episode_picker.open
+            || self.enhanced.help_open
+            || self.sync.panel_open
+            || self.cast.panel_open
+            || self.subs.panel_open
+            || self.enhanced.bookmarks.panel_open
+    }
+
+    /// Closes every panel that is not a menu; true when one was open.
+    pub fn close_panels(&mut self) -> bool {
+        std::mem::take(&mut self.episode_picker.open)
+            | std::mem::take(&mut self.enhanced.help_open)
             | std::mem::take(&mut self.sync.panel_open)
             | std::mem::take(&mut self.cast.panel_open)
             | self.close_subs_panel()
-        {
-            cx.notify();
-        }
-        if self.close_bookmarks_panel() {
-            cx.notify();
-        }
+            | self.close_bookmarks_panel()
     }
 
     /// Loads the title index again now: the server said the library changed.
@@ -1871,6 +1968,8 @@ impl Bloom {
         self.refresh_catalog(cx);
     }
 
+    /// Loads the title index, when there is none or it is older than ten
+    /// minutes, and fetches the posters of its titles to the disk.
     pub fn refresh_catalog(&mut self, cx: &mut Context<Self>) {
         const MAX_AGE: Duration = Duration::from_secs(600);
         if self.catalog_loaded.is_some_and(|at| at.elapsed() < MAX_AGE) {
@@ -2342,7 +2441,12 @@ impl Bloom {
                         }
                         if let Page::Detail(data) = &mut this.page {
                             match result {
-                                Ok(fresh) => {
+                                Ok(mut fresh) => {
+                                    // A reload of the same item keeps the
+                                    // tracks the user picked on the page.
+                                    if fresh.item.id == data.item.id {
+                                        (fresh.audio, fresh.subtitle) = (data.audio, data.subtitle);
+                                    }
                                     *data = fresh;
                                     // The row of the season starts at the
                                     // episode of the page; the ones before
@@ -2669,10 +2773,7 @@ impl Bloom {
             || self.audio_menu.read(cx).is_open()
             || self.subtitle_menu.read(cx).is_open()
             || self.settings_menu.read(cx).is_open()
-            || self.episode_picker.open
-            || self.sync.panel_open
-            || self.cast.panel_open
-            || self.subs.panel_open
+            || self.panel_open()
     }
 
     /// Switches the player between the full window and picture in picture.
@@ -2818,7 +2919,12 @@ impl Bloom {
             return;
         }
         self.slider_pos = pos;
-        let (pos, dur) = (status.position as f32, status.duration as f32);
+        self.move_seek_slider(cx);
+    }
+
+    /// Puts the seek slider at the position of the player.
+    fn move_seek_slider(&mut self, cx: &mut Context<Self>) {
+        let (pos, dur) = (self.player_status.position as f32, self.player_status.duration as f32);
         self.seek_slider.update(cx, |s, cx| {
             // Update in place: a fresh state has no bounds, and a click
             // before the next paint would divide by zero.
@@ -3053,20 +3159,7 @@ impl Bloom {
                         // The slider follows the position; an update with no
                         // change would only cause a redraw.
                         if changed && !this.scrubbing && this.player_status.duration > 0. {
-                            let (pos, dur) = (
-                                this.player_status.position as f32,
-                                this.player_status.duration as f32,
-                            );
-                            this.seek_slider.update(cx, |s, cx| {
-                                // Update in place: a fresh state has no bounds, and a
-                                // click before the next paint would divide by zero.
-                                *s = std::mem::replace(s, SliderState::new())
-                                    .min(0.)
-                                    .max(dur)
-                                    .step(1.)
-                                    .default_value(pos.clamp(0., dur));
-                                cx.notify();
-                            });
+                            this.move_seek_slider(cx);
                         }
                         this.enhanced_tick(cx);
                         this.adaptive_tick(cx);
@@ -3313,6 +3406,9 @@ impl Render for Bloom {
             // `performClose:` would not, while the player hides the buttons.
             .on_action(cx.listener(|this, _: &menus::CloseWindow, window, cx| {
                 this.request_stop(cx);
+                // This way out does not ask `on_window_should_close`: a
+                // save of the config that still waits goes here.
+                this.flush_config_save(cx);
                 window.remove_window();
             }))
             .on_action(cx.listener(|this, _: &menus::About, _, cx| {

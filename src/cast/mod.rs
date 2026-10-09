@@ -49,6 +49,12 @@ use crate::{
 /// Time between two reads of the sessions while a target is set and the
 /// socket does not push them.
 const POLL_WITHOUT_SOCKET: Duration = Duration::from_secs(2);
+/// How long after an item was sent to a cast device a status with no app
+/// counts as the launch of its app with no word of the connection: the
+/// load is a command on its way to the connection's thread for a moment.
+/// After that the status itself says whether a load waits for its app
+/// (`Status::launching`), for as long as the launch takes.
+const CAST_LAUNCH_GRACE: Duration = Duration::from_secs(2);
 /// With the socket, a read now and then catches what a push missed.
 const POLL_WITH_SOCKET: Duration = Duration::from_secs(15);
 /// The subscription: the first push after 100 ms, then one a second.
@@ -114,6 +120,10 @@ pub struct CastState {
     /// The item this app loaded on the cast device: the device reports
     /// only its id.
     pub cast_item: Option<Item>,
+    /// An app ran on the cast device since the item was sent there.
+    cast_app_up: bool,
+    /// When the item was sent to the cast device.
+    cast_sent_at: Option<Instant>,
     /// The streams the Jellyfin receiver app says it plays.
     pub cast_tracks: CastTracks,
     /// When the search for cast devices started, for "Searching…".
@@ -1032,7 +1042,21 @@ impl Bloom {
             }
             CastEvent::Status(status) => {
                 // The app that played our item is gone: so is the item.
-                if status.app.is_none() {
+                // A status with no app before the app is up (the launch
+                // takes a moment, and the device sends its status for a
+                // key on its remote too) is not that.
+                // The same while a new item makes the device change its
+                // app: the app before goes, and the next one is not up
+                // yet. For the time a launch can take, "no app" is the
+                // launch, not the end of the item.
+                // The connection says so while the load waits for its app;
+                // for the moment before it has taken the load, the time
+                // since the item was sent stands in.
+                let launching = status.launching
+                    || self.cast.cast_sent_at.is_some_and(|at| at.elapsed() < CAST_LAUNCH_GRACE);
+                if status.app.is_some() {
+                    self.cast.cast_app_up = true;
+                } else if !launching && std::mem::take(&mut self.cast.cast_app_up) {
                     self.cast.cast_item = None;
                 }
             }
@@ -1059,13 +1083,13 @@ impl Bloom {
             subtitle_index: None,
         });
         let play_session_id = uuid::Uuid::new_v4().simple().to_string();
-        let media = cast_jellyfin::stream_url(client, &item.id, start_secs, &play_session_id).map(|url| LoadMedia {
+        let media = cast_jellyfin::stream_url(client, &item.id, &play_session_id).map(|url| LoadMedia {
             url,
             content_type: cast_jellyfin::STREAM_CONTENT_TYPE.into(),
             title: item.display_title(),
             subtitle: item.series_name.clone().unwrap_or_default(),
             image_url: Some(client.image_url(&item.id, "Primary", None, 480)),
-            start_secs: 0.,
+            start_secs,
             duration: item.run_time_ticks.map(|t| t as f64 / crate::jellyfin::TICKS_PER_SECOND as f64),
             tracks: Vec::new(),
             active_tracks: Vec::new(),
@@ -1073,6 +1097,7 @@ impl Bloom {
         });
         session.load(LoadRequest { jellyfin, media });
         self.cast.cast_item = Some(item.clone());
+        self.cast.cast_sent_at = Some(Instant::now());
         self.cast.cast_tracks = CastTracks::default();
         self.toast("Play On", format!("Playing on {}.", self.cast.device_name()), cx);
         cx.notify();
@@ -1115,6 +1140,13 @@ impl Bloom {
         if let AirPlayEvent::LoadFailed { error, .. } = &event {
             self.cast.error = Some(error.clone());
             self.toast("AirPlay", error.clone(), cx);
+        }
+        // A failure after the start has no load to answer: the user hears
+        // of it here.
+        if matches!(event, AirPlayEvent::State(crate::airplay::AirPlayState::Failed)) {
+            let error = self.airplay.status().error.unwrap_or_else(|| "Playback failed.".to_string());
+            self.cast.error = Some(error.clone());
+            self.toast("AirPlay", error, cx);
         }
         cx.notify();
     }
@@ -1411,6 +1443,65 @@ mod race_tests {
     use serde_json::json;
 
     use crate::app::{Screen, race_harness::{MockServer, app, plain, session, tick_until}};
+
+    /// A new item makes the device change its app: the app before goes
+    /// (a status with no app) before the next one is up. That is the
+    /// launch, and the new item stays.
+    #[gpui_kit::test]
+    fn a_change_of_the_app_for_a_new_item_keeps_the_item(cx: &mut TestAppContext) {
+        use crate::chromecast::session::{Event, Status};
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            // An app ran for the item before; the next item was just sent.
+            this.cast.cast_app_up = true;
+            this.cast.cast_item = Some(crate::app::race_harness::item("m2", "Two", "Movie"));
+            this.cast.cast_sent_at = Some(std::time::Instant::now());
+            this.on_cast_event(Event::Status(Status::default()), cx);
+            assert!(this.cast.cast_item.is_some(), "the launch of the next app dropped the new item");
+            // Later, the connection says the load still waits for its app.
+            this.cast.cast_sent_at = Some(std::time::Instant::now() - super::CAST_LAUNCH_GRACE);
+            this.on_cast_event(Event::Status(Status { launching: true, ..Default::default() }), cx);
+            assert!(this.cast.cast_item.is_some(), "a slow launch dropped the new item");
+            // The app came up and went within the same half minute: gone.
+            this.cast.cast_app_up = true;
+            // Long after the launch, the same status is the end of the app.
+            this.cast.cast_sent_at = Some(std::time::Instant::now() - super::CAST_LAUNCH_GRACE);
+            this.on_cast_event(Event::Status(Status::default()), cx);
+            assert!(this.cast.cast_item.is_none());
+        });
+    }
+
+    /// A status with no app before the app is up (the launch takes a
+    /// moment; a key on the remote of the TV sends one) does not drop the
+    /// item this app sent. It did: the chip showed the id as the title, and
+    /// leaving the device no longer stopped the item there. The item goes
+    /// when the app that ran is gone.
+    #[gpui_kit::test]
+    fn the_cast_item_stays_until_an_app_that_ran_is_gone(cx: &mut TestAppContext) {
+        use crate::chromecast::{messages::App, session::{Event, Status}};
+        let (bloom, cx) = app(cx);
+        let with_app = Status {
+            app: Some(App {
+                app_id: "F007D354".into(),
+                display_name: "Jellyfin".into(),
+                session_id: "s".into(),
+                transport_id: "t".into(),
+                status_text: String::new(),
+                is_idle_screen: false,
+                namespaces: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        bloom.update(cx, |this, cx| {
+            this.cast.cast_item = Some(crate::app::race_harness::item("m1", "One", "Movie"));
+            this.on_cast_event(Event::Status(Status::default()), cx);
+            assert!(this.cast.cast_item.is_some(), "a status during the launch dropped the item");
+            this.on_cast_event(Event::Status(with_app), cx);
+            assert!(this.cast.cast_item.is_some());
+            this.on_cast_event(Event::Status(Status::default()), cx);
+            assert!(this.cast.cast_item.is_none(), "the item stays though its app is gone");
+        });
+    }
 
     /// A server whose second list of the sessions lacks the TV.
     fn server() -> MockServer {

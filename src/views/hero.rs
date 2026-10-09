@@ -165,7 +165,6 @@ impl Bloom {
         self.hero_video.player.set_muted(self.hero_video.muted);
     }
 
-    /// Turns trailer backdrops on or off and keeps the choice.
     /// Liquid glass or the frosted glass of before, for every panel.
     pub fn toggle_liquid_glass(&mut self, cx: &mut Context<Self>) {
         let on = !self.config.liquid_glass.unwrap_or(true);
@@ -175,6 +174,7 @@ impl Bloom {
         cx.refresh_windows();
     }
 
+    /// Turns trailer backdrops on or off and keeps the choice.
     pub fn toggle_hero_video(&mut self, cx: &mut Context<Self>) {
         let enabled = !self.config.hero_video.unwrap_or(true);
         self.config.hero_video = Some(enabled);
@@ -193,7 +193,10 @@ impl Bloom {
 
     /// True while the hero is on screen.
     fn hero_visible(&self) -> bool {
+        // Not behind the sign-in page: the home page is still the page
+        // under it, and its trailer would play there.
         matches!(self.page, Page::Home(_))
+            && self.screen == crate::app::Screen::Main
             && !self.player_open
             && !self.hero.is_empty()
             && -f32::from(self.page_scroll.offset().y) < self.hero_height()

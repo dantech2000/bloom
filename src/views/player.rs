@@ -68,11 +68,7 @@ impl Bloom {
             // A click on the video closes the episode list when it is open;
             // otherwise it pauses or resumes.
             .on_click(cx.listener(|this, _, _, cx| {
-                if this.episode_picker.open || this.sync.panel_open || this.cast.panel_open || this.subs.panel_open {
-                    this.subs.panel_open = false;
-                    this.episode_picker.open = false;
-                    this.sync.panel_open = false;
-                    this.cast.panel_open = false;
+                if this.close_panels() {
                     cx.notify();
                 } else {
                     this.request_toggle_pause(cx)
@@ -538,11 +534,8 @@ impl Bloom {
                         "down" => this.nudge_volume(-5., window, cx),
                         "m" => this.toggle_mute(cx),
                         "f" => window.toggle_fullscreen(),
-                        "escape" if this.episode_picker.open || this.sync.panel_open || this.cast.panel_open || this.subs.panel_open => {
-                            this.subs.panel_open = false;
-                            this.episode_picker.open = false;
-                            this.sync.panel_open = false;
-                            this.cast.panel_open = false;
+                        "escape" if this.panel_open() => {
+                            this.close_panels();
                         }
                         "e" => this.toggle_episode_picker(window, cx),
                         "escape" => {

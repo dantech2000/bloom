@@ -378,7 +378,7 @@ impl Client {
     /// The rights of the user: may manage subtitles, is an administrator,
     /// and the subtitle language of the user.
     fn subtitle_rights(&self) -> Result<Rights> {
-        let me: Value = self.get("/Users/Me", &[])?;
+        let me: Value = self.me()?;
         let flag = |name: &str| {
             me.pointer(&format!("/Policy/{name}")).and_then(Value::as_bool).unwrap_or(false)
         };
@@ -528,7 +528,12 @@ impl Bloom {
                         }
                         cx.notify();
                     }
-                    Err(err) => log::warn!("subtitle rights: {err:#}"),
+                    // The next menu asks again: one failed request must not
+                    // hide the search for the whole session.
+                    Err(err) => {
+                        log::warn!("subtitle rights: {err:#}");
+                        this.subs.rights_asked = None;
+                    }
                 }
             },
         );

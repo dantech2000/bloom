@@ -148,6 +148,11 @@ impl Session {
             }
             Action::Load { item_id, playlist_item_id, position } => {
                 self.next_load += 1;
+                // The newest load is the one the group waits for. A load
+                // it replaced gets no answer (the player refuses it in
+                // silence), and a late answer of one must not count for
+                // the item of the newest.
+                self.loads.clear();
                 self.loads.insert(self.next_load, playlist_item_id);
                 self.sample = None;
                 // The server says how the item plays (see `stream`).

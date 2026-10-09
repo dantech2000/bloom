@@ -287,7 +287,7 @@ impl Client {
             #[serde(default)]
             enable_collection_management: bool,
         }
-        let me: Me = self.get("/Users/Me", &[])?;
+        let me: Me = serde_json::from_value(self.me()?)?;
         Ok(me.policy.is_administrator || me.policy.enable_collection_management)
     }
 }
@@ -591,7 +591,11 @@ impl Bloom {
                         Vec::new()
                     }
                 };
-                if let Some(Dialog::Add { lists: slot, .. }) = &mut this.lists.dialog {
+                // The dialog for this kind of list: the one for the other
+                // kind may be open by now.
+                if let Some(Dialog::Add { lists: slot, kind: open, .. }) = &mut this.lists.dialog
+                    && *open == kind
+                {
                     *slot = Some(lists);
                 }
                 cx.notify();
@@ -647,7 +651,14 @@ impl Bloom {
                 this.after_list_change(cx);
                 then(this, cx);
             }
-            Err(err) => this.toast(failed, format!("{err:#}"), cx),
+            // The page may show the change already (an entry moved at
+            // once): it loads again and shows what the server has.
+            Err(err) => {
+                this.toast(failed, format!("{err:#}"), cx);
+                if matches!(this.page, crate::app::Page::Playlist(_)) {
+                    this.load_page(cx);
+                }
+            }
         });
     }
 

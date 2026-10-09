@@ -855,7 +855,8 @@ impl Bloom {
                     let typed = values.first().map(|v| v.trim()).unwrap_or_default();
                     let value = match &kind {
                         Kind::Number { min, max, scale, whole, .. } => {
-                            let Ok(number) = typed.parse::<f64>() else {
+                            // "nan" parses as a number, and comes out as 0.
+                            let Some(number) = typed.parse::<f64>().ok().filter(|n| n.is_finite()) else {
                                 this.toast(label, "That is not a number.", cx);
                                 return;
                             };

@@ -507,6 +507,7 @@ impl Bloom {
         entries.push(
             MenuItem::new("menu.je.keys", "Keyboard shortcuts…").on_click(move |_, _, cx| {
                 this.update(cx, |this, cx| {
+                    this.close_panels();
                     this.enhanced.help_open = true;
                     cx.notify();
                 })
@@ -865,13 +866,15 @@ impl Bloom {
             self.enhanced.remote_activity,
             activity,
         );
+        // The state is named, not toggled: `paused` is from the last
+        // poll, and a toggle on an old value resumes what the user paused.
         if !in_view && !paused && wanted {
-            self.player.toggle_pause();
+            self.player.set_paused(true);
             self.enhanced.auto_paused = true;
         } else if in_view && self.enhanced.auto_paused {
             self.enhanced.auto_paused = false;
             if paused && self.je("auto_resume") {
-                self.player.toggle_pause();
+                self.player.set_paused(false);
             }
         }
     }
@@ -983,6 +986,8 @@ impl Bloom {
             return true;
         }
         if combo(event).as_deref() == Some("?") && self.je("shortcuts") {
+            // One popup at a time: the panels go as the list comes.
+            self.close_panels();
             self.enhanced.help_open = true;
             return true;
         }

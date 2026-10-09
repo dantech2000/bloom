@@ -119,7 +119,19 @@ fn connect(client: &Client) -> Result<Socket> {
     let uri = request.uri().clone();
     let host = uri.host().context("no host")?.to_string();
     let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
-    let stream = TcpStream::connect((host.as_str(), port)).context("connect")?;
+    // With a limit: the system waits over a minute for a host that does
+    // not answer, and the thread cannot see a stop meanwhile.
+    use std::net::ToSocketAddrs as _;
+    // Each address of the name in turn, as `TcpStream::connect` does: the
+    // first can be one this Mac does not reach (IPv6 with no route).
+    let mut stream = Err(anyhow!("the name has no address"));
+    for address in (host.as_str(), port).to_socket_addrs().context("resolve")? {
+        stream = TcpStream::connect_timeout(&address, Duration::from_secs(15)).context("connect");
+        if stream.is_ok() {
+            break;
+        }
+    }
+    let stream = stream?;
     stream.set_nodelay(true).ok();
     stream.set_read_timeout(Some(Duration::from_secs(15)))?;
     stream.set_write_timeout(Some(Duration::from_secs(15)))?;
@@ -170,7 +182,9 @@ fn serve(
                 match kind.as_str() {
                     // The server names its limit in seconds; answer at half.
                     "ForceKeepAlive" => {
-                        if let Some(limit) = data.as_f64().filter(|limit| *limit >= 2.) {
+                        // A number of seconds a day can hold: a huge one
+                        // would be a panic in `from_secs_f64`.
+                        if let Some(limit) = data.as_f64().filter(|limit| (2. ..=86_400.).contains(limit)) {
                             keep_alive = Duration::from_secs_f64(limit / 2.);
                         }
                         socket.send(Message::text(r#"{"MessageType":"KeepAlive"}"#))?;

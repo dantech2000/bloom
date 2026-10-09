@@ -54,6 +54,7 @@ pub struct Secret {
 impl Bloom {
     /// Shows a form; the action runs when the user submits it.
     pub fn ask_prompt(&mut self, prompt: Prompt, cx: &mut Context<Self>) {
+        self.close_panels();
         self.admin_prompt = Some(prompt);
         // The fields are cleared and focused in the next render, which has
         // the window.

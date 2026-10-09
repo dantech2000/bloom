@@ -126,6 +126,9 @@ impl Target {
             AirPlayEvent::Stopped | AirPlayEvent::Ended | AirPlayEvent::LoadFailed { .. } if !status.external => {
                 self.give_up_airplay()
             }
+            // Playback that failed after its start is over as well: the
+            // target does not stay on a receiver that plays nothing.
+            AirPlayEvent::State(AirPlayState::Failed) if !status.external => self.give_up_airplay(),
             _ => self,
         }
     }

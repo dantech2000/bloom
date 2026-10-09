@@ -266,19 +266,21 @@ impl MenuState {
     fn level(&self, depth: usize) -> &[MenuItem] {
         let mut items = self.items.as_slice();
         for &index in self.path.iter().take(depth) {
-            items = &items[index].children;
+            items = items.get(index).map_or(&[], |item| item.children.as_slice());
         }
         items
     }
     fn highlight(&mut self, depth: usize, index: usize, cx: &mut Context<Self>) {
-        if !self.level(depth)[index].enabled() {
+        // The rows on screen can be those of the entries before
+        // `set_items`: a place that is gone since is no entry.
+        if !self.level(depth).get(index).is_some_and(MenuItem::enabled) {
             return;
         }
         if self.highlighted.get(depth).copied().flatten() == Some(index) {
             return;
         }
         self.path.truncate(depth);
-        self.highlighted.truncate(depth + 1);
+        self.highlighted.resize(depth + 1, None);
         self.highlighted[depth] = Some(index);
         cx.notify();
     }
@@ -290,7 +292,9 @@ impl MenuState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let item = self.level(depth)[index].clone();
+        let Some(item) = self.level(depth).get(index).cloned() else {
+            return;
+        };
         if !item.enabled() {
             return;
         }

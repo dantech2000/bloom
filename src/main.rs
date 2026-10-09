@@ -41,7 +41,8 @@ mod subtitles;
 mod swipe;
 mod syncplay;
 mod trailer;
-#[allow(dead_code, unused_imports)]
+// The parts of the component kit that the app does not use yet.
+#[allow(dead_code)]
 mod ui;
 mod updates;
 mod video_surface;

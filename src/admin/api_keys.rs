@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use super::{
     Confirm, Field, Prompt, Secret, ago, card,
-    users::{AMBER, absolute, action, content_width, icon_disc, is_real_date, primary, stat},
+    users::{GREY, absolute, action, content_width, icon_disc, is_real_date, primary, stat},
 };
 use crate::{app::Bloom, jellyfin::Client, ui::theme::UiTheme};
 use crate::ui::tip::tip;
@@ -79,7 +79,8 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
             .items_center()
             .gap(px(14.))
             .hover(|s| s.bg(rgba(0xffffff0a)))
-            .child(icon_disc(LucideIcon::KeyRound, rgba(AMBER), 40.))
+            // A key is a thing, not a state: the quiet disc.
+            .child(icon_disc(LucideIcon::KeyRound, rgba(GREY), 40.))
             .child(
                 div()
                     .flex_1()

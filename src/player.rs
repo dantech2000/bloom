@@ -1152,6 +1152,17 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>) -> Result<()> {
         init.set_option("config", "no")?;
         init.set_option("sub-auto", "no")?;
         init.set_option("audio-display", "no")?;
+        // In a test the sound goes to mpv's null output, which keeps the
+        // time of a real one. The CoreAudio output listens for changes of
+        // the audio devices of the Mac, and that listener of libmpv
+        // crashed the test process when a device came or went while a
+        // core of a test closed (two runs on 2026-10-07, in
+        // `HALSystem::ObjectsPublishedAndDied`). The tests are muted in any
+        // case. `BLOOM_TEST_REAL_AUDIO=1` gives a test the real output.
+        #[cfg(test)]
+        if std::env::var_os("BLOOM_TEST_REAL_AUDIO").is_none() {
+            init.set_option("ao", "null")?;
+        }
         init.set_option(
             "user-agent",
             format!("{}/{}", crate::config::APP_NAME, crate::config::APP_VERSION),
@@ -1290,6 +1301,13 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>) -> Result<()> {
                     if handle_event(&event, &shared, &mut session, &mut worker) {
                         finish(&shared, &mut session, &mut worker);
                     }
+                }
+                // The end of a file that a new load replaced, when that
+                // file ended with an error: it comes as `Err` (below), and
+                // it is not the end of the item that loads now.
+                Err(libmpv2::Error::Raw(code)) if stale_ends > 0 => {
+                    stale_ends -= 1;
+                    log::debug!("mpv: the replaced file ended with an error ({code})");
                 }
                 // The wrapper reports events that carry an mpv error (such as a
                 // failed end-file) as `Err`; treat those as a failed load.
@@ -2540,6 +2558,9 @@ mod tests {
     #[test]
     #[ignore = "a measurement, not a check"]
     fn speed_change_position_error() {
+        // The turn of a test with the real player: a second player at the
+        // same time would spoil these numbers and the other test's.
+        let Some(_one) = real_player_turn() else { return };
         let Some(media) = test_clip("bloom-embedded-speed-test.mp4") else {
             return;
         };

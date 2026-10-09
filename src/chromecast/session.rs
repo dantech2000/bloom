@@ -54,6 +54,10 @@ pub struct Timing {
     pub read_wait: Duration,
     /// An answer that does not come in this time is given up.
     pub answer: Duration,
+    /// The same for a launch: a receiver app that starts cold takes
+    /// longer than a command, and a launch given up too soon is replaced
+    /// by the next app while the first still comes up.
+    pub launch: Duration,
 }
 
 impl Default for Timing {
@@ -63,9 +67,13 @@ impl Default for Timing {
             silence: Duration::from_secs(15),
             read_wait: Duration::from_millis(100),
             answer: Duration::from_secs(10),
+            launch: Duration::from_secs(30),
         }
     }
 }
+
+/// The refusal of a certificate that is not the one kept for the device.
+const OTHER_CERTIFICATE: &str = "the device shows another certificate than before";
 
 /// What the thread tells the app, at the moment it happens.
 #[derive(Clone, Debug)]
@@ -102,6 +110,8 @@ pub struct Status {
     /// The Jellyfin item that plays, from the report of the Jellyfin app.
     pub item_id: Option<String>,
     pub active_tracks: Vec<i64>,
+    /// A load waits for its app to come up.
+    pub launching: bool,
     /// Round trip of the last answered request.
     pub rtt_ms: Option<f64>,
     /// App id to APP_AVAILABLE or APP_UNAVAILABLE, from the last question.
@@ -173,6 +183,10 @@ enum Command {
 struct Shared {
     status: Mutex<Status>,
     stop: AtomicBool,
+    /// When the app sent a load that the thread has not taken yet. The
+    /// load is a command in a queue until then (behind a reconnect, or a
+    /// write that waits), and a status of that time is of before the load.
+    load_queued: Mutex<Option<Instant>>,
 }
 
 /// The handle of the app. Dropping it closes the connection.
@@ -199,7 +213,11 @@ impl Session {
     pub fn connect_with(device: Device, timing: Timing) -> (Self, async_channel::Receiver<Event>) {
         let (tx, rx) = async_channel::unbounded();
         let (commands, inbox) = mpsc::channel();
-        let shared = Arc::new(Shared { status: Mutex::new(Status::default()), stop: AtomicBool::new(false) });
+        let shared = Arc::new(Shared {
+            status: Mutex::new(Status::default()),
+            stop: AtomicBool::new(false),
+            load_queued: Mutex::new(None),
+        });
         let worker = Worker::new(device.clone(), timing, tx, shared.clone(), inbox);
         let _ = thread::Builder::new()
             .name(format!("cast-{}", device.name))
@@ -258,6 +276,7 @@ impl Session {
 
     /// Launches the right app when it does not run, then loads.
     pub fn load(&self, request: LoadRequest) {
+        *self.shared.load_queued.lock().unwrap() = Some(Instant::now());
         self.send(Command::Load(request));
     }
 
@@ -413,11 +432,14 @@ impl Worker {
     }
 
     fn run(mut self) {
+        // Connects in a row that the kept certificate refused.
+        let mut refused = 0;
         let (mut again, mut wait) = (false, Duration::from_secs(1));
         while !self.stopped() {
             match self.connect() {
                 Ok(mut stream) => {
                     wait = Duration::from_secs(1);
+                    refused = 0;
                     match self.serve(&mut stream, again) {
                         Ok(()) => {
                             let _ = stream.write_all(&self.frame(RECEIVER, NS_CONNECTION, messages::close()).frame());
@@ -441,6 +463,10 @@ impl Worker {
                     }
                     self.pending.clear();
                     self.seek_in_flight = None;
+                    // The launch went with the socket; a load that waited
+                    // for it must not play over whatever runs on the
+                    // device when the next socket opens.
+                    self.pending_load = None;
                     // The new socket must connect to the app again; the
                     // status that comes first says whether it still runs.
                     self.transport = None;
@@ -450,6 +476,20 @@ impl Worker {
                 Err(err) => {
                     log::warn!("cast {}: {err:#}", self.device.name);
                     self.emit(Event::Error(format!("{err:#}")));
+                    // A device makes itself a new certificate now and
+                    // then. The one kept from the first connection would
+                    // then refuse it at every try, for good: after three
+                    // tries in a row the next certificate is taken.
+                    // Only for that refusal: a device that is off or out of
+                    // reach must not cost the certificate that is kept.
+                    if format!("{err:#}").contains(OTHER_CERTIFICATE) {
+                        refused += 1;
+                    } else {
+                        refused = 0;
+                    }
+                    if refused >= 3 {
+                        *self.verifier.pinned.lock().unwrap() = None;
+                    }
                 }
             }
             // Wait in small steps, so a drop ends the thread soon.
@@ -632,8 +672,13 @@ impl Worker {
     /// Gives up answers that do not come: a seek that waited lets the
     /// next one go; a launch tries the next app, or fails the load.
     fn expire(&mut self, stream: &mut Stream) -> Result<()> {
-        let answer = self.timing.answer;
-        let late: Vec<u64> = self.pending.iter().filter(|(_, p)| p.sent.elapsed() > answer).map(|(id, _)| *id).collect();
+        let (answer, launch) = (self.timing.answer, self.timing.launch);
+        let late: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.sent.elapsed() > if matches!(p.waiting, Waiting::Launch { .. }) { launch } else { answer })
+            .map(|(id, _)| *id)
+            .collect();
         for id in late {
             match self.pending.remove(&id).map(|p| p.waiting) {
                 Some(Waiting::Seek) => self.seek_in_flight = None,
@@ -669,8 +714,14 @@ impl Worker {
 
     /// Copies the status for the app and tells it.
     fn publish(&self) {
-        *self.shared.status.lock().unwrap() = self.status.clone();
-        self.emit(Event::Status(self.status.clone()));
+        let mut status = self.status.clone();
+        // A load waits for its app, or is still on its way to this thread
+        // (for as long as a launch may take: a load that was dropped on
+        // the way must not count for ever).
+        let queued = self.shared.load_queued.lock().unwrap().is_some_and(|at| at.elapsed() < self.timing.launch);
+        status.launching = self.pending_load.is_some() || queued;
+        *self.shared.status.lock().unwrap() = status.clone();
+        self.emit(Event::Status(status));
     }
 
     fn frame(&self, destination: &str, namespace: &str, payload: Value) -> CastMessage {
@@ -728,22 +779,38 @@ impl Worker {
                 self.request(stream, RECEIVER, NS_RECEIVER, messages::get_status(0), Waiting::Quiet)?;
                 self.pending_join = true;
             }
-            Command::StopApp => match self.status.app.clone() {
-                Some(app) => {
-                    self.request(stream, RECEIVER, NS_RECEIVER, messages::stop_app(0, &app.session_id), Waiting::Quiet)?;
+            // A stop also ends a load that still waits for its app: the
+            // item must not start on the device seconds after the stop.
+            Command::StopApp => {
+                self.pending_load = None;
+                match self.status.app.clone() {
+                    Some(app) => {
+                        self.request(stream, RECEIVER, NS_RECEIVER, messages::stop_app(0, &app.session_id), Waiting::Quiet)?;
+                    }
+                    None => self.fail("no app runs"),
                 }
-                None => self.fail("no app runs"),
-            },
+            }
             Command::SetVolume(level) => {
                 self.request(stream, RECEIVER, NS_RECEIVER, messages::set_volume(0, level), Waiting::Quiet)?;
             }
             Command::SetMuted(muted) => {
                 self.request(stream, RECEIVER, NS_RECEIVER, messages::set_muted(0, muted), Waiting::Quiet)?;
             }
-            Command::Load(request) => self.load(stream, request)?,
+            Command::Load(request) => {
+                // The load is this thread's now: it waits for its app
+                // (`pending_load`) or goes to the app that runs.
+                *self.shared.load_queued.lock().unwrap() = None;
+                self.load(stream, request)?
+            }
             Command::Play => self.media_command(stream, jellyfin::unpause, |id| messages::play(0, id))?,
             Command::Pause => self.media_command(stream, jellyfin::pause, |id| messages::pause(0, id))?,
-            Command::StopMedia => self.media_command(stream, jellyfin::stop, |id| messages::media_stop(0, id))?,
+            Command::StopMedia => {
+                // With a load that waits for its app there is nothing to
+                // stop yet, and the stop is the end of that load.
+                if self.pending_load.take().is_none() || self.app_transport().is_some() {
+                    self.media_command(stream, jellyfin::stop, |id| messages::media_stop(0, id))?
+                }
+            }
             Command::Seek(secs) => {
                 if self.seek_in_flight.is_some() {
                     self.seek_queued = Some(secs);
@@ -931,6 +998,10 @@ impl Worker {
             self.status.rtt_ms = Some(pending.sent.elapsed().as_secs_f64() * 1000.);
         }
         if let Some(text) = messages::error_text(&payload) {
+            // The load that waits for the app goes with the launch that
+            // failed, and with no other error: a refused seek or volume
+            // says nothing about it.
+            let of_launch = matches!(pending, Some(Pending { waiting: Waiting::Launch { .. }, .. }));
             match pending {
                 Some(Pending { waiting: Waiting::Launch { rest }, .. }) if !rest.is_empty() => {
                     log::info!("cast {}: {text}; next app", self.device.name);
@@ -942,7 +1013,9 @@ impl Worker {
                 Some(Pending { waiting: Waiting::Seek, .. }) => self.seek_in_flight = None,
                 _ => {}
             }
-            self.pending_load = None;
+            if of_launch {
+                self.pending_load = None;
+            }
             self.fail(text);
             return Ok(());
         }
@@ -956,6 +1029,8 @@ impl Worker {
                 // The app went away.
                 if payload["type"] == "CLOSE" && self.transport.as_deref() == Some(&message.source) {
                     self.app_gone();
+                    // The panel hears of it now, not at the next status.
+                    self.publish();
                 }
             }
             NS_RECEIVER => {
@@ -1104,6 +1179,9 @@ impl Worker {
         self.status.player_state = String::new();
         self.status.content_id = None;
         self.status.item_id = None;
+        // The length is of the item that is gone: the next one must not
+        // show it until its own report comes.
+        self.status.duration = None;
         self.seek_in_flight = None;
         self.seek_queued = None;
     }
@@ -1202,7 +1280,7 @@ impl ServerCertVerifier for DeviceCertificate {
         let mut pinned = self.pinned.lock().unwrap();
         match &*pinned {
             Some(known) if known.as_slice() != end_entity.as_ref() => {
-                Err(rustls::Error::General("the device shows another certificate than before".into()))
+                Err(rustls::Error::General(OTHER_CERTIFICATE.into()))
             }
             Some(_) => Ok(ServerCertVerified::assertion()),
             None => {
@@ -1252,6 +1330,7 @@ mod tests {
             silence: Duration::from_secs(3),
             read_wait: Duration::from_millis(10),
             answer: Duration::from_secs(2),
+            launch: Duration::from_secs(2),
         }
     }
 
@@ -1482,6 +1561,7 @@ mod tests {
             silence: Duration::from_millis(400),
             read_wait: Duration::from_millis(10),
             answer: Duration::from_secs(1),
+            launch: Duration::from_secs(1),
         };
         let (session, events) = Session::connect_with(mock.device(), short);
         let mut log = Vec::new();
@@ -1561,6 +1641,7 @@ mod tests {
             silence: Duration::from_secs(5),
             read_wait: Duration::from_millis(10),
             answer: Duration::from_secs(1),
+            launch: Duration::from_secs(1),
         }
     }
 
@@ -1761,6 +1842,51 @@ mod tests {
         session.load(request());
         until(&session, &events, &mut log, "error after the silence", 8., |s| s.error.is_some());
         assert_eq!(errors(&log), ["the device did not answer the launch"]);
+    }
+
+    /// A load counts as a launch from the moment the app sends it, also
+    /// while it still waits in the queue of the thread, until the item is
+    /// in its app: a status of that time must not read as "no app, so the
+    /// item is gone".
+    #[test]
+    fn a_load_counts_as_a_launch_until_it_is_in_its_app() {
+        let mock = Mock::start();
+        let (session, events) = Session::connect_with(mock.device(), timing());
+        let mut log = Vec::new();
+        until(&session, &events, &mut log, "connect", 5., |s| s.connected);
+        assert!(!session.status().launching);
+        // Only what comes after the load counts below.
+        log.clear();
+        session.load(request());
+        assert!(session.shared.load_queued.lock().unwrap().is_some(), "the load is not noted as on its way");
+        let status = until(&session, &events, &mut log, "playing", 6., |s| s.player_state == "PLAYING");
+        assert!(!status.launching, "the launch is not over though the item plays");
+        assert!(session.shared.load_queued.lock().unwrap().is_none());
+        // No status between the load and the app said "no app, no launch".
+        let dropped = log.iter().any(|event| matches!(event, Event::Status(s) if s.app.is_none() && !s.launching));
+        assert!(!dropped, "a status after the load says no app and no launch");
+    }
+
+    /// A stop while the app of a load still launches ends the load: the
+    /// item does not start on the device after the stop. The Jellyfin app
+    /// hangs here, the media receiver comes up as the next app, and
+    /// nothing is loaded into it. Before, the stop found "no app" and the
+    /// load stayed, to play seconds later.
+    #[test]
+    fn a_stop_during_the_launch_ends_the_load() {
+        let mock = Mock::start();
+        let (session, events) = Session::connect_with(mock.device(), timing());
+        let mut log = Vec::new();
+        until(&session, &events, &mut log, "connect", 5., |s| s.connected);
+        mock.set(|m| m.ignores = vec![jellyfin::APP_STABLE.into()]);
+        session.load(request());
+        thread::sleep(Duration::from_millis(100));
+        session.stop_media();
+        // The launch of the first app is given up and the next app comes.
+        until(&session, &events, &mut log, "the next app", 6., |s| s.app.is_some());
+        thread::sleep(Duration::from_millis(500));
+        assert!(mock.state.lock().unwrap().media.is_none(), "the item plays after the stop");
+        assert_eq!(media_count(&mock, "LOAD"), 0);
     }
 
     /// A seek while the media receiver is paused leaves it paused, as the
