@@ -841,6 +841,63 @@ impl Bloom {
                 self.player.set_property(name, value);
                 return format!("set {name}");
             }
+            // The events for other programs (`events.rs`): `stream on`,
+            // `stream off`, `stream titles on|off`, and the state.
+            "stream" => {
+                match rest {
+                    "on" => self.set_events(true, cx),
+                    "off" => self.set_events(false, cx),
+                    "titles on" => self.set_events_titles(true, cx),
+                    "titles off" => self.set_events_titles(false, cx),
+                    "colours on" => self.set_events_colours(true, cx),
+                    "colours off" => self.set_events_colours(false, cx),
+                    // The newest look at the picture, top band first.
+                    "colours" => return format!("stream colours {:?}", self.player.colours()),
+                    // The lights: the helper, a look for lights, the list,
+                    // a light chosen or told to blink by its place in it.
+                    "helper on" => self.set_lights(true, cx),
+                    "helper off" => self.set_lights(false, cx),
+                    "scan" => self.lights_scan(cx),
+                    "lamps" => {}
+                    // The events of a short film, with no film.
+                    "test" => return format!("stream test: {}", self.events_test_run(cx)),
+                    _ => {}
+                }
+                let row = |text: &str| text.parse::<usize>().ok().and_then(|at| self.lights_rows().into_iter().nth(at));
+                if let Some((lamp, _)) = rest.strip_prefix("choose ").and_then(row) {
+                    self.lights_choose(&lamp, cx);
+                } else if let Some((lamp, _)) = rest.strip_prefix("identify ").and_then(row) {
+                    self.lights_identify(&lamp, cx);
+                }
+                if ["helper", "scan", "lamps", "choose", "identify"].iter().any(|verb| rest.starts_with(verb)) {
+                    let rows: Vec<String> = self.lights_rows().iter().map(|(lamp, chosen)| format!("{}{lamp}", if *chosen { "*" } else { " " })).collect();
+                    return format!("stream lights helper={} lamps=[{}]", self.lights_on(), rows.join(" "));
+                }
+                // `stream lights film=8 gap=0.5 colour=artwork`: the lights
+                // lab, as its sliders set it.
+                if let Some(pairs) = rest.strip_prefix("lights") {
+                    let wrong: Vec<&str> = pairs
+                        .split_whitespace()
+                        .filter(|pair| !pair.split_once('=').is_some_and(|(name, value)| self.lights_set(name, value, cx)))
+                        .collect();
+                    return format!(
+                        "stream lights {} colour_seen={:?} file={}{}",
+                        self.lights_json(cx),
+                        self.events.colour,
+                        crate::events::lights_path(),
+                        if wrong.is_empty() { String::new() } else { format!(" not set: {}", wrong.join(" ")) }
+                    );
+                }
+                let hub = crate::events::hub();
+                return format!(
+                    "stream on={} titles={} readers={} closed_slow={} socket={}",
+                    hub.on(),
+                    self.config.events_titles == Some(true),
+                    hub.readers(),
+                    hub.closed_slow.load(std::sync::atomic::Ordering::Relaxed),
+                    crate::events::socket_path()
+                );
+            }
             // Quits as the menu does, so the quit path can be tested.
             "quit" => {
                 cx.quit();

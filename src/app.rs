@@ -457,6 +457,8 @@ pub struct Bloom {
     pub chromecast: crate::chromecast::State,
     /// Downloads for offline use and the offline mode.
     pub downloads: crate::downloads::DownloadsState,
+    /// Events for other programs (src/events.rs).
+    pub events: crate::events::State,
     /// Whether the server answers (src/connection.rs).
     pub connection: crate::connection::ConnectionState,
     pub subtitle_menu: Entity<MenuState>,
@@ -829,6 +831,7 @@ impl Bloom {
             stream: Default::default(),
             chromecast: Default::default(),
             downloads: Default::default(),
+            events: Default::default(),
             connection: Default::default(),
             subtitle_menu,
             subs: Default::default(),
@@ -871,6 +874,8 @@ impl Bloom {
         }
         this.rebuild_menu(cx);
         this.start_debug_channel(window, cx);
+        this.start_events();
+        this.start_lights(cx);
         this.start_hero_tick(window, cx);
         // The red button and cmd-w: playback stops the way the Stop button
         // stops it (the position is reported) before the window goes; the
@@ -1139,6 +1144,7 @@ impl Bloom {
         self.page = Page::Home(HomeData::default());
         // The home page loads the libraries with its own data.
         self.load_page(cx);
+        self.events_page(cx);
         self.rebuild_menu(cx);
         cx.notify();
         true
@@ -1160,6 +1166,7 @@ impl Bloom {
         self.clear_history();
         self.views.clear();
         self.page = Page::Home(HomeData::default());
+        self.events_page(cx);
         self.screen = Screen::Connect;
         self.rebuild_menu(cx);
         cx.notify();
@@ -1199,6 +1206,12 @@ impl Bloom {
             self.menus_fullscreen = fullscreen;
             crate::menus::set_menus(cx, fullscreen);
         }
+    }
+
+    /// Whether the window is full screen, as the bounds observer last saw
+    /// it; for the events, which have no window at hand.
+    pub(crate) fn events_fullscreen(&self) -> bool {
+        self.menus_fullscreen
     }
 
     /// Card and padding sizes for the current window width.
@@ -1302,6 +1315,7 @@ impl Bloom {
         self.forward.clear();
         self.forward_scroll.clear();
         self.load_page(cx);
+        self.events_page(cx);
         cx.notify();
     }
 
@@ -1354,6 +1368,7 @@ impl Bloom {
         } else {
             self.next_generation();
         }
+        self.events_page(cx);
         cx.notify();
         (left, left_offset)
     }
@@ -1376,6 +1391,7 @@ impl Bloom {
         self.forget_admin_dialogs();
         self.clear_history();
         self.page = Page::Home(HomeData::default());
+        self.events_page(cx);
         self.load_page(cx);
         cx.notify();
     }
@@ -1393,6 +1409,7 @@ impl Bloom {
         self.forget_admin_dialogs();
         self.clear_history();
         self.page = Page::Library(LibraryData::new(view));
+        self.events_page(cx);
         self.rebuild_library_menus(cx);
         self.load_page(cx);
         cx.notify();
@@ -2900,6 +2917,8 @@ impl Bloom {
 
     pub fn close_player_view(&mut self, cx: &mut Context<Self>) {
         self.player_open = false;
+        // The end of the playback is an event, at once.
+        self.events_tick(cx);
         // The preview sheets of the timeline are not needed any more.
         crate::images::preload(Vec::new(), cx);
         self.news_player_closed(cx);
@@ -3163,6 +3182,7 @@ impl Bloom {
                         }
                         this.enhanced_tick(cx);
                         this.adaptive_tick(cx);
+                        this.events_tick(cx);
                         // At the end of a file the queue goes on.
                         // In a group the group decides what comes after an item.
                         let ended = ended && !this.sync.holds_player() && !this.advance_at_end(cx);

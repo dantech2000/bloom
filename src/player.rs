@@ -369,6 +369,13 @@ struct Shared {
     /// In a SyncPlay group: read at each load, as the group can be joined
     /// before the worker runs.
     in_group: AtomicBool,
+    /// Something reads the colours of the picture (the events for other
+    /// programs): the render thread then looks at a frame some times a
+    /// second. `colours` has the count of the looks and the newest bands,
+    /// from the top of the picture to its bottom.
+    colours_on: AtomicBool,
+    colours_ns: AtomicU64,
+    colours: Mutex<(u64, Vec<[u8; 3]>)>,
     /// The display link, once the worker has started it (display pacing).
     clock: Mutex<Option<DisplayClock>>,
     /// mpv's own view of the display sync, for `dev/jctl pacing clock`.
@@ -504,6 +511,9 @@ impl Default for Player {
                 ui_seen_ns: AtomicU64::new(0),
                 display: AtomicU32::new(0),
                 in_group: AtomicBool::new(false),
+                colours_on: AtomicBool::new(false),
+                colours_ns: AtomicU64::new(0),
+                colours: Mutex::new((0, Vec::new())),
                 clock: Mutex::new(None),
                 sync_info: Mutex::new(String::new()),
             }),
@@ -603,6 +613,35 @@ impl Player {
     /// The display the window is on; the display link follows it.
     pub fn set_display(&self, display: u32) {
         self.shared.display.store(display, Ordering::Relaxed);
+    }
+
+    /// Looks at the colours of the picture some times a second, or not.
+    pub fn watch_colours(&self, on: bool) {
+        // On again after a time off: the colours of the last look are of
+        // another moment, and must not be told as those of this one.
+        if on && !self.shared.colours_on.swap(on, Ordering::Relaxed) {
+            self.shared.colours.lock().unwrap().1.clear();
+        } else {
+            self.shared.colours_on.store(on, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn watches_colours(&self) -> bool {
+        self.shared.colours_on.load(Ordering::Relaxed)
+    }
+
+    /// Bands as the render thread would leave them, for a test.
+    #[cfg(test)]
+    pub fn put_colours(&self, bands: Vec<[u8; 3]>) {
+        let mut colours = self.shared.colours.lock().unwrap();
+        *colours = (colours.0 + 1, bands);
+    }
+
+    /// The count of the looks at the picture, and the colours of the
+    /// newest one: bands from the top of the picture to its bottom.
+    pub fn colours(&self) -> (u64, Vec<[u8; 3]>) {
+        self.shared.colours.lock().unwrap().clone()
     }
 
     /// In a SyncPlay group or not: chooses the video-sync mode of mpv.
@@ -1923,6 +1962,14 @@ fn next_frame_info(renderer: &Renderer) -> sys::mpv_render_frame_info {
 /// `frame_size`), then publishes its GPU surface.
 /// With `skip` mpv takes the frame as rendered and nothing is drawn.
 /// `synced` says the frame is in display sync: made for the next refresh.
+/// The bands the colours of the picture are told in, and the least time
+/// between two looks at a frame. Under the time of two frames of a film
+/// (83.3 ms at 24 a second) by a margin, so each second frame is looked at
+/// and a frame that comes a little early does not move the look to the
+/// third: 12 looks a second for a film, 10 to 15 for other rates.
+pub const COLOUR_BANDS: usize = 14;
+const COLOURS_EVERY_NS: u64 = 75_000_000;
+
 fn render_frame(renderer: &mut Renderer, shared: &Shared, skip: bool, synced: bool) -> Result<()> {
     // The time of the tick a frame in display sync is made after. A frame
     // with audio timing waits in the render call for its time instead and
@@ -1989,6 +2036,16 @@ fn render_frame(renderer: &mut Renderer, shared: &Shared, skip: bool, synced: bo
     let code = unsafe { sys::mpv_render_context_render(renderer.ctx, params.as_mut_ptr()) };
     if code < 0 {
         return Err(anyhow!("mpv_render_context_render failed ({code})"));
+    }
+    if shared.colours_on.load(Ordering::Relaxed) {
+        let now = clock_ns();
+        if now.saturating_sub(shared.colours_ns.load(Ordering::Relaxed)) >= COLOURS_EVERY_NS {
+            shared.colours_ns.store(now, Ordering::Relaxed);
+            // The first row of the surface is the top of the picture.
+            let bands = renderer.gl.colours(COLOUR_BANDS);
+            let mut colours = shared.colours.lock().unwrap();
+            *colours = (colours.0 + 1, bands);
+        }
     }
     let frame = renderer.gl.finish()?;
     let seq = shared.publish(Some(frame), tick, vsync);

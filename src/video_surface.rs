@@ -197,6 +197,34 @@ impl GlRenderer {
         (bars[0] < width / 2 && agree).then(|| bars[0].min(bars[1]))
     }
 
+    /// The colours of the frame mpv rendered since `begin`: the mean
+    /// colour of each of `bands` bands of the picture, in the order of the
+    /// rows of the surface. Black bars at the two edges are left out. All
+    /// black for a black frame. Reads a few columns of the frame, which
+    /// waits for the GPU: for some calls a second, not for each frame.
+    pub fn colours(&mut self, bands: usize) -> Vec<[u8; 3]> {
+        const DARK: u8 = 24;
+        let (width, height) = self.size;
+        let rows = height as usize;
+        let parts = [0.08, 0.2, 0.32, 0.44, 0.56, 0.68, 0.8, 0.92];
+        let mut columns = vec![0u8; rows * 4 * parts.len()];
+        unsafe { gl::glBindFramebuffer(gl::FRAMEBUFFER, self.pool[self.next].fbo) };
+        for (column, part) in columns.chunks_exact_mut(rows * 4).zip(parts) {
+            unsafe {
+                gl::glReadPixels(
+                    (width as f32 * part) as i32,
+                    0,
+                    1,
+                    height as i32,
+                    gl::BGRA,
+                    gl::UNSIGNED_BYTE,
+                    column.as_mut_ptr().cast(),
+                );
+            }
+        }
+        band_colours(&columns, rows, bands, DARK)
+    }
+
     /// Returns the surface of the frame mpv rendered since `begin`.
     pub fn finish(&mut self) -> Result<VideoFrame> {
         let target = &self.pool[self.next];
@@ -295,6 +323,42 @@ impl Drop for GlRenderer {
             gl::CGLReleaseContext(self.ctx);
         }
     }
+}
+
+/// The mean colour of each band of some columns of BGRA pixels, each
+/// `rows` long. The bands share the rows between the first and the last
+/// row with a pixel brighter than `dark` in any column.
+fn band_colours(columns: &[u8], rows: usize, bands: usize, dark: u8) -> Vec<[u8; 3]> {
+    let bright = |row: usize| {
+        columns.chunks_exact(rows * 4).any(|column| column[row * 4..row * 4 + 3].iter().any(|c| *c > dark))
+    };
+    let (Some(first), Some(last)) = ((0..rows).find(|row| bright(*row)), (0..rows).rev().find(|row| bright(*row)))
+    else {
+        return vec![[0; 3]; bands];
+    };
+    let picture = last + 1 - first;
+    // A column in a bar at the side of the picture (a narrow film in a wide
+    // video) has no bright pixel, and is left out of the means.
+    let lit: Vec<bool> = columns
+        .chunks_exact(rows * 4)
+        .map(|column| (first..=last).any(|row| column[row * 4..row * 4 + 3].iter().any(|c| *c > dark)))
+        .collect();
+    (0..bands)
+        .map(|band| {
+            let (from, to) = (first + picture * band / bands, first + picture * (band + 1) / bands);
+            let mut sum = [0u64; 3];
+            let mut count = 0u64;
+            // Some rows of a band say as much as all of them.
+            for row in (from..to.max(from + 1).min(rows)).step_by(((to - from) / 12).max(1)) {
+                for column in columns.chunks_exact(rows * 4).zip(&lit).filter_map(|(column, lit)| lit.then_some(column)) {
+                    let pixel = &column[row * 4..row * 4 + 3];
+                    sum = [sum[0] + u64::from(pixel[2]), sum[1] + u64::from(pixel[1]), sum[2] + u64::from(pixel[0])];
+                    count += 1;
+                }
+            }
+            sum.map(|part| (part / count.max(1)) as u8)
+        })
+        .collect()
 }
 
 /// Symbol lookup mpv uses to load OpenGL functions.
@@ -404,5 +468,32 @@ mod gl {
 
     unsafe extern "C" {
         pub fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+}
+
+#[cfg(test)]
+mod colour_tests {
+    use super::band_colours;
+
+    /// Bars at the two edges are left out, and each band has the mean
+    /// colour of its rows; a black frame has no colour.
+    #[test]
+    fn the_bands_of_a_picture_leave_its_bars_out() {
+        // Two columns of 12 rows: 2 rows of bar, 4 red, 4 blue, 2 of bar.
+        let row = |r: u8, g: u8, b: u8| [b, g, r, 255];
+        let column: Vec<u8> = (0..12)
+            .flat_map(|y| match y {
+                2..6 => row(200, 0, 0),
+                6..10 => row(0, 0, 100),
+                _ => row(3, 3, 3),
+            })
+            .collect();
+        let columns = [column.clone(), column].concat();
+        assert_eq!(band_colours(&columns, 12, 2, 24), [[200, 0, 0], [0, 0, 100]]);
+        assert_eq!(band_colours(&columns, 12, 4, 24), [[200, 0, 0], [200, 0, 0], [0, 0, 100], [0, 0, 100]]);
+        assert_eq!(band_colours(&vec![3u8; 96], 12, 3, 24), [[0; 3]; 3]);
+        // A black column at the side of the picture does not darken it.
+        let with_bar = [columns.clone(), vec![3u8; 48]].concat();
+        assert_eq!(band_colours(&with_bar, 12, 2, 24), [[200, 0, 0], [0, 0, 100]]);
     }
 }

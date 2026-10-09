@@ -631,6 +631,33 @@ fn a_change_of_the_server_clears_the_typed_password(cx: &mut TestAppContext) {
     cx.run_until_parked();
 }
 
+/// The render thread looks at the picture for the events only while a
+/// program can get the colours: the setting for the colours off, or the
+/// stream off, ends the looks (the tick that would end them does not run
+/// with the stream off). And colours of a look before a time off are not
+/// those of the picture when the looks begin again.
+#[gpui_kit::test]
+fn the_looks_at_the_picture_end_with_their_setting(cx: &mut TestAppContext) {
+    let (bloom, cx) = app(cx);
+    cx.run_until_parked();
+    bloom.update(cx, |this, cx| {
+        this.player.watch_colours(true);
+        this.player.put_colours(vec![[1, 2, 3]]);
+        assert_eq!(this.player.colours().1, [[1, 2, 3]]);
+        this.set_events_colours(false, cx);
+        assert!(!this.player.watches_colours(), "the colours setting is off and the render thread still looks");
+        this.player.watch_colours(true);
+        assert!(this.player.colours().1.is_empty(), "the colours of an older look are still there");
+        // On while on keeps what the render thread found.
+        this.player.put_colours(vec![[4, 5, 6]]);
+        this.player.watch_colours(true);
+        assert_eq!(this.player.colours().1, [[4, 5, 6]]);
+        this.set_events(false, cx);
+        assert!(!this.player.watches_colours(), "the stream is off and the render thread still looks");
+    });
+    cx.run_until_parked();
+}
+
 /// A setting that changes many times in a row is saved once, when the
 /// changes stop; and a save that still waits is written at once on the way
 /// out of the window, as its task ends with the window.

@@ -1,0 +1,10 @@
+#!/bin/sh
+# Prints the events of a running Bloom, one line of JSON for each, until
+# the app or this script ends. The stream must be on: Settings > Automation,
+# "Events for other programs", or `dev/jctl stream on`.
+# The socket: BLOOM_EVENTS_SOCK, else the one of the instance named by
+# BLOOM_TEST_NAME, else the one of the app.
+sock=$BLOOM_EVENTS_SOCK
+[ -n "$sock" ] || sock="$HOME/Library/Application Support/bloom/events${BLOOM_TEST_NAME:+-$BLOOM_TEST_NAME}.sock"
+[ -S "$sock" ] || { echo "no event stream at $sock (turn it on in Settings > Automation)" >&2; exit 1; }
+exec nc -U "$sock" </dev/null

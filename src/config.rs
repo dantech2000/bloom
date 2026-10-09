@@ -71,6 +71,21 @@ pub struct Config {
     /// tool on this Mac can drive the app. Off unless set to true.
     #[serde(default)]
     pub debug_channel: Option<bool>,
+    /// Events for other programs (`events.rs`): a read-only stream on a
+    /// socket in the folder of the app. Off unless set to true.
+    #[serde(default)]
+    pub events: Option<bool>,
+    /// The events name the title of what plays. Off unless set to true:
+    /// without it an event has the id and the kind of the item only.
+    #[serde(default)]
+    pub events_titles: Option<bool>,
+    /// The events tell the colours of the picture, some times a second.
+    #[serde(default)]
+    pub events_colours: Option<bool>,
+    /// The helper that drives the lights runs (experimental): Bloom starts
+    /// it, and it reads the events.
+    #[serde(default)]
+    pub lights: Option<bool>,
     /// The speed of the connection at the last measurement, in bits per
     /// second, and when (seconds since the Unix epoch).
     #[serde(default)]

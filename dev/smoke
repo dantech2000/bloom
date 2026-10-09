@@ -157,7 +157,7 @@ for dialog in newkey newuser secret; do
 done
 page dialog-authorize authorize
 ctl authorize-close >/dev/null 2>&1
-for section in profile playback subtitles home display; do
+for section in profile playback subtitles home display automation; do
   page "settings-$section" settings "$section"
 done
 page dialog-password settings password

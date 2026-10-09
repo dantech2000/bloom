@@ -1023,8 +1023,19 @@ fn fits_in_memory(width: u32, height: u32) -> bool {
 /// Decodes to the BGRA pixels GPUI paints. Only the first frame is kept; the
 /// encoded bytes are dropped by the caller.
 fn decode(format: ImageFormat, bytes: &[u8]) -> anyhow::Result<RenderImage> {
+    if format == ImageFormat::Svg {
+        return decode_svg(bytes);
+    }
+    let mut data = rgba(format, bytes)?;
+    for pixel in data.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    Ok(RenderImage::new(SmallVec::from_elem(Frame::new(data), 1)))
+}
+
+/// The pixels of an encoded picture, red first.
+fn rgba(format: ImageFormat, bytes: &[u8]) -> anyhow::Result<image::RgbaImage> {
     let format = match format {
-        ImageFormat::Svg => return decode_svg(bytes),
         ImageFormat::Png => image::ImageFormat::Png,
         ImageFormat::Jpeg => image::ImageFormat::Jpeg,
         ImageFormat::Webp => image::ImageFormat::WebP,
@@ -1042,11 +1053,13 @@ fn decode(format: ImageFormat, bytes: &[u8]) -> anyhow::Result<RenderImage> {
     let orientation = decoder.orientation()?;
     let mut image = DynamicImage::from_decoder(decoder)?;
     image.apply_orientation(orientation);
-    let mut data = image.into_rgba8();
-    for pixel in data.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
-    Ok(RenderImage::new(SmallVec::from_elem(Frame::new(data), 1)))
+    Ok(image.into_rgba8())
+}
+
+/// The pixels of an encoded picture, for a look at its colours
+/// (`events::artwork_colour`). Blocks for the decode.
+pub fn pixels(bytes: &[u8]) -> anyhow::Result<image::RgbaImage> {
+    rgba(sniff(bytes).ok_or_else(|| anyhow::anyhow!("unknown image type"))?, bytes)
 }
 
 /// Longest side of a drawn SVG, in pixels. Enough for a card at 2x scale.

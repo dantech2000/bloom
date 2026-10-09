@@ -15,6 +15,7 @@ mod credits;
 mod debug;
 mod downloads;
 mod enhanced;
+mod events;
 mod hidden;
 mod icons;
 mod images;
