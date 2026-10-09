@@ -8,7 +8,14 @@
 # With BLOOM_CONFIG_PATH set, the instance uses (and may write) that config.
 dir=$(cd "$(dirname "$0")/.." && pwd)
 name=${BLOOM_TEST_NAME:-test}
-[ -f /tmp/bloom-$name.pid ] && kill "$(cat /tmp/bloom-$name.pid)" 2>/dev/null
+# Stops the process of a pid file when it is still Bloom: after a quit by
+# hand the number can be another program's by now.
+stop_old() {
+  [ -f "$1" ] || return 0
+  old=$(cat "$1")
+  case $(ps -p "$old" -o comm= 2>/dev/null) in *[Bb]loom*) kill "$old" 2>/dev/null ;; esac
+}
+stop_old /tmp/bloom-$name.pid
 rm -f /tmp/bloom-$name.pid
 [ "$1" = stop ] && exit 0
 sleep 1

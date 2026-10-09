@@ -7,7 +7,14 @@
 #   Stop it with:   dev/run-second stop
 dir=$(cd "$(dirname "$0")/.." && pwd)
 config="$HOME/Library/Application Support/bloom/second-device.json"
-[ -f /tmp/bloom-second.pid ] && kill "$(cat /tmp/bloom-second.pid)" 2>/dev/null
+# Stops the process of a pid file when it is still Bloom: after a quit by
+# hand the number can be another program's by now.
+stop_old() {
+  [ -f "$1" ] || return 0
+  old=$(cat "$1")
+  case $(ps -p "$old" -o comm= 2>/dev/null) in *[Bb]loom*) kill "$old" 2>/dev/null ;; esac
+}
+stop_old /tmp/bloom-second.pid
 rm -f /tmp/bloom-second.pid
 [ "$1" = stop ] && exit 0
 sleep 1

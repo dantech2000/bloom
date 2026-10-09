@@ -3,7 +3,23 @@
 dir=$(cd "$(dirname "$0")/.." && pwd)
 # The binary runs from a light bundle, so the menu bar shows the app's name.
 bin=$("$dir/dev/devapp") || exit 1
-[ -f /tmp/bloom.pid ] && kill "$(cat /tmp/bloom.pid)" 2>/dev/null; sleep 1
+# Stops the process of a pid file when it is still Bloom: after a quit by
+# hand the number can be another program's by now.
+stop_old() {
+  [ -f "$1" ] || return 0
+  old=$(cat "$1")
+  case $(ps -p "$old" -o comm= 2>/dev/null) in *[Bb]loom*) kill "$old" 2>/dev/null ;; esac
+}
+# Not while its player is in use: a restart would cut what plays.
+# BLOOM_RUN_FORCE=1 restarts all the same.
+if [ -z "$BLOOM_RUN_FORCE" ] && [ -S "${BLOOM_DEBUG_SOCK:-/tmp/bloom-debug.sock}" ]; then
+  case $("$dir/dev/jctl" state 2>/dev/null) in
+    *player=Playing*|*player=Starting*)
+      echo "dev/run: the player is in use; not restarting (BLOOM_RUN_FORCE=1 to do it anyway)" >&2
+      exit 1 ;;
+  esac
+fi
+stop_old /tmp/bloom.pid; sleep 1
 BLOOM_DEBUG_SOCK=${BLOOM_DEBUG_SOCK:-/tmp/bloom-debug.sock} RUST_LOG=${RUST_LOG:-bloom=info} RUST_BACKTRACE=1 \
   nohup "$bin" > /tmp/bloom.log 2>&1 &
 echo $! > /tmp/bloom.pid
