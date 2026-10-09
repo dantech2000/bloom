@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.97.1"
 license = "AGPL-3.0-or-later"
 description = "A native Jellyfin client built with GPUI and libmpv"
+default-run = "bloom"
 
 [dependencies]
 web-time = "1.1"
@@ -77,3 +78,9 @@ inherits = "release"
 lto = "fat"
 codegen-units = 1
 strip = true
+
+# The helper that drives lights from the events of Bloom (experimental):
+# a program of its own, which shares no code with the app.
+[workspace]
+members = ["lights"]
+default-members = [".", "lights"]

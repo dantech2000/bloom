@@ -21,6 +21,11 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$dir/Cargo.toml" | head -1)
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin" "$app/Contents/MacOS/$name" || exit 1
+# The lights helper (lights/, experimental) goes next to the program: Bloom
+# starts it from there. It is built with the program (`cargo build`).
+helper="$(dirname "$bin")/bloom-lights"
+[ -f "$helper" ] || { echo "no lights helper at $helper; build the whole workspace" >&2; exit 1; }
+cp "$helper" "$app/Contents/MacOS/bloom-lights" || exit 1
 if [ -d "$dir/vendor/mpv/lib" ]; then
   mkdir -p "$app/Contents/Frameworks"
   cp -R "$dir/vendor/mpv/lib/." "$app/Contents/Frameworks/"
@@ -78,6 +83,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.video</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSLocalNetworkUsageDescription</key><string>$name finds cast devices and lights on your network, and sends to the ones you choose.</string>
 $updater
 </dict>
 </plist>
@@ -91,5 +97,6 @@ if [ -d "$sparkle" ]; then
     codesign --force --sign - "$part" 2>/dev/null
   done
 fi
+codesign --force --sign - "$app/Contents/MacOS/bloom-lights" 2>/dev/null
 codesign --force --sign - "$app" || exit 1
 echo "$app"

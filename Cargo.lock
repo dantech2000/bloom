@@ -790,6 +790,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-lights"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "borsh"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
