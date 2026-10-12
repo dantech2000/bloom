@@ -311,6 +311,22 @@ answered at the start of a film; at a pause both went to 25%; the pipe from
 the parent ended during the pause, and both got their colour, 13% and then
 5% before the helper ended.
 
+Found by Daniel on the real H6076 on 2026-10-12, and fixed:
+
+- A find missed the lamp about one time in five, on or off (13 of 16 single
+  questions were answered): the question is one packet to a group. A find
+  asks again every 0.4 seconds now; 12 of 12 finds saw the lamp, switched
+  off. A question to the lamp's own address was answered 30 of 30 times.
+- A lamp that was off stayed on after "Blink": the helper did not know on
+  from off. `LampState::on` and `Lamp::power` (Govee: `onOff`, `turn`). A
+  lamp that is off blinks and is off again (checked on the lamp). For a
+  film that dims, a lamp that is off is told nothing; to follow the picture
+  it is switched on after the stream began, out of a dark first frame, and
+  switched off before the stream ends. The film cases are tested with a
+  mock lamp only.
+- `dev/run` starts Bloom from a light bundle that had no helper in it
+  (`dev/devapp` copies it now).
+
 Known and left: the helper is the file next to the program, with no check
 of who made it (as for the program itself); a machine on the network can
 answer a find as a lamp does, the protocol has no proof; "Blink" by the

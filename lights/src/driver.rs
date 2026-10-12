@@ -47,6 +47,9 @@ pub fn lamps_of(file: &Value) -> Vec<Found> {
 /// What a lamp shows: its brightness in percent, and a colour or a white.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LampState {
+    /// Switched on. A lamp that is off still answers, and keeps the
+    /// brightness and the colour it will have when it is on again.
+    pub on: bool,
     pub level: f64,
     /// None when the lamp did not say its colour.
     pub colour: Option<[u8; 3]>,
@@ -59,7 +62,10 @@ pub struct LampState {
 pub trait Lamp: Send + Sync {
     /// What the lamp shows now. None when it does not answer in a second.
     fn state(&self) -> Option<LampState>;
-    /// The brightness, 1 to 100.
+    /// Switches the lamp on or off.
+    fn power(&self, on: bool);
+    /// The brightness, 1 to 100. A lamp that is off can take this as "on"
+    /// (a Govee lamp does): an off lamp that must stay off is told nothing.
     fn level(&self, percent: u32);
     fn colour(&self, colour: [u8; 3]);
     /// A white of a colour temperature in kelvin.
@@ -106,6 +112,9 @@ pub struct Printed;
 impl Lamp for Printed {
     fn state(&self) -> Option<LampState> {
         None
+    }
+    fn power(&self, on: bool) {
+        println!("light: {}", if on { "on" } else { "off" });
     }
     fn level(&self, percent: u32) {
         println!("light: brightness {percent}");

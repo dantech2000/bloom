@@ -32,7 +32,7 @@ Bloom turns on "Send events" as well, because the lights need it. macOS can ask 
 
 ### 3. Find and choose your lights
 
-1. Press **Find**. Bloom looks on your network for two seconds.
+1. Press **Find**. Bloom looks on your network for two seconds. A light that is switched off in the Govee app is found as well; a light with no power is not.
 2. Each light that answers shows as a row, for example "Govee H6076".
 3. Press **Blink** on a row to see which light it is. The light goes bright and dim twice. Blink works when no film plays.
 4. Tick the box of each light that Bloom may use.
@@ -55,6 +55,14 @@ Open a film and press play. Your lights now follow the player.
 | The film ends, or you stop it | The light gets back what it had | The light gets back what it had |
 | Picture in picture | The light gets back what it had | The light gets back what it had |
 | The window is large again | The light dims again | The light follows the picture again |
+
+### A light that is switched off
+
+Bloom puts back whether a light was on or off, as well as its brightness and colour.
+
+- **Normal mode:** a light that is off stays off for the film. Bloom tells it nothing.
+- **Follow the picture:** a light that is off is switched on for the film, and switched off again at the end.
+- **Blink:** a light that is off blinks, and is off again afterwards.
 
 ## Follow the picture
 

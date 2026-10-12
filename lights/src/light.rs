@@ -58,6 +58,9 @@ pub struct Light {
     /// The lamp was told something since `Remember`: only then is there
     /// something to put back.
     touched: Arc<std::sync::atomic::AtomicBool>,
+    /// The lamp was off, and was switched on to follow the picture: it is
+    /// switched off again at the end.
+    woken: Arc<std::sync::atomic::AtomicBool>,
     stream: Arc<Mutex<Stream>>,
 }
 
@@ -105,6 +108,7 @@ impl Light {
             fades: Arc::new(AtomicU64::new(0)),
             waiting: Arc::new(AtomicU64::new(0)),
             touched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            woken: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stream: Arc::new(Mutex::new(Stream::default())),
         }
     }
@@ -113,6 +117,10 @@ impl Light {
     fn own_light(&self) -> [f64; 3] {
         let before = self.before.lock().unwrap();
         let Some(before) = &*before else { return [60.; 3] };
+        // A lamp that was off comes out of the dark, and goes back to it.
+        if !before.on {
+            return [0.; 3];
+        }
         let colour = match (before.kelvin, before.colour) {
             (Some(kelvin), _) => white(kelvin),
             (None, Some(colour)) => colour.map(f64::from),
@@ -144,9 +152,17 @@ impl Light {
         };
         let mine = stream.starts;
         self.touched.store(true, Ordering::Release);
+        // A lamp that is off shows no frame: it is switched on for the
+        // picture, after the stream began, so its first light is the dark
+        // first frame and not the light it kept from before.
+        let wake = self.off_before() && !self.woken.swap(true, Ordering::AcqRel);
         // Sent with the lock held, as the frames are: the lamp gets the
         // start, the frames and the end in that order.
         self.lamp.stream(true);
+        if wake {
+            self.lamp.frame(&vec![[0; 3]; colours]);
+            self.lamp.power(true);
+        }
         drop(stream);
         let light = self.clone();
         thread::spawn(move || {
@@ -188,7 +204,24 @@ impl Light {
         thread::sleep(Duration::from_secs_f64(STREAM_SOFT * 3.));
         let mut stream = self.stream.lock().unwrap();
         stream.on = false;
+        // A lamp that was switched on for the picture goes off while it
+        // still shows the dark end of the glide: the end of the stream
+        // would show the light it kept from before for a moment.
+        if self.woken.swap(false, Ordering::AcqRel) {
+            self.lamp.power(false);
+        }
         self.lamp.stream(false);
+    }
+
+    /// Whether the lamp was off when it was asked.
+    fn off_before(&self) -> bool {
+        self.before.lock().unwrap().as_ref().is_some_and(|before| !before.on)
+    }
+
+    /// A lamp that was off stays off for a film that only dims the lights:
+    /// off is dim enough, and a brightness command would switch it on.
+    fn sleeps(&self) -> bool {
+        self.off_before() && !self.woken.load(Ordering::Acquire)
     }
 
     /// Whether the light is in the frame stream.
@@ -290,6 +323,7 @@ impl Light {
                 }
                 *self.before.lock().unwrap() = state;
             }
+            Action::Colour(_) | Action::OwnColour | Action::Fade { .. } if self.sleeps() => {}
             Action::Colour(colour) => {
                 self.touched.store(true, Ordering::Release);
                 self.lamp.colour(colour);
@@ -307,8 +341,17 @@ impl Light {
                 self.fade(to, gap);
             }
             Action::Restore => {
+                // A lamp that was off: the picture switched it on, and the
+                // way out of the stream switches it off. Nothing else of
+                // it was changed.
+                let was_off = self.off_before();
                 self.leave_stream();
                 let before = self.before.lock().unwrap().take();
+                if was_off {
+                    self.touched.store(false, Ordering::Release);
+                    *self.restored.lock().unwrap() = Some((Instant::now(), before));
+                    return;
+                }
                 // A lamp that was told nothing has nothing to get back (a
                 // lamp with no frame stream while the picture is followed):
                 // it is not set to full light for an answer that never came.
@@ -326,14 +369,24 @@ impl Light {
     }
 
     /// Makes the lamp show which one it is: bright, dim, bright, dim, and
-    /// then what it had.
+    /// then what it had. A lamp that was off is switched on for it, and
+    /// off again.
     pub fn identify(&self) {
         let before = self.lamp.state();
+        let was_off = before.as_ref().is_some_and(|before| !before.on);
+        if was_off {
+            self.lamp.power(true);
+        }
         for level in [100, 5, 100, 5] {
             self.lamp.level(level);
             thread::sleep(Duration::from_millis(600));
         }
         self.lamp.level(before.map_or(100, |before| before.level.round() as u32));
+        if was_off {
+            // After the level: the lamp keeps it for the next time it is on.
+            thread::sleep(Duration::from_millis(300));
+            self.lamp.power(false);
+        }
     }
 }
 
@@ -376,6 +429,7 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     enum Told {
         Asked,
+        Power(bool),
         Level(u32),
         Colour([u8; 3]),
         White(u32),
@@ -389,11 +443,18 @@ mod tests {
         told: Mutex<Vec<Told>>,
         answers: bool,
         frame: usize,
+        /// Whether the lamp says it is switched on.
+        on: bool,
     }
 
     impl Mock {
         fn light(answers: bool, frame: usize) -> (Arc<Mock>, Light) {
-            let mock = Arc::new(Mock { told: Mutex::new(Vec::new()), answers, frame });
+            let mock = Arc::new(Mock { told: Mutex::new(Vec::new()), answers, frame, on: true });
+            (mock.clone(), Light::new(mock))
+        }
+        /// A lamp that is switched off, and says so.
+        fn off() -> (Arc<Mock>, Light) {
+            let mock = Arc::new(Mock { told: Mutex::new(Vec::new()), answers: true, frame: 4, on: false });
             (mock.clone(), Light::new(mock))
         }
         fn told(&self) -> Vec<Told> {
@@ -410,7 +471,10 @@ mod tests {
     impl Lamp for Mock {
         fn state(&self) -> Option<LampState> {
             self.note(Told::Asked);
-            self.answers.then_some(LampState { level: 80., colour: Some([255, 200, 100]), kelvin: None })
+            self.answers.then_some(LampState { on: self.on, level: 80., colour: Some([255, 200, 100]), kelvin: None })
+        }
+        fn power(&self, on: bool) {
+            self.note(Told::Power(on));
         }
         fn level(&self, percent: u32) {
             self.note(Told::Level(percent));
@@ -583,6 +647,66 @@ mod tests {
             light.act(Action::Restore, NO_GAP, 0.05);
             assert_eq!(lamp.told(), [Told::Asked]);
         }
+    }
+
+    /// A lamp that is off stays off for a film that dims the lights: it is
+    /// told nothing, at the start, at a pause and at the end.
+    #[test]
+    fn a_lamp_that_is_off_stays_off_for_a_film_that_dims() {
+        let (lamp, light) = Mock::off();
+        light.act(Action::Remember, NO_GAP, 0.05);
+        light.act(Action::Colour([1, 2, 3]), NO_GAP, 0.05);
+        light.act(Action::Fade { to: 5., kelvin: None }, NO_GAP, 0.05);
+        light.act(Action::Fade { to: 25., kelvin: Some(2700) }, NO_GAP, 0.05);
+        light.act(Action::OwnColour, NO_GAP, 0.05);
+        light.act(Action::Restore, NO_GAP, 0.05);
+        assert_eq!(lamp.told(), [Told::Asked]);
+    }
+
+    /// A lamp that is off is switched on to follow the picture, out of the
+    /// dark and after the stream began, and is switched off again at the
+    /// end, before the stream ends. Its brightness and colour are not
+    /// touched.
+    #[test]
+    fn a_lamp_that_is_off_follows_the_picture_and_goes_off_again() {
+        let (lamp, light) = Mock::off();
+        light.act(Action::Remember, NO_GAP, 0.05);
+        light.act(Action::Aura(vec![[255, 0, 0]]), NO_GAP, 0.01);
+        thread::sleep(Duration::from_millis(300));
+        let told = lamp.told();
+        assert_eq!(told[..4], [Told::Asked, Told::Stream(true), Told::Frame(vec![[0; 3]; 4]), Told::Power(true)]);
+        // The next frames come out of the dark, not from the light it kept.
+        let Told::Frame(first) = &told[4] else { panic!("{:?}", told[4]) };
+        assert!(first[0][0] < 80 && first[0][1] == 0, "{first:?}");
+        light.act(Action::AuraWhite { kelvin: 2700, level: 25. }, NO_GAP, 0.05);
+        light.act(Action::Aura(vec![[0, 0, 255]]), NO_GAP, 0.01);
+        assert_eq!(lamp.told().iter().filter(|told| **told == Told::Power(true)).count(), 1, "switched on more than once");
+        light.act(Action::Restore, NO_GAP, 0.05);
+        let told = lamp.told();
+        assert_eq!(told[told.len() - 2..], [Told::Power(false), Told::Stream(false)]);
+        // The last frame before it is dark again.
+        let dark = told.iter().rev().find_map(|told| if let Told::Frame(frame) = told { Some(frame.clone()) } else { None }).unwrap();
+        assert!(dark.iter().flatten().all(|part| *part < 12), "{dark:?}");
+        assert!(!told.iter().any(|told| matches!(told, Told::Level(_) | Told::Colour(_) | Told::White(_))));
+        // The next film finds it as it was: off.
+        light.act(Action::Remember, NO_GAP, 0.05);
+        light.act(Action::Fade { to: 5., kelvin: None }, NO_GAP, 0.05);
+        assert_eq!(lamp.told().len(), told.len(), "a lamp that is off again was dimmed");
+    }
+
+    /// The blink of a lamp that is off switches it on, and off again at
+    /// the end with the brightness it kept.
+    #[test]
+    fn a_blink_puts_an_off_lamp_off_again() {
+        let (lamp, light) = Mock::off();
+        light.identify();
+        let told = lamp.told();
+        assert_eq!(told[..2], [Told::Asked, Told::Power(true)]);
+        assert_eq!(told[told.len() - 2..], [Told::Level(80), Told::Power(false)]);
+        let (lamp, light) = Mock::light(true, 4);
+        light.identify();
+        assert!(!lamp.told().iter().any(|told| matches!(told, Told::Power(_))), "a lamp that was on was switched");
+        assert_eq!(lamp.told().last(), Some(&Told::Level(80)));
     }
 
     /// The way back to a low light has two commands: the lights are busy

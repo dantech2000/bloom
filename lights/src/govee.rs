@@ -30,6 +30,8 @@ const ANSWERS: u16 = 4002;
 const COMMANDS: u16 = 4003;
 /// The colours a frame of the stream takes.
 const FRAME: usize = 14;
+/// The time between two questions of one find.
+const ASK_AGAIN: Duration = Duration::from_millis(400);
 
 /// The Govee driver. The two fields are other values for a test only.
 pub struct Govee {
@@ -80,18 +82,31 @@ impl Driver for Govee {
                 return Vec::new();
             }
         };
-        if let Err(err) = socket.send_to(&message("scan", json!({ "account_topic": "reserve" })), &self.group) {
+        // The question goes to a group, in one packet with no receipt, and
+        // a lamp misses it now and then (an H6076 was found by 13 of 16
+        // single questions, on or off). So it is asked again every 400 ms
+        // for as long as the find waits; a lamp is listed once.
+        let ask = || socket.send_to(&message("scan", json!({ "account_topic": "reserve" })), &self.group);
+        if let Err(err) = ask() {
             eprintln!("bloom-lights: govee: the find was not sent: {err}");
             return Vec::new();
         }
         let until = Instant::now() + wait;
+        let mut again = Instant::now() + ASK_AGAIN;
         let mut found: Vec<Found> = Vec::new();
         let mut buffer = [0u8; 2048];
         while let Some(left) = until.checked_duration_since(Instant::now()).filter(|left| !left.is_zero()) {
-            if socket.set_read_timeout(Some(left)).is_err() {
+            let to_ask = again.saturating_duration_since(Instant::now());
+            if to_ask.is_zero() {
+                let _ = ask();
+                again = Instant::now() + ASK_AGAIN;
+                continue;
+            }
+            if socket.set_read_timeout(Some(left.min(to_ask))).is_err() {
                 break;
             }
-            let Ok((n, from)) = socket.recv_from(&mut buffer) else { break };
+            // No answer in this stretch: the time to ask again, or the end.
+            let Ok((n, from)) = socket.recv_from(&mut buffer) else { continue };
             let Ok(answer) = serde_json::from_slice::<Value>(&buffer[..n]) else { continue };
             let data = &answer["msg"]["data"];
             let (Some(id), true) = (data["device"].as_str(), answer["msg"]["cmd"] == "scan") else { continue };
@@ -159,11 +174,17 @@ impl Lamp for GoveeLamp {
             };
             let part = |name: &str| data["color"][name].as_u64().and_then(|value| u8::try_from(value).ok());
             return Some(LampState {
+                // With no word on it the lamp counts as on.
+                on: data["onOff"].as_u64() != Some(0),
                 level: level.clamp(1., 100.),
                 colour: part("r").zip(part("g")).zip(part("b")).map(|((r, g), b)| [r, g, b]),
                 kelvin: data["colorTemInKelvin"].as_u64().filter(|kelvin| *kelvin > 0).map(|kelvin| kelvin as u32),
             });
         }
+    }
+
+    fn power(&self, on: bool) {
+        self.send("turn", json!({ "value": u8::from(on) }));
     }
 
     fn level(&self, percent: u32) {
@@ -269,7 +290,8 @@ mod tests {
         let found = govee.find(Duration::from_millis(400));
         assert_eq!(found, [Found { driver: "govee".into(), id: "AA:BB:CC".into(), model: "H6076".into(), address: "127.0.0.1".into() }]);
         let lamp = govee.open(&Found { address: address.to_string(), ..found[0].clone() }).unwrap();
-        assert_eq!(lamp.state(), Some(LampState { level: 80., colour: Some([255, 200, 100]), kelvin: None }));
+        assert_eq!(lamp.state(), Some(LampState { on: true, level: 80., colour: Some([255, 200, 100]), kelvin: None }));
+        lamp.power(false);
         lamp.level(250);
         lamp.colour([1, 2, 3]);
         lamp.white(2700);
@@ -278,7 +300,8 @@ mod tests {
         lamp.frame(&[[7; 3]; 20]);
         lamp.stream(false);
         thread::sleep(Duration::from_millis(200));
-        let told: Vec<Value> = told.lock().unwrap().iter().filter(|m| m["cmd"] != "scan" && m["cmd"] != "devStatus").cloned().collect();
+        let mut told: Vec<Value> = told.lock().unwrap().iter().filter(|m| m["cmd"] != "scan" && m["cmd"] != "devStatus").cloned().collect();
+        assert_eq!(told.remove(0), json!({ "cmd": "turn", "data": { "value": 0 } }));
         assert_eq!(told[0], json!({ "cmd": "brightness", "data": { "value": 100 } }));
         assert_eq!(told[1]["data"], json!({ "color": { "r": 1, "g": 2, "b": 3 }, "colorTemInKelvin": 0 }));
         assert_eq!(told[2]["data"], json!({ "color": { "r": 0, "g": 0, "b": 0 }, "colorTemInKelvin": 2700 }));
@@ -290,6 +313,30 @@ mod tests {
         // An address with no port is the port of the commands.
         assert!(govee.open(&Found { address: "10.0.0.9".into(), ..found[0].clone() }).is_some());
         assert!(govee.open(&Found { address: "lamp.local".into(), ..found[0].clone() }).is_none());
+    }
+
+    /// A lamp that misses the first questions of a find is found all the
+    /// same: the find asks again while it waits.
+    #[test]
+    fn a_lamp_that_misses_the_first_question_is_found() {
+        let answers = free_port();
+        let lamp = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let address = lamp.local_addr().unwrap();
+        thread::spawn(move || {
+            let mut buffer = [0u8; 2048];
+            let mut asked = 0;
+            while let Ok((_, from)) = lamp.recv_from(&mut buffer) {
+                asked += 1;
+                if asked >= 3 {
+                    let answer = json!({ "msg": { "cmd": "scan", "data": { "device": "LATE", "sku": "H6076" } } });
+                    let _ = lamp.send_to(answer.to_string().as_bytes(), (from.ip(), answers));
+                }
+            }
+        });
+        let govee = Govee { group: address.to_string(), answers };
+        assert!(govee.find(Duration::from_millis(300)).is_empty(), "one question is not enough for this lamp");
+        let found = govee.find(Duration::from_millis(1500));
+        assert_eq!(found.iter().map(|lamp| lamp.id.as_str()).collect::<Vec<_>>(), ["LATE"]);
     }
 
     /// A lamp that does not answer has no state, after a second.

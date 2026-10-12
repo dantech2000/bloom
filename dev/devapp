@@ -12,6 +12,11 @@ app="$dir/target/dev/$name.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 /bin/cp -c "$dir/target/release/bloom" "$app/Contents/MacOS/$name" 2>/dev/null ||
   /bin/cp "$dir/target/release/bloom" "$app/Contents/MacOS/$name" || exit 1
+# The lights helper (lights/, experimental) goes next to the binary: Bloom
+# starts it from there.
+[ -f "$dir/target/release/bloom-lights" ] ||
+  { echo "no lights helper in target/release; run: cargo build --release" >&2; exit 1; }
+/bin/cp "$dir/target/release/bloom-lights" "$app/Contents/MacOS/bloom-lights" || exit 1
 # The binary looks for libmpv two folders above itself, in vendor/mpv/lib.
 ln -sfn "$dir/vendor" "$app/vendor"
 # The icon with its looks for macOS 26 (default, dark, clear, tinted).
@@ -29,6 +34,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSLocalNetworkUsageDescription</key><string>$name finds cast devices and lights on your network, and sends to the ones you choose.</string>
 </dict>
 </plist>
 PLIST
