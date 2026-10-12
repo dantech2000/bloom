@@ -18,7 +18,7 @@ use std::{
 
 use gpui_kit::{App, Context, SharedString, Window, px, size};
 
-use crate::app::{Bloom, Page};
+use crate::app::{Bloom, Page, Panel};
 
 pub struct Request {
     line: String,
@@ -555,7 +555,11 @@ impl Bloom {
             "je" => {
                 let (verb, argument) = rest.split_once(' ').unwrap_or((rest, ""));
                 match verb {
-                    "help" => self.enhanced.help_open = !self.enhanced.help_open,
+                    "help" => {
+                        if !self.close_panel(Panel::Help) {
+                            self.open_panel(Panel::Help, window, cx);
+                        }
+                    }
                     "toggle" => match crate::enhanced::TOGGLES
                         .iter()
                         .find(|(key, _)| *key == argument)

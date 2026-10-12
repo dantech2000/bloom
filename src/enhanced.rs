@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    app::{Bloom, Page},
+    app::{Bloom, Page, Panel},
     icons::{Filled, filled},
     jellyfin::{Client, Item, SeerrItem},
     macos::{Id, class, send},
@@ -115,8 +115,6 @@ pub enum Aspect {
 pub struct State {
     pub settings: Settings,
     pub detail: Option<DetailExtras>,
-    /// The list of keys is open.
-    pub help_open: bool,
     pub bookmarks: crate::bookmarks::BookmarkState,
     pub hidden: crate::hidden::HiddenState,
     pub seasons: crate::seasons::SeasonsState,
@@ -505,12 +503,8 @@ impl Bloom {
             .collect();
         entries.push(MenuItem::separator());
         entries.push(
-            MenuItem::new("menu.je.keys", "Keyboard shortcuts…").on_click(move |_, _, cx| {
-                this.update(cx, |this, cx| {
-                    this.close_panels();
-                    this.enhanced.help_open = true;
-                    cx.notify();
-                })
+            MenuItem::new("menu.je.keys", "Keyboard shortcuts…").on_click(move |_, window, cx| {
+                this.update(cx, |this, cx| this.open_panel(Panel::Help, window, cx))
                 .ok();
             }),
         );
@@ -980,15 +974,13 @@ impl Bloom {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.enhanced.help_open {
+        if self.panel_is(Panel::Help) {
             // Any key closes the list.
-            self.enhanced.help_open = false;
+            self.close_panel(Panel::Help);
             return true;
         }
         if combo(event).as_deref() == Some("?") && self.je("shortcuts") {
-            // One popup at a time: the panels go as the list comes.
-            self.close_panels();
-            self.enhanced.help_open = true;
+            self.open_panel(Panel::Help, window, cx);
             return true;
         }
         let Some(action) = self.enhanced_action(event, false) else {
@@ -1009,7 +1001,7 @@ impl Bloom {
 
     /// The list of keys, over the page.
     pub fn render_enhanced_help(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
-        if !self.enhanced.help_open {
+        if !self.panel_is(Panel::Help) {
             return None;
         }
         let t = UiTheme::read(cx).clone();
@@ -1090,7 +1082,7 @@ impl Bloom {
                 .justify_center()
                 .bg(rgba(0x00000099))
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.enhanced.help_open = false;
+                    this.close_panel(Panel::Help);
                     cx.notify();
                 }))
                 .child(
@@ -1149,7 +1141,7 @@ impl Bloom {
             "bookmark-jump" => self.bookmark_jump_debug(argument, cx),
             "bookmarks-panel" => {
                 self.toggle_bookmarks_panel(window, cx);
-                format!("panel_open={}", self.enhanced.bookmarks.panel_open)
+                format!("panel_open={}", self.panel_is(Panel::Bookmarks))
             }
             "hidden" => self.hidden_debug(),
             // Hidden content on in this app only, with no call to the server.
@@ -1247,7 +1239,7 @@ impl Bloom {
             self.enhanced.auto_paused,
             self.enhanced.remote_activity == Some(self.last_activity()),
             self.speed,
-            self.enhanced.bookmarks.panel_open,
+            self.panel_is(Panel::Bookmarks),
         )
     }
 }

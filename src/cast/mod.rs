@@ -35,7 +35,7 @@ use self::{
 };
 use crate::{
     airplay::{AirPlayEvent, picker},
-    app::Bloom,
+    app::{Bloom, Panel},
     chromecast::{
         jellyfin::{self as cast_jellyfin, Identity, ItemStub},
         mdns::{self, Device},
@@ -87,9 +87,6 @@ impl PollTicket {
 /// Remote control as the app holds it.
 #[derive(Default)]
 pub struct CastState {
-    pub panel_open: bool,
-    /// When a click outside the panel closed it.
-    pub panel_closed: Option<Instant>,
     /// The sessions this user can control, for the panel.
     pub sessions: Vec<SessionInfo>,
     pub loading: bool,
@@ -429,7 +426,7 @@ impl Bloom {
     /// the AirPlay row of the panel painted its button at the last frame,
     /// and away when the panel closes or shows a target.
     fn place_picker(&mut self, window: &Window) {
-        let wanted = self.cast.panel_open && self.cast.target.is_local() && self.airplay_row_shown();
+        let wanted = self.panel_is(Panel::Cast) && self.cast.target.is_local() && self.airplay_row_shown();
         if !wanted {
             if self.cast.picker_place.take().is_some() || picker::shown() {
                 picker::hide();
@@ -465,15 +462,7 @@ impl Bloom {
     // ----- this app as a controller ---------------------------------------
 
     pub fn toggle_cast_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // One popup at a time.
-        let open = !self.cast.panel_open;
-        self.close_popups(None, window, cx);
-        // A click on the button while the panel is open closed it a moment
-        // ago, as a click outside of it; that click must not open it again.
-        if open && self.cast.panel_closed.is_some_and(|at| at.elapsed() < Duration::from_millis(250)) {
-            return;
-        }
-        self.cast.panel_open = open;
+        let open = self.toggle_panel(Panel::Cast, window, cx);
         if open {
             self.load_cast_sessions(cx);
             self.start_cast_search(cx);
@@ -1168,7 +1157,7 @@ impl Bloom {
                 self.airplay.routes().len(),
                 self.cast.searching(),
                 self.cast.subscribed,
-                self.cast.panel_open,
+                self.panel_is(Panel::Cast),
                 picker,
                 self.cast.error
             ),
@@ -1197,7 +1186,7 @@ impl Bloom {
                 view.can_skip,
                 view.can_tracks,
                 self.cast.subscribed,
-                self.cast.panel_open,
+                self.panel_is(Panel::Cast),
                 picker,
                 view.error.or(self.cast.error.clone()),
             ),
@@ -1308,13 +1297,13 @@ impl Bloom {
             // Opens the panel with the AirPlay row; the user picks the
             // route in the system picker there.
             "airplay" => {
-                if !self.cast.panel_open {
+                if !self.panel_is(Panel::Cast) {
                     self.toggle_cast_panel(window, cx);
                 }
                 let routes = self.airplay.routes();
                 return format!(
                     "panel={} airplay_row={} routes={:?} picker={}",
-                    self.cast.panel_open,
+                    self.panel_is(Panel::Cast),
                     !routes.is_empty(),
                     routes,
                     self.cast.picker_place.map_or("pending".to_string(), |p| format!("{p:?}"))

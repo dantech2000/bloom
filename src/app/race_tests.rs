@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use gpui_kit::{Focusable as _, TestAppContext};
 
 use super::race_harness::{MockServer, add_server, app, item, items_json, plain, session, tick_until};
-use super::{Page, Screen};
+use super::{Page, Panel, Screen};
 
 // ----- finding 1 ----------------------------------------------------------
 
@@ -372,13 +372,13 @@ fn escape_closes_an_open_panel_before_it_goes_back(cx: &mut TestAppContext) {
     });
     for cast in [false, true] {
         bloom.update(cx, |this, cx| {
-            if cast { this.cast.panel_open = true } else { this.sync.panel_open = true }
+            this.panel = Some(if cast { Panel::Cast } else { Panel::SyncPlay });
             cx.notify();
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
         cx.simulate_keystrokes("escape");
         bloom.read_with(cx, |this, _| {
-            assert!(!this.sync.panel_open && !this.cast.panel_open, "Escape left the panel open");
+            assert!(this.panel.is_none(), "Escape left the panel open");
             assert!(matches!(this.page, Page::Detail(_)), "Escape went back with a panel open");
         });
     }
@@ -591,13 +591,12 @@ fn an_answer_for_the_session_before_opens_no_page(cx: &mut TestAppContext) {
 fn the_keys_list_and_the_panels_close_together(cx: &mut TestAppContext) {
     let (bloom, cx) = app(cx);
     bloom.update(cx, |this, cx| {
-        this.enhanced.help_open = true;
-        this.sync.panel_open = true;
+        this.panel = Some(Panel::Help);
         assert!(this.panel_open());
         assert!(this.close_panels());
-        assert!(!this.enhanced.help_open && !this.sync.panel_open && !this.panel_open());
+        assert!(!this.panel_open());
         assert!(!this.close_panels());
-        this.cast.panel_open = true;
+        this.panel = Some(Panel::Cast);
         this.ask_confirm(
             crate::admin::Confirm {
                 title: String::new(),
@@ -608,7 +607,56 @@ fn the_keys_list_and_the_panels_close_together(cx: &mut TestAppContext) {
             },
             cx,
         );
-        assert!(!this.cast.panel_open, "a panel stays open beside the question");
+        assert!(this.panel.is_none(), "a panel stays open beside the question");
+    });
+}
+
+/// One popup at a time: a panel takes the place of an open menu and of
+/// another panel, and a menu takes the place of a panel.
+#[gpui_kit::test]
+fn a_panel_and_a_menu_are_never_open_together(cx: &mut TestAppContext) {
+    let (bloom, cx) = app(cx);
+    let menu = bloom.read_with(cx, |this, _| this.profile_menu.clone());
+    cx.update(|window, cx| {
+        menu.update(cx, |menu, cx| {
+            menu.set_items([crate::ui::menu::MenuItem::new("one", "One")], cx);
+            menu.open(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        bloom.update(cx, |this, cx| {
+            assert!(this.toggle_panel(Panel::SyncPlay, window, cx));
+            assert!(!this.profile_menu.read(cx).is_open(), "the menu stays open beside the panel");
+            this.open_panel(Panel::Cast, window, cx);
+            assert!(this.panel_is(Panel::Cast) && !this.panel_is(Panel::SyncPlay));
+        });
+        menu.update(cx, |menu, cx| menu.open(window, cx));
+    });
+    cx.run_until_parked();
+    bloom.read_with(cx, |this, cx| {
+        assert!(this.profile_menu.read(cx).is_open());
+        assert!(!this.panel_open(), "the panel stays open beside the menu");
+    });
+}
+
+/// The click that closed a panel from outside does not open it again when
+/// it was a click on the panel's own button.
+#[gpui_kit::test]
+fn the_button_of_a_panel_closed_from_outside_does_not_open_it_again(cx: &mut TestAppContext) {
+    let (bloom, cx) = app(cx);
+    cx.update(|window, cx| {
+        bloom.update(cx, |this, cx| {
+            assert!(this.toggle_panel(Panel::SyncPlay, window, cx));
+            this.dismiss_panel(Panel::SyncPlay, cx);
+            assert!(!this.toggle_panel(Panel::SyncPlay, window, cx), "the same click opened the panel again");
+            // The next click is a new one, and another panel never waits.
+            assert!(this.toggle_panel(Panel::SyncPlay, window, cx));
+            this.dismiss_panel(Panel::SyncPlay, cx);
+            assert!(this.toggle_panel(Panel::Cast, window, cx));
+            assert!(!this.toggle_panel(Panel::Cast, window, cx), "a second press left the panel open");
+            assert!(!this.panel_open());
+        });
     });
 }
 

@@ -10,7 +10,7 @@ use gpui_kit::{
 };
 
 use crate::{
-    app::Bloom,
+    app::{Bloom, Panel},
     jellyfin::{Item, format_runtime},
     ui::{glass::glass, scroll_area::ScrollArea, theme::UiTheme},
     views::cards::{artwork, icon},
@@ -26,7 +26,6 @@ const ROW_H: f32 = 106.;
 /// State of the episode list.
 #[derive(Default)]
 pub struct EpisodePicker {
-    pub open: bool,
     pub loading: bool,
     pub seasons: Vec<Item>,
     /// Season whose episodes show.
@@ -46,21 +45,16 @@ impl Bloom {
     /// Opens or closes the episode list. It opens at the season of the
     /// episode that plays.
     pub fn toggle_episode_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // One popup at a time: the list takes the place of whatever is open.
-        let was_open = self.episode_picker.open;
-        self.close_popups(None, window, cx);
-        if was_open {
-            cx.notify();
+        let series = self.playing.as_ref().and_then(|item| Some((item.series_id.clone()?, item.season_id.clone())));
+        let Some((series_id, season_id)) = series else {
+            // Nothing to list: whatever is open closes, as before.
+            self.close_popups(None, window, cx);
+            return;
+        };
+        if !self.toggle_panel(Panel::Episodes, window, cx) {
             return;
         }
-        let Some(playing) = self.playing.clone() else {
-            return;
-        };
-        let Some(series_id) = playing.series_id.clone() else {
-            return;
-        };
-        self.episode_picker.open = true;
-        self.episode_picker.season = playing.season_id.clone();
+        self.episode_picker.season = season_id;
         self.load_picker_episodes(series_id, true, cx);
     }
 
@@ -129,7 +123,7 @@ impl Bloom {
 
     /// Plays an episode of the list; the episodes after it follow.
     fn pick_episode(&mut self, episode: Item, cx: &mut Context<Self>) {
-        self.episode_picker.open = false;
+        self.close_panel(Panel::Episodes);
         if self.playing.as_ref().is_some_and(|i| i.id == episode.id) {
             cx.notify();
             return;
@@ -147,7 +141,7 @@ impl Bloom {
     /// The episode list over the video, above the right end of the controls.
     pub fn render_episode_picker(&self, bottom: f32, cx: &mut Context<Self>) -> Option<Div> {
         let picker = &self.episode_picker;
-        if !picker.open {
+        if !self.panel_is(Panel::Episodes) {
             return None;
         }
         let client = self.session.as_ref()?.client.clone();

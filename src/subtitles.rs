@@ -28,7 +28,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    app::Bloom,
+    app::{Bloom, Panel},
     jellyfin::Client,
     ui::{glass::glass, menu::MenuItem, scroll_area::ScrollArea, theme::UiTheme, tip::tip},
     views::cards::icon,
@@ -474,7 +474,6 @@ pub struct State {
     /// Asked for: the rights of the user, for the signed-in user.
     rights: Option<Rights>,
     rights_asked: Option<String>,
-    pub panel_open: bool,
     /// The item of the panel.
     pub item_id: String,
     pub item_title: String,
@@ -665,9 +664,8 @@ impl Bloom {
     }
 
     pub fn open_subs_panel(&mut self, item_id: &str, title: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_popups(None, window, cx);
+        self.open_panel(Panel::Subtitles, window, cx);
         let same = self.subs.item_id == item_id;
-        self.subs.panel_open = true;
         self.subs.item_id = item_id.to_string();
         self.subs.item_title = title.to_string();
         if !same || self.subs.language.is_empty() {
@@ -678,11 +676,6 @@ impl Bloom {
         }
         self.subs_search(cx);
         cx.notify();
-    }
-
-    /// Closes the panel; called with the other popups.
-    pub fn close_subs_panel(&mut self) -> bool {
-        std::mem::take(&mut self.subs.panel_open)
     }
 
     fn subs_search(&mut self, cx: &mut Context<Self>) {
@@ -767,7 +760,7 @@ impl Bloom {
 
     /// The panel: language chips and the results.
     pub fn render_subs_panel(&self, top: Option<f32>, cx: &mut Context<Self>) -> Option<Div> {
-        if !self.subs.panel_open {
+        if !self.panel_is(Panel::Subtitles) {
             return None;
         }
         let t = UiTheme::read(cx).clone();
@@ -913,7 +906,7 @@ impl Bloom {
             .border_color(rgba(0xf5f5f733))
             .on_mouse_down(MouseButton::Left, cx.listener(swallow))
             .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                if this.close_subs_panel() {
+                if this.close_panel(Panel::Subtitles) {
                     cx.notify();
                 }
             }))
@@ -1001,7 +994,7 @@ impl Bloom {
             }
             "panel" => {
                 if arg.is_empty() {
-                    return if self.close_subs_panel() { "closed".into() } else { "error: subs panel <item id>".into() };
+                    return if self.close_panel(Panel::Subtitles) { "closed".into() } else { "error: subs panel <item id>".into() };
                 }
                 self.subs_load_rights(cx);
                 let title = self
@@ -1082,7 +1075,7 @@ impl Bloom {
             status.sub_delay,
             status.audio_delay,
             if self.subs_burned() { "yes" } else { "no" },
-            self.subs.panel_open,
+            self.panel_is(Panel::Subtitles),
             self.subs.language,
             self.subs.loading,
             self.subs.results.len(),

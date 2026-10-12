@@ -12,7 +12,6 @@
 //! is not lost. The app keeps the file as it got it, so keys it does not know
 //! stay.
 
-use std::time::{Duration, Instant};
 
 use gpui_icons::LucideIcon;
 use gpui_kit::{
@@ -23,7 +22,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use crate::{
-    app::Bloom,
+    app::{Bloom, Panel},
     jellyfin::{Client, Item, format_duration},
     ui::{
         glass::glass,
@@ -270,8 +269,6 @@ pub struct BookmarkState {
     /// for each change of it: the seek bar of the player asks for them at
     /// each of its frames.
     all: Vec<Bookmark>,
-    pub panel_open: bool,
-    pub panel_closed: Option<Instant>,
     /// The label field of the panel.
     pub input: Option<Entity<InputState>>,
     _subscription: Option<Subscription>,
@@ -435,39 +432,18 @@ impl Bloom {
         if !self.bookmarks_on() {
             return;
         }
-        // One popup at a time.
-        let open = !self.enhanced.bookmarks.panel_open;
-        self.close_popups(None, window, cx);
-        // A click on the button while the panel is open closed it as a click
-        // outside of it a moment ago; that click must not open it again.
-        if open
-            && self
-                .enhanced
-                .bookmarks
-                .panel_closed
-                .is_some_and(|at| at.elapsed() < Duration::from_millis(250))
-        {
-            return;
-        }
-        self.enhanced.bookmarks.panel_open = open;
-        if open {
+        if self.toggle_panel(Panel::Bookmarks, window, cx) {
             self.bookmark_input(window, cx);
             self.load_bookmarks(cx);
         }
-        cx.notify();
-    }
-
-    /// Closes the panel; called with the other popups.
-    pub fn close_bookmarks_panel(&mut self) -> bool {
-        std::mem::take(&mut self.enhanced.bookmarks.panel_open)
     }
 
     /// Escape in the player closes the panel first.
     pub fn bookmarks_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if !self.enhanced.bookmarks.panel_open {
+        if !self.panel_is(Panel::Bookmarks) {
             return false;
         }
-        self.enhanced.bookmarks.panel_open = false;
+        self.close_panel(Panel::Bookmarks);
         window.focus(&self.player_focus, cx);
         true
     }
@@ -475,7 +451,7 @@ impl Bloom {
     /// True while the label field has the focus: the keys of the player must
     /// leave the typing alone.
     pub fn bookmark_typing(&self, window: &Window, cx: &Context<Self>) -> bool {
-        self.enhanced.bookmarks.panel_open
+        self.panel_is(Panel::Bookmarks)
             && self
                 .enhanced
                 .bookmarks
@@ -491,7 +467,7 @@ impl Bloom {
         if !self.bookmarks_on() {
             return None;
         }
-        let open = self.enhanced.bookmarks.panel_open;
+        let open = self.panel_is(Panel::Bookmarks);
         Some(
             div()
                 .id("player.bookmarks")
@@ -542,7 +518,7 @@ impl Bloom {
 
     /// The panel in the player: add one, jump to one, delete one.
     pub fn render_bookmarks_panel(&self, cx: &mut Context<Self>) -> Option<Div> {
-        if !self.enhanced.bookmarks.panel_open || !self.bookmarks_on() {
+        if !self.panel_is(Panel::Bookmarks) || !self.bookmarks_on() {
             return None;
         }
         let t = UiTheme::read(cx).clone();
@@ -622,10 +598,7 @@ impl Bloom {
                 .on_mouse_down(MouseButton::Left, cx.listener(swallow))
                 // A click anywhere else closes the panel, as it closes a menu.
                 .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    if this.close_bookmarks_panel() {
-                        this.enhanced.bookmarks.panel_closed = Some(Instant::now());
-                        cx.notify();
-                    }
+                    this.dismiss_panel(Panel::Bookmarks, cx);
                 }))
                 .child(glass(px(24.), crate::ui::glass::POPUP_TINT))
                 .p(px(12.))
@@ -926,7 +899,7 @@ mod tests {
         let time = |ask: &dyn Fn() -> usize| {
             (0..5)
                 .map(|_| {
-                    let started = Instant::now();
+                    let started = std::time::Instant::now();
                     for _ in 0..RUNS {
                         std::hint::black_box(ask());
                     }
