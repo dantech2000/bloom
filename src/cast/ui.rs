@@ -18,7 +18,7 @@ use gpui_kit::{
 
 use super::target::{Kind, Target};
 use crate::{
-    app::Bloom,
+    app::{Bloom, Panel},
     icons::{Filled, filled},
     jellyfin::{Item, format_duration},
     ui::{glass::glass, menu::MenuItem, scroll_area::ScrollArea, theme::UiTheme, tip::tip},
@@ -122,7 +122,7 @@ impl Bloom {
     /// The panel. `top` places it under the top bar; without it the panel
     /// sits over the controls of the player.
     pub fn render_cast_panel(&self, top: Option<f32>, cx: &mut Context<Self>) -> Option<Div> {
-        if !self.cast.panel_open {
+        if !self.panel_is(Panel::Cast) {
             return None;
         }
         let t = UiTheme::read(cx).clone();
@@ -515,10 +515,7 @@ impl Bloom {
             .on_mouse_down(MouseButton::Left, cx.listener(swallow))
             // A click anywhere else closes the panel, as it closes a menu.
             .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                if std::mem::take(&mut this.cast.panel_open) {
-                    this.cast.panel_closed = Some(std::time::Instant::now());
-                    cx.notify();
-                }
+                this.dismiss_panel(Panel::Cast, cx);
             }))
             .child(glass(px(24.), crate::ui::glass::POPUP_TINT))
             .p(px(12.))

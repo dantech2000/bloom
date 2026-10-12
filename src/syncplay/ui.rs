@@ -17,7 +17,7 @@ use super::{
     session::{Session, Ui},
 };
 use crate::{
-    app::{Bloom, Page},
+    app::{Bloom, Page, Panel},
     jellyfin::Item,
     realtime::{self, Realtime},
     ui::{glass::glass, scroll_area::ScrollArea, theme::UiTheme, tip::tip},
@@ -36,14 +36,11 @@ pub struct SyncState {
     /// What the server lets this user do: "CreateAndJoinGroups",
     /// "JoinGroups" or "None".
     pub access: String,
-    pub panel_open: bool,
     /// The groups of the server, for the panel.
     pub groups: Vec<GroupInfo>,
     pub groups_loading: bool,
     /// Titles of the items of the queue, by item id.
     pub titles: HashMap<String, String>,
-    /// When a click outside the panel closed it.
-    pub panel_closed: Option<std::time::Instant>,
     /// The player must get the keyboard focus at the next frame.
     pub focus_player: bool,
     /// Waits for the news of the server to go quiet before a page loads
@@ -157,7 +154,7 @@ impl Bloom {
                         let ui = this.sync.session.as_mut().map(|s| s.tick());
                         this.sync_apply(ui.unwrap_or_default(), cx);
                         // The numbers of the open panel move.
-                        if this.sync.panel_open && this.sync.in_group() {
+                        if this.panel_is(Panel::SyncPlay) && this.sync.in_group() {
                             cx.notify();
                         }
                     });
@@ -205,7 +202,7 @@ impl Bloom {
         self.sync.session = None;
         self.sync.realtime = None;
         self.sync.groups.clear();
-        self.sync.panel_open = false;
+        self.close_panel(Panel::SyncPlay);
     }
 
     /// Gives an action of the user to the session and does what comes back.
@@ -280,7 +277,7 @@ impl Bloom {
         // start would move the position.
         self.queue.explicit_audio = true;
         self.segments.clear();
-        self.episode_picker.open = false;
+        self.close_panel(Panel::Episodes);
         // The item of the player is not known until the server answers; a
         // local play meanwhile sets its own (`begin`).
         self.playing = None;
@@ -435,19 +432,9 @@ impl Bloom {
     }
 
     pub fn toggle_sync_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // One popup at a time.
-        let open = !self.sync.panel_open;
-        self.close_popups(None, window, cx);
-        // A click on the button while the panel is open closed it a moment
-        // ago, as a click outside of it; that click must not open it again.
-        if open && self.sync.panel_closed.is_some_and(|at| at.elapsed() < Duration::from_millis(250)) {
-            return;
-        }
-        self.sync.panel_open = open;
-        if self.sync.panel_open {
+        if self.toggle_panel(Panel::SyncPlay, window, cx) {
             self.load_groups(cx);
         }
-        cx.notify();
     }
 
     fn load_groups(&mut self, cx: &mut Context<Self>) {
@@ -542,7 +529,7 @@ impl Bloom {
     /// The panel of the groups. `top` places it under the top bar; without
     /// it the panel sits over the controls of the player.
     pub fn render_sync_panel(&self, top: Option<f32>, cx: &mut Context<Self>) -> Option<Div> {
-        if !self.sync.panel_open {
+        if !self.panel_is(Panel::SyncPlay) {
             return None;
         }
         let t = UiTheme::read(cx).clone();
@@ -845,10 +832,7 @@ impl Bloom {
             .on_mouse_down(MouseButton::Left, cx.listener(swallow))
             // A click anywhere else closes the panel, as it closes a menu.
             .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                if std::mem::take(&mut this.sync.panel_open) {
-                    this.sync.panel_closed = Some(std::time::Instant::now());
-                    cx.notify();
-                }
+                this.dismiss_panel(Panel::SyncPlay, cx);
             }))
             .child(glass(px(24.), crate::ui::glass::POPUP_TINT))
             .p(px(12.))

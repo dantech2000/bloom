@@ -305,6 +305,21 @@ pub enum Page {
     Downloads,
 }
 
+/// A popup that is not a menu (it has no `MenuState`). `Bloom::panel` holds
+/// the open one, so two panels are never open next to each other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Panel {
+    /// Episode list of the player.
+    Episodes,
+    /// The list of keys of Jellyfin Enhanced.
+    Help,
+    SyncPlay,
+    Cast,
+    /// Search for subtitles.
+    Subtitles,
+    Bookmarks,
+}
+
 pub struct Bloom {
     pub config: Config,
     pub screen: Screen,
@@ -333,6 +348,11 @@ pub struct Bloom {
     /// Focus of the main screen, so its keyboard shortcuts work.
     pub app_focus: FocusHandle,
     pub profile_menu: Entity<MenuState>,
+    /// The open panel that is not a menu; see [`Panel`]. `open_panel` sets
+    /// it and nothing else does, so a panel never opens next to a menu.
+    panel: Option<Panel>,
+    /// The panel a click outside of it closed, and when (`toggle_panel`).
+    panel_dismissed: Option<(Panel, std::time::Instant)>,
     pub search_input: Entity<InputState>,
     /// Scroll position of the current page.
     pub page_scroll: ScrollHandle,
@@ -652,27 +672,6 @@ impl Bloom {
             },
         ));
 
-        // One popup at a time, in the whole app: a menu that opens closes
-        // every other menu and panel. See `close_popups`.
-        for menu in [
-            &profile_menu,
-            &audio_menu,
-            &settings_menu,
-            &sort_menu,
-            &show_menu,
-            &filter_menu,
-            &detail_audio_menu,
-            &detail_subtitle_menu,
-            &more_menu,
-            &card_menu,
-            &subtitle_menu,
-        ] {
-            subscriptions.push(cx.observe_in(menu, window, |this, opened, window, cx| {
-                if opened.read(cx).is_open() {
-                    this.close_popups(Some(&opened), window, cx);
-                }
-            }));
-        }
         // The bitrate limit of the config, and the end of a transcode at quit.
         subscriptions.push(crate::stream::install(&config, cx));
         // The updater says when a version is on its way or ready.
@@ -763,6 +762,8 @@ impl Bloom {
             menus_fullscreen: false,
             app_focus: cx.focus_handle(),
             profile_menu,
+            panel: None,
+            panel_dismissed: None,
             search_input,
             page_scroll: ScrollHandle::new(),
             row_scrolls: RefCell::new(HashMap::new()),
@@ -896,6 +897,15 @@ impl Bloom {
         // then sends keys and menu actions to a node that is not there, and
         // the shortcuts are dead until a click. The screen takes the focus
         // back the moment the field goes.
+        // One popup at a time, in the whole app: a menu that opens closes
+        // every other menu and panel. See `close_popups`.
+        for menu in this.menus().map(Clone::clone) {
+            this._subscriptions.push(cx.observe_in(&menu, window, |this, opened, window, cx| {
+                if opened.read(cx).is_open() {
+                    this.close_popups(Some(&opened), window, cx);
+                }
+            }));
+        }
         this._subscriptions.push(cx.on_focus_lost(window, |this, window, cx| {
             if this.screen == Screen::Main {
                 let target = if this.player_open { &this.player_focus } else { &this.app_focus };
@@ -1915,8 +1925,8 @@ impl Bloom {
         cx.notify();
     }
 
-    /// Every menu of the app. A new menu must be added here (and to the
-    /// observers in `new`), or it can be open next to another popup.
+    /// Every menu of the app. A new menu goes into this list, and nowhere
+    /// else: the observers of `Bloom::new` and `close_popups` read it.
     fn menus(&self) -> [&Entity<MenuState>; 11] {
         [
             &self.profile_menu,
@@ -1933,10 +1943,8 @@ impl Bloom {
         ]
     }
 
-    /// Closes every popup but `keep`: the menus, the episode list of the
-    /// player and the SyncPlay panel. The app shows one popup at a time;
-    /// whatever opens one calls this first. A panel that is not a menu (it
-    /// has no `MenuState`) must be closed here by hand.
+    /// Closes every popup but `keep`: the menus and the open panel. The app
+    /// shows one popup at a time; whatever opens one calls this first.
     pub fn close_popups(
         &mut self,
         keep: Option<&Entity<MenuState>>,
@@ -1957,26 +1965,59 @@ impl Bloom {
         }
     }
 
-    /// True while a panel that is not a menu is open. The panels are named
-    /// here and in `close_panels`, and nowhere else: a new one goes into
-    /// these two, and every place that asks or closes has it.
+    /// True while a panel that is not a menu is open.
     pub fn panel_open(&self) -> bool {
-        self.episode_picker.open
-            || self.enhanced.help_open
-            || self.sync.panel_open
-            || self.cast.panel_open
-            || self.subs.panel_open
-            || self.enhanced.bookmarks.panel_open
+        self.panel.is_some()
     }
 
-    /// Closes every panel that is not a menu; true when one was open.
+    /// True while this panel is the open one.
+    pub fn panel_is(&self, panel: Panel) -> bool {
+        self.panel == Some(panel)
+    }
+
+    /// Opens a panel in the place of whatever popup is open.
+    pub fn open_panel(&mut self, panel: Panel, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_popups(None, window, cx);
+        self.panel = Some(panel);
+        cx.notify();
+    }
+
+    /// The button of a panel: closes the panel when it is open and opens it
+    /// in the place of every other popup when it is not. True when the
+    /// panel is open afterwards.
+    pub fn toggle_panel(&mut self, panel: Panel, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let was_open = self.panel_is(panel);
+        self.close_popups(None, window, cx);
+        // A click on the button while the panel is open closed it a moment
+        // ago, as a click outside of it; that click must not open it again.
+        let dismissed = self
+            .panel_dismissed
+            .take()
+            .is_some_and(|(which, at)| which == panel && at.elapsed() < Duration::from_millis(250));
+        if was_open || dismissed {
+            cx.notify();
+            return false;
+        }
+        self.open_panel(panel, window, cx);
+        true
+    }
+
+    /// A click outside of a panel: closes it when it is the open one.
+    pub fn dismiss_panel(&mut self, panel: Panel, cx: &mut Context<Self>) {
+        if self.close_panel(panel) {
+            self.panel_dismissed = Some((panel, std::time::Instant::now()));
+            cx.notify();
+        }
+    }
+
+    /// Closes the open panel, whichever it is; true when one was open.
     pub fn close_panels(&mut self) -> bool {
-        std::mem::take(&mut self.episode_picker.open)
-            | std::mem::take(&mut self.enhanced.help_open)
-            | std::mem::take(&mut self.sync.panel_open)
-            | std::mem::take(&mut self.cast.panel_open)
-            | self.close_subs_panel()
-            | self.close_bookmarks_panel()
+        self.panel.take().is_some()
+    }
+
+    /// Closes this panel; true when it was the open one.
+    pub fn close_panel(&mut self, panel: Panel) -> bool {
+        self.panel_is(panel) && self.close_panels()
     }
 
     /// Loads the title index again now: the server said the library changed.
@@ -2738,7 +2779,7 @@ impl Bloom {
         self.player.set_speed(self.speed as f64);
         self.apply_subtitle_style();
         self.playing = Some(item.clone());
-        self.episode_picker.open = false;
+        self.close_panel(Panel::Episodes);
         self.segments.clear();
         let item_id = item.id.clone();
         self.fetch(
