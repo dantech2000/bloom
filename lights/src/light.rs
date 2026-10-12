@@ -593,8 +593,10 @@ mod tests {
         assert!(shown.iter().all(|frame| frame.len() == 4));
         // The first frame is near the light the lamp had (80% of its
         // colour), the last one is the picture: blue below, red above.
+        // (The first frame has some of the green of that light, which the
+        // picture has none of; how much is a matter of when it was sent.)
         let (first, last) = (&shown[0], shown.last().unwrap());
-        assert!(first[0][0] > 150 && first[0][1] > 100, "{first:?}");
+        assert!(first[0][1] > 20 && first[3][1] > 20, "{first:?}");
         assert!(last[0][2] > 200 && last[0][0] < 30 && last[3][0] > 200 && last[3][2] < 30, "{last:?}");
         // The white of a pause is one light along the whole lamp.
         light.act(Action::AuraWhite { kelvin: 2700, level: 25. }, NO_GAP, 0.05);
@@ -689,12 +691,17 @@ mod tests {
         let (lamp, light) = Mock::off();
         light.act(Action::Remember, NO_GAP, 0.05);
         light.act(Action::Aura(vec![[255, 0, 0]]), NO_GAP, 0.01);
-        thread::sleep(Duration::from_millis(300));
+        // Until the sender has sent its first frame, however late it wakes.
+        let until = Instant::now() + Duration::from_secs(10);
+        while lamp.told().len() < 5 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(20));
+        }
         let told = lamp.told();
         assert_eq!(told[..4], [Told::Asked, Told::Stream(true), Told::Frame(vec![[0; 3]; 4]), Told::Power(true)]);
-        // The next frames come out of the dark, not from the light it kept.
+        // The next frames come out of the dark, not from the light it
+        // kept: on the way to red there is no green, which that light has.
         let Told::Frame(first) = &told[4] else { panic!("{:?}", told[4]) };
-        assert!(first[0][0] < 80 && first[0][1] == 0, "{first:?}");
+        assert!(first[0][1] == 0 && first[0][2] == 0, "{first:?}");
         light.act(Action::AuraWhite { kelvin: 2700, level: 25. }, NO_GAP, 0.05);
         light.act(Action::Aura(vec![[0, 0, 255]]), NO_GAP, 0.01);
         assert_eq!(lamp.told().iter().filter(|told| **told == Told::Power(true)).count(), 1, "switched on more than once");
