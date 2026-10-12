@@ -674,11 +674,12 @@ const DISK_MAX_BYTES: u64 = 500 * 1024 * 1024;
 fn disk_dir() -> Option<&'static std::path::Path> {
     static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
-        if std::env::var_os("BLOOM_NO_DISK_CACHE").is_some() {
+        let options = crate::options::options();
+        if options.no_disk_cache {
             return None;
         }
-        let dir = match std::env::var_os("BLOOM_CACHE_DIR") {
-            Some(dir) => std::path::PathBuf::from(dir),
+        let dir = match &options.cache_dir {
+            Some(dir) => dir.clone(),
             None => dirs::cache_dir()?.join(crate::brand::FOLDER).join("images"),
         };
         std::fs::create_dir_all(&dir).ok()?;

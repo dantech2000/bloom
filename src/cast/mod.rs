@@ -62,9 +62,6 @@ const SUBSCRIPTION: &str = "100,1000";
 /// How long the panel says "Searching…" for cast devices once the search
 /// starts; after that a list with nobody in it says nothing.
 const SEARCH_NOTE: Duration = Duration::from_secs(6);
-/// A fake cast device on this Mac for tests of the panel; see
-/// `crate::chromecast::mock`.
-const MOCK_ENV: &str = "BLOOM_CHROMECAST_MOCK";
 
 /// Where a poll of the sessions stands: the session that asked, and the
 /// choice of the target at the time.
@@ -964,7 +961,7 @@ impl Bloom {
         }
         self.chromecast.discovery = Some(mdns::discover());
         self.cast.search_started = Some(Instant::now());
-        if std::env::var_os(MOCK_ENV).is_some() && self.cast.mock.is_none() {
+        if crate::options::options().chromecast_mock && self.cast.mock.is_none() {
             let mock = crate::chromecast::mock::Mock::start();
             log::info!("cast: mock device on 127.0.0.1:{}", mock.port);
             self.cast.mock = Some(mock);

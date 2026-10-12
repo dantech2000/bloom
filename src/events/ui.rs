@@ -151,7 +151,7 @@ impl Bloom {
             ));
         }
         // A test film, in a development instance only.
-        if std::env::var_os("BLOOM_DEBUG_SOCK").is_some() {
+        if crate::options::options().debug_sock.is_some() {
             lights = lights.child(field(
                 "Test film (development)",
                 if !on {

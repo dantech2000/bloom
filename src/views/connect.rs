@@ -272,7 +272,7 @@ impl Bloom {
     /// An instance that must not write the config does not own the saved
     /// sessions, so it leaves them alone.
     pub fn revoke_profile(&self, url: &str, profile: &Profile, cx: &mut Context<Self>) {
-        if std::env::var_os("BLOOM_CONFIG_READONLY").is_some() {
+        if crate::options::options().config_readonly {
             return;
         }
         let client = Client::new(url, &self.config.device_id)

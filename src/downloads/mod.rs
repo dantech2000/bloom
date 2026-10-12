@@ -33,8 +33,8 @@ static ENGINE: OnceLock<Engine> = OnceLock::new();
 
 /// Folder of the downloads.
 pub fn dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("BLOOM_DOWNLOAD_DIR") {
-        return PathBuf::from(dir);
+    if let Some(dir) = &crate::options::options().download_dir {
+        return dir.clone();
     }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -161,7 +161,7 @@ impl Bloom {
         self.downloads.offline = false;
         self.downloads.online_client = None;
         self.connection_reset();
-        if std::env::var_os("BLOOM_OFFLINE").is_some() {
+        if crate::options::options().offline {
             self.simulate_unreachable(true);
         }
         let Some(session) = self.session.as_ref() else { return };

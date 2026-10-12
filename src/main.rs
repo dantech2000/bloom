@@ -26,6 +26,7 @@ mod menus;
 mod metadata;
 mod news;
 mod nowplaying;
+mod options;
 mod pacing;
 mod perf;
 mod pip;
@@ -104,14 +105,14 @@ fn main() {
             // appearance of the system, so they match the window in both
             // settings of the Mac. `BLOOM_APPEARANCE=light|dark|system`
             // overrides it for a test.
-            macos::set_app_appearance(match std::env::var("BLOOM_APPEARANCE").as_deref() {
-                Ok("light") => Some(false),
-                Ok("dark") => Some(true),
-                Ok(_) => None,
-                Err(_) => Some(true),
+            macos::set_app_appearance(match options::options().appearance.as_deref() {
+                Some("light") => Some(false),
+                Some("dark") => Some(true),
+                Some(_) => None,
+                None => Some(true),
             });
 
-            let test_instance = std::env::var_os("BLOOM_TEST_NAME").is_some();
+            let test_instance = options::options().test_name.is_some();
             open_main_window(cx, config);
             log::debug!("window open {} ms after start", perf::since_start_ms());
             // Nothing may play from a window that is gone: the cores close
@@ -151,7 +152,7 @@ fn open_main_window(cx: &mut App, config: Config) {
                 .any(|display| display.bounds().intersects(bounds))
         })
         .unwrap_or_else(|| Bounds::centered(None, size(px(1280.), px(820.)), cx));
-    let test_instance = std::env::var_os("BLOOM_TEST_NAME").is_some();
+    let test_instance = options::options().test_name.is_some();
     cx.open_window(
         WindowOptions {
             titlebar: Some(TitlebarOptions {

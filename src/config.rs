@@ -149,8 +149,8 @@ impl Config {
     pub fn path() -> PathBuf {
         // A test instance can use its own file, for example an empty one
         // to see the sign-in page.
-        if let Some(path) = std::env::var_os("BLOOM_CONFIG_PATH") {
-            return PathBuf::from(path);
+        if let Some(path) = &crate::options::options().config_path {
+            return path.clone();
         }
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -192,7 +192,7 @@ impl Config {
     pub fn save(&self) -> Result<()> {
         // A second instance started for tests must not change the settings
         // of the instance the user runs.
-        if std::env::var_os("BLOOM_CONFIG_READONLY").is_some() {
+        if crate::options::options().config_readonly {
             return Ok(());
         }
         self.save_to(&Self::path())

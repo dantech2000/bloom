@@ -47,9 +47,9 @@ pub fn socket_path() -> String {
     dirs::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(crate::brand::FOLDER)
-        .join(match std::env::var("BLOOM_TEST_NAME") {
-            Ok(name) => format!("events-{name}.sock"),
-            Err(_) => "events.sock".into(),
+        .join(match &crate::options::options().test_name {
+            Some(name) => format!("events-{name}.sock"),
+            None => "events.sock".into(),
         })
         .display()
         .to_string()

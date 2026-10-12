@@ -113,9 +113,9 @@ pub fn setting_socket() -> String {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(crate::brand::FOLDER)
         // A test instance must not take the socket of the app the user runs.
-        .join(match std::env::var("BLOOM_TEST_NAME") {
-            Ok(name) => format!("debug-{name}.sock"),
-            Err(_) => "debug.sock".into(),
+        .join(match &crate::options::options().test_name {
+            Some(name) => format!("debug-{name}.sock"),
+            None => "debug.sock".into(),
         })
         .display()
         .to_string()
@@ -127,9 +127,9 @@ impl Bloom {
     /// or test instance), one when the setting is on.
     pub fn start_debug_channel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (tx, rx) = async_channel::unbounded::<Request>();
-        if let Ok(path) = std::env::var("BLOOM_DEBUG_SOCK") {
+        if let Some(path) = &crate::options::options().debug_sock {
             // Lives as long as the app.
-            let _ = Listener::start(path, tx.clone());
+            let _ = Listener::start(path.clone(), tx.clone());
         }
         self.debug_requests = Some(tx);
         if self.config.debug_channel == Some(true) {
@@ -278,7 +278,7 @@ impl Bloom {
                 self.request_stop(cx);
                 // `play` muted the player for the test; give the sound back.
                 // A test instance (`BLOOM_MUTED`) never makes a sound.
-                if std::env::var_os("BLOOM_MUTED").is_none() {
+                if !crate::options::options().muted {
                     self.muted = false;
                     self.player.set_muted(false);
                 }

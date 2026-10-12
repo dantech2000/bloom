@@ -81,7 +81,7 @@ impl Default for HeroVideo {
             muted: true,
             window_active: true,
             held: false,
-            play_inactive: std::env::var_os("BLOOM_HERO_PLAY_INACTIVE").is_some(),
+            play_inactive: crate::options::options().hero_play_inactive,
             scale: 2.,
             last_redraw: Instant::now(),
             _activation: None,

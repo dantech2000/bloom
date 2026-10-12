@@ -251,7 +251,7 @@ impl Bloom {
             found: Vec::new(),
             scanning: false,
         });
-        if self.config.lights == Some(true) && hub().on() && std::env::var_os("BLOOM_TEST_NAME").is_none() {
+        if self.config.lights == Some(true) && hub().on() && crate::options::options().test_name.is_none() {
             self.lights_helper(true);
         }
     }

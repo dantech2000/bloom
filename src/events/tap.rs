@@ -64,7 +64,7 @@ impl Bloom {
             }
             // The lights were on when the events went off: their helper
             // has the events again. (A test instance starts none itself.)
-            if hub().on() && self.config.lights == Some(true) && std::env::var_os("BLOOM_TEST_NAME").is_none() {
+            if hub().on() && self.config.lights == Some(true) && crate::options::options().test_name.is_none() {
                 self.lights_helper(true);
             }
         } else {
