@@ -684,6 +684,7 @@ impl Engine {
     }
 
     /// The folder of an item's files.
+    #[cfg(test)]
     pub fn folder(&self, item_id: &str) -> Option<PathBuf> {
         self.folder_of(None, item_id)
     }

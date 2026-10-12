@@ -16,9 +16,11 @@ pub const FOLDER: &str = "bloom";
 /// Where the app asks for updates: the feed that `dev/release` makes, as an
 /// asset of the newest release on GitHub. Nothing is there until the
 /// repository is published and has a release.
+#[allow(dead_code)] // read by `dev/bundle`, which writes it into the bundle
 pub const UPDATE_FEED: &str = "https://github.com/dantech2000/bloom/releases/latest/download/appcast.xml";
 /// The public key that updates must be signed with (`dev/release key`
 /// prints it). Empty: the app has no updater.
+#[allow(dead_code)] // read by `dev/bundle`, as the feed above
 pub const UPDATE_PUBLIC_KEY: &str = "y8Y1xqeM5kuV8zwj6mrK41E7dxoXjehwDXaeT9XOKfQ=";
 /// Folders of earlier names. Their content moves to `FOLDER` at the start.
 const OLD_FOLDERS: [&str; 1] = ["jellyui"];

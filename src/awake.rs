@@ -149,6 +149,7 @@ pub struct Awake {
 }
 
 impl Awake {
+    #[cfg(test)]
     pub fn held(&self) -> bool {
         self.id.is_some()
     }
