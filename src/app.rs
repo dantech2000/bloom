@@ -803,7 +803,7 @@ impl Bloom {
             volume_slider,
             volume: 100.,
             // A test instance never makes a sound (`dev/run-test` sets this).
-            muted: std::env::var_os("BLOOM_MUTED").is_some(),
+            muted: crate::options::options().muted,
             speed: 1.,
             playing: None,
             segments: Vec::new(),
@@ -3548,7 +3548,7 @@ impl Render for Bloom {
             .children(self.render_seasons_dialog(cx))
             // A test instance says so in its window, so nobody takes it for
             // the app in use (`dev/run-test` sets the name).
-            .children(std::env::var("BLOOM_TEST_NAME").ok().map(|name| {
+            .children(crate::options::options().test_name.clone().map(|name| {
                 div()
                     .absolute()
                     // Under the top bar, clear of its buttons and of the title

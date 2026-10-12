@@ -269,12 +269,8 @@ impl Default for Options {
             limit_bytes: None,
             free_override: None,
             retry_wait: Duration::from_secs(1),
-            byte_limit: std::env::var("BLOOM_DOWNLOAD_LIMIT_BYTES")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            throttle_bps: std::env::var("BLOOM_DOWNLOAD_THROTTLE_BPS")
-                .ok()
-                .and_then(|v| v.parse().ok()),
+            byte_limit: crate::options::options().download_limit_bytes,
+            throttle_bps: crate::options::options().download_throttle_bps,
             stall: Duration::from_secs(30),
             #[cfg(test)]
             start_gate: None,

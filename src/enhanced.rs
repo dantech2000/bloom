@@ -1263,8 +1263,8 @@ impl Bloom {
 /// A test instance often sits behind other windows; it does not pause for
 /// that, unless the test asks for it.
 fn auto_pause_allowed() -> bool {
-    std::env::var_os("BLOOM_CONFIG_READONLY").is_none()
-        || std::env::var_os("BLOOM_AUTO_PAUSE").is_some()
+    let options = crate::options::options();
+    !options.config_readonly || options.auto_pause
 }
 
 #[cfg(test)]

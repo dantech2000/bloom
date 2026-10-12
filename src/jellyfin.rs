@@ -2106,7 +2106,7 @@ impl Client {
 /// `BLOOM_NO_REPORT` keeps playback from the server's records, so a test
 /// does not move a resume point or mark an item as played.
 pub fn no_report() -> bool {
-    std::env::var_os("BLOOM_NO_REPORT").is_some()
+    crate::options::options().no_report
 }
 
 /// With the reports off, the log still shows what would go to the server,

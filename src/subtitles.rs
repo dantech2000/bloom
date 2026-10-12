@@ -950,7 +950,7 @@ impl Bloom {
     pub fn debug_subs(&mut self, rest: &str, window: &mut Window, cx: &mut Context<Self>) -> String {
         let (verb, arg) = rest.split_once(' ').unwrap_or((rest, ""));
         let arg = arg.trim();
-        let write_allowed = std::env::var("BLOOM_ALLOW_SUBTITLE_WRITE").as_deref() == Ok("1");
+        let write_allowed = crate::options::options().allow_subtitle_write;
         match verb {
             "" | "state" => self.subs_describe(),
             "delay" | "audio-delay" => {

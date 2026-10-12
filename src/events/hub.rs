@@ -81,7 +81,7 @@ pub struct Hub {
 /// The hub of the app.
 pub fn hub() -> &'static Hub {
     static HUB: OnceLock<Hub> = OnceLock::new();
-    HUB.get_or_init(|| Hub::new(std::env::var("BLOOM_TEST_NAME").unwrap_or_else(|_| "default".into())))
+    HUB.get_or_init(|| Hub::new(crate::options::options().test_name.clone().unwrap_or_else(|| "default".into())))
 }
 
 impl Hub {

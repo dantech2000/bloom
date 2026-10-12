@@ -29,7 +29,7 @@ const OLD_FOLDERS: [&str; 1] = ["jellyui"];
 pub fn migrate_folders() {
     // A test instance with a config file of its own leaves the folders of
     // the user alone.
-    if std::env::var_os("BLOOM_CONFIG_PATH").is_some() {
+    if crate::options::options().config_path.is_some() {
         return;
     }
     for base in [dirs::config_dir(), dirs::cache_dir()].into_iter().flatten() {

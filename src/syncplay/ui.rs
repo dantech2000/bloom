@@ -106,7 +106,7 @@ impl Bloom {
         };
         // A test instance on the config of the user would be the same
         // session on the server and take its socket messages away.
-        if std::env::var_os("BLOOM_NO_SOCKET").is_some() {
+        if crate::options::options().no_socket {
             return;
         }
         let (realtime, socket) = realtime::start(client.clone());

@@ -77,9 +77,10 @@ pub enum Mode {
 pub fn mode() -> Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
     *MODE.get_or_init(|| {
-        if std::env::var_os("BLOOM_OLD_PACING").is_some() {
+        let options = crate::options::options();
+        if options.old_pacing {
             Mode::Old
-        } else if std::env::var_os("BLOOM_AUDIO_PACING").is_some() {
+        } else if options.audio_pacing {
             Mode::Audio
         } else {
             Mode::Display
@@ -108,12 +109,7 @@ const DUE_MARGIN: Duration = Duration::from_millis(2);
 /// for an A/B on other hardware; 0 is the timing before (the draw at the
 /// next tick). It must be below the period of the display.
 fn phase_override() -> Option<u64> {
-    static PHASE: OnceLock<Option<u64>> = OnceLock::new();
-    *PHASE.get_or_init(|| {
-        std::env::var("BLOOM_FRAME_PHASE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-    })
+    crate::options::options().frame_phase_ms
 }
 
 /// How long after the tick of a frame the UI draws it, in nanoseconds, for
@@ -966,11 +962,11 @@ pub mod trace {
     /// file (see [`log_line`]), drained once a second by a thread of its
     /// own, for a long run with no debug command in it.
     pub fn enable_from_env() {
-        if std::env::var_os("BLOOM_PACING_TRACE").is_some() {
+        if crate::options::options().pacing_trace {
             enable();
         }
-        if let Some(path) = std::env::var_os("BLOOM_PACING_LOG") {
-            match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Some(path) = &crate::options::options().pacing_log {
+            match std::fs::OpenOptions::new().create(true).append(true).open(path) {
                 Ok(file) => {
                     let _ = LOG.set(Mutex::new(file));
                     enable();

@@ -134,9 +134,9 @@ static SETTINGS: LazyLock<RwLock<Settings>> = LazyLock::new(|| {
 /// The mode `BLOOM_GLASS=liquid|frosted` asks for, which wins over the
 /// user's setting, for a test.
 pub fn forced() -> Option<Mode> {
-    match std::env::var("BLOOM_GLASS").as_deref() {
-        Ok("liquid") => Some(Mode::Liquid),
-        Ok("frosted") => Some(Mode::Frosted),
+    match crate::options::options().glass.as_deref() {
+        Some("liquid") => Some(Mode::Liquid),
+        Some("frosted") => Some(Mode::Frosted),
         _ => None,
     }
 }
@@ -200,7 +200,7 @@ fn layer(radius: Pixels, tint: Rgba, card: bool) -> Canvas<()> {
             // The shader does not clamp the radius; a pill passes a large one.
             let radius = radius.min(bounds.size.width.min(bounds.size.height) / 2.);
             // Bench switch: plain tint without the blur pass.
-            let style = if std::env::var_os("BLOOM_NO_GLASS").is_some() {
+            let style = if crate::options::options().no_glass {
                 BorderStyle::Solid
             } else {
                 BorderStyle::Dashed
