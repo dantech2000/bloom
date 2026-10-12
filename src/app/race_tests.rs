@@ -42,6 +42,33 @@ fn back_restores_a_library_page_whose_load_was_thrown_away(cx: &mut TestAppConte
     });
 }
 
+/// The answer of a page that the user has left does not land in the page
+/// of the same kind that is open now (`Bloom::fetch_for_page`).
+#[gpui_kit::test(iterations = 20)]
+fn the_answer_of_a_library_the_user_left_stays_out_of_the_next_one(cx: &mut TestAppContext) {
+    let server = MockServer::start(|method, path, _| match (method, path) {
+        ("GET", p) if p.starts_with("/Items?") && p.contains("lib1") => (200, items_json(&["a1", "a2"], "Movie")),
+        ("GET", p) if p.starts_with("/Items?") && p.contains("lib2") => (200, items_json(&["b1"], "Movie")),
+        _ => plain(method, path),
+    });
+    let (bloom, cx) = app(cx);
+    bloom.update(cx, |this, cx| {
+        this.session = Some(session(&server.url, "u1"));
+        this.screen = Screen::Main;
+        this.open_library(item("lib1", "One", "CollectionFolder"), cx);
+        // The user opens another library before the first one answers.
+        this.open_library(item("lib2", "Two", "CollectionFolder"), cx);
+    });
+    cx.run_until_parked();
+    bloom.read_with(cx, |this, _| match &this.page {
+        Page::Library(data) => {
+            let ids: Vec<&str> = data.items.iter().map(|i| i.id.as_str()).collect();
+            assert_eq!(ids, ["b1"], "library two shows the titles of library one");
+        }
+        _ => panic!("the second library is not open"),
+    });
+}
+
 // ----- finding 3 ----------------------------------------------------------
 
 /// What marks the request of the title index among the item queries.

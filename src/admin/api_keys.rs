@@ -261,8 +261,7 @@ fn create(app: &mut Bloom, name: String, cx: &mut Context<Bloom>) {
     let shown = name.clone();
     // The key is shown on the page that asked, in the session that
     // asked: after a switch of the server it is not this server's key.
-    let epoch = app.session_epoch;
-    app.fetch(
+    app.fetch_in_session(
         cx,
         move |client| -> Result<Option<String>> {
             // The server does not answer with the key, so the new one is the
@@ -280,9 +279,6 @@ fn create(app: &mut Bloom, name: String, cx: &mut Context<Bloom>) {
                 .map(|k| k.access_token))
         },
         move |this, result, cx| {
-            if this.session_epoch != epoch {
-                return;
-            }
             match result {
                 Ok(Some(value)) if matches!(this.page, crate::app::Page::Admin(_)) => {
                     this.admin_secret = Some(Secret {

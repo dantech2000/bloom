@@ -416,14 +416,10 @@ impl Bloom {
             return;
         }
         self.pref_lanes.loading = Some(epoch);
-        self.fetch(
+        self.fetch_in_session(
             cx,
             |client| client.user_prefs(),
             move |this, result, cx| {
-                // Another session may be open by now, with settings of its own.
-                if this.session_epoch != epoch {
-                    return;
-                }
                 this.pref_lanes.loading = None;
                 match result {
                     Ok(loaded) => {

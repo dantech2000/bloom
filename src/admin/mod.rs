@@ -312,7 +312,7 @@ impl Bloom {
     }
 
     /// Loads the data of the open section. `load_page` calls this.
-    pub fn load_admin(&mut self, generation: u64, cx: &mut Context<Self>) {
+    pub fn load_admin(&mut self, cx: &mut Context<Self>) {
         let Page::Admin(data) = &mut self.page else {
             return;
         };
@@ -320,7 +320,7 @@ impl Bloom {
         let section = data.section;
         let log_open = data.log_open.clone();
         self.start_admin_tick(cx);
-        self.fetch(
+        self.fetch_for_page(
             cx,
             move |client| -> Result<Loaded> {
                 let client = &client;
@@ -338,9 +338,6 @@ impl Bloom {
                 })
             },
             move |this, result, cx| {
-                if this.generation != generation {
-                    return;
-                }
                 if let Page::Admin(data) = &mut this.page {
                     data.loading = false;
                     match result {
