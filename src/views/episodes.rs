@@ -11,7 +11,7 @@ use gpui_kit::{
 
 use crate::{
     app::{Bloom, Panel},
-    jellyfin::{Item, format_runtime},
+    jellyfin::{Item, ItemKind, format_runtime},
     ui::{glass::glass, scroll_area::ScrollArea, theme::UiTheme},
     views::cards::{artwork, icon},
 };
@@ -39,7 +39,7 @@ impl Bloom {
     pub fn can_pick_episode(&self) -> bool {
         self.playing
             .as_ref()
-            .is_some_and(|item| item.kind == "Episode" && item.series_id.is_some())
+            .is_some_and(|item| item.kind == ItemKind::Episode && item.series_id.is_some())
     }
 
     /// Opens or closes the episode list. It opens at the season of the

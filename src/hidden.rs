@@ -30,7 +30,7 @@ use serde_json::{Value, json};
 
 use crate::{
     app::{Bloom, Page},
-    jellyfin::{Client, Item},
+    jellyfin::{Client, Item, ItemKind},
     ui::{menu::MenuItem, theme::UiTheme, tip::tip},
     views::cards::icon,
 };
@@ -317,11 +317,11 @@ impl HideRequest {
     /// For an item of the library. A series gets its own TMDB id; an episode
     /// carries the series' name and its place, as in the plugin.
     pub fn of(item: &Item) -> Self {
-        let episode = item.kind == "Episode";
+        let episode = item.kind == ItemKind::Episode;
         Self {
             item_id: item.id.clone(),
             name: item.name.clone(),
-            kind: item.kind.clone(),
+            kind: item.kind.to_string(),
             tmdb_id: item.provider_ids.get("Tmdb").cloned().flatten().unwrap_or_default(),
             series_id: item.series_id.clone().unwrap_or_default(),
             series_name: item.series_name.clone().unwrap_or_default(),
@@ -609,7 +609,7 @@ impl Bloom {
         let allowed = self.hidden_on()
             && settings.show_hide_buttons
             && (!detail || settings.show_button_details)
-            && matches!(item.kind.as_str(), "Movie" | "Series" | "Season" | "Episode");
+            && matches!(item.kind, ItemKind::Movie | ItemKind::Series | ItemKind::Season | ItemKind::Episode);
         if !allowed {
             return Vec::new();
         }
@@ -624,15 +624,15 @@ impl Bloom {
             return entries;
         }
         let (handle, request) = (this.clone(), HideRequest::of(item));
-        let label = match item.kind.as_str() {
-            "Episode" => "Hide this episode",
-            "Season" => "Hide this season",
+        let label = match item.kind {
+            ItemKind::Episode => "Hide this episode",
+            ItemKind::Season => "Hide this season",
             _ => "Hide",
         };
         entries.push(MenuItem::new("hidden.hide", label).on_click(move |_, _, cx| {
             handle.update(cx, |this, cx| this.hide_items(vec![request.clone()], cx)).ok();
         }));
-        if let (true, Some(series)) = (matches!(item.kind.as_str(), "Episode" | "Season"), &item.series_id) {
+        if let (true, Some(series)) = (matches!(item.kind, ItemKind::Episode | ItemKind::Season), &item.series_id) {
             let handle = this.clone();
             let request = HideRequest {
                 item_id: series.clone(),

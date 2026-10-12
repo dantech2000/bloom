@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use crate::{
     app::{Bloom, Page},
-    jellyfin::{Client, Item, ItemQuery},
+    jellyfin::{Client, Item, ItemKind, ItemQuery},
     ui::menu::MenuItem,
 };
 
@@ -43,18 +43,21 @@ impl ListKind {
 
 /// Only a playlist or a collection can be deleted. `DELETE /Items/{id}` also
 /// deletes real media, so every delete goes through this check.
-pub fn is_deletable_kind(kind: &str) -> bool {
-    matches!(kind, "Playlist" | "BoxSet")
+pub fn is_deletable_kind(kind: &ItemKind) -> bool {
+    matches!(kind, ItemKind::Playlist | ItemKind::BoxSet)
 }
 
 /// The kinds of item that can go into a playlist.
-pub fn can_add_to_playlist(kind: &str) -> bool {
-    matches!(kind, "Movie" | "Series" | "Season" | "Episode" | "Video")
+pub fn can_add_to_playlist(kind: &ItemKind) -> bool {
+    matches!(
+        kind,
+        ItemKind::Movie | ItemKind::Series | ItemKind::Season | ItemKind::Episode | ItemKind::Video
+    )
 }
 
 /// The kinds of item that can go into a collection.
-pub fn can_add_to_collection(kind: &str) -> bool {
-    matches!(kind, "Movie" | "Series")
+pub fn can_add_to_collection(kind: &ItemKind) -> bool {
+    matches!(kind, ItemKind::Movie | ItemKind::Series)
 }
 
 /// The place an entry takes when it moves one step. `place` counts from 0.
@@ -465,7 +468,7 @@ impl Bloom {
         let Page::Library(data) = &self.page else {
             return Vec::new();
         };
-        if data.view.kind != "BoxSet" || !self.lists.can_collect {
+        if data.view.kind != ItemKind::BoxSet || !self.lists.can_collect {
             return Vec::new();
         }
         let (handle, collection, target) = (cx.weak_entity(), data.view.clone(), item.clone());
@@ -488,7 +491,7 @@ impl Bloom {
         let Page::Library(data) = &self.page else {
             return;
         };
-        if data.view.kind != "BoxSet" {
+        if data.view.kind != ItemKind::BoxSet {
             return;
         }
         let (handle, collection) = (cx.weak_entity(), data.view.clone());
@@ -745,7 +748,7 @@ impl Bloom {
             log::warn!("lists: refused to offer delete for a {}", list.kind);
             return;
         }
-        let noun = if list.kind == "Playlist" { "playlist" } else { "collection" };
+        let noun = if list.kind == ItemKind::Playlist { "playlist" } else { "collection" };
         let message = format!("\"{}\" goes away. The titles in it stay in the library.", list.name);
         let target = list.clone();
         self.open_lists_dialog(
@@ -893,7 +896,7 @@ impl Bloom {
     ) -> Result<String> {
         let line = |item: &Item, count: usize| format!("{} {:?} {}", item.id, item.name, count);
         let count_of = |client: &Client, item: &Item| -> usize {
-            if item.kind == "Playlist" {
+            if item.kind == ItemKind::Playlist {
                 client.playlist_entries(&item.id).map(|e| e.len()).unwrap_or(0)
             } else {
                 item.child_count.unwrap_or(0).max(0) as usize
@@ -940,7 +943,7 @@ impl Bloom {
                 let list = guard(client, args.first().ok_or_else(|| anyhow!("a list id is missing"))?)?;
                 let ids = ids_of(&args[1..]);
                 ensure!(!ids.is_empty(), "an item id is missing");
-                if list.kind == "Playlist" {
+                if list.kind == ItemKind::Playlist {
                     client.add_to_playlist(&list.id, &ids)?;
                 } else {
                     client.add_to_collection(&list.id, &ids)?;
@@ -951,7 +954,7 @@ impl Bloom {
             "entries" => {
                 let id = args.first().ok_or_else(|| anyhow!("a list id is missing"))?;
                 let list = client.item(id)?;
-                if list.kind == "Playlist" {
+                if list.kind == ItemKind::Playlist {
                     let entries = client.playlist_entries(id)?;
                     Ok(entries
                         .iter()
@@ -973,7 +976,7 @@ impl Bloom {
             "remove" => {
                 let list = guard(client, args.first().ok_or_else(|| anyhow!("a list id is missing"))?)?;
                 let n = place(args.get(1))?;
-                if list.kind == "Playlist" {
+                if list.kind == ItemKind::Playlist {
                     let entries = client.playlist_entries(&list.id)?;
                     let entry = entries.get(n).ok_or_else(|| anyhow!("no entry at that place"))?;
                     client.remove_from_playlist(&list.id, &[entry.entry_id.clone()])?;
@@ -987,7 +990,7 @@ impl Bloom {
             }
             "move" => {
                 let list = guard(client, args.first().ok_or_else(|| anyhow!("a list id is missing"))?)?;
-                ensure!(list.kind == "Playlist", "only a playlist has an order");
+                ensure!(list.kind == ItemKind::Playlist, "only a playlist has an order");
                 let (from, to) = (place(args.get(1))?, place(args.get(2))?);
                 let entries = client.playlist_entries(&list.id)?;
                 let entry = entries.get(from).ok_or_else(|| anyhow!("no entry at that place"))?;
@@ -999,7 +1002,7 @@ impl Bloom {
             "rename" => {
                 let list = guard(client, args.first().ok_or_else(|| anyhow!("a list id is missing"))?)?;
                 let name = tail(2);
-                ensure!(list.kind == "Playlist", "only a playlist is renamed here");
+                ensure!(list.kind == ItemKind::Playlist, "only a playlist is renamed here");
                 ensure!(is_test_name(&name), "refused: the new name must start with {TEST_PREFIX}");
                 client.rename_playlist(&list.id, &name)?;
                 self.after_list_change(cx);
@@ -1113,7 +1116,7 @@ impl Bloom {
                         self.playlist_remove(n, cx);
                     }
                     // On the page of a collection: the menu entry "Remove from collection".
-                    Page::Library(data) if data.view.kind == "BoxSet" => {
+                    Page::Library(data) if data.view.kind == ItemKind::BoxSet => {
                         ensure!(is_test_name(&data.view.name), "refused: not a {TEST_PREFIX} list");
                         let item = data.items.get(n).ok_or_else(|| anyhow!("no item at that place"))?.clone();
                         let collection = data.view.clone();
@@ -1185,10 +1188,10 @@ mod tests {
 
     #[test]
     fn only_a_playlist_or_a_collection_is_deletable() {
-        assert!(is_deletable_kind("Playlist"));
-        assert!(is_deletable_kind("BoxSet"));
+        assert!(is_deletable_kind(&ItemKind::Playlist));
+        assert!(is_deletable_kind(&ItemKind::BoxSet));
         for kind in ["Movie", "Series", "Season", "Episode", "Folder", "CollectionFolder", "UserView", ""] {
-            assert!(!is_deletable_kind(kind), "{kind}");
+            assert!(!is_deletable_kind(&kind.into()), "{kind}");
         }
     }
 
@@ -1266,9 +1269,9 @@ mod tests {
 
     #[test]
     fn kinds_for_lists() {
-        assert!(can_add_to_playlist("Episode"));
-        assert!(!can_add_to_playlist("BoxSet"));
-        assert!(can_add_to_collection("Movie"));
-        assert!(!can_add_to_collection("Episode"));
+        assert!(can_add_to_playlist(&ItemKind::Episode));
+        assert!(!can_add_to_playlist(&ItemKind::BoxSet));
+        assert!(can_add_to_collection(&ItemKind::Movie));
+        assert!(!can_add_to_collection(&ItemKind::Episode));
     }
 }

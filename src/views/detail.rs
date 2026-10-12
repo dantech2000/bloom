@@ -16,7 +16,7 @@ use gpui_kit::{
 use crate::{
     app::{DetailData, Bloom, Page},
     icons::{Filled, filled},
-    jellyfin::{Client, Item, Person, format_runtime},
+    jellyfin::{Client, Item, ItemKind, Person, format_runtime},
     ui::{glass::glass, menu::Menu, scroll_area::ScrollArea, theme::UiTheme},
     views::{
         cards::{
@@ -201,7 +201,7 @@ impl Bloom {
                 cx,
             ));
         }
-        if item.kind == "Episode" && data.episodes.len() > 1 {
+        if item.kind == ItemKind::Episode && data.episodes.len() > 1 {
             // The other episodes of the season, with this one marked.
             let w = (vw * 0.173).round();
             let current = item.id.clone();
@@ -322,16 +322,16 @@ impl Bloom {
         let Some(series) = item
             .series_name
             .clone()
-            .filter(|_| matches!(item.kind.as_str(), "Season" | "Episode"))
+            .filter(|_| matches!(item.kind, ItemKind::Season | ItemKind::Episode))
         else {
             return div().child(heading(item.name.clone()));
         };
         let series_id = item.series_id.clone();
         let target_name = series.clone();
         // On an episode page the season is a link too.
-        let season = item.season_name.clone().filter(|_| item.kind == "Episode");
-        let second = match (item.kind.as_str(), item.index_number) {
-            ("Episode", Some(n)) => format!("{n}. {}", item.name),
+        let season = item.season_name.clone().filter(|_| item.kind == ItemKind::Episode);
+        let second = match (&item.kind, item.index_number) {
+            (ItemKind::Episode, Some(n)) => format!("{n}. {}", item.name),
             _ => item.name.clone(),
         };
         let season_link = season.zip(item.season_id.clone()).map(|(name, id)| {
@@ -635,7 +635,7 @@ impl Bloom {
 
 /// Height to width ratio of the detail poster.
 fn poster_ratio(item: &Item) -> f32 {
-    if item.kind == "Episode" { 9. / 16. } else { 1.5 }
+    if item.kind == ItemKind::Episode { 9. / 16. } else { 1.5 }
 }
 
 /// Year, runtime, age rating, score and end time under the title.
@@ -660,7 +660,7 @@ fn meta_line(item: &Item, cx: &Context<Bloom>) -> Div {
     if let Some(rating) = item
         .official_rating
         .clone()
-        .filter(|_| !matches!(item.kind.as_str(), "Season" | "Episode"))
+        .filter(|_| !matches!(item.kind, ItemKind::Season | ItemKind::Episode))
     {
         line = line.child(
             div()

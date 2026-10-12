@@ -11,7 +11,7 @@ use gpui_kit::{
 use crate::{
     app::{CardRow, Bloom, Page},
     icons::{Filled, filled},
-    jellyfin::{Item, SeerrItem},
+    jellyfin::{Item, ItemKind, SeerrItem},
     ui::{input::Input, scroll_area::ScrollArea, theme::UiTheme},
     views::cards::{
         CARD_RADIUS, CARD_TEXT_H, Cards, artwork, empty_state, icon, poster_card, section, skeleton_row,
@@ -46,12 +46,12 @@ impl Bloom {
                 cx,
             ));
         } else {
-            let of_kind = |kind: &str| -> Vec<&Item> {
+            let of_kind = |kind: ItemKind| -> Vec<&Item> {
                 data.results.iter().filter(|i| i.kind == kind).collect()
             };
             for (id, title, kind) in [
-                ("search.movies", "Movies", "Movie"),
-                ("search.shows", "Shows", "Series"),
+                ("search.movies", "Movies", ItemKind::Movie),
+                ("search.shows", "Shows", ItemKind::Series),
             ] {
                 let items = of_kind(kind);
                 if items.is_empty() {
@@ -70,7 +70,7 @@ impl Bloom {
                     cx,
                 ));
             }
-            let episodes = of_kind("Episode");
+            let episodes = of_kind(ItemKind::Episode);
             if !episodes.is_empty() {
                 let cards = Cards::new(m.backdrop_w, episodes.len(), |i, cx| {
                     wide_card(episodes[i], &client, m.backdrop_w, CardRow::None, cx)

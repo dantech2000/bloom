@@ -11,6 +11,7 @@ use gpui_kit::{
 use crate::{
     app::{Bloom, LibraryShow, PAGE_SIZE, Page},
     icons::{Filled, filled},
+    jellyfin::ItemKind,
     ui::{glass::glass, menu::Menu, scroll_area::ScrollArea, theme::UiTheme},
     views::cards::{empty_state, grid, icon, skeleton_row},
 };
@@ -181,7 +182,7 @@ impl Bloom {
                     .items_center()
                     .gap(px(4.))
                     // The page of a collection has a menu of its own.
-                    .when(data.view.kind == "BoxSet", |el| {
+                    .when(data.view.kind == ItemKind::BoxSet, |el| {
                         el.child(
                             Menu::new(&self.more_menu, "More")
                                 .trigger_style_with(|button| button)

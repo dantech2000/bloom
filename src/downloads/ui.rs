@@ -17,7 +17,7 @@ use super::{Entry, EntryState, engine, format_bytes};
 use crate::{
     admin::Confirm,
     app::{Bloom, Page},
-    jellyfin::Item,
+    jellyfin::{Item, ItemKind},
     settings::{Choice, field, group, icon_button, raised, select},
     ui::{menu::MenuItem, scroll_area::ScrollArea, theme::UiTheme, tip::tip},
     views::cards::{CARD_RADIUS, icon},
@@ -143,7 +143,7 @@ impl Bloom {
                 .hover(|s| s.bg(rgba(0x00000066)))
         };
         let engine = engine();
-        if item.kind == "Season" {
+        if item.kind == ItemKind::Season {
             let episodes: Vec<Item> = match &self.page {
                 Page::Detail(data) => data.episodes.iter().filter(|e| e.is_playable()).cloned().collect(),
                 _ => Vec::new(),
@@ -272,7 +272,7 @@ impl Bloom {
         }
         let this = cx.weak_entity();
         let mut items = Vec::new();
-        if item.kind == "Season" {
+        if item.kind == ItemKind::Season {
             let (Some(series_id), season_id) = (item.series_id.clone(), item.id.clone()) else {
                 return items;
             };

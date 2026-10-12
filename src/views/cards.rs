@@ -16,7 +16,7 @@ use gpui_kit::{
 use crate::{
     app::{CardRow, Bloom},
     icons::{Filled, filled},
-    jellyfin::{Client, Item},
+    jellyfin::{Client, Item, ItemKind},
     ui::theme::UiTheme,
 };
 use crate::ui::tip::tip;
@@ -400,27 +400,27 @@ pub fn poster_card(
     let h = (w * 1.5).round();
     let width = (w * 2.) as u32;
     let series_poster = match (&item.series_id, &item.series_primary_image_tag) {
-        (Some(series), Some(tag)) if item.kind == "Episode" => {
+        (Some(series), Some(tag)) if item.kind == ItemKind::Episode => {
             Some(client.image_url(series, "Primary", Some(tag), width))
         }
         _ => None,
     };
     let url = series_poster.or_else(|| item.poster_url(client, width));
-    let (title, subtitle) = match item.kind.as_str() {
-        "Episode" => (
+    let (title, subtitle) = match item.kind {
+        ItemKind::Episode => (
             item.series_name
                 .clone()
                 .unwrap_or_else(|| item.name.clone()),
             Some(episode_line(item)),
         ),
-        "Season" => (item.name.clone(), None),
+        ItemKind::Season => (item.name.clone(), None),
         _ => (item.name.clone(), item.year_label()),
     };
-    let placeholder = match item.kind.as_str() {
-        "Series" | "Season" | "Episode" => LucideIcon::Tv,
-        "BoxSet" => LucideIcon::GalleryVerticalEnd,
-        "Playlist" => LucideIcon::ListVideo,
-        "Folder" | "CollectionFolder" => LucideIcon::Folder,
+    let placeholder = match item.kind {
+        ItemKind::Series | ItemKind::Season | ItemKind::Episode => LucideIcon::Tv,
+        ItemKind::BoxSet => LucideIcon::GalleryVerticalEnd,
+        ItemKind::Playlist => LucideIcon::ListVideo,
+        ItemKind::Folder | ItemKind::CollectionFolder => LucideIcon::Folder,
         _ => LucideIcon::Clapperboard,
     };
     let card = card(
@@ -473,8 +473,8 @@ pub fn wide_card(
     let url = item
         .wide_url(client, width)
         .or_else(|| item.poster_url(client, width));
-    let (title, subtitle) = match item.kind.as_str() {
-        "Episode" => (
+    let (title, subtitle) = match item.kind {
+        ItemKind::Episode => (
             item.series_name
                 .clone()
                 .unwrap_or_else(|| item.name.clone()),

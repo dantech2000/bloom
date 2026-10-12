@@ -399,7 +399,7 @@ impl Bloom {
                     };
                     let (id, name, kind) =
                         (data.item.id.clone(), data.item.name.clone(), data.item.kind.clone());
-                    self.open_metadata(&id, &name, &kind, tab, cx);
+                    self.open_metadata(&id, &name, kind.name(), tab, cx);
                 } else {
                     return "error: open an item first".into();
                 }
