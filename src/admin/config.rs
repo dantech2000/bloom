@@ -775,8 +775,7 @@ impl Bloom {
         // refused one keeps its edits on show, to change or send again. The
         // answer is for the session that sent the objects.
         let section = admin.section;
-        let epoch = self.session_epoch;
-        self.fetch(
+        self.fetch_in_session(
             cx,
             move |client| -> Result<Sent> {
                 let mut sent = Sent::default();
@@ -793,9 +792,6 @@ impl Bloom {
                 Ok(sent)
             },
             move |this, result, cx| {
-                if this.session_epoch != epoch {
-                    return;
-                }
                 let sent = result.unwrap_or_else(|err| Sent { taken: Vec::new(), refused: vec![err] });
                 match sent.refused.first() {
                     None => this.toast("Settings saved", "", cx),

@@ -557,9 +557,8 @@ impl Bloom {
         // left it and opened another one (of this plugin or another, on
         // this server or another) meanwhile.
         let revision = editor.revision;
-        let epoch = self.session_epoch;
         let sent = body.clone();
-        self.fetch(
+        self.fetch_in_session(
             cx,
             move |client| -> Result<Value> {
                 // The object of the server now, with the edits in it: what
@@ -569,9 +568,6 @@ impl Bloom {
                 client.get::<Value>(&path, &[])
             },
             move |this, result, cx| {
-                if this.session_epoch != epoch {
-                    return;
-                }
                 match result {
                     Ok(server) => {
                         this.toast("Settings saved", "", cx);

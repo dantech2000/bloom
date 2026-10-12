@@ -405,19 +405,16 @@ impl Bloom {
     }
 
     /// Loads the entries of the playlist on the page.
-    pub fn load_playlist(&mut self, generation: u64, cx: &mut Context<Self>) {
+    pub fn load_playlist(&mut self, cx: &mut Context<Self>) {
         let Page::Playlist(data) = &mut self.page else {
             return;
         };
         data.loading = true;
         let id = data.list.id.clone();
-        self.fetch(
+        self.fetch_for_page(
             cx,
             move |client| Ok((client.item(&id)?, client.playlist_entries(&id)?)),
             move |this, result, cx| {
-                if this.generation != generation {
-                    return;
-                }
                 if let Page::Playlist(data) = &mut this.page {
                     data.loading = false;
                     match result {

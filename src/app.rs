@@ -1023,6 +1023,23 @@ impl Bloom {
         });
     }
 
+    /// As [`Bloom::fetch`], for an answer that belongs to the page on show:
+    /// it is dropped when the user has gone to another page, or the page
+    /// has asked again, by the time it comes.
+    pub fn fetch_for_page<T, W, D>(&self, cx: &mut Context<Self>, work: W, done: D)
+    where
+        T: Send + 'static,
+        W: FnOnce(Client) -> Result<T> + Send + 'static,
+        D: FnOnce(&mut Self, Result<T>, &mut Context<Self>) + 'static,
+    {
+        let generation = self.generation;
+        self.fetch(cx, work, move |this, result, cx| {
+            if this.generation == generation {
+                done(this, result, cx);
+            }
+        });
+    }
+
     fn next_generation(&mut self) -> u64 {
         self.generation += 1;
         self.generation
@@ -2231,7 +2248,7 @@ impl Bloom {
 
     /// (Re)loads the data for the current page.
     pub fn load_page(&mut self, cx: &mut Context<Self>) {
-        let generation = self.next_generation();
+        self.next_generation();
         // Without the server, the pages show what is on this Mac.
         if self.offline_load_page(cx) {
             return;
@@ -2245,7 +2262,7 @@ impl Bloom {
                 // the same pass as the page, so the page does not wait for
                 // them first.
                 let need_views = self.views.is_empty();
-                self.fetch(
+                self.fetch_for_page(
                     cx,
                     move |client| {
                         let started = std::time::Instant::now();
@@ -2335,9 +2352,6 @@ impl Bloom {
                         ))
                     },
                     move |this, result, cx| {
-                        if this.generation != generation {
-                            return;
-                        }
                         if let Page::Home(data) = &mut this.page {
                             match result {
                                 Ok((views, mut fresh)) => {
@@ -2367,7 +2381,7 @@ impl Bloom {
             Page::Library(data) => {
                 data.loading = true;
                 let query = library_query(data);
-                self.fetch(
+                self.fetch_for_page(
                     cx,
                     move |client| {
                         let started = std::time::Instant::now();
@@ -2380,9 +2394,6 @@ impl Bloom {
                         Ok(page)
                     },
                     move |this, result, cx| {
-                        if this.generation != generation {
-                            return;
-                        }
                         if let Page::Library(data) = &mut this.page {
                             data.loading = false;
                             match result {
@@ -2409,7 +2420,7 @@ impl Bloom {
                 let kind = data.item.kind.clone();
                 let series_id = data.item.series_id.clone();
                 let season_id = data.item.season_id.clone();
-                self.fetch(
+                self.fetch_for_page(
                     cx,
                     move |client| {
                         let started = std::time::Instant::now();
@@ -2496,9 +2507,6 @@ impl Bloom {
                         Ok(fresh)
                     },
                     move |this, result, cx| {
-                        if this.generation != generation {
-                            return;
-                        }
                         if let Page::Detail(data) = &mut this.page {
                             match result {
                                 Ok(mut fresh) => {
@@ -2538,8 +2546,8 @@ impl Bloom {
                     },
                 );
             }
-            Page::Admin(_) => self.load_admin(generation, cx),
-            Page::Playlist(_) => self.load_playlist(generation, cx),
+            Page::Admin(_) => self.load_admin(cx),
+            Page::Playlist(_) => self.load_playlist(cx),
             // The downloads page reads the index of this Mac; nothing loads.
             Page::Downloads => {}
             // The settings load with the session and stay in the app.
@@ -2569,7 +2577,7 @@ impl Bloom {
                 };
                 let text = data.query.clone();
                 let asked = text.clone();
-                self.fetch(
+                self.fetch_for_page(
                     cx,
                     move |client| {
                         let started = std::time::Instant::now();
@@ -2595,9 +2603,6 @@ impl Bloom {
                         Ok((page.items, seerr))
                     },
                     move |this, result, cx| {
-                        if this.generation != generation {
-                            return;
-                        }
                         if let Page::Search(data) = &mut this.page {
                             if data.pending.as_deref() == Some(asked.as_str()) {
                                 data.pending = None;
@@ -2642,14 +2647,10 @@ impl Bloom {
         };
         let item_id = data.item.id.clone();
         let played = !data.item.user_data.played;
-        let generation = self.generation;
-        self.fetch(
+        self.fetch_for_page(
             cx,
             move |client| client.set_played(&item_id, played),
             move |this, result, cx| {
-                if this.generation != generation {
-                    return;
-                }
                 match result {
                     Ok(user_data) => {
                         if let Page::Detail(data) = &mut this.page {
@@ -2676,14 +2677,10 @@ impl Bloom {
         };
         let item_id = data.item.id.clone();
         let favorite = !data.item.user_data.is_favorite;
-        let generation = self.generation;
-        self.fetch(
+        self.fetch_for_page(
             cx,
             move |client| client.set_favorite(&item_id, favorite),
             move |this, result, cx| {
-                if this.generation != generation {
-                    return;
-                }
                 match result {
                     Ok(user_data) => {
                         if let Page::Detail(data) = &mut this.page {
