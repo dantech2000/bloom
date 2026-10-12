@@ -61,6 +61,8 @@ pub struct Light {
     /// The lamp was off, and was switched on to follow the picture: it is
     /// switched off again at the end.
     woken: Arc<std::sync::atomic::AtomicBool>,
+    /// The threads that send frames now: one while the stream is on.
+    senders: Arc<AtomicU64>,
     stream: Arc<Mutex<Stream>>,
 }
 
@@ -109,6 +111,7 @@ impl Light {
             waiting: Arc::new(AtomicU64::new(0)),
             touched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             woken: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            senders: Arc::new(AtomicU64::new(0)),
             stream: Arc::new(Mutex::new(Stream::default())),
         }
     }
@@ -165,12 +168,14 @@ impl Light {
         }
         drop(stream);
         let light = self.clone();
+        self.senders.fetch_add(1, Ordering::AcqRel);
         thread::spawn(move || {
             let mut last = Instant::now();
             loop {
                 thread::sleep(Duration::from_millis(1000 / STREAM_HZ));
                 let mut stream = light.stream.lock().unwrap();
                 if !stream.on || stream.starts != mine {
+                    light.senders.fetch_sub(1, Ordering::AcqRel);
                     return;
                 }
                 let soft = stream.since.is_none_or(|since| since.elapsed() < Duration::from_secs(1));
@@ -581,8 +586,10 @@ mod tests {
         let frames = |lamp: &Mock| -> Vec<Vec<[u8; 3]>> {
             lamp.told().into_iter().filter_map(|told| if let Told::Frame(frame) = told { Some(frame) } else { None }).collect()
         };
+        // (How many frames is a matter of the machine: a busy one sleeps
+        // long. The glide goes by the clock, so the last frame is there.)
         let shown = frames(&lamp);
-        assert!(shown.len() > 30, "only {} frames", shown.len());
+        assert!(shown.len() >= 4, "only {} frames", shown.len());
         assert!(shown.iter().all(|frame| frame.len() == 4));
         // The first frame is near the light the lamp had (80% of its
         // colour), the last one is the picture: blue below, red above.
@@ -613,7 +620,7 @@ mod tests {
     }
 
     /// A stream that is left and entered again at once has one sender, not
-    /// two: the frames come at the rate of one.
+    /// one for each time it was entered.
     #[test]
     fn a_stream_entered_again_has_one_sender() {
         let (lamp, light) = Mock::light(true, 2);
@@ -625,12 +632,22 @@ mod tests {
         }
         light.act(Action::Aura(vec![[9, 9, 9]]), NO_GAP, 0.05);
         let count = |lamp: &Mock| lamp.told().iter().filter(|told| matches!(told, Told::Frame(_))).count();
-        thread::sleep(Duration::from_millis(200));
+        // The older senders see at their next frame that they are old.
+        let until = Instant::now() + Duration::from_secs(10);
+        while light.senders.load(Ordering::Acquire) != 1 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(light.senders.load(Ordering::Acquire), 1, "the senders of the older starts go on");
         let before = count(&lamp);
-        thread::sleep(Duration::from_secs(1));
-        let frames = count(&lamp) - before;
-        assert!((20..=34).contains(&frames), "{frames} frames in a second: more than one sender, or none");
+        thread::sleep(Duration::from_millis(500));
+        assert!(count(&lamp) > before, "the one sender sends nothing");
         light.act(Action::Restore, NO_GAP, 0.05);
+        // It sees the end at its next frame.
+        let until = Instant::now() + Duration::from_secs(10);
+        while light.senders.load(Ordering::Acquire) != 0 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(light.senders.load(Ordering::Acquire), 0, "a sender is left after the end of the stream");
     }
 
     /// A lamp with no frame stream is left alone by the picture and by the

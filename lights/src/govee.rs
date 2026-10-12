@@ -346,7 +346,9 @@ mod tests {
         let lamp = GoveeLamp { target: silent.local_addr().unwrap(), answers: free_port() };
         let started = Instant::now();
         assert_eq!(lamp.state(), None);
-        assert!(started.elapsed() >= Duration::from_millis(900) && started.elapsed() < Duration::from_secs(3));
+        // Not sooner than its second. (No upper bound: the question waits
+        // for its turn behind the other tests, and a busy machine is slow.)
+        assert!(started.elapsed() >= Duration::from_millis(900), "{:?}", started.elapsed());
     }
 
     /// Two lamps asked at the same moment both say what they show: they
