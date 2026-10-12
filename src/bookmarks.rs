@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 
 use crate::{
     app::{Bloom, Panel},
-    jellyfin::{Client, Item, format_duration},
+    jellyfin::{Client, Item, ItemKind, format_duration},
     ui::{
         glass::glass,
         input::{Input, InputEvent, InputState},
@@ -190,7 +190,7 @@ impl Target {
         let id_of = |item: &Item, name: &str| {
             item.provider_ids.get(name).cloned().flatten().unwrap_or_default()
         };
-        let episode = item.kind == "Episode";
+        let episode = item.kind == ItemKind::Episode;
         let (mut tmdb, mut tvdb) = (id_of(item, "Tmdb"), id_of(item, "Tvdb"));
         // A season or an episode has no TMDB id of its own; the series' id
         // stands for it. TVDB has one per episode, so the episode's wins.
@@ -207,10 +207,10 @@ impl Target {
             item_id: item.id.clone(),
             tmdb_id: tmdb,
             tvdb_id: tvdb,
-            media_type: match item.kind.as_str() {
-                "Movie" => "movie".into(),
-                "Series" | "Season" | "Episode" => "tv".into(),
-                other => other.to_lowercase(),
+            media_type: match &item.kind {
+                ItemKind::Movie => "movie".into(),
+                ItemKind::Series | ItemKind::Season | ItemKind::Episode => "tv".into(),
+                other => other.name().to_lowercase(),
             },
             name: if item.name.is_empty() { "Unknown".into() } else { item.name.clone() },
             season: episode.then_some(item.parent_index_number).flatten().map(i64::from),
@@ -228,8 +228,8 @@ impl Client {
     /// Who a bookmark of this item is for: its ids at other sites.
     pub fn bookmark_target(&self, item_id: &str) -> anyhow::Result<Target> {
         let item = self.item(item_id)?;
-        let series = match (&item.series_id, item.kind.as_str()) {
-            (Some(series), "Episode" | "Season") => self.item(series).ok(),
+        let series = match (&item.series_id, &item.kind) {
+            (Some(series), ItemKind::Episode | ItemKind::Season) => self.item(series).ok(),
             _ => None,
         };
         Ok(Target::of(&item, series.as_ref()))

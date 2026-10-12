@@ -12,6 +12,7 @@ use gpui_kit::{
 
 use crate::{
     app::{Bloom, Page, Panel},
+    jellyfin::ItemKind,
     ui::{
         button::{Button, ButtonSize, ButtonVariant},
         glass::glass,
@@ -255,10 +256,10 @@ impl Bloom {
             return Some(data.view.id.clone());
         }
         match &self.page {
-            Page::Detail(data) => match data.item.kind.as_str() {
-                "Movie" => by_type("movies"),
-                "Series" | "Season" | "Episode" => by_type("tvshows"),
-                "BoxSet" => by_type("boxsets"),
+            Page::Detail(data) => match data.item.kind {
+                ItemKind::Movie => by_type("movies"),
+                ItemKind::Series | ItemKind::Season | ItemKind::Episode => by_type("tvshows"),
+                ItemKind::BoxSet => by_type("boxsets"),
                 _ => None,
             },
             Page::Playlist(_) => Some(crate::lists::PLAYLISTS_ID.to_string()),

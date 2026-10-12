@@ -439,7 +439,7 @@ impl Bloom {
             engine().entry_of(server_id, item_id).map(|e| Item {
                 id: e.item_id.clone(),
                 name: e.name.clone(),
-                kind: e.kind.clone(),
+                kind: e.kind.as_str().into(),
                 series_name: e.series_name.clone(),
                 series_id: e.series_id.clone(),
                 parent_index_number: e.season,
@@ -538,7 +538,7 @@ impl Bloom {
             // The entries the card menu of an item gets, by their ids.
             "menu" => {
                 let item = engine.item(arg).or_else(|| {
-                    engine.entry(arg).map(|e| Item { id: e.item_id.clone(), kind: e.kind.clone(), ..Default::default() })
+                    engine.entry(arg).map(|e| Item { id: e.item_id.clone(), kind: e.kind.as_str().into(), ..Default::default() })
                 });
                 let Some(item) = item else {
                     return "error: not a downloaded item; use `add` first".into();

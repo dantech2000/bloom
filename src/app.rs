@@ -12,7 +12,7 @@ use gpui_kit::{
 
 use crate::{
     config::{Config, Profile},
-    jellyfin::{Client, Item, ItemQuery, SeerrItem, MediaSegment},
+    jellyfin::{Client, Item, ItemKind, ItemQuery, SeerrItem, MediaSegment},
     player::{PlayState, Player, PlayerStatus},
     ui::menu::MenuItem,
     ui::{
@@ -1588,7 +1588,7 @@ impl Bloom {
         items.extend(self.cast_menu_items(item, cx));
         items.extend(self.download_menu_items(item, cx));
         items.extend(self.hide_menu_items(item, false, cx));
-        items.extend(self.metadata_menu_items(&item.id, &item.name, &item.kind, cx));
+        items.extend(self.metadata_menu_items(&item.id, &item.name, item.kind.name(), cx));
         if let Some(url) = self.session.as_ref().map(|s| s.client.web_url(&item.id)) {
             items.push(MenuItem::separator());
             items.push(
@@ -1793,7 +1793,7 @@ impl Bloom {
         }
         let hide = self.hide_menu_items(&data.item.clone(), true, cx);
         more.extend(hide);
-        more.extend(self.metadata_menu_items(&id, &name, &kind, cx));
+        more.extend(self.metadata_menu_items(&id, &name, kind.name(), cx));
 
         self.detail_audio_menu
             .update(cx, |menu, cx| menu.set_items(audio, cx));
@@ -1833,9 +1833,11 @@ impl Bloom {
     }
 
     pub fn open_item(&mut self, item: Item, cx: &mut Context<Self>) {
-        match item.kind.as_str() {
-            "Playlist" => self.open_playlist(item, cx),
-            "CollectionFolder" | "UserView" | "Folder" | "BoxSet" => self.open_folder(item, cx),
+        match item.kind {
+            ItemKind::Playlist => self.open_playlist(item, cx),
+            ItemKind::CollectionFolder | ItemKind::UserView | ItemKind::Folder | ItemKind::BoxSet => {
+                self.open_folder(item, cx)
+            }
             _ => self.navigate(
                 Page::Detail(DetailData {
                     item,
@@ -2411,33 +2413,33 @@ impl Bloom {
                     cx,
                     move |client| {
                         let started = std::time::Instant::now();
-                        let is = |wanted: &str| kind == wanted;
+                        let is = |wanted: ItemKind| kind == wanted;
                         let (item, seasons, next_up, episodes, similar) =
                             std::thread::scope(|scope| {
                                 let item = scope.spawn(|| client.item(&item_id));
                                 let seasons =
-                                    scope.spawn(|| match is("Series") {
+                                    scope.spawn(|| match is(ItemKind::Series) {
                                         true => client.seasons(&item_id),
                                         false => Ok(Vec::new()),
                                     });
-                                let next_up = scope.spawn(|| match is("Series") {
+                                let next_up = scope.spawn(|| match is(ItemKind::Series) {
                                     true => client.series_next_up(&item_id).unwrap_or(None),
                                     false => None,
                                 });
                                 // A season shows its episodes; an episode
                                 // shows the others of its season.
                                 let episodes = scope.spawn(|| match (&series_id, &season_id) {
-                                    (Some(series), _) if is("Season") => {
+                                    (Some(series), _) if is(ItemKind::Season) => {
                                         client.episodes(series, &item_id)
                                     }
-                                    (Some(series), Some(season)) if is("Episode") => {
+                                    (Some(series), Some(season)) if is(ItemKind::Episode) => {
                                         Ok(client.episodes(series, season).unwrap_or_default())
                                     }
                                     _ => Ok(Vec::new()),
                                 });
                                 // The row is optional; the page loads without it.
                                 let similar = scope.spawn(|| {
-                                    if is("Movie") || is("Series") {
+                                    if is(ItemKind::Movie) || is(ItemKind::Series) {
                                         client.similar(&item_id, 12).unwrap_or_default()
                                     } else {
                                         Vec::new()
@@ -2460,27 +2462,27 @@ impl Bloom {
                             ..Default::default()
                         };
                         // An item opened by id alone has no kind until now.
-                        if kind.is_empty() {
-                            match item.kind.as_str() {
-                                "Series" => {
+                        if kind.is_unknown() {
+                            match item.kind {
+                                ItemKind::Series => {
                                     fresh.seasons = client.seasons(&item_id)?;
                                     fresh.next_up =
                                         client.series_next_up(&item_id).unwrap_or(None);
                                 }
-                                "Season" => {
+                                ItemKind::Season => {
                                     if let Some(series) = &item.series_id {
                                         fresh.episodes = client.episodes(series, &item_id)?;
                                     }
                                 }
                                 _ => {}
                             }
-                            if matches!(item.kind.as_str(), "Movie" | "Series") {
+                            if matches!(item.kind, ItemKind::Movie | ItemKind::Series) {
                                 fresh.similar = client.similar(&item_id, 12).unwrap_or_default();
                             }
                         }
                         // The card that opened an episode page does not
                         // always carry the season id; the item does.
-                        if item.kind == "Episode"
+                        if item.kind == ItemKind::Episode
                             && fresh.episodes.is_empty()
                             && let (Some(series), Some(season)) = (&item.series_id, &item.season_id)
                         {
@@ -2509,7 +2511,7 @@ impl Bloom {
                                     // The row of the season starts at the
                                     // episode of the page; the ones before
                                     // it are a scroll to the left away.
-                                    if data.item.kind == "Episode" {
+                                    if data.item.kind == ItemKind::Episode {
                                         let at = data
                                             .episodes
                                             .iter()

@@ -18,7 +18,7 @@ use super::{
 };
 use crate::{
     app::{Bloom, Page, Panel},
-    jellyfin::Item,
+    jellyfin::{Item, ItemKind},
     realtime::{self, Realtime},
     ui::{glass::glass, scroll_area::ScrollArea, theme::UiTheme, tip::tip},
     views::cards::icon,
@@ -389,7 +389,7 @@ impl Bloom {
             .collect();
         // One episode stands for itself and the episodes after it, as the
         // queue of this app does outside a group.
-        let follow = (items.len() == 1 && first.kind == "Episode")
+        let follow = (items.len() == 1 && first.kind == ItemKind::Episode)
             .then(|| first.series_id.clone())
             .flatten();
         match follow {

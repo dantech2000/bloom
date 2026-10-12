@@ -16,7 +16,7 @@
 
 use serde_json::{Value, json};
 
-use crate::jellyfin::{Client, Item, TICKS_PER_SECOND};
+use crate::jellyfin::{Client, Item, ItemKind, TICKS_PER_SECOND};
 
 pub const APP_STABLE: &str = "F007D354";
 pub const APP_UNSTABLE: &str = "6F511C87";
@@ -71,9 +71,9 @@ impl ItemStub {
         Self {
             id: item.id.clone(),
             name: item.name.clone(),
-            kind: item.kind.clone(),
-            media_type: if item.kind == "Audio" { "Audio" } else { "Video" }.to_string(),
-            is_folder: matches!(item.kind.as_str(), "Series" | "Season" | "Folder" | "BoxSet" | "Playlist" | "MusicAlbum"),
+            kind: item.kind.to_string(),
+            media_type: if item.kind == ItemKind::Audio { "Audio" } else { "Video" }.to_string(),
+            is_folder: matches!(item.kind, ItemKind::Series | ItemKind::Season | ItemKind::Folder | ItemKind::BoxSet | ItemKind::Playlist | ItemKind::MusicAlbum),
         }
     }
 

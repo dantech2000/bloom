@@ -151,7 +151,7 @@ impl Entry {
             server_id: server_id.to_string(),
             item_id: item.id.clone(),
             name: item.name.clone(),
-            kind: item.kind.clone(),
+            kind: item.kind.to_string(),
             series_name: item.series_name.clone(),
             series_id: item.series_id.clone(),
             season: item.parent_index_number,

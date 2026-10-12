@@ -13,7 +13,7 @@ use crate::{
     admin::{ButtonKind, button},
     app::{Bloom, Page},
     icons::{Filled, filled},
-    jellyfin::format_runtime,
+    jellyfin::{ItemKind, format_runtime},
     lists::{Dialog, ListKind},
     ui::{
         glass::glass, input::Input, scroll_area::ScrollArea, theme::UiTheme, tip::tip,
@@ -161,13 +161,13 @@ impl Bloom {
                     .wide_url(&client, 320)
                     .or_else(|| item.poster_url(&client, 320));
                 let wide = item.wide_url(&client, 320).is_some();
-                let title = if item.kind == "Episode" {
+                let title = if item.kind == ItemKind::Episode {
                     item.display_title()
                 } else {
                     item.name.clone()
                 };
-                let detail = match item.kind.as_str() {
-                    "Episode" => item.series_name.clone().unwrap_or_default(),
+                let detail = match item.kind {
+                    ItemKind::Episode => item.series_name.clone().unwrap_or_default(),
                     _ => item.year_label().unwrap_or_default(),
                 };
                 let runtime = item.runtime_secs().map(format_runtime).unwrap_or_default();

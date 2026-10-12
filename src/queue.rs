@@ -11,7 +11,7 @@ use gpui_kit::{Bounds, Context, Pixels};
 
 use crate::{
     app::Bloom,
-    jellyfin::{Chapter, Item, TimelineInfo},
+    jellyfin::{Chapter, Item, ItemKind, TimelineInfo},
     player::PlayState,
 };
 
@@ -188,7 +188,7 @@ impl Bloom {
     /// After an episode, the episodes that follow it play. This fills the
     /// queue with them, unless the caller gave the queue its own items.
     pub fn queue_followers(&mut self, item: &Item, cx: &mut Context<Self>) {
-        if item.kind != "Episode" {
+        if item.kind != ItemKind::Episode {
             return;
         }
         let Some(series_id) = item.series_id.clone() else {
@@ -258,7 +258,7 @@ impl Bloom {
     /// starts. False when playback is over and the player must close.
     pub fn advance_at_end(&mut self, cx: &mut Context<Self>) -> bool {
         // After an episode, the user's setting decides if the next starts.
-        let stay = self.playing.as_ref().is_some_and(|item| item.kind == "Episode")
+        let stay = self.playing.as_ref().is_some_and(|item| item.kind == ItemKind::Episode)
             && !self.prefs.auto_play_next();
         self.player_status.reached_end
             && self.player_status.error.is_none()
@@ -275,7 +275,7 @@ impl Bloom {
         }
         // The card is a setting of the user, and it has nothing to say when
         // the next episode does not start by itself.
-        let episode = self.playing.as_ref().is_some_and(|item| item.kind == "Episode");
+        let episode = self.playing.as_ref().is_some_and(|item| item.kind == ItemKind::Episode);
         if !self.prefs.up_next_card() || (episode && !self.prefs.auto_play_next()) {
             return None;
         }

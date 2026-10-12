@@ -18,7 +18,7 @@ use serde_json::Value;
 use crate::{
     app::{Bloom, Page, Panel},
     icons::{Filled, filled},
-    jellyfin::{Client, Item, SeerrItem},
+    jellyfin::{Client, Item, ItemKind, SeerrItem},
     macos::{Id, class, send},
     player::PlayState,
     ui::{glass::glass, menu::MenuItem, theme::UiTheme},
@@ -524,9 +524,9 @@ impl Bloom {
             return;
         };
         let item = &data.item;
-        let movie = match item.kind.as_str() {
-            "Movie" => true,
-            "Series" => false,
+        let movie = match item.kind {
+            ItemKind::Movie => true,
+            ItemKind::Series => false,
             _ => return,
         };
         if self.enhanced.detail.as_ref().is_some_and(|d| d.item_id == item.id) {

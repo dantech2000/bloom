@@ -120,7 +120,7 @@ impl Bloom {
             active,
             item: self.playing.as_ref().filter(|_| active).map(|item| ItemInfo {
                 id: item.id.clone(),
-                kind: item.kind.clone(),
+                kind: item.kind.to_string(),
                 name: item.name.clone(),
                 series: item.series_name.clone(),
                 season: item.parent_index_number.map(i64::from),
@@ -252,7 +252,7 @@ impl Bloom {
                 match bands {
                     Ok(bands) => {
                         this.events.detail_told = true;
-                        hub().emit("detail.opened", json!({ "item": { "id": id, "type": kind }, "colours": bands }));
+                        hub().emit("detail.opened", json!({ "item": { "id": id, "type": kind.name() }, "colours": bands }));
                     }
                     // No artwork for this page: the page before it is
                     // left all the same, and a light gives its colours up.

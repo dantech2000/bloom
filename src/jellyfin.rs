@@ -1080,6 +1080,93 @@ pub struct ItemsResult {
     pub total_record_count: usize,
 }
 
+/// What an item is: the `Type` of the server (`BaseItemKind`). The kinds
+/// the app treats in a way of their own have a variant; every other one
+/// keeps the name the server gave it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ItemKind {
+    Movie,
+    Series,
+    Season,
+    Episode,
+    BoxSet,
+    Playlist,
+    Folder,
+    CollectionFolder,
+    UserView,
+    Video,
+    MusicVideo,
+    Audio,
+    MusicAlbum,
+    MusicArtist,
+    Person,
+    Trailer,
+    /// A kind with no variant, by its name; empty when the server sent none.
+    Other(String),
+}
+
+impl ItemKind {
+    const NAMED: [(&'static str, ItemKind); 16] = [
+        ("Movie", ItemKind::Movie),
+        ("Series", ItemKind::Series),
+        ("Season", ItemKind::Season),
+        ("Episode", ItemKind::Episode),
+        ("BoxSet", ItemKind::BoxSet),
+        ("Playlist", ItemKind::Playlist),
+        ("Folder", ItemKind::Folder),
+        ("CollectionFolder", ItemKind::CollectionFolder),
+        ("UserView", ItemKind::UserView),
+        ("Video", ItemKind::Video),
+        ("MusicVideo", ItemKind::MusicVideo),
+        ("Audio", ItemKind::Audio),
+        ("MusicAlbum", ItemKind::MusicAlbum),
+        ("MusicArtist", ItemKind::MusicArtist),
+        ("Person", ItemKind::Person),
+        ("Trailer", ItemKind::Trailer),
+    ];
+
+    /// The name the server uses, as in `includeItemTypes`.
+    /// True for a kind the server did not name: an item opened by its id
+    /// alone, before its answer.
+    pub fn is_unknown(&self) -> bool {
+        self.name().is_empty()
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            ItemKind::Other(name) => name,
+            known => Self::NAMED.iter().find(|(_, kind)| kind == known).map_or("", |(name, _)| name),
+        }
+    }
+}
+
+impl Default for ItemKind {
+    fn default() -> Self {
+        ItemKind::Other(String::new())
+    }
+}
+
+impl From<&str> for ItemKind {
+    fn from(name: &str) -> Self {
+        Self::NAMED
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map_or_else(|| ItemKind::Other(name.to_string()), |(_, kind)| kind.clone())
+    }
+}
+
+impl std::fmt::Display for ItemKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for ItemKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        Ok(String::deserialize(deserializer)?.as_str().into())
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "PascalCase")]
 pub struct Item {
@@ -1087,7 +1174,7 @@ pub struct Item {
     #[serde(default)]
     pub name: String,
     #[serde(rename = "Type", default)]
-    pub kind: String,
+    pub kind: ItemKind,
     #[serde(default)]
     pub collection_type: Option<String>,
     #[serde(default)]
@@ -1364,14 +1451,11 @@ pub struct UserData {
 
 impl Item {
     pub fn is_playable(&self) -> bool {
-        matches!(
-            self.kind.as_str(),
-            "Movie" | "Episode" | "Video" | "MusicVideo"
-        )
+        matches!(self.kind, ItemKind::Movie | ItemKind::Episode | ItemKind::Video | ItemKind::MusicVideo)
     }
 
     pub fn is_series(&self) -> bool {
-        self.kind == "Series"
+        self.kind == ItemKind::Series
     }
 
     pub fn runtime_secs(&self) -> Option<i64> {
@@ -1424,7 +1508,7 @@ impl Item {
         ) {
             return Some(client.image_url(parent, "Backdrop", Some(tag), width));
         }
-        if self.kind == "Episode"
+        if self.kind == ItemKind::Episode
             && let Some(tag) = &self.image_tags.primary
         {
             return Some(client.image_url(&self.id, "Primary", Some(tag), width));
@@ -1524,7 +1608,7 @@ impl Item {
             (Some(series), Some(code)) => format!("{series} · {code} · {}", self.name),
             (Some(series), None) => format!("{series} · {}", self.name),
             _ => match self.production_year {
-                Some(year) if self.kind == "Movie" => format!("{} ({year})", self.name),
+                Some(year) if self.kind == ItemKind::Movie => format!("{} ({year})", self.name),
                 _ => self.name.clone(),
             },
         }
@@ -1589,6 +1673,22 @@ pub fn format_runtime(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kind_keeps_the_name_of_the_server() {
+        let item: Item = serde_json::from_str(r#"{"Id":"1","Type":"Episode"}"#).unwrap();
+        assert_eq!(item.kind, ItemKind::Episode);
+        for (name, kind) in ItemKind::NAMED {
+            assert_eq!(ItemKind::from(name), kind);
+            assert_eq!(kind.name(), name);
+        }
+        // A kind with no variant is not lost, and no kind is not a kind.
+        let item: Item = serde_json::from_str(r#"{"Id":"1","Type":"LiveTvChannel"}"#).unwrap();
+        assert_eq!(item.kind.name(), "LiveTvChannel");
+        assert!(!item.kind.is_unknown());
+        let item: Item = serde_json::from_str(r#"{"Id":"1"}"#).unwrap();
+        assert!(item.kind.is_unknown());
+    }
 
     /// A server that answers every request with `head` and `body`, then
     /// closes the connection. `body` may be shorter than the head says. It
