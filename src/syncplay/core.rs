@@ -1424,7 +1424,7 @@ mod tests {
         // The player fell 90 ms behind the group.
         rig.view.position -= 90.;
         let mut speeds = Vec::new();
-        let mut step = |rig: &mut Rig, speeds: &mut Vec<(f64, f64)>| {
+        let step = |rig: &mut Rig, speeds: &mut Vec<(f64, f64)>| {
             rig.pass(100.);
             // The player runs at the speed of the correction.
             rig.view.position += 100. * (rig.core.speed() - 1.);

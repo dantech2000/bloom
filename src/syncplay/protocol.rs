@@ -235,6 +235,9 @@ pub enum Request {
     Leave,
     Unpause,
     Pause,
+    /// Stops every member of the group. The app never sends it, as the web
+    /// client does not (`no_action_of_the_user_asks_the_group_to_stop`).
+    #[allow(dead_code)]
     Stop,
     Seek { position_ticks: i64 },
     Ready(PlayerReport),

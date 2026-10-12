@@ -247,11 +247,6 @@ pub mod phase {
             self.period_ns
         }
 
-        /// Starts from the model again for this period.
-        pub fn reset(&mut self, period_ns: u64) {
-            *self = Self::new(period_ns);
-        }
-
         pub fn observe(&mut self, o: Observation) {
             let step = (self.period_ns / 16).max(1);
             let settled = self.stepped_at.is_none_or(|at| o.seq > at + Self::SETTLE);
