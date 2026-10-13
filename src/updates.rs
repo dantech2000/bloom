@@ -4,7 +4,7 @@
 //! Sparkle is not linked: it is loaded from the Frameworks folder of the
 //! app bundle at the start, and only when the bundle names a feed and a
 //! public key (`SUFeedURL`, `SUPublicEDKey`; `dev/bundle` writes them from
-//! `src/brand.rs`). A bare binary, a development bundle, or a build with no
+//! `core/src/brand.rs`). A bare binary, a development bundle, or a build with no
 //! key has no updater, and the app says so.
 //!
 //! The app behaves as the Zed editor does: Sparkle asks the feed once a
