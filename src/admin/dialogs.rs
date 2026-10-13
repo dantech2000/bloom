@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Dialogs of the dashboard that need more than a yes or a no: a form with
-//! text fields ([`Prompt`]) and a value shown once with a Copy button
-//! ([`Secret`]). The app holds the editing state of the fields, because a
-//! page renders with `&Bloom` and cannot make an entity.
+//! The dialogs of the app ([`Dialogs`]): a question, a form with text
+//! fields ([`Prompt`]) and a value shown once with a Copy button
+//! ([`Secret`]). They began in the dashboard, which is why they are here;
+//! the settings and the downloads open them as well. The app holds the
+//! editing state of the fields, because a page renders with `&Bloom` and
+//! cannot make an entity.
 
 use std::rc::Rc;
 
@@ -16,6 +18,35 @@ use crate::{
     app::{Bloom, Page},
     ui::{glass::glass, input::Input, theme::UiTheme},
 };
+
+/// The dialogs that wait for the user. One shows at a time.
+pub struct Dialogs {
+    /// Question that waits for an answer.
+    pub confirm: Option<super::Confirm>,
+    /// Form that waits for its text.
+    pub prompt: Option<Prompt>,
+    /// The prompt opened since the last render: its fields are not ready.
+    pub prompt_fresh: bool,
+    /// Editing state of the prompt fields: a plain one and two masked ones.
+    pub inputs: [gpui_kit::Entity<crate::ui::input::InputState>; 3],
+    /// Value shown once, such as a new API key.
+    pub secret: Option<Secret>,
+}
+
+impl Dialogs {
+    pub fn new(inputs: [gpui_kit::Entity<crate::ui::input::InputState>; 3]) -> Self {
+        Self { confirm: None, prompt: None, prompt_fresh: false, inputs, secret: None }
+    }
+
+    /// Drops what is open, with no action. The text of the fields stays;
+    /// `Bloom::close_admin_dialog` clears it.
+    pub fn forget(&mut self) {
+        self.confirm = None;
+        self.prompt = None;
+        self.prompt_fresh = false;
+        self.secret = None;
+    }
+}
 
 /// One text field of a [`Prompt`].
 #[derive(Clone)]
@@ -55,19 +86,19 @@ impl Bloom {
     /// Shows a form; the action runs when the user submits it.
     pub fn ask_prompt(&mut self, prompt: Prompt, cx: &mut Context<Self>) {
         self.close_panels();
-        self.admin_prompt = Some(prompt);
+        self.dialogs.prompt = Some(prompt);
         // The fields are cleared and focused in the next render, which has
         // the window.
-        self.admin_prompt_fresh = true;
+        self.dialogs.prompt_fresh = true;
         cx.notify();
     }
 
     /// True while a dialog of the dashboard is open.
     pub fn admin_dialog_open(&self) -> bool {
         matches!(self.page, Page::Admin(_) | Page::Settings(_))
-            && (self.admin_confirm.is_some()
-                || self.admin_prompt.is_some()
-                || self.admin_secret.is_some()
+            && (self.dialogs.confirm.is_some()
+                || self.dialogs.prompt.is_some()
+                || self.dialogs.secret.is_some()
                 || self.text_editor_open())
     }
 
@@ -77,17 +108,14 @@ impl Bloom {
     /// open, it showed again on the next page that draws dialogs, and
     /// after a switch of the server its action ran against the new one.
     pub fn forget_admin_dialogs(&mut self) {
-        self.admin_confirm = None;
-        self.admin_prompt = None;
-        self.admin_prompt_fresh = false;
-        self.admin_secret = None;
+        self.dialogs.forget();
     }
 
     /// Closes the open dialog without an action.
     pub fn close_admin_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.admin_confirm = None;
-        self.admin_prompt = None;
-        self.admin_secret = None;
+        self.dialogs.confirm = None;
+        self.dialogs.prompt = None;
+        self.dialogs.secret = None;
         self.close_text_editor();
         self.clear_admin_inputs(window, cx);
         window.focus(&self.app_focus, cx);
@@ -96,7 +124,7 @@ impl Bloom {
 
     /// A password must not stay in a field that is out of view.
     fn clear_admin_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for input in &self.admin_inputs {
+        for input in &self.dialogs.inputs {
             input.update(cx, |input, cx| input.set_value("", window, cx));
         }
     }
@@ -110,8 +138,8 @@ impl Bloom {
     ) -> &gpui_kit::Entity<crate::ui::input::InputState> {
         let masked_before = prompt.fields[..index].iter().filter(|f| f.masked).count();
         match prompt.fields[index].masked {
-            false => &self.admin_inputs[0],
-            true => &self.admin_inputs[1 + masked_before.min(1)],
+            false => &self.dialogs.inputs[0],
+            true => &self.dialogs.inputs[1 + masked_before.min(1)],
         }
     }
 
@@ -119,10 +147,10 @@ impl Bloom {
     /// text and placeholders, and the focus in the first one. The root render calls
     /// this.
     pub fn prepare_admin_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !std::mem::take(&mut self.admin_prompt_fresh) {
+        if !std::mem::take(&mut self.dialogs.prompt_fresh) {
             return;
         }
-        let Some(prompt) = self.admin_prompt.clone() else {
+        let Some(prompt) = self.dialogs.prompt.clone() else {
             return;
         };
         for (index, field) in prompt.fields.iter().enumerate() {
@@ -139,7 +167,7 @@ impl Bloom {
 
     /// Moves the focus to the next field of the prompt (Tab).
     pub fn next_admin_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(prompt) = &self.admin_prompt else {
+        let Some(prompt) = &self.dialogs.prompt else {
             return;
         };
         let current = (0..prompt.fields.len()).position(|index| {
@@ -158,7 +186,7 @@ impl Bloom {
     /// Runs the action of the prompt with the text of its fields. Does
     /// nothing while a required field is empty.
     pub fn submit_admin_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(prompt) = self.admin_prompt.clone() else {
+        let Some(prompt) = self.dialogs.prompt.clone() else {
             return;
         };
         let values: Vec<String> = prompt
@@ -186,7 +214,7 @@ impl Bloom {
 
     /// The form dialog over the page.
     pub(crate) fn render_prompt(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
-        let prompt = self.admin_prompt.clone()?;
+        let prompt = self.dialogs.prompt.clone()?;
         let t = UiTheme::read(cx).clone();
         let mut fields = div().flex().flex_col().gap(px(12.));
         for (index, field) in prompt.fields.iter().enumerate() {
@@ -243,7 +271,7 @@ impl Bloom {
 
     /// The dialog that shows a value once.
     pub(super) fn render_secret(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
-        let secret = self.admin_secret.clone()?;
+        let secret = self.dialogs.secret.clone()?;
         let t = UiTheme::read(cx).clone();
         let value = secret.value.clone();
         Some(

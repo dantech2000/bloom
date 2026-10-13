@@ -469,7 +469,7 @@ fn a_question_does_not_outlive_its_page_or_its_session(cx: &mut TestAppContext) 
     let server = MockServer::start(|method, path, _| plain(method, path));
     let (bloom, cx) = app(cx);
     let ask = |this: &mut super::Bloom| {
-        this.admin_confirm = Some(crate::admin::Confirm {
+        this.dialogs.confirm = Some(crate::admin::Confirm {
             title: "Shut down the server?".into(),
             message: String::new(),
             action: "Shut down".into(),
@@ -483,13 +483,13 @@ fn a_question_does_not_outlive_its_page_or_its_session(cx: &mut TestAppContext) 
         assert!(this.open_session("one", "u1", cx));
         ask(this);
         this.open_item(item("m1", "One", "Movie"), cx);
-        assert!(this.admin_confirm.is_none(), "the question is open on the next page");
+        assert!(this.dialogs.confirm.is_none(), "the question is open on the next page");
         ask(this);
         this.back(cx);
-        assert!(this.admin_confirm.is_none(), "the question is open after Back");
+        assert!(this.dialogs.confirm.is_none(), "the question is open after Back");
         ask(this);
         assert!(this.open_session("two", "u2", cx));
-        assert!(this.admin_confirm.is_none(), "the question is open for the next session");
+        assert!(this.dialogs.confirm.is_none(), "the question is open for the next session");
     });
     cx.run_until_parked();
 }
@@ -526,16 +526,16 @@ fn the_debug_channel_knows_its_own_question(cx: &mut TestAppContext) {
     };
     bloom.update(cx, |this, _| {
         // A person opened it.
-        this.admin_confirm = Some(question());
+        this.dialogs.confirm = Some(question());
         assert!(!this.debug_opened_confirm());
         // A debug command opened this one, and the channel noted it.
         let own = question();
         this.debug_dialogs.0 = Some(std::rc::Rc::downgrade(&own.run));
-        this.admin_confirm = Some(own);
+        this.dialogs.confirm = Some(own);
         assert!(this.debug_opened_confirm());
         // It is closed, and a person opens another: not the channel's.
-        this.admin_confirm = None;
-        this.admin_confirm = Some(question());
+        this.dialogs.confirm = None;
+        this.dialogs.confirm = Some(question());
         assert!(!this.debug_opened_confirm(), "a question of a person counts as the channel's");
     });
 }

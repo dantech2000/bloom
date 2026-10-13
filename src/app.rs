@@ -444,24 +444,11 @@ pub struct Bloom {
     /// Quality tag settings of the user in Jellyfin Enhanced: on, resolution
     /// tag, dynamic range tag.
     pub je_quality_tags: (bool, bool, bool),
-    /// Question of the dashboard that waits for an answer.
-    pub admin_confirm: Option<crate::admin::Confirm>,
-    /// Form of the dashboard that waits for its text.
-    pub admin_prompt: Option<crate::admin::Prompt>,
-    /// The prompt opened since the last render: its fields are not ready.
-    pub admin_prompt_fresh: bool,
-    /// Editing state of the prompt fields: a plain one and a masked one.
-    pub admin_inputs: [Entity<InputState>; 3],
-    /// Value the dashboard shows once, such as a new API key.
-    pub admin_secret: Option<crate::admin::Secret>,
-    /// A load of the live part is on its way: the timer starts no second
-    /// one behind it, so a slow server does not collect requests.
-    pub(crate) admin_live_busy: bool,
-    /// Names the live load on its way: only its own answer ends the wait,
-    /// not a late one of a session or a page before.
-    pub(crate) admin_live_load: u64,
-    /// Timer that loads the live part of the dashboard again.
-    pub admin_tick: Option<Task<()>>,
+    /// The question, the form and the value shown once that wait for the
+    /// user. The dashboard, the settings and the downloads open them.
+    pub dialogs: crate::admin::dialogs::Dialogs,
+    /// The loads of the live part of the dashboard, and their timer.
+    pub(crate) admin_live: crate::admin::Live,
     /// SyncPlay: the session with the server and the panel of the groups.
     pub sync: crate::syncplay::ui::SyncState,
     /// Remote control of and by other devices ("Play On").
@@ -816,15 +803,9 @@ impl Bloom {
             detail_subtitle_menu,
             more_menu,
             card_menu,
-            admin_confirm: None,
             je_quality_tags: (false, true, true),
-            admin_prompt: None,
-            admin_prompt_fresh: false,
-            admin_inputs,
-            admin_secret: None,
-            admin_live_busy: false,
-            admin_live_load: 0,
-            admin_tick: None,
+            dialogs: crate::admin::dialogs::Dialogs::new(admin_inputs),
+            admin_live: crate::admin::Live::default(),
             sync: Default::default(),
             cast: Default::default(),
             metadata: crate::metadata::State::new(window, cx),
@@ -1063,8 +1044,8 @@ impl Bloom {
         self.forget_admin_dialogs();
         // A live load of the dashboard of the session before has no answer
         // to wait for here.
-        self.admin_live_busy = false;
-        self.admin_live_load += 1;
+        self.admin_live.busy = false;
+        self.admin_live.load += 1;
     }
 
     /// Ends the session in the app (the server and the config are the

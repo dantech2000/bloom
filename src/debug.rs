@@ -180,14 +180,14 @@ impl Bloom {
     /// form; 0 for none.
     fn open_dialogs(&self) -> (usize, usize) {
         (
-            self.admin_confirm.as_ref().map_or(0, |c| std::rc::Rc::as_ptr(&c.run) as *const () as usize),
-            self.admin_prompt.as_ref().map_or(0, |p| std::rc::Rc::as_ptr(&p.run) as *const () as usize),
+            self.dialogs.confirm.as_ref().map_or(0, |c| std::rc::Rc::as_ptr(&c.run) as *const () as usize),
+            self.dialogs.prompt.as_ref().map_or(0, |p| std::rc::Rc::as_ptr(&p.run) as *const () as usize),
         )
     }
 
     /// True when the open question is the one a debug command opened.
     pub(crate) fn debug_opened_confirm(&self) -> bool {
-        match (&self.admin_confirm, &self.debug_dialogs.0) {
+        match (&self.dialogs.confirm, &self.debug_dialogs.0) {
             (Some(open), Some(noted)) => noted.upgrade().is_some_and(|run| std::rc::Rc::ptr_eq(&run, &open.run)),
             _ => false,
         }
@@ -195,7 +195,7 @@ impl Bloom {
 
     /// The same for the open form.
     fn debug_opened_prompt(&self) -> bool {
-        match (&self.admin_prompt, &self.debug_dialogs.1) {
+        match (&self.dialogs.prompt, &self.debug_dialogs.1) {
             (Some(open), Some(noted)) => noted.upgrade().is_some_and(|run| std::rc::Rc::ptr_eq(&run, &open.run)),
             _ => false,
         }
@@ -210,10 +210,10 @@ impl Bloom {
         // any dialog can be compared with it, and its place in memory is
         // not given to another dialog meanwhile.
         if after.0 != before.0 {
-            self.debug_dialogs.0 = self.admin_confirm.as_ref().map(|c| std::rc::Rc::downgrade(&c.run));
+            self.debug_dialogs.0 = self.dialogs.confirm.as_ref().map(|c| std::rc::Rc::downgrade(&c.run));
         }
         if after.1 != before.1 {
-            self.debug_dialogs.1 = self.admin_prompt.as_ref().map(|p| std::rc::Rc::downgrade(&p.run));
+            self.debug_dialogs.1 = self.dialogs.prompt.as_ref().map(|p| std::rc::Rc::downgrade(&p.run));
         }
         answer
     }
@@ -422,18 +422,18 @@ impl Bloom {
                     // Only a question a debug command opened: one a person
                     // opened (restart, shut down, delete a user) is not
                     // for this channel to answer.
-                    "confirm" if self.admin_confirm.is_some() && !self.debug_opened_confirm() => {
+                    "confirm" if self.dialogs.confirm.is_some() && !self.debug_opened_confirm() => {
                         return "error: the open question was not opened by a debug command".into();
                     }
-                    "submit" if self.admin_prompt.is_some() && !self.debug_opened_prompt() => {
+                    "submit" if self.dialogs.prompt.is_some() && !self.debug_opened_prompt() => {
                         return "error: the open form was not opened by a debug command".into();
                     }
-                    "confirm" => match self.admin_confirm.take() {
+                    "confirm" => match self.dialogs.confirm.take() {
                         Some(confirm) => (confirm.run)(self, cx),
                         None => return "error: no question is open".into(),
                     },
                     // Submits the open form; the values are separated by "|".
-                    "submit" => match self.admin_prompt.clone() {
+                    "submit" => match self.dialogs.prompt.clone() {
                         Some(prompt) => {
                             self.close_admin_dialog(window, cx);
                             (prompt.run)(self, arg.split('|').map(str::to_string).collect(), cx);
@@ -494,7 +494,7 @@ impl Bloom {
                 "newkey" => crate::admin::api_keys::ask_new(self, cx),
                 "newuser" => crate::admin::users::ask_new(self, cx),
                 "secret" => {
-                    self.admin_secret = Some(crate::admin::Secret {
+                    self.dialogs.secret = Some(crate::admin::Secret {
                         title: "API key for Example".to_string(),
                         message: "Copy the key now and keep it in a safe place.".to_string(),
                         value: "0123456789abcdef0123456789abcdef".to_string(),
