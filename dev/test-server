@@ -1,0 +1,82 @@
+#!/bin/sh
+# Gets the server a test instance signs in to ready, and prints the config
+# file for that instance (nothing for the live server).
+#
+#   dev/test-server <name>          prepare the server of BLOOM_TEST_SERVER
+#   dev/test-server <name> stop     stop what the first call started
+#
+# BLOOM_TEST_SERVER chooses the server:
+#   live       (default) the server of the user's config, read-only. It has
+#              the real library, so pages load and paint as they do in use.
+#              The rules of CLAUDE.md for that server hold.
+#   mock       dev/mock-jellyfin on this Mac: a fixed library, no network, no
+#              media files. Nothing a test does can reach a real server.
+#   container  a Jellyfin in a container with a small library of its own
+#              (dev/jellyfin-local). A real server that a test may change.
+#
+# dev/run-test and dev/smoke call this; with a config file from here they
+# set BLOOM_CONFIG_PATH, so the instance is a device of its own.
+dir=$(cd "$(dirname "$0")" && pwd)
+name=${1:?usage: dev/test-server <name> [stop]}
+mode=${BLOOM_TEST_SERVER:-live}
+config=/tmp/bloom-$name-config.json
+mock_pid=/tmp/bloom-$name-mock.pid
+
+stop_mock() {
+  [ -f "$mock_pid" ] || return 0
+  old=$(cat "$mock_pid")
+  case $(ps -p "$old" -o command= 2>/dev/null) in *mock-jellyfin*) kill "$old" 2>/dev/null ;; esac
+  rm -f "$mock_pid"
+}
+
+# One config for a device of its own: the server, one profile, and that
+# profile as the one to open.
+write_config() { # url server_id server_name user_id user_name token
+  umask 077
+  cat > "$config" <<EOF
+{
+  "device_id": "bloom-test-$name",
+  "servers": [{"id": "$2", "name": "$3", "url": "$1",
+    "profiles": [{"user_id": "$4", "name": "$5", "token": "$6"}]}],
+  "active": ["$2", "$4"]
+}
+EOF
+}
+
+stop_mock
+if [ "$2" = stop ]; then
+  rm -f "$config"
+  exit 0
+fi
+
+case $mode in
+  live)
+    rm -f "$config"
+    ;;
+  mock)
+    command -v python3 >/dev/null 2>&1 || { echo "dev/test-server: the mock needs python3" >&2; exit 1; }
+    port_file=/tmp/bloom-$name-mock.port
+    rm -f "$port_file"
+    nohup "$dir/mock-jellyfin" --port-file "$port_file" > "/tmp/bloom-$name-mock.log" 2>&1 &
+    echo $! > "$mock_pid"
+    tries=0
+    until [ -s "$port_file" ]; do
+      tries=$((tries + 1))
+      [ "$tries" -le 50 ] || { echo "dev/test-server: the mock did not start (/tmp/bloom-$name-mock.log)" >&2; exit 1; }
+      sleep 0.1
+    done
+    write_config "http://127.0.0.1:$(cat "$port_file")" mock "Mock Jellyfin" u1 tester mock-token
+    echo "$config"
+    ;;
+  container)
+    # The script prints: url, server id, user id, user name, token.
+    set -- $("$dir/jellyfin-local" up) || exit 1
+    [ $# -eq 5 ] || { echo "dev/test-server: dev/jellyfin-local gave no server" >&2; exit 1; }
+    write_config "$1" "$2" "Local Jellyfin" "$3" "$4" "$5"
+    echo "$config"
+    ;;
+  *)
+    echo "dev/test-server: BLOOM_TEST_SERVER is live, mock or container, not '$mode'" >&2
+    exit 1
+    ;;
+esac

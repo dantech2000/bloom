@@ -1,0 +1,128 @@
+#!/bin/sh
+# A Jellyfin server in a container on this Mac, with a small library of its
+# own, for tests that write to a server or must not touch the live one.
+#
+#   dev/jellyfin-local up      start it (the first time: set it up), and print
+#                              "<url> <server id> <user id> <user name> <token>"
+#   dev/jellyfin-local down    stop the container; its data stays
+#   dev/jellyfin-local reset   remove the container and its data
+#
+# `dev/test-server` calls `up` for BLOOM_TEST_SERVER=container. The data is
+# in target/jellyfin-local (config, cache, media). The media are clips that
+# ffmpeg makes, 20 seconds each, under the names of films with an open
+# licence, so the server finds posters and backdrops for them when the
+# container reaches the network. The account is `bloom-test`; its token is
+# for this server alone.
+#
+# Needs a container engine that answers `docker` (Docker Desktop, Rancher
+# Desktop, colima), ffmpeg, curl and python3. BLOOM_JELLYFIN_IMAGE names the image and
+# BLOOM_JELLYFIN_PORT the port on this Mac (default 8097).
+dir=$(cd "$(dirname "$0")/.." && pwd)
+data=$dir/target/jellyfin-local
+image=${BLOOM_JELLYFIN_IMAGE:-jellyfin/jellyfin:latest}
+port=${BLOOM_JELLYFIN_PORT:-8097}
+url=http://127.0.0.1:$port
+container=bloom-jellyfin-local
+user=bloom-test
+auth='MediaBrowser Client="bloom-dev", Device="dev", DeviceId="bloom-jellyfin-local", Version="1"'
+
+say() { echo "dev/jellyfin-local: $*" >&2; }
+die() { say "$*"; exit 1; }
+post() { # path body [token]
+  curl -fsS -X POST "$url$1" -H 'Content-Type: application/json' \
+    -H "Authorization: $auth${3:+, Token=\"$3\"}" -d "$2"
+}
+
+engine() {
+  command -v docker >/dev/null 2>&1 || die "no docker command; install a container engine"
+  docker info >/dev/null 2>&1 || die "the container engine does not answer; start it (for example: colima start)"
+}
+
+clip() { # file
+  [ -f "$1" ] && return 0
+  mkdir -p "$(dirname "$1")"
+  ffmpeg -loglevel error -y -f lavfi -i testsrc2=size=1280x720:rate=24:duration=20 \
+    -f lavfi -i sine=frequency=440:duration=20 -c:v libx264 -preset veryfast -pix_fmt yuv420p \
+    -c:a aac -shortest "$1" || die "ffmpeg could not make $1"
+}
+
+media() {
+  command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg is not in PATH; the library needs it"
+  for film in "Big Buck Bunny (2008)" "Sintel (2010)" "Tears of Steel (2012)" \
+    "Elephants Dream (2006)" "Cosmos Laundromat (2015)" "Night of the Living Dead (1968)"; do
+    clip "$data/media/movies/$film/$film.mkv"
+  done
+  for episode in 01 02 03; do
+    clip "$data/media/shows/Pioneer One (2010)/Season 01/Pioneer One S01E$episode.mkv"
+  done
+}
+
+wait_for_server() {
+  tries=0
+  until curl -fsS "$url/System/Info/Public" >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    [ "$tries" -le 120 ] || die "the server did not answer at $url (docker logs $container)"
+    sleep 1
+  done
+}
+
+# The first start: the steps of the setup wizard, then the two libraries.
+setup() {
+  say "setting up the server"
+  post /Startup/Configuration '{"UICulture":"en-US","MetadataCountryCode":"US","PreferredMetadataLanguage":"en"}' >/dev/null ||
+    die "the setup did not take the configuration"
+  # The server makes its first user when it is asked for it.
+  curl -fsS "$url/Startup/User" >/dev/null || die "the setup has no first user"
+  post /Startup/User "{\"Name\":\"$user\",\"Password\":\"$user\"}" >/dev/null || die "the setup did not take the user"
+  post '/Library/VirtualFolders?name=Movies&collectionType=movies&refreshLibrary=false&paths=%2Fmedia%2Fmovies' \
+    '{"LibraryOptions":{}}' >/dev/null || die "the Movies library was not added"
+  post '/Library/VirtualFolders?name=Shows&collectionType=tvshows&refreshLibrary=false&paths=%2Fmedia%2Fshows' \
+    '{"LibraryOptions":{}}' >/dev/null || die "the Shows library was not added"
+  post /Startup/RemoteAccess '{"EnableRemoteAccess":false,"EnableAutomaticPortMapping":false}' >/dev/null ||
+    die "the setup did not take the remote access"
+  post /Startup/Complete '' >/dev/null || die "the setup did not end"
+}
+
+up() {
+  engine
+  media
+  mkdir -p "$data/config" "$data/cache"
+  if [ -z "$(docker ps -q -f "name=^$container\$")" ]; then
+    docker rm "$container" >/dev/null 2>&1
+    docker run -d --name "$container" -p "127.0.0.1:$port:8096" \
+      -v "$data/config:/config" -v "$data/cache:/cache" -v "$data/media:/media:ro" \
+      "$image" >/dev/null || die "the container did not start"
+  fi
+  wait_for_server
+  info=$(curl -fsS "$url/System/Info/Public")
+  case $info in *'"StartupWizardCompleted":false'*) setup ;; esac
+  answer=$(post /Users/AuthenticateByName "{\"Username\":\"$user\",\"Pw\":\"$user\"}") ||
+    die "the sign-in of $user failed"
+  set -- $(echo "$answer" | python3 -c 'import json, sys
+a = json.load(sys.stdin)
+print(a["ServerId"], a["User"]["Id"], a["AccessToken"])') || die "the sign-in answer has no token or ids"
+  [ $# -eq 3 ] || die "the sign-in answer has no token or ids"
+  server_id=$1 user_id=$2 token=$3
+  # A scan at each start: it is quick, and it takes clips added since.
+  post /Library/Refresh '' "$token" >/dev/null || say "the library scan did not start"
+  echo "$url $server_id $user_id $user $token"
+}
+
+case ${1:-} in
+  up) up ;;
+  down)
+    engine
+    docker stop "$container" >/dev/null 2>&1
+    say "stopped"
+    ;;
+  reset)
+    engine
+    docker rm -f "$container" >/dev/null 2>&1
+    rm -rf "$data"
+    say "removed the container and $data"
+    ;;
+  *)
+    echo "usage: dev/jellyfin-local up | down | reset" >&2
+    exit 1
+    ;;
+esac
