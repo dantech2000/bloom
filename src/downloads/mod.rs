@@ -35,6 +35,8 @@ pub fn engine() -> &'static Engine {
         // The engine keeps artwork that the image loader can show, and
         // puts it in the loader's cache.
         let artwork = engine::Artwork { is_image: crate::images::looks_like_image, seed: crate::images::seed_file };
+        // And the loader shows the artwork the engine kept.
+        crate::images::set_local_image(local_image);
         Engine::open(dir(), engine::Options { artwork, ..Default::default() })
     })
 }
