@@ -11,6 +11,8 @@ cd "$(dirname "$0")/.." || exit 1
 expect=
 [ "$1" = --expect-skipped ] && expect=$2
 log=${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ci-test.log
+# The crate with no window first: its tests need no player.
+cargo test --release --locked -p bloom-core || exit 1
 BLOOM_CI_NO_PLAYER=1 cargo test --release --bin bloom -- --nocapture >"$log" 2>&1
 status=$?
 tail -n 5 "$log"

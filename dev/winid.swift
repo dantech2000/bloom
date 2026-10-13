@@ -6,7 +6,7 @@ let pid = CommandLine.arguments.count > 2 ? Int(CommandLine.arguments[2]) : nil
 if let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] {
     for w in list {
         // With a process id, the id decides; the name of the owner is the
-        // name of the app (src/brand.rs) or of the bare binary.
+        // name of the app (core/src/brand.rs) or of the bare binary.
         guard let owner = w[kCGWindowOwnerName as String] as? String, pid != nil || owner == name,
               let layer = w[kCGWindowLayer as String] as? Int, layer == 0 || layer == 3,
               let id = w[kCGWindowNumber as String] as? Int else { continue }

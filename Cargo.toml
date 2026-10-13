@@ -1,6 +1,6 @@
 [package]
 name = "bloom"
-version = "0.1.6"
+version.workspace = true
 edition = "2024"
 rust-version = "1.97.1"
 license = "AGPL-3.0-or-later"
@@ -8,6 +8,11 @@ description = "A native Jellyfin client built with GPUI and libmpv"
 default-run = "bloom"
 
 [dependencies]
+# The parts with no window (core/).
+bloom-core = { path = "core" }
+# Makes a trait of an `impl Client` block in a module of the app: the type
+# is `bloom-core`'s, and a crate may not add methods to it in another way.
+easy-ext = "1"
 web-time = "1.1"
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.4", features = ["font-kit"] }
 gpui-icons = { git = "https://github.com/devaryakjha/gpui-icons", rev = "01ac07dd83e97f9d6a3526466413732fbdfc2975" }
@@ -82,5 +87,11 @@ strip = true
 # The helper that drives lights from the events of Bloom (experimental):
 # a program of its own, which shares no code with the app.
 [workspace]
-members = ["lights"]
-default-members = [".", "lights"]
+members = ["core", "lights"]
+default-members = [".", "core", "lights"]
+
+# The version of the app, for it and for `bloom-core`, which names it to the
+# server. `dev/bump`, `dev/bundle` and `dev/release` read this line: it is
+# the first one of the file that starts with `version = `.
+[workspace.package]
+version = "0.1.6"

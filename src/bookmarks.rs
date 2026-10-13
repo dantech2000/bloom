@@ -219,14 +219,15 @@ impl Target {
     }
 }
 
-impl Client {
-    pub fn bookmarks_file(&self) -> anyhow::Result<Value> {
+#[easy_ext::ext(BookmarksApi)]
+pub(crate) impl Client {
+    fn bookmarks_file(&self) -> anyhow::Result<Value> {
         let user = self.user()?.to_string();
         self.get(&format!("/JellyfinEnhanced/user-settings/{user}/bookmark.json"), &[])
     }
 
     /// Who a bookmark of this item is for: its ids at other sites.
-    pub fn bookmark_target(&self, item_id: &str) -> anyhow::Result<Target> {
+    fn bookmark_target(&self, item_id: &str) -> anyhow::Result<Target> {
         let item = self.item(item_id)?;
         let series = match (&item.series_id, &item.kind) {
             (Some(series), ItemKind::Episode | ItemKind::Season) => self.item(series).ok(),
@@ -236,7 +237,7 @@ impl Client {
     }
 
     /// Asks the plugin to add a bookmark. It answers with the new key.
-    pub fn bookmark_add(&self, body: &Value) -> anyhow::Result<String> {
+    fn bookmark_add(&self, body: &Value) -> anyhow::Result<String> {
         let user = self.user()?.to_string();
         let mut answer = self.post(
             &format!("/JellyfinEnhanced/user-settings/{user}/bookmark.json/add"),
@@ -250,7 +251,7 @@ impl Client {
             .ok_or_else(|| anyhow::anyhow!("the server gave no bookmark id"))
     }
 
-    pub fn bookmark_remove(&self, id: &str) -> anyhow::Result<()> {
+    fn bookmark_remove(&self, id: &str) -> anyhow::Result<()> {
         let user = self.user()?.to_string();
         self.call(
             "DELETE",

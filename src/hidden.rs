@@ -425,8 +425,9 @@ pub fn unhide(file: &mut Value, key_or_id: &str) -> bool {
     false
 }
 
-impl Client {
-    pub fn hidden_file(&self) -> anyhow::Result<Value> {
+#[easy_ext::ext(HiddenApi)]
+pub(crate) impl Client {
+    fn hidden_file(&self) -> anyhow::Result<Value> {
         let user = self.user()?.to_string();
         self.get(&format!("/JellyfinEnhanced/user-settings/{user}/hidden-content.json"), &[])
     }
@@ -440,7 +441,7 @@ impl Client {
     /// Reads the file, changes it, writes it, and answers with the new file.
     /// The read is fresh, so a change the server made a moment ago (such as a
     /// "remove from Continue Watching") stays.
-    pub fn change_hidden(
+    fn change_hidden(
         &self,
         change: impl FnOnce(&mut Value) -> bool,
     ) -> anyhow::Result<Value> {

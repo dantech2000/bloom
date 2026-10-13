@@ -5,8 +5,8 @@
 # The app is signed ad hoc, for this Mac only.
 dir=$(cd "$(dirname "$0")/.." && pwd)
 dest=${1:-/Applications}
-name=$(sed -n 's/^pub const NAME: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
-[ -n "$name" ] || { echo "no name in src/brand.rs" >&2; exit 1; }
+name=$(sed -n 's/^pub const NAME: &str = "\(.*\)";/\1/p' "$dir/core/src/brand.rs")
+[ -n "$name" ] || { echo "no name in core/src/brand.rs" >&2; exit 1; }
 (cd "$dir" && cargo build --profile ship) || exit 1
 "$dir/dev/bundle" || exit 1
 # A running copy is asked to quit, as Cmd-Q does, and opened again after.

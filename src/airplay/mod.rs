@@ -21,6 +21,8 @@ pub mod picker;
 pub mod routes;
 pub mod stream;
 
+use crate::airplay::stream::AirPlayApi as _;
+use crate::stream::StreamApi as _;
 use std::{
     sync::{
         Arc, Mutex, OnceLock,

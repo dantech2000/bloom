@@ -368,7 +368,8 @@ pub fn new_stream<'a>(before: &[SubStream], after: &'a [SubStream]) -> Option<&'
         .filter(|_| after.iter().filter(|a| a.external).count() > before.iter().filter(|b| b.external).count())
 }
 
-impl Client {
+#[easy_ext::ext(SubtitlesApi)]
+pub(crate) impl Client {
     fn subtitle_streams(&self, item_id: &str) -> Result<Vec<SubStream>> {
         let user = self.user()?.to_string();
         let item: Value = self.get(&format!("/Items/{}", segment(item_id)), &[("userId", user)])?;
@@ -402,7 +403,7 @@ impl Client {
     }
 
     /// Searches the providers of the server.
-    pub fn search_subtitles(&self, item_id: &str, language: &str) -> Result<Search> {
+    fn search_subtitles(&self, item_id: &str, language: &str) -> Result<Search> {
         let body: Value = self.get(
             &search_path(item_id, language),
             &[("isPerfectMatch", "false".to_string())],
@@ -415,7 +416,7 @@ impl Client {
     /// Downloads a candidate into the library of the server and waits for
     /// the new stream: the server lists it after it refreshes the item.
     /// None when the stream did not appear in time.
-    pub fn download_subtitle(&self, item_id: &str, subtitle_id: &str) -> Result<Option<SubStream>> {
+    fn download_subtitle(&self, item_id: &str, subtitle_id: &str) -> Result<Option<SubStream>> {
         let before = self.subtitle_streams(item_id)?;
         self.call("POST", &download_path(item_id, subtitle_id), &[])?;
         for _ in 0..16 {
@@ -430,7 +431,7 @@ impl Client {
 
     /// Removes an external subtitle of an item. Refuses a stream that is
     /// not external.
-    pub fn remove_subtitle(&self, item_id: &str, index: i64) -> Result<()> {
+    fn remove_subtitle(&self, item_id: &str, index: i64) -> Result<()> {
         let streams = self.subtitle_streams(item_id)?;
         match streams.iter().find(|s| s.index == index) {
             None => return Err(anyhow!("the item has no subtitle stream {index}")),

@@ -177,11 +177,12 @@ pub fn force_categories(names: &str) -> Result<(), String> {
     Ok(())
 }
 
-impl Client {
+#[easy_ext::ext(QualityApi)]
+pub(crate) impl Client {
     /// The tag choices of the user and the master switch: tags on, resolution
     /// tag, dynamic range tag. It also stores the choices of all six
     /// categories. `None` without the plugin.
-    pub fn quality_prefs(&self) -> Option<(bool, bool, bool)> {
+    fn quality_prefs(&self) -> Option<(bool, bool, bool)> {
         use serde_json::Value;
         let user = self.user().ok()?.to_string();
         let own: Value = self

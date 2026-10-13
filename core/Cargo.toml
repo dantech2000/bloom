@@ -1,0 +1,23 @@
+[package]
+name = "bloom-core"
+version.workspace = true
+edition = "2024"
+rust-version = "1.97.1"
+license = "AGPL-3.0-or-later"
+description = "The parts of Bloom with no window: the Jellyfin client, the config and the state machines"
+publish = false
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+ureq = { version = "3", features = ["json"] }
+tungstenite = { version = "0.29", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+dirs = "6"
+uuid = { version = "1", features = ["v4"] }
+log = "0.4"
+async-channel = "2"
+base64 = "0.22"
+jiff = "0.2"

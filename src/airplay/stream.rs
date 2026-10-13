@@ -97,10 +97,11 @@ pub fn redact(url: &str) -> String {
     out
 }
 
-impl Client {
+#[easy_ext::ext(AirPlayApi)]
+pub(crate) impl Client {
     /// A new stream of the item for this device, under a play session of
     /// its own.
-    pub fn airplay_stream(&self, item_id: &str, options: &StreamOptions) -> Result<Stream> {
+    fn airplay_stream(&self, item_id: &str, options: &StreamOptions) -> Result<Stream> {
         let token = self.token.as_deref().ok_or_else(|| anyhow!("not signed in"))?;
         let play_session_id = uuid::Uuid::new_v4().to_string();
         let url = build_url(&self.base, item_id, &self.device_id, token, &play_session_id, options);

@@ -207,9 +207,10 @@ pub fn measure_with(mut fetch: impl FnMut(u64) -> Result<(u64, Duration)>) -> Re
     Ok(Measurement { bps: bps.unwrap_or(0), bytes, took })
 }
 
-impl Client {
+#[easy_ext::ext(AdaptiveApi)]
+pub(crate) impl Client {
     /// Measures the link to the server. Downloads a few MB at most.
-    pub fn measure_link(&self) -> Result<Measurement> {
+    fn measure_link(&self) -> Result<Measurement> {
         measure_with(|size| self.timed_download(size))
     }
 

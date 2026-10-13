@@ -443,7 +443,7 @@ pub fn poster_card(
 
 /// Quality tags at the top left of a poster, as Jellyfin Enhanced shows them.
 fn quality_tags(item: &Item) -> Option<Div> {
-    let labels = item.quality_labels();
+    let labels = crate::quality::labels(item);
     if labels.is_empty() {
         return None;
     }

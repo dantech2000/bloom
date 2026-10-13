@@ -1,15 +1,16 @@
 // Copyright (C) 2026 Sarat Chandra
 // SPDX-License-Identifier: AGPL-3.0-or-later
+// The parts with no window live in `bloom-core`; they keep their names here.
+pub(crate) use bloom_core::{brand, config, jellyfin, news, options, realtime, search_index};
+
 mod adaptive;
 mod admin;
 mod airplay;
 mod app;
 mod awake;
 mod bookmarks;
-mod brand;
 mod chromecast;
 mod cast;
-mod config;
 mod connection;
 mod credits;
 mod debug;
@@ -19,14 +20,11 @@ mod events;
 mod hidden;
 mod icons;
 mod images;
-mod jellyfin;
 mod lists;
 mod macos;
 mod menus;
 mod metadata;
-mod news;
 mod nowplaying;
-mod options;
 mod pacing;
 mod perf;
 mod pip;
@@ -34,8 +32,6 @@ mod playback;
 mod player;
 mod quality;
 mod queue;
-mod realtime;
-mod search_index;
 mod seasons;
 mod settings;
 mod stream;

@@ -762,9 +762,11 @@ dependencies = [
  "async-channel",
  "base64 0.22.1",
  "block",
+ "bloom-core",
  "core-foundation 0.10.1",
  "core-video",
  "dirs 6.0.0",
+ "easy-ext",
  "env_logger",
  "gpui-icons",
  "gpui-kit",
@@ -786,6 +788,25 @@ dependencies = [
  "ureq",
  "uuid",
  "web-time",
+ "webpki-roots 1.0.9",
+]
+
+[[package]]
+name = "bloom-core"
+version = "0.1.6"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "base64 0.22.1",
+ "dirs 6.0.0",
+ "jiff",
+ "log",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tungstenite",
+ "ureq",
+ "uuid",
  "webpki-roots 1.0.9",
 ]
 
@@ -1681,6 +1702,12 @@ name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
+
+[[package]]
+name = "easy-ext"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8072bec12b909b65aec01fa6518f387cfbf3427d4475409ad622898cd347522c"
 
 [[package]]
 name = "either"

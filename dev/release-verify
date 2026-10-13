@@ -8,7 +8,7 @@ Fails (exit 1) with one line for each problem. The checks:
   1. the feed has one new entry for <version> with the address of its
      release, the length of the archive, and an EdDSA signature that
      verifies against the PUBLIC key (BLOOM_UPDATE_KEY, else UPDATE_PUBLIC_KEY
-     of src/brand.rs): a feed signed with a wrong key cannot pass;
+     of core/src/brand.rs): a feed signed with a wrong key cannot pass;
   2. with --source: every older entry is the same text as in the source feed
      (so its original signature is unchanged) and has its own release address;
   3. the archive, unpacked: `codesign --verify --deep --strict`; the version
