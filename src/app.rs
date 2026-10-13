@@ -2210,299 +2210,10 @@ impl Bloom {
         if self.offline_load_page(cx) {
             return;
         }
-        match &mut self.page {
-            Page::Home(data) => {
-                data.loading = true;
-                let libraries = home_libraries(&self.views);
-                let need_hero = self.hero.slides.is_empty();
-                // At sign-in the libraries are not known yet. They load in
-                // the same pass as the page, so the page does not wait for
-                // them first.
-                let need_views = self.views.is_empty();
-                self.fetch_for_page(
-                    cx,
-                    move |client| {
-                        let started = std::time::Instant::now();
-                        // The requests do not depend on each other, so they
-                        // run at the same time; the page waits for the slowest
-                        // one and not for their sum.
-                        let loaded = std::thread::scope(|scope| {
-                            let views = scope.spawn(|| {
-                                if need_views {
-                                    client.views().map(library_views)
-                                } else {
-                                    Ok(Vec::new())
-                                }
-                            });
-                            let order = scope.spawn(|| client.home_sections());
-                            let resume = scope.spawn(|| client.resume(12));
-                            let next_up = scope.spawn(|| client.next_up(24));
-                            let hero = scope.spawn(|| {
-                                if !need_hero {
-                                    return Vec::new();
-                                }
-                                // The hero is optional; the page loads without it.
-                                let mut items =
-                                    client.hero_items(HERO_ITEMS * 2).unwrap_or_default();
-                                items.retain(crate::views::hero::usable);
-                                items.truncate(HERO_ITEMS);
-                                items
-                            });
-                            let join = |what: &str| anyhow::anyhow!("{what} request stopped");
-                            // The latest rows need the libraries; they start
-                            // as soon as those are in, while the rest runs.
-                            let views = views.join().map_err(|_| join("libraries"))??;
-                            let libraries = if need_views {
-                                home_libraries(&views)
-                            } else {
-                                libraries
-                            };
-                            let latest = std::thread::scope(|scope| {
-                                let latest: Vec<_> = libraries
-                                    .iter()
-                                    .map(|library| scope.spawn(|| client.latest(&library.id, 16)))
-                                    .collect();
-                                latest
-                                    .into_iter()
-                                    .map(|handle| handle.join().map_err(|_| join("latest"))?)
-                                    .collect::<Result<Vec<_>>>()
-                            })?;
-                            let latest: Vec<(Item, Vec<Item>)> = libraries
-                                .into_iter()
-                                .zip(latest)
-                                .filter(|(_, items)| !items.is_empty())
-                                .collect();
-                            anyhow::Ok((
-                                views,
-                                // A failed settings read falls back to the web defaults.
-                                order
-                                    .join()
-                                    .map_err(|_| join("settings"))?
-                                    .unwrap_or_else(|_| {
-                                        crate::jellyfin::DEFAULT_HOME_SECTIONS
-                                            .iter()
-                                            .map(|s| s.to_string())
-                                            .collect()
-                                    }),
-                                resume.join().map_err(|_| join("resume"))??,
-                                next_up.join().map_err(|_| join("next up"))??,
-                                latest,
-                                hero.join().map_err(|_| join("hero"))?,
-                            ))
-                        })?;
-                        let (views, order, resume, next_up, latest, hero) = loaded;
-                        log::info!(
-                            "home data loaded in {} ms ({} ms after start)",
-                            started.elapsed().as_millis(),
-                            crate::perf::since_start_ms()
-                        );
-                        Ok((
-                            views,
-                            HomeData {
-                                loading: false,
-                                order,
-                                hero,
-                                resume,
-                                next_up,
-                                latest,
-                            },
-                        ))
-                    },
-                    move |this, result, cx| {
-                        if let Page::Home(data) = &mut this.page {
-                            match result {
-                                Ok((views, mut fresh)) => {
-                                    if !views.is_empty() {
-                                        this.views = views;
-                                    }
-                                    let hero = std::mem::take(&mut fresh.hero);
-                                    *data = fresh;
-                                    if this.hero.slides.is_empty() && !hero.is_empty() {
-                                        this.hero.slides = hero;
-                                        this.show_hero_slide(0);
-                                    }
-                                }
-                                Err(err) => {
-                                    data.loading = false;
-                                    // No server at all: the offline state takes over.
-                                    if !this.downloads_server_failed(&err, cx) {
-                                        this.toast("Could not load home", format!("{err:#}"), cx);
-                                    }
-                                }
-                            }
-                        }
-                        cx.notify();
-                    },
-                );
-            }
-            Page::Library(data) => {
-                data.loading = true;
-                let query = library_query(data);
-                self.fetch_for_page(
-                    cx,
-                    move |client| {
-                        let started = std::time::Instant::now();
-                        let page = client.items(&query)?;
-                        log::info!(
-                            "library data loaded in {} ms ({} items)",
-                            started.elapsed().as_millis(),
-                            page.items.len()
-                        );
-                        Ok(page)
-                    },
-                    move |this, result, cx| {
-                        if let Page::Library(data) = &mut this.page {
-                            data.loading = false;
-                            match result {
-                                Ok(page) => {
-                                    data.total = page.total_record_count;
-                                    data.items = page.items;
-                                }
-                                Err(err) => {
-                                    if !this.request_failed(&err, cx) {
-                                        this.toast("Could not load library", format!("{err:#}"), cx)
-                                    }
-                                }
-                            }
-                        }
-                        cx.notify();
-                    },
-                );
-            }
-            Page::Detail(data) => {
-                data.loading = true;
-                let item_id = data.item.id.clone();
-                // The card already says what kind of item this is, so the
-                // requests for its rows start with the item request.
-                let kind = data.item.kind.clone();
-                let series_id = data.item.series_id.clone();
-                let season_id = data.item.season_id.clone();
-                self.fetch_for_page(
-                    cx,
-                    move |client| {
-                        let started = std::time::Instant::now();
-                        let is = |wanted: ItemKind| kind == wanted;
-                        let (item, seasons, next_up, episodes, similar) =
-                            std::thread::scope(|scope| {
-                                let item = scope.spawn(|| client.item(&item_id));
-                                let seasons =
-                                    scope.spawn(|| match is(ItemKind::Series) {
-                                        true => client.seasons(&item_id),
-                                        false => Ok(Vec::new()),
-                                    });
-                                let next_up = scope.spawn(|| match is(ItemKind::Series) {
-                                    true => client.series_next_up(&item_id).unwrap_or(None),
-                                    false => None,
-                                });
-                                // A season shows its episodes; an episode
-                                // shows the others of its season.
-                                let episodes = scope.spawn(|| match (&series_id, &season_id) {
-                                    (Some(series), _) if is(ItemKind::Season) => {
-                                        client.episodes(series, &item_id)
-                                    }
-                                    (Some(series), Some(season)) if is(ItemKind::Episode) => {
-                                        Ok(client.episodes(series, season).unwrap_or_default())
-                                    }
-                                    _ => Ok(Vec::new()),
-                                });
-                                // The row is optional; the page loads without it.
-                                let similar = scope.spawn(|| {
-                                    if is(ItemKind::Movie) || is(ItemKind::Series) {
-                                        client.similar(&item_id, 12).unwrap_or_default()
-                                    } else {
-                                        Vec::new()
-                                    }
-                                });
-                                let stopped = || anyhow::anyhow!("detail request stopped");
-                                anyhow::Ok((
-                                    item.join().map_err(|_| stopped())??,
-                                    seasons.join().map_err(|_| stopped())??,
-                                    next_up.join().map_err(|_| stopped())?,
-                                    episodes.join().map_err(|_| stopped())??,
-                                    similar.join().map_err(|_| stopped())?,
-                                ))
-                            })?;
-                        let mut fresh = DetailData {
-                            seasons,
-                            next_up,
-                            episodes,
-                            similar,
-                            ..Default::default()
-                        };
-                        // An item opened by id alone has no kind until now.
-                        if kind.is_unknown() {
-                            match item.kind {
-                                ItemKind::Series => {
-                                    fresh.seasons = client.seasons(&item_id)?;
-                                    fresh.next_up =
-                                        client.series_next_up(&item_id).unwrap_or(None);
-                                }
-                                ItemKind::Season => {
-                                    if let Some(series) = &item.series_id {
-                                        fresh.episodes = client.episodes(series, &item_id)?;
-                                    }
-                                }
-                                _ => {}
-                            }
-                            if matches!(item.kind, ItemKind::Movie | ItemKind::Series) {
-                                fresh.similar = client.similar(&item_id, 12).unwrap_or_default();
-                            }
-                        }
-                        // The card that opened an episode page does not
-                        // always carry the season id; the item does.
-                        if item.kind == ItemKind::Episode
-                            && fresh.episodes.is_empty()
-                            && let (Some(series), Some(season)) = (&item.series_id, &item.season_id)
-                        {
-                            fresh.episodes = client.episodes(series, season).unwrap_or_default();
-                        }
-                        log::info!(
-                            "detail data loaded in {} ms",
-                            started.elapsed().as_millis()
-                        );
-                        fresh.item = item;
-                        Ok(fresh)
-                    },
-                    move |this, result, cx| {
-                        if let Page::Detail(data) = &mut this.page {
-                            match result {
-                                Ok(mut fresh) => {
-                                    // A reload of the same item keeps the
-                                    // tracks the user picked on the page.
-                                    if fresh.item.id == data.item.id {
-                                        (fresh.audio, fresh.subtitle) = (data.audio, data.subtitle);
-                                    }
-                                    *data = fresh;
-                                    // The row of the season starts at the
-                                    // episode of the page; the ones before
-                                    // it are a scroll to the left away.
-                                    if data.item.kind == ItemKind::Episode {
-                                        let at = data
-                                            .episodes
-                                            .iter()
-                                            .position(|ep| ep.id == data.item.id)
-                                            .unwrap_or(0);
-                                        let step = (this.viewport_w * 0.173).round()
-                                            + crate::views::cards::CARD_GAP;
-                                        let offset = at as f32 * step;
-                                        this.row_scroll(&"detail.season-episodes".into())
-                                            .set_offset(gpui_kit::point(px(-offset), px(0.)));
-                                    }
-                                    this.rebuild_detail_menus(cx);
-                                    this.load_enhanced_detail(cx);
-                                }
-                                Err(err) => {
-                                    data.loading = false;
-                                    if !this.request_failed(&err, cx) {
-                                        this.toast("Could not load details", format!("{err:#}"), cx)
-                                    }
-                                }
-                            }
-                        }
-                        cx.notify();
-                    },
-                );
-            }
+        match &self.page {
+            Page::Home(_) => self.load_home(cx),
+            Page::Library(_) => self.load_library(cx),
+            Page::Detail(_) => self.load_detail(cx),
             Page::Admin(_) => self.load_admin(cx),
             Page::Playlist(_) => self.load_playlist(cx),
             // The downloads page reads the index of this Mac; nothing loads.
@@ -2513,86 +2224,399 @@ impl Bloom {
                     self.load_prefs(cx);
                 }
             }
-            Page::Search(data) => {
-                if data.query.is_empty() {
-                    // The title index may already show results for the text
-                    // in the field; the server search starts when typing rests.
-                    if data.typed.is_empty() {
-                        data.results.clear();
-                        data.loading = false;
-                    }
-                    return;
-                }
-                data.loading = true;
-                data.pending = Some(data.query.clone());
-                let query = ItemQuery {
-                    search: Some(data.query.clone()),
-                    include_types: vec!["Movie".into(), "Series".into(), "Episode".into()],
-                    recursive: Some(true),
-                    limit: Some(100),
-                    ..Default::default()
-                };
-                let text = data.query.clone();
-                let asked = text.clone();
-                self.fetch_for_page(
-                    cx,
-                    move |client| {
-                        let started = std::time::Instant::now();
-                        // The library and Seerr requests do not depend on each
-                        // other, so they run at the same time.
-                        let (page, seerr) = std::thread::scope(|scope| {
-                            let page = scope.spawn(|| client.items(&query));
-                            // Seerr is optional; the library results still show.
-                            let seerr = scope.spawn(|| {
-                                if client.seerr_active() {
-                                    client.seerr_search(&text).unwrap_or_default()
-                                } else {
-                                    Vec::new()
-                                }
-                            });
-                            let stopped = || anyhow::anyhow!("search request stopped");
-                            anyhow::Ok((
-                                page.join().map_err(|_| stopped())??,
-                                seerr.join().map_err(|_| stopped())?,
-                            ))
-                        })?;
-                        log::info!("search data loaded in {} ms", started.elapsed().as_millis());
-                        Ok((page.items, seerr))
+            Page::Search(_) => self.load_search(cx),
+        }
+    }
+
+    /// Loads the rows of the home page and, at sign-in, the libraries. `load_page` calls this.
+    fn load_home(&mut self, cx: &mut Context<Self>) {
+        let Page::Home(data) = &mut self.page else {
+            return;
+        };
+        data.loading = true;
+        let libraries = home_libraries(&self.views);
+        let need_hero = self.hero.slides.is_empty();
+        // At sign-in the libraries are not known yet. They load in
+        // the same pass as the page, so the page does not wait for
+        // them first.
+        let need_views = self.views.is_empty();
+        self.fetch_for_page(
+            cx,
+            move |client| {
+                let started = std::time::Instant::now();
+                // The requests do not depend on each other, so they
+                // run at the same time; the page waits for the slowest
+                // one and not for their sum.
+                let loaded = std::thread::scope(|scope| {
+                    let views = scope.spawn(|| {
+                        if need_views {
+                            client.views().map(library_views)
+                        } else {
+                            Ok(Vec::new())
+                        }
+                    });
+                    let order = scope.spawn(|| client.home_sections());
+                    let resume = scope.spawn(|| client.resume(12));
+                    let next_up = scope.spawn(|| client.next_up(24));
+                    let hero = scope.spawn(|| {
+                        if !need_hero {
+                            return Vec::new();
+                        }
+                        // The hero is optional; the page loads without it.
+                        let mut items =
+                            client.hero_items(HERO_ITEMS * 2).unwrap_or_default();
+                        items.retain(crate::views::hero::usable);
+                        items.truncate(HERO_ITEMS);
+                        items
+                    });
+                    let join = |what: &str| anyhow::anyhow!("{what} request stopped");
+                    // The latest rows need the libraries; they start
+                    // as soon as those are in, while the rest runs.
+                    let views = views.join().map_err(|_| join("libraries"))??;
+                    let libraries = if need_views {
+                        home_libraries(&views)
+                    } else {
+                        libraries
+                    };
+                    let latest = std::thread::scope(|scope| {
+                        let latest: Vec<_> = libraries
+                            .iter()
+                            .map(|library| scope.spawn(|| client.latest(&library.id, 16)))
+                            .collect();
+                        latest
+                            .into_iter()
+                            .map(|handle| handle.join().map_err(|_| join("latest"))?)
+                            .collect::<Result<Vec<_>>>()
+                    })?;
+                    let latest: Vec<(Item, Vec<Item>)> = libraries
+                        .into_iter()
+                        .zip(latest)
+                        .filter(|(_, items)| !items.is_empty())
+                        .collect();
+                    anyhow::Ok((
+                        views,
+                        // A failed settings read falls back to the web defaults.
+                        order
+                            .join()
+                            .map_err(|_| join("settings"))?
+                            .unwrap_or_else(|_| {
+                                crate::jellyfin::DEFAULT_HOME_SECTIONS
+                                    .iter()
+                                    .map(|s| s.to_string())
+                                    .collect()
+                            }),
+                        resume.join().map_err(|_| join("resume"))??,
+                        next_up.join().map_err(|_| join("next up"))??,
+                        latest,
+                        hero.join().map_err(|_| join("hero"))?,
+                    ))
+                })?;
+                let (views, order, resume, next_up, latest, hero) = loaded;
+                log::info!(
+                    "home data loaded in {} ms ({} ms after start)",
+                    started.elapsed().as_millis(),
+                    crate::perf::since_start_ms()
+                );
+                Ok((
+                    views,
+                    HomeData {
+                        loading: false,
+                        order,
+                        hero,
+                        resume,
+                        next_up,
+                        latest,
                     },
-                    move |this, result, cx| {
-                        if let Page::Search(data) = &mut this.page {
-                            if data.pending.as_deref() == Some(asked.as_str()) {
-                                data.pending = None;
+                ))
+            },
+            move |this, result, cx| {
+                if let Page::Home(data) = &mut this.page {
+                    match result {
+                        Ok((views, mut fresh)) => {
+                            if !views.is_empty() {
+                                this.views = views;
                             }
-                            // The user typed on; a search for the new text
-                            // follows. The answer is kept for a return to
-                            // this text.
-                            let shown = data.typed == data.query && data.query == asked;
-                            match result {
-                                Ok((items, seerr)) => {
-                                    if shown {
-                                        data.results = items.clone();
-                                        data.seerr = seerr.clone();
-                                        data.loading = false;
-                                    }
-                                    data.answered = Some((asked, items, seerr));
-                                }
-                                Err(err) => {
-                                    if !shown {
-                                        return;
-                                    }
-                                    data.loading = false;
-                                    if !this.request_failed(&err, cx) {
-                                        this.toast("Search failed", format!("{err:#}"), cx)
-                                    }
-                                }
+                            let hero = std::mem::take(&mut fresh.hero);
+                            *data = fresh;
+                            if this.hero.slides.is_empty() && !hero.is_empty() {
+                                this.hero.slides = hero;
+                                this.show_hero_slide(0);
                             }
                         }
-                        cx.notify();
-                    },
+                        Err(err) => {
+                            data.loading = false;
+                            // No server at all: the offline state takes over.
+                            if !this.downloads_server_failed(&err, cx) {
+                                this.toast("Could not load home", format!("{err:#}"), cx);
+                            }
+                        }
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Loads the first page of the library on show. `load_page` calls this.
+    fn load_library(&mut self, cx: &mut Context<Self>) {
+        let Page::Library(data) = &mut self.page else {
+            return;
+        };
+        data.loading = true;
+        let query = library_query(data);
+        self.fetch_for_page(
+            cx,
+            move |client| {
+                let started = std::time::Instant::now();
+                let page = client.items(&query)?;
+                log::info!(
+                    "library data loaded in {} ms ({} items)",
+                    started.elapsed().as_millis(),
+                    page.items.len()
                 );
+                Ok(page)
+            },
+            move |this, result, cx| {
+                if let Page::Library(data) = &mut this.page {
+                    data.loading = false;
+                    match result {
+                        Ok(page) => {
+                            data.total = page.total_record_count;
+                            data.items = page.items;
+                        }
+                        Err(err) => {
+                            if !this.request_failed(&err, cx) {
+                                this.toast("Could not load library", format!("{err:#}"), cx)
+                            }
+                        }
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Loads the item of the detail page and the rows under it. `load_page` calls this.
+    fn load_detail(&mut self, cx: &mut Context<Self>) {
+        let Page::Detail(data) = &mut self.page else {
+            return;
+        };
+        data.loading = true;
+        let item_id = data.item.id.clone();
+        // The card already says what kind of item this is, so the
+        // requests for its rows start with the item request.
+        let kind = data.item.kind.clone();
+        let series_id = data.item.series_id.clone();
+        let season_id = data.item.season_id.clone();
+        self.fetch_for_page(
+            cx,
+            move |client| {
+                let started = std::time::Instant::now();
+                let is = |wanted: ItemKind| kind == wanted;
+                let (item, seasons, next_up, episodes, similar) =
+                    std::thread::scope(|scope| {
+                        let item = scope.spawn(|| client.item(&item_id));
+                        let seasons =
+                            scope.spawn(|| match is(ItemKind::Series) {
+                                true => client.seasons(&item_id),
+                                false => Ok(Vec::new()),
+                            });
+                        let next_up = scope.spawn(|| match is(ItemKind::Series) {
+                            true => client.series_next_up(&item_id).unwrap_or(None),
+                            false => None,
+                        });
+                        // A season shows its episodes; an episode
+                        // shows the others of its season.
+                        let episodes = scope.spawn(|| match (&series_id, &season_id) {
+                            (Some(series), _) if is(ItemKind::Season) => {
+                                client.episodes(series, &item_id)
+                            }
+                            (Some(series), Some(season)) if is(ItemKind::Episode) => {
+                                Ok(client.episodes(series, season).unwrap_or_default())
+                            }
+                            _ => Ok(Vec::new()),
+                        });
+                        // The row is optional; the page loads without it.
+                        let similar = scope.spawn(|| {
+                            if is(ItemKind::Movie) || is(ItemKind::Series) {
+                                client.similar(&item_id, 12).unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            }
+                        });
+                        let stopped = || anyhow::anyhow!("detail request stopped");
+                        anyhow::Ok((
+                            item.join().map_err(|_| stopped())??,
+                            seasons.join().map_err(|_| stopped())??,
+                            next_up.join().map_err(|_| stopped())?,
+                            episodes.join().map_err(|_| stopped())??,
+                            similar.join().map_err(|_| stopped())?,
+                        ))
+                    })?;
+                let mut fresh = DetailData {
+                    seasons,
+                    next_up,
+                    episodes,
+                    similar,
+                    ..Default::default()
+                };
+                // An item opened by id alone has no kind until now.
+                if kind.is_unknown() {
+                    match item.kind {
+                        ItemKind::Series => {
+                            fresh.seasons = client.seasons(&item_id)?;
+                            fresh.next_up =
+                                client.series_next_up(&item_id).unwrap_or(None);
+                        }
+                        ItemKind::Season => {
+                            if let Some(series) = &item.series_id {
+                                fresh.episodes = client.episodes(series, &item_id)?;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if matches!(item.kind, ItemKind::Movie | ItemKind::Series) {
+                        fresh.similar = client.similar(&item_id, 12).unwrap_or_default();
+                    }
+                }
+                // The card that opened an episode page does not
+                // always carry the season id; the item does.
+                if item.kind == ItemKind::Episode
+                    && fresh.episodes.is_empty()
+                    && let (Some(series), Some(season)) = (&item.series_id, &item.season_id)
+                {
+                    fresh.episodes = client.episodes(series, season).unwrap_or_default();
+                }
+                log::info!(
+                    "detail data loaded in {} ms",
+                    started.elapsed().as_millis()
+                );
+                fresh.item = item;
+                Ok(fresh)
+            },
+            move |this, result, cx| {
+                if let Page::Detail(data) = &mut this.page {
+                    match result {
+                        Ok(mut fresh) => {
+                            // A reload of the same item keeps the
+                            // tracks the user picked on the page.
+                            if fresh.item.id == data.item.id {
+                                (fresh.audio, fresh.subtitle) = (data.audio, data.subtitle);
+                            }
+                            *data = fresh;
+                            // The row of the season starts at the
+                            // episode of the page; the ones before
+                            // it are a scroll to the left away.
+                            if data.item.kind == ItemKind::Episode {
+                                let at = data
+                                    .episodes
+                                    .iter()
+                                    .position(|ep| ep.id == data.item.id)
+                                    .unwrap_or(0);
+                                let step = (this.viewport_w * 0.173).round()
+                                    + crate::views::cards::CARD_GAP;
+                                let offset = at as f32 * step;
+                                this.row_scroll(&"detail.season-episodes".into())
+                                    .set_offset(gpui_kit::point(px(-offset), px(0.)));
+                            }
+                            this.rebuild_detail_menus(cx);
+                            this.load_enhanced_detail(cx);
+                        }
+                        Err(err) => {
+                            data.loading = false;
+                            if !this.request_failed(&err, cx) {
+                                this.toast("Could not load details", format!("{err:#}"), cx)
+                            }
+                        }
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Runs the search of the page on the server. `load_page` calls this.
+    fn load_search(&mut self, cx: &mut Context<Self>) {
+        let Page::Search(data) = &mut self.page else {
+            return;
+        };
+        if data.query.is_empty() {
+            // The title index may already show results for the text
+            // in the field; the server search starts when typing rests.
+            if data.typed.is_empty() {
+                data.results.clear();
+                data.loading = false;
             }
+            return;
         }
+        data.loading = true;
+        data.pending = Some(data.query.clone());
+        let query = ItemQuery {
+            search: Some(data.query.clone()),
+            include_types: vec!["Movie".into(), "Series".into(), "Episode".into()],
+            recursive: Some(true),
+            limit: Some(100),
+            ..Default::default()
+        };
+        let text = data.query.clone();
+        let asked = text.clone();
+        self.fetch_for_page(
+            cx,
+            move |client| {
+                let started = std::time::Instant::now();
+                // The library and Seerr requests do not depend on each
+                // other, so they run at the same time.
+                let (page, seerr) = std::thread::scope(|scope| {
+                    let page = scope.spawn(|| client.items(&query));
+                    // Seerr is optional; the library results still show.
+                    let seerr = scope.spawn(|| {
+                        if client.seerr_active() {
+                            client.seerr_search(&text).unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        }
+                    });
+                    let stopped = || anyhow::anyhow!("search request stopped");
+                    anyhow::Ok((
+                        page.join().map_err(|_| stopped())??,
+                        seerr.join().map_err(|_| stopped())?,
+                    ))
+                })?;
+                log::info!("search data loaded in {} ms", started.elapsed().as_millis());
+                Ok((page.items, seerr))
+            },
+            move |this, result, cx| {
+                if let Page::Search(data) = &mut this.page {
+                    if data.pending.as_deref() == Some(asked.as_str()) {
+                        data.pending = None;
+                    }
+                    // The user typed on; a search for the new text
+                    // follows. The answer is kept for a return to
+                    // this text.
+                    let shown = data.typed == data.query && data.query == asked;
+                    match result {
+                        Ok((items, seerr)) => {
+                            if shown {
+                                data.results = items.clone();
+                                data.seerr = seerr.clone();
+                                data.loading = false;
+                            }
+                            data.answered = Some((asked, items, seerr));
+                        }
+                        Err(err) => {
+                            if !shown {
+                                return;
+                            }
+                            data.loading = false;
+                            if !this.request_failed(&err, cx) {
+                                this.toast("Search failed", format!("{err:#}"), cx)
+                            }
+                        }
+                    }
+                }
+                cx.notify();
+            },
+        );
     }
 
     // ----- user data --------------------------------------------------------
