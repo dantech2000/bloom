@@ -236,9 +236,28 @@ impl Entry {
     }
 }
 
+/// What the engine asks of the image cache of the app. The engine has no
+/// image decoder and knows no cache, so the app gives it these two; with
+/// the defaults every answer counts as an image and nothing is seeded.
+#[derive(Clone, Copy, Debug)]
+pub struct Artwork {
+    /// True when the bytes are a whole image that the app can show.
+    pub is_image: fn(&[u8]) -> bool,
+    /// Puts a file of this Mac in the image cache of the app, under a URL.
+    pub seed: fn(&str, &Path),
+}
+
+impl Default for Artwork {
+    fn default() -> Self {
+        Self { is_image: |_| true, seed: |_, _| {} }
+    }
+}
+
 /// Settings of an engine. The defaults are the ones of the app.
 #[derive(Clone, Debug)]
 pub struct Options {
+    /// The image cache of the app, for the artwork of an item.
+    pub artwork: Artwork,
     /// Downloads that run at the same time: 1 or 2.
     pub parallel: usize,
     /// Space all downloads may take; none for no limit.
@@ -265,6 +284,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            artwork: Artwork::default(),
             parallel: 1,
             limit_bytes: None,
             free_override: None,
@@ -1000,7 +1020,7 @@ fn download_run(inner: &Arc<Inner>, job: &Job, again: bool) -> Result<(), Stop> 
 
     // Artwork and subtitles are small and optional: the item plays
     // without them.
-    fetch_images(&agent, client, &item, folder, &live);
+    fetch_images(&agent, client, &item, folder, &live, options.artwork);
     // Once, unless one of them did not come: then the next run of the
     // download asks again (a file that is there is not fetched twice).
     if meta.get("Subtitles").is_none() || meta["SubtitlesMissing"].as_bool() == Some(true) {
@@ -1478,7 +1498,14 @@ fn media_file_name(source: &Value) -> String {
 /// Poster and backdrop of the item, to its folder and to the image cache of
 /// the app, so the pages show them without the server. `live` is asked
 /// before each write: a job whose entry is gone writes nothing.
-fn fetch_images(agent: &ureq::Agent, client: &Client, item: &Value, folder: &Path, live: &dyn Fn() -> bool) {
+fn fetch_images(
+    agent: &ureq::Agent,
+    client: &Client,
+    item: &Value,
+    folder: &Path,
+    live: &dyn Fn() -> bool,
+    artwork: Artwork,
+) {
     let id = item["Id"].as_str().unwrap_or_default();
     let text = |value: &Value| value.as_str().map(str::to_string);
     let poster = text(&item["ImageTags"]["Primary"])
@@ -1516,7 +1543,7 @@ fn fetch_images(agent: &ureq::Agent, client: &Client, item: &Value, folder: &Pat
             let url = client.image_url(&owner, kind, Some(&tag), width);
             // An answer that is no image (the page of a proxy) is not kept.
             let Ok(bytes) = get_bytes(agent, &url, None) else { continue };
-            if !crate::images::looks_like_image(&bytes) || !live() {
+            if !(artwork.is_image)(&bytes) || !live() {
                 continue;
             }
             if write_whole(&path, &bytes).is_err() {
@@ -1527,7 +1554,7 @@ fn fetch_images(agent: &ureq::Agent, client: &Client, item: &Value, folder: &Pat
         // pages ask for: one file on the disk, cloned (APFS), not copied.
         for seed_width in seed_widths {
             let url = client.image_url(&owner, kind, Some(&tag), *seed_width);
-            crate::images::seed_file(&url, &path);
+            (artwork.seed)(&url, &path);
         }
     }
 }
@@ -2037,9 +2064,12 @@ mod tests {
                 "SeriesName": "Test show", "SeriesId": "series1",
                 "ParentIndexNumber": 1, "IndexNumber": 2,
                 "MediaSources": [{ "Id": id, "Size": size, "Container": "bin", "MediaStreams": [] }],
-                "ImageTags": {}
+                // An item named "art..." has a poster (`POSTER`).
+                "ImageTags": if id.starts_with("art") { serde_json::json!({"Primary": "t"}) } else { serde_json::json!({}) }
             });
             reply(&mut stream, "200 OK", "Content-Type: application/json\r\n", body.to_string().as_bytes());
+        } else if path.starts_with("/Items/art") && path.contains("/Images/Primary") {
+            reply(&mut stream, "200 OK", "Content-Type: image/png\r\n", POSTER);
         } else if path.starts_with("/MediaSegments/") {
             reply(&mut stream, "200 OK", "Content-Type: application/json\r\n", br#"{"Items":[]}"#);
         } else {
@@ -2056,6 +2086,7 @@ mod tests {
 
     fn options() -> Options {
         Options {
+            artwork: Artwork::default(),
             parallel: 1,
             limit_bytes: None,
             free_override: Some(100 * MIN_FREE_BYTES),
@@ -2185,6 +2216,43 @@ mod tests {
         assert_eq!(ranges[0], None);
         assert_eq!(ranges[1].as_deref(), Some("bytes=120000-"));
         assert_eq!(fs::read(engine.local_path("ep2").unwrap()).unwrap(), *mock.file);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// What the mock sends for the poster of an "art..." item.
+    const POSTER: &[u8] = b"POSTER bytes of the mock";
+
+    /// The image cache of the app is two functions the engine is given: it
+    /// keeps a poster they accept and seeds the cache with it, and keeps
+    /// none they refuse.
+    #[test]
+    fn artwork_goes_through_the_checks_of_the_app() {
+        static SEEDED: Mutex<Vec<(String, PathBuf)>> = Mutex::new(Vec::new());
+        fn seed(url: &str, path: &Path) {
+            SEEDED.lock().unwrap().push((url.to_string(), path.to_path_buf()));
+        }
+        let mock = Mock::start(10_000);
+        let seeded = |id: &str| SEEDED.lock().unwrap().iter().filter(|(url, _)| url.contains(id)).count();
+
+        let dir = temp_dir("art-kept");
+        let artwork = Artwork { is_image: |bytes| bytes == POSTER, seed };
+        let kept = engine(&mock, dir.clone(), Options { artwork, ..options() });
+        kept.add(&item("art1")).unwrap();
+        wait_state(&kept, "art1", EntryState::Done);
+        let poster = kept.folder("art1").unwrap().join(POSTER_FILE);
+        assert_eq!(fs::read(&poster).unwrap(), POSTER);
+        // Once for each width a page asks for, each time with the file.
+        assert_eq!(seeded("art1"), 6);
+        assert!(SEEDED.lock().unwrap().iter().all(|(_, path)| *path == poster));
+        let _ = fs::remove_dir_all(dir);
+
+        let dir = temp_dir("art-refused");
+        let artwork = Artwork { is_image: |_| false, seed };
+        let refused = engine(&mock, dir.clone(), Options { artwork, ..options() });
+        refused.add(&item("art2")).unwrap();
+        wait_state(&refused, "art2", EntryState::Done);
+        assert!(!refused.folder("art2").unwrap().join(POSTER_FILE).exists(), "a refused answer was kept");
+        assert_eq!(seeded("art2"), 0);
         let _ = fs::remove_dir_all(dir);
     }
 

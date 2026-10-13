@@ -7,10 +7,9 @@
 //! (`BLOOM_DOWNLOAD_DIR` for tests). A complete file plays in place of
 //! the stream: see [`local_source`], called where the player gets its URL.
 
-pub mod engine;
-mod stall;
-pub mod offline;
 mod ui;
+
+pub use bloom_core::downloads::{dir, engine, offline};
 
 use std::{
     path::PathBuf,
@@ -31,19 +30,13 @@ use crate::{
 /// The engine of this process; opened on first use.
 static ENGINE: OnceLock<Engine> = OnceLock::new();
 
-/// Folder of the downloads.
-pub fn dir() -> PathBuf {
-    if let Some(dir) = &crate::options::options().download_dir {
-        return dir.clone();
-    }
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(crate::brand::FOLDER)
-        .join("downloads")
-}
-
 pub fn engine() -> &'static Engine {
-    ENGINE.get_or_init(|| Engine::open(dir(), engine::Options::default()))
+    ENGINE.get_or_init(|| {
+        // The engine keeps artwork that the image loader can show, and
+        // puts it in the loader's cache.
+        let artwork = engine::Artwork { is_image: crate::images::looks_like_image, seed: crate::images::seed_file };
+        Engine::open(dir(), engine::Options { artwork, ..Default::default() })
+    })
 }
 
 /// The complete local file of an item of the server `server_id`, when
