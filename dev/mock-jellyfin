@@ -9,11 +9,15 @@ network. It has no media files: a play fails, as it does for an item whose
 file is gone. A request it does not know gets an empty answer and a line on
 stderr, so a gap shows in the log. `dev/test-server` starts it for
 `BLOOM_TEST_SERVER=mock`.
+
+BLOOM_MOCK_PICTURE=rrggbb makes every picture that one colour, for a check
+of what the app paints (dev/paint-check).
 """
 
 import argparse
 import hashlib
 import json
+import os
 import re
 import struct
 import sys
@@ -185,11 +189,12 @@ def png(width, height, seed):
     """A picture of two colours from `seed`, so each item has its own."""
     digest = hashlib.md5(seed.encode()).digest()
     top, bottom = digest[0:3], digest[3:6]
+    flat = os.environ.get("BLOOM_MOCK_PICTURE")
     rows = bytearray()
     for y in range(height):
         share = y / max(height - 1, 1)
         pixel = bytes(int(top[c] * (1 - share) * 0.7 + bottom[c] * share * 0.7) for c in range(3))
-        rows += b"\x00" + pixel * width
+        rows += b"\x00" + (bytes.fromhex(flat) if flat else pixel) * width
 
     def chunk(kind, data):
         body = kind + data

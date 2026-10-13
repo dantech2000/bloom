@@ -90,6 +90,8 @@ Servers, profiles, access tokens and downloads are in
 | --- | --- |
 | `dev/test` | All tests |
 | `dev/smoke` | Opens every page in a test instance and checks the frame cost |
+| `dev/pacing-check` | Plays a clip in a muted test instance and fails when a frame is shown late; needs a quiet machine |
+| `dev/paint-check` | Checks on a screenshot that a red poster of the mock server is red in the window |
 | `dev/run-test` | A second, muted instance for tests, labelled "TEST INSTANCE" |
 | `dev/jctl <command>` | Drives an instance through its debug socket (`dev/jctl state`) |
 | `dev/shot <file>` | Captures the window of an instance |

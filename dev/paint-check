@@ -1,0 +1,87 @@
+#!/bin/sh
+# Checks that a picture of the server comes out on the screen in its own
+# colours: the tests of the image loader look at the bytes of the pixels,
+# and this looks at the window.
+#
+#   dev/paint-check [screenshot]      (default /tmp/bloom-paint.png)
+#
+# The mock server sends every poster in one red (BLOOM_MOCK_PICTURE). A test
+# instance of dev/run-test opens the library of the movies, and the script
+# counts the red and the blue pixels of a screenshot of its window. A loader
+# that gave the pixels out in the wrong order would paint the posters blue.
+# It fails when less than a twentieth of the window is red (no posters), or
+# when blue pixels show.
+#
+# The instance has its own image cache, so each poster is fetched and
+# decoded in this run. Needs the Screen Recording permission (dev/shot),
+# sips and python3. Run a release build first. Not for CI: it needs a display.
+dir=$(cd "$(dirname "$0")/.." && pwd)
+shot=${1:-/tmp/bloom-paint.png}
+name=${BLOOM_TEST_NAME:-paint}
+sock=/tmp/bloom-$name.sock
+cache=$(mktemp -d "${TMPDIR:-/tmp}/bloom-paint-cache.XXXXXX") || exit 1
+
+die() { echo "dev/paint-check: $*" >&2; exit 1; }
+ctl() { BLOOM_DEBUG_SOCK=$sock "$dir/dev/jctl" "$@"; }
+# settled <text>: the page has its data and its state has the text.
+settled() {
+  for _ in $(seq 1 80); do
+    state=$(ctl state 2>/dev/null)
+    case $state in
+      *loading=true*) ;;
+      *"$1"*) return 0 ;;
+    esac
+    sleep 0.25
+  done
+  return 1
+}
+
+[ -x "$dir/target/release/bloom" ] || die "no release build; run cargo build --release"
+stop() {
+  BLOOM_TEST_NAME=$name BLOOM_TEST_SERVER=mock "$dir/dev/run-test" stop
+  rm -rf "$cache"
+}
+trap stop EXIT
+BLOOM_TEST_NAME=$name BLOOM_TEST_SERVER=mock BLOOM_MOCK_PICTURE=e02010 BLOOM_CACHE_DIR=$cache \
+  "$dir/dev/run-test" 2 || die "the test instance did not start"
+settled home || die "no signed-in session; see /tmp/bloom-$name.log"
+case $(ctl library Movies) in error:*) die "the library did not open" ;; esac
+settled library || die "the library did not load: $state"
+# The posters arrive after the page has its list.
+sleep 2
+BLOOM_PID_FILE=/tmp/bloom-$name.pid "$dir/dev/shot" "$shot" >/dev/null ||
+  die "no screenshot (Screen Recording permission?)"
+sips -s format bmp "$shot" --out "$cache/shot.bmp" >/dev/null || die "sips could not read $shot"
+
+python3 - "$cache/shot.bmp" <<'PY'
+import struct
+import sys
+
+data = open(sys.argv[1], "rb").read()
+start, = struct.unpack_from("<I", data, 10)
+width, height, _, depth = struct.unpack_from("<iiHH", data, 18)
+step, height = depth // 8, abs(height)
+row = (width * step + 3) // 4 * 4
+red = blue = 0
+for y in range(height):
+    line = data[start + y * row:start + y * row + width * step]
+    for x in range(0, len(line), step):
+        b, g, r = line[x], line[x + 1], line[x + 2]
+        # A strong red or a strong blue; the page itself is grey.
+        if r > g + 80 and r > b + 80:
+            red += 1
+        elif b > g + 80 and b > r + 80:
+            blue += 1
+total = width * height
+print(f"window {width}x{height}: red {100 * red / total:.1f}%, blue {100 * blue / total:.2f}%")
+failed = False
+if red * 20 < total:
+    print("FAIL  less than a twentieth of the window is red: the posters did not paint")
+    failed = True
+if blue * 500 > total:
+    print("FAIL  blue pixels show: the red of the posters came out in the wrong order")
+    failed = True
+if not failed:
+    print("ok    the posters are red")
+sys.exit(failed)
+PY
