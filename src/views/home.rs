@@ -51,7 +51,7 @@ impl Bloom {
         // reuses the rows of the last frame: they are a cached view, so GPUI
         // does not build or lay them out again. Any other redraw builds them.
         let rows = match self.home_rows_height() {
-            Some(height) if self.hero_only_frame => {
+            Some(height) if self.hero.only_frame => {
                 let mut size = div().w_full().h(px(height));
                 self.rows_view
                     .clone()
@@ -136,7 +136,7 @@ impl Bloom {
             ));
         } else {
             // Top of the first row in the page, as laid out by `render_home`.
-            let mut y = if self.hero.is_empty() {
+            let mut y = if self.hero.slides.is_empty() {
                 TOPBAR_H + 16.
             } else {
                 self.viewport_h * HERO_ROWS_START + TOPBAR_H + 16.

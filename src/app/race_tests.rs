@@ -503,10 +503,10 @@ fn the_hero_slides_of_one_profile_do_not_show_for_the_next(cx: &mut TestAppConte
         add_server(this, "one", &server.url, "u1");
         add_server(this, "two", &server.url, "u2");
         assert!(this.open_session("one", "u1", cx));
-        this.hero = vec![item("m1", "Of user one", "Movie")];
-        this.hero_index = 0;
+        this.hero.slides = vec![item("m1", "Of user one", "Movie")];
+        this.hero.index = 0;
         assert!(this.open_session("two", "u2", cx));
-        assert!(this.hero.is_empty(), "the slides of the profile before are still there");
+        assert!(this.hero.slides.is_empty(), "the slides of the profile before are still there");
     });
     cx.run_until_parked();
 }

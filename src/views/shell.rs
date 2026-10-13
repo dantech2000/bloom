@@ -212,7 +212,7 @@ impl Bloom {
         }
         // The hero keys apply while the hero is in view on the home page.
         let on_hero = matches!(self.page, Page::Home(_))
-            && !self.hero.is_empty()
+            && !self.hero.slides.is_empty()
             && -f32::from(self.page_scroll.offset().y) < self.hero_height();
         // The list of keys and the shortcuts of Jellyfin Enhanced.
         if self.enhanced_shell_key(event, window, cx) {
@@ -688,7 +688,7 @@ impl Bloom {
                     && d.resume.is_empty()
                     && d.next_up.is_empty()
                     && d.latest.is_empty()
-                    && self.hero.is_empty()
+                    && self.hero.slides.is_empty()
             }
             Page::Library(d) => !d.loading && d.items.is_empty(),
             Page::Playlist(d) => !d.loading && d.entries.is_empty(),

@@ -362,12 +362,9 @@ pub struct Bloom {
     /// Window width at the last render; card sizes follow it.
     pub viewport_w: f32,
     pub viewport_h: f32,
-    /// Current slide of the home hero and the time it came on screen.
-    pub hero_index: usize,
-    pub hero_since: std::time::Instant,
-    /// Time shown on the current slide before the user paused the hero.
-    pub hero_paused: Option<Duration>,
-    pub hero_tick: Option<Task<()>>,
+    /// The hero of the home page: its slides, the one on show and its
+    /// trailer. Kept for the session, so it survives navigation.
+    pub hero: crate::views::hero::Hero,
     /// How often a save of the config was asked for; a test reads it (a
     /// test writes no config file).
     pub(crate) config_saves: std::cell::Cell<u64>,
@@ -381,24 +378,11 @@ pub struct Bloom {
     catalog_loaded: Option<std::time::Instant>,
     /// The request of the title index whose answer is wanted.
     catalog_request: Revision,
-    /// Trailer backdrop of the hero.
-    pub hero_video: crate::views::hero::HeroVideo,
-    /// Hero slides; kept for the session so the list survives navigation.
-    pub hero: Vec<Item>,
     /// The home rows as a view GPUI can cache between frames.
     pub rows_view: Entity<crate::views::home::HomeRows>,
-    /// Set by a redraw request that changes the hero alone (trailer frame,
-    /// progress line), so the observer below does not count it.
-    pub hero_only_redraw: bool,
     /// True when something other than the hero asked for a redraw since the
     /// last render.
     content_dirty: bool,
-    /// True while the current frame may reuse the cached home rows.
-    pub hero_only_frame: bool,
-    /// Slide the hero showed before the current one, and when it changed;
-    /// the new backdrop fades in over the old one.
-    pub hero_previous: Option<usize>,
-    pub hero_changed: std::time::Instant,
     /// Whether the embedded video view covers the content area.
     pub player_open: bool,
     /// `player_open` at the frame before, and whether the window was full
@@ -638,7 +622,7 @@ impl Bloom {
         // Every redraw request passes here. One from the hero tick leaves the
         // page content clean, so the next frame can reuse the cached rows.
         subscriptions.push(cx.observe(&cx.entity(), |this, _, _| {
-            if !std::mem::take(&mut this.hero_only_redraw) {
+            if !std::mem::take(&mut this.hero.only_redraw) {
                 this.content_dirty = true;
             }
         }));
@@ -757,24 +741,15 @@ impl Bloom {
             row_scrolls: RefCell::new(HashMap::new()),
             viewport_w: 1280.,
             viewport_h: 820.,
-            hero_index: 0,
-            hero_since: std::time::Instant::now(),
-            hero_paused: None,
-            hero_tick: None,
+            hero: crate::views::hero::Hero::new(),
             config_saves: std::cell::Cell::new(0),
             window_save: None,
             search_debounce: None,
             catalog: Vec::new(),
             catalog_loaded: None,
             catalog_request: Revision::default(),
-            hero_video: Default::default(),
-            hero: Vec::new(),
             rows_view,
-            hero_only_redraw: false,
             content_dirty: true,
-            hero_only_frame: false,
-            hero_previous: None,
-            hero_changed: std::time::Instant::now(),
             player_open: false,
             player_was_open: false,
             fullscreen_before_player: false,
@@ -2239,7 +2214,7 @@ impl Bloom {
             Page::Home(data) => {
                 data.loading = true;
                 let libraries = home_libraries(&self.views);
-                let need_hero = self.hero.is_empty();
+                let need_hero = self.hero.slides.is_empty();
                 // At sign-in the libraries are not known yet. They load in
                 // the same pass as the page, so the page does not wait for
                 // them first.
@@ -2342,8 +2317,8 @@ impl Bloom {
                                     }
                                     let hero = std::mem::take(&mut fresh.hero);
                                     *data = fresh;
-                                    if this.hero.is_empty() && !hero.is_empty() {
-                                        this.hero = hero;
+                                    if this.hero.slides.is_empty() && !hero.is_empty() {
+                                        this.hero.slides = hero;
                                         this.show_hero_slide(0);
                                     }
                                 }
@@ -3338,7 +3313,7 @@ impl Render for Bloom {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let started = std::time::Instant::now();
         let started_cpu = crate::perf::thread_cpu_ns();
-        self.hero_only_frame = !std::mem::take(&mut self.content_dirty);
+        self.hero.only_frame = !std::mem::take(&mut self.content_dirty);
         self.sync_frame(window);
         crate::ui::glass::set_over_video(self.player_open);
         self.viewport_w = f32::from(window.viewport_size().width);
