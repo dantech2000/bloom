@@ -11,9 +11,10 @@ mod ui;
 
 pub use bloom_core::downloads::{dir, engine, offline};
 
+use bloom_core::downloads::ENGINE;
+
 use std::{
     path::PathBuf,
-    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -28,17 +29,25 @@ use crate::{
 };
 
 /// The engine of this process; opened on first use.
-static ENGINE: OnceLock<Engine> = OnceLock::new();
-
 pub fn engine() -> &'static Engine {
     ENGINE.get_or_init(|| {
         // The engine keeps artwork that the image loader can show, and
         // puts it in the loader's cache.
         let artwork = engine::Artwork { is_image: crate::images::looks_like_image, seed: crate::images::seed_file };
-        // And the loader shows the artwork the engine kept.
-        crate::images::set_local_image(local_image);
-        Engine::open(dir(), engine::Options { artwork, ..Default::default() })
+        Engine::open(folder(), engine::Options { artwork, ..Default::default() })
     })
+}
+
+/// The folder of the engine of this process. The tests get one of their
+/// own: they open sessions with mock servers, and the engine of the user's
+/// folder would take such a server for the one of his downloads.
+fn folder() -> PathBuf {
+    #[cfg(test)]
+    {
+        std::env::temp_dir().join(format!("bloom-test-downloads-{}", std::process::id()))
+    }
+    #[cfg(not(test))]
+    dir()
 }
 
 /// The complete local file of an item of the server `server_id`, when
@@ -46,12 +55,6 @@ pub fn engine() -> &'static Engine {
 /// count. Cheap; it reads the index in memory and asks the disk once.
 pub fn local_path(server_id: Option<&str>, item_id: &str) -> Option<PathBuf> {
     ENGINE.get()?.local_path_of(server_id, item_id)
-}
-
-/// The artwork of a download for an image URL of the server; see
-/// [`Engine::local_image`]. The image loader asks before the network.
-pub fn local_image(url: &str) -> Option<PathBuf> {
-    ENGINE.get()?.local_image(url)
 }
 
 /// The source the player loads for an item: its local file when the item
@@ -622,5 +625,17 @@ mod segment_tests {
         assert!(segments_of_meta(&json!({"Segments": []})).is_none());
         assert!(segments_of_meta(&json!({"ItemId": "a"})).is_none());
         assert!(segments_of_meta(&json!({"Segments": "bad"})).is_none());
+    }
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::*;
+
+    /// The engine of a test run is not in the folder of the user.
+    #[test]
+    fn the_engine_of_the_tests_has_a_folder_of_its_own() {
+        assert!(folder().starts_with(std::env::temp_dir()));
+        assert_ne!(folder(), dir());
     }
 }

@@ -19,7 +19,7 @@ use gpui_kit::{
 use image::Frame;
 use smallvec::SmallVec;
 
-pub use loader::{fetch_bytes, looks_like_image, pixels, seed_file, set_local_image};
+pub use loader::{fetch_bytes, looks_like_image, pixels, seed_file};
 
 /// Decoded bytes kept before the least recently shown images are dropped.
 const MAX_BYTES: usize = 64 * 1024 * 1024;

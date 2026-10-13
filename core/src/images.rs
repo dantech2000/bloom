@@ -7,8 +7,7 @@
 use std::{
     collections::HashMap,
     io::Cursor,
-    path::PathBuf,
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -209,14 +208,6 @@ pub fn new_agent() -> ureq::Agent {
     )
 }
 
-/// Finds the artwork of a download for an image URL of the server. The app
-/// sets it once (`downloads::engine`); the loader asks before the network.
-static LOCAL_IMAGE: OnceLock<fn(&str) -> Option<PathBuf>> = OnceLock::new();
-
-pub fn set_local_image(lookup: fn(&str) -> Option<PathBuf>) {
-    let _ = LOCAL_IMAGE.set(lookup);
-}
-
 
 /// Where the bytes of an image came from, and so what to do with them.
 enum Origin {
@@ -268,7 +259,7 @@ fn fetch(agent: &ureq::Agent, url: &str, cache: Option<&std::path::Path>) -> any
         });
     }
     // The artwork of a download is on this Mac, server or no server.
-    if let Some(path) = LOCAL_IMAGE.get().and_then(|lookup| lookup(url))
+    if let Some(path) = crate::downloads::local_image(url)
         && let Ok(bytes) = std::fs::read(path)
     {
         return Ok(local(bytes));
@@ -1282,25 +1273,28 @@ mod tests {
     }
 
     /// The artwork of a download shows without the server: the loader asks
-    /// the lookup of the app before the network. Nothing listens on the
-    /// port, so an image the lookup does not know fails.
+    /// the download engine of the process before the network. Nothing
+    /// listens on the port, so an image the engine does not have fails.
     #[test]
     fn the_artwork_of_a_download_comes_from_its_file_without_the_server() {
-        static POSTER: OnceLock<PathBuf> = OnceLock::new();
-        fn lookup(url: &str) -> Option<PathBuf> {
-            url.contains("/Items/downloaded/").then(|| POSTER.get().cloned()).flatten()
-        }
+        use crate::downloads::{ENGINE, engine};
         let dir = cache_dir("local");
-        let poster = dir.join("poster.png");
-        std::fs::write(&poster, png(4)).unwrap();
-        POSTER.set(poster).unwrap();
-        set_local_image(lookup);
+        let url = |id: &str| format!("http://127.0.0.1:9/Items/{id}/Images/Primary?tag=t1");
         let agent = plain_agent();
-        let image = download_in(&agent, "http://127.0.0.1:9/Items/downloaded/Images/Primary?tag=t1", None)
-            .expect("the poster of the download");
+        assert!(download_in(&agent, &url("downloaded"), None).is_err(), "no engine yet, and no server");
+        let engine = ENGINE.get_or_init(|| engine::Engine::open(dir.clone(), engine::Options::default()));
+        let client = crate::jellyfin::Client::new("http://127.0.0.1:9", "device").with_session("token", "user");
+        engine.set_client(Some(client), "server1");
+        let item = crate::jellyfin::Item { id: "downloaded".into(), name: "Downloaded".into(), ..Default::default() };
+        engine.add(&item).unwrap();
+        let folder = engine.folder("downloaded").unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join(engine::POSTER_FILE), png(4)).unwrap();
+        let image = download_in(&agent, &url("downloaded"), None).expect("the poster of the download");
         assert_eq!(image.dimensions(), (4, 4));
-        assert_eq!(fetch_bytes_in(&agent, "http://127.0.0.1:9/Items/downloaded/Images/Primary", None).unwrap(), png(4));
-        assert!(download_in(&agent, "http://127.0.0.1:9/Items/other/Images/Primary?tag=t1", None).is_err());
+        assert_eq!(fetch_bytes_in(&agent, &url("downloaded"), None).unwrap(), png(4));
+        assert!(download_in(&agent, &url("other"), None).is_err(), "an item that is not downloaded");
+        engine.remove("downloaded");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
