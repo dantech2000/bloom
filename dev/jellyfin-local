@@ -57,9 +57,11 @@ media() {
   done
 }
 
+# The server answers from a small "starting" server first and drops that
+# one for the real one; only the real one says whether it is set up.
 wait_for_server() {
   tries=0
-  until curl -fsS "$url/System/Info/Public" >/dev/null 2>&1; do
+  until curl -fsS "$url/System/Info/Public" 2>/dev/null | grep -q '"StartupWizardCompleted"'; do
     tries=$((tries + 1))
     [ "$tries" -le 120 ] || die "the server did not answer at $url (docker logs $container)"
     sleep 1
