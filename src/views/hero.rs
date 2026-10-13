@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use gpui_icons::LucideIcon;
 use gpui_kit::{
     Animation, AnimationExt as _, ClickEvent, Context, Div, InteractiveElement as _, ObjectFit, ParentElement as _,
-    SharedString, Stateful, StatefulInteractiveElement as _, Styled, Subscription, Window, div,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled, Subscription, Task, Window, div,
     linear_color_stop, linear_gradient, prelude::FluentBuilder as _, px, relative, rgb, rgba,
     surface,
 };
@@ -41,6 +41,46 @@ enum Phase {
     Loading,
     /// Frames arrive; the slide lasts until the trailer ends.
     Playing,
+}
+
+/// The hero of the home page, as the app keeps it.
+pub struct Hero {
+    /// The slides.
+    pub slides: Vec<Item>,
+    /// Current slide and the time it came on screen.
+    pub index: usize,
+    pub since: Instant,
+    /// Time shown on the current slide before the user paused the hero.
+    pub paused: Option<Duration>,
+    pub tick: Option<Task<()>>,
+    /// Trailer backdrop of the current slide.
+    pub video: HeroVideo,
+    /// Slide the hero showed before the current one, and when it changed;
+    /// the new backdrop fades in over the old one.
+    pub previous: Option<usize>,
+    pub changed: Instant,
+    /// Set by a redraw request that changes the hero alone (trailer frame,
+    /// progress line), so the observer of `Bloom::new` does not count it.
+    pub only_redraw: bool,
+    /// True while the current frame may reuse the cached home rows.
+    pub only_frame: bool,
+}
+
+impl Hero {
+    pub fn new() -> Self {
+        Self {
+            slides: Vec::new(),
+            index: 0,
+            since: Instant::now(),
+            paused: None,
+            tick: None,
+            video: HeroVideo::default(),
+            previous: None,
+            changed: Instant::now(),
+            only_redraw: false,
+            only_frame: false,
+        }
+    }
 }
 
 /// Trailer backdrop state of the hero.
@@ -110,59 +150,59 @@ impl Bloom {
 
     /// Time the current slide has been on screen.
     fn hero_elapsed(&self) -> Duration {
-        self.hero_paused
-            .unwrap_or_else(|| self.hero_since.elapsed())
+        self.hero.paused
+            .unwrap_or_else(|| self.hero.since.elapsed())
     }
 
     /// Forgets the slides: they are those of one user on one server, and
     /// the next session loads its own.
     pub fn clear_hero(&mut self) {
-        self.hero_video.stop();
-        self.hero.clear();
-        self.hero_index = 0;
-        self.hero_previous = None;
+        self.hero.video.stop();
+        self.hero.slides.clear();
+        self.hero.index = 0;
+        self.hero.previous = None;
     }
 
     pub fn show_hero_slide(&mut self, index: usize) {
-        if self.hero.is_empty() {
+        if self.hero.slides.is_empty() {
             return;
         }
-        self.hero_video.stop();
-        let next = index % self.hero.len();
-        if next != self.hero_index {
-            self.hero_previous = Some(self.hero_index);
-            self.hero_changed = Instant::now();
+        self.hero.video.stop();
+        let next = index % self.hero.slides.len();
+        if next != self.hero.index {
+            self.hero.previous = Some(self.hero.index);
+            self.hero.changed = Instant::now();
         }
-        self.hero_index = next;
-        self.hero_since = Instant::now();
-        if self.hero_paused.is_some() {
-            self.hero_paused = Some(Duration::ZERO);
+        self.hero.index = next;
+        self.hero.since = Instant::now();
+        if self.hero.paused.is_some() {
+            self.hero.paused = Some(Duration::ZERO);
         }
     }
 
     pub fn step_hero(&mut self, forward: bool) {
-        let len = self.hero.len();
+        let len = self.hero.slides.len();
         if len == 0 {
             return;
         }
         let next = if forward {
-            self.hero_index + 1
+            self.hero.index + 1
         } else {
-            self.hero_index + len - 1
+            self.hero.index + len - 1
         };
         self.show_hero_slide(next);
     }
 
     pub fn toggle_hero_pause(&mut self) {
-        match self.hero_paused.take() {
-            Some(shown) => self.hero_since = Instant::now() - shown,
-            None => self.hero_paused = Some(self.hero_since.elapsed()),
+        match self.hero.paused.take() {
+            Some(shown) => self.hero.since = Instant::now() - shown,
+            None => self.hero.paused = Some(self.hero.since.elapsed()),
         }
     }
 
     pub fn toggle_hero_mute(&mut self) {
-        self.hero_video.muted = !self.hero_video.muted;
-        self.hero_video.player.set_muted(self.hero_video.muted);
+        self.hero.video.muted = !self.hero.video.muted;
+        self.hero.video.player.set_muted(self.hero.video.muted);
     }
 
     /// Liquid glass or the frosted glass of before, for every panel.
@@ -179,13 +219,13 @@ impl Bloom {
         let enabled = !self.config.hero_video.unwrap_or(true);
         self.config.hero_video = Some(enabled);
         self.save_config(cx);
-        if !enabled && self.hero_video.phase != Phase::None {
+        if !enabled && self.hero.video.phase != Phase::None {
             // The slide goes on as an image slide from here.
-            self.hero_video.stop();
-            self.hero_video.slide = Some(self.hero_index);
-            self.hero_since = Instant::now();
+            self.hero.video.stop();
+            self.hero.video.slide = Some(self.hero.index);
+            self.hero.since = Instant::now();
         } else {
-            self.hero_video.slide = None;
+            self.hero.video.slide = None;
         }
         self.rebuild_menu(cx);
         cx.notify();
@@ -198,25 +238,26 @@ impl Bloom {
         matches!(self.page, Page::Home(_))
             && self.screen == crate::app::Screen::Main
             && !self.player_open
-            && !self.hero.is_empty()
+            && !self.hero.slides.is_empty()
             && -f32::from(self.page_scroll.offset().y) < self.hero_height()
     }
 
     /// Requests the trailer of the current slide, if it has one.
     fn start_hero_video(&mut self) {
-        let index = self.hero_index;
-        self.hero_video.slide = Some(index);
-        if !self.config.hero_video.unwrap_or(true) || !self.hero_video.player.available() {
+        let index = self.hero.index;
+        self.hero.video.slide = Some(index);
+        if !self.config.hero_video.unwrap_or(true) || !self.hero.video.player.available() {
             return;
         }
         let Some(url) = self
             .hero
+            .slides
             .get(index)
             .and_then(|item| best_trailer(&item.remote_trailers))
         else {
             return;
         };
-        let video = &mut self.hero_video;
+        let video = &mut self.hero.video;
         video.load += 1;
         video.phase = Phase::Loading;
         video.frame = None;
@@ -224,7 +265,7 @@ impl Bloom {
         log::debug!("hero trailer: slide {index} loads {url}");
         video.player.play(url, video.load, video.muted);
         // The slide timer starts only if the trailer is not up in time.
-        self.hero_since = Instant::now() + TRAILER_GRACE;
+        self.hero.since = Instant::now() + TRAILER_GRACE;
     }
 
     /// One step of the slideshow: starts and follows the trailer, advances
@@ -232,31 +273,31 @@ impl Bloom {
     fn tick_hero(&mut self, cx: &mut Context<Self>) {
         if !self.hero_visible() {
             // Hold the slide while it is hidden; its trailer starts again later.
-            self.hero_video.stop();
-            if self.hero_paused.is_none() {
-                self.hero_since = Instant::now() - self.hero_elapsed().min(HERO_SLIDE);
+            self.hero.video.stop();
+            if self.hero.paused.is_none() {
+                self.hero.since = Instant::now() - self.hero_elapsed().min(HERO_SLIDE);
             }
             return;
         }
-        let hold = self.hero_paused.is_some()
-            || !(self.hero_video.window_active || self.hero_video.play_inactive);
-        if hold != self.hero_video.held && self.hero_video.phase != Phase::None {
-            self.hero_video.player.set_paused(hold);
+        let hold = self.hero.paused.is_some()
+            || !(self.hero.video.window_active || self.hero.video.play_inactive);
+        if hold != self.hero.video.held && self.hero.video.phase != Phase::None {
+            self.hero.video.player.set_paused(hold);
         }
-        self.hero_video.held = hold;
+        self.hero.video.held = hold;
         if hold {
-            if self.hero_paused.is_none() {
-                self.hero_since = Instant::now() - self.hero_elapsed().min(HERO_SLIDE);
+            if self.hero.paused.is_none() {
+                self.hero.since = Instant::now() - self.hero_elapsed().min(HERO_SLIDE);
             }
             return;
         }
-        if self.hero_video.slide != Some(self.hero_index) {
+        if self.hero.video.slide != Some(self.hero.index) {
             self.start_hero_video();
         }
 
-        let status = self.hero_video.player.status();
-        let current = status.load == self.hero_video.load;
-        match self.hero_video.phase {
+        let status = self.hero.video.player.status();
+        let current = status.load == self.hero.video.load;
+        match self.hero.video.phase {
             Phase::Playing => {
                 if current && (status.ended || status.failed) {
                     log::debug!("hero trailer: ended, next slide");
@@ -265,19 +306,19 @@ impl Bloom {
                     return;
                 }
                 if current && status.duration > 0. {
-                    self.hero_video.progress =
+                    self.hero.video.progress =
                         (status.position / status.duration).clamp(0., 1.) as f32;
                 }
-                let newest = self.hero_video.player.frame(self.hero_video.load);
-                let shown = self.hero_video.frame.as_ref().map(|(seq, _)| *seq);
+                let newest = self.hero.video.player.frame(self.hero.video.load);
+                let shown = self.hero.video.frame.as_ref().map(|(seq, _)| *seq);
                 // A trailer above 30 frames a second costs redraws nobody sees.
                 if let Some((seq, frame)) = newest
                     && shown != Some(seq)
-                    && self.hero_video.last_redraw.elapsed() >= Duration::from_millis(30)
+                    && self.hero.video.last_redraw.elapsed() >= Duration::from_millis(30)
                 {
-                    self.hero_video.frame = Some((seq, frame));
-                    self.hero_video.last_redraw = Instant::now();
-                    self.hero_only_redraw = true;
+                    self.hero.video.frame = Some((seq, frame));
+                    self.hero.video.last_redraw = Instant::now();
+                    self.hero.only_redraw = true;
                     cx.notify();
                 }
                 return;
@@ -286,12 +327,12 @@ impl Bloom {
                 if current && (status.failed || status.ended) {
                     // No picture came; the slide goes on as an image slide.
                     log::debug!("hero trailer: could not play, slide timer runs");
-                    self.hero_video.phase = Phase::None;
-                    self.hero_since = Instant::now();
-                } else if let Some(frame) = self.hero_video.player.frame(self.hero_video.load) {
+                    self.hero.video.phase = Phase::None;
+                    self.hero.since = Instant::now();
+                } else if let Some(frame) = self.hero.video.player.frame(self.hero.video.load) {
                     log::debug!("hero trailer: playing");
-                    self.hero_video.frame = Some(frame);
-                    self.hero_video.phase = Phase::Playing;
+                    self.hero.video.frame = Some(frame);
+                    self.hero.video.phase = Phase::Playing;
                     cx.notify();
                     return;
                 }
@@ -299,14 +340,14 @@ impl Bloom {
             Phase::None => {}
         }
 
-        if self.hero_since.elapsed() >= HERO_SLIDE {
+        if self.hero.since.elapsed() >= HERO_SLIDE {
             self.step_hero(true);
             cx.notify();
-        } else if self.hero_video.last_redraw.elapsed() >= Duration::from_millis(150) {
+        } else if self.hero.video.last_redraw.elapsed() >= Duration::from_millis(150) {
             // The rows are cached, so a redraw for the progress line is cheap;
             // it still runs only a few times a second to keep the idle load low.
-            self.hero_video.last_redraw = Instant::now();
-            self.hero_only_redraw = true;
+            self.hero.video.last_redraw = Instant::now();
+            self.hero.only_redraw = true;
             cx.notify();
         }
     }
@@ -314,16 +355,16 @@ impl Bloom {
     /// Runs the slideshow. The loop is slow while images show and fast while
     /// a trailer plays, so a new frame reaches the screen without delay.
     pub fn start_hero_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.hero_video.scale = window.scale_factor();
-        self.hero_video._activation =
+        self.hero.video.scale = window.scale_factor();
+        self.hero.video._activation =
             Some(cx.observe_window_activation(window, |this, window, cx| {
-                this.hero_video.window_active = window.is_window_active();
+                this.hero.video.window_active = window.is_window_active();
                 cx.notify();
             }));
-        self.hero_tick = Some(cx.spawn(async move |this, cx| {
+        self.hero.tick = Some(cx.spawn(async move |this, cx| {
             loop {
                 let fast = this
-                    .read_with(cx, |this, _| this.hero_video.phase != Phase::None)
+                    .read_with(cx, |this, _| this.hero.video.phase != Phase::None)
                     .unwrap_or(false);
                 cx.background_executor()
                     .timer(Duration::from_millis(if fast { 8 } else { 150 }))
@@ -338,7 +379,7 @@ impl Bloom {
     /// Favourite toggle for a hero slide. It changes the slide in place, so
     /// the page does not reload and the slide order stays.
     fn toggle_hero_favorite(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(item) = self.hero.get(index) else {
+        let Some(item) = self.hero.slides.get(index) else {
             return;
         };
         let item_id = item.id.clone();
@@ -352,7 +393,7 @@ impl Bloom {
             move |this, result, cx| {
                 match result {
                     Ok(user_data) => {
-                        if let Some(item) = this.hero.iter_mut().find(|i| i.id == item_id) {
+                        if let Some(item) = this.hero.slides.iter_mut().find(|i| i.id == item_id) {
                             item.user_data = user_data;
                         }
                     }
@@ -364,18 +405,18 @@ impl Bloom {
     }
 
     pub fn render_hero(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
-        let item = self.hero.get(self.hero_index)?;
+        let item = self.hero.slides.get(self.hero.index)?;
         let client = self.session.as_ref()?.client.clone();
         let t = UiTheme::read(cx).clone();
         let (vw, vh) = (self.viewport_w, self.viewport_h);
         let height = self.hero_height();
         let left = vw * 0.04;
-        let index = self.hero_index;
-        let total = self.hero.len();
+        let index = self.hero.index;
+        let total = self.hero.slides.len();
         let white = rgb(0xffffff);
         let soft = rgba(0xffffffd9);
 
-        let video = &self.hero_video;
+        let video = &self.hero.video;
         video
             .player
             .set_target_size((vw * video.scale) as u32, (height * video.scale) as u32);
@@ -396,11 +437,12 @@ impl Bloom {
         };
         // While a slide comes in, the old backdrop stays under the new one,
         // and the new one fades in over it.
-        let fading = self.hero_changed.elapsed() < HERO_FADE;
+        let fading = self.hero.changed.elapsed() < HERO_FADE;
         let previous = self
-            .hero_previous
+            .hero
+            .previous
             .filter(|_| fading)
-            .and_then(|index| self.hero.get(index))
+            .and_then(|index| self.hero.slides.get(index))
             .and_then(backdrop_of);
         let backdrop = backdrop_of(item).map(|image| {
             div()
@@ -408,7 +450,7 @@ impl Bloom {
                 .inset_0()
                 .child(image)
                 .with_animation(
-                    ("hero.fade", self.hero_index),
+                    ("hero.fade", self.hero.index),
                     Animation::new(HERO_FADE),
                     |layer, progress| layer.opacity(progress),
                 )
@@ -624,7 +666,7 @@ impl Bloom {
                 }))
         };
 
-        let paused = self.hero_paused.is_some();
+        let paused = self.hero.paused.is_some();
         Some(
             div()
                 .id(SharedString::from("hero"))
