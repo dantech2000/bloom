@@ -20,7 +20,7 @@ Fails (exit 1) with one line for each problem. The checks:
 import os, plistlib, re, subprocess, sys, tempfile
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-brand = open(os.path.join(root, "src", "brand.rs")).read()
+brand = open(os.path.join(root, "core", "src", "brand.rs")).read()
 
 
 def const(name):
