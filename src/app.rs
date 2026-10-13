@@ -3161,17 +3161,11 @@ impl Bloom {
                 let fast = this
                     .read_with(cx, |this, _| this.player_open)
                     .unwrap_or(false);
-                // The frames have their own signal; only the old pacing
-                // mode finds them through this poll, and needs its 8 ms.
-                // Everything else here moves by quarter seconds or slower,
-                // or is a change the eye sees within 50 ms (a pause, the
-                // end, a seek's new position; the frame of a seek comes
-                // through the frames task).
-                let interval = match (fast, crate::player::old_pacing()) {
-                    (true, true) => 8,
-                    (true, false) => 50,
-                    (false, _) => 500,
-                };
+                // The frames have their own signal. Everything here moves
+                // by quarter seconds or slower, or is a change the eye sees
+                // within 50 ms (a pause, the end, a seek's new position; the
+                // frame of a seek comes through the frames task).
+                let interval = if fast { 50 } else { 500 };
                 cx.background_executor()
                     .timer(Duration::from_millis(interval))
                     .await;
@@ -3180,13 +3174,6 @@ impl Bloom {
                         let poll_started = crate::player::clock_ns();
                         let status = this.player.status();
                         let ended = status.state == PlayState::Ended;
-                        // The frames have their own signal; the poll only
-                        // sees them with the timing of before.
-                        let frame_changed = crate::player::old_pacing()
-                            && this.player.frame_seq() != this.frame_seq;
-                        if frame_changed {
-                            this.note_frame_wait();
-                        }
                         // The seek slider and the time label move by whole
                         // seconds; a redraw for each 8 ms change of the
                         // position cost the whole UI about 48 draws a
@@ -3203,8 +3190,7 @@ impl Bloom {
                             && status.state == PlayState::Playing
                             && !status.paused
                             && this.player.frame_wait_ms() < 100.;
-                        let changed = frame_changed
-                            || (position_moved && !frames_flow)
+                        let changed = (position_moved && !frames_flow)
                             || status.paused != this.player_status.paused
                             || status.buffering != this.player_status.buffering
                             || status.state != this.player_status.state
