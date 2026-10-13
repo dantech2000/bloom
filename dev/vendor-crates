@@ -1,0 +1,119 @@
+#!/bin/sh
+# The vendored crates (vendor/gpui-pre-apple, vendor/gpui-pre-macos,
+# vendor/taffy) are the published crates with local changes. The changes
+# are kept as one patch for each crate in vendor/patches, next to a table
+# of the versions (vendor/patches/crates.txt: name, version, SHA-256 of the
+# published .crate). vendor/README.md says what each change is for.
+#
+#   dev/vendor-crates check
+#       Builds each crate again from crates.io and its patch, and compares
+#       the result with vendor/. Changes nothing. Run it after an edit of
+#       vendored code that should be in the patch already, and in doubt.
+#   dev/vendor-crates diff
+#       Writes the patches again from what vendor/ holds now. Run it after
+#       an edit of vendored code, and commit the patch with the edit.
+#   dev/vendor-crates upgrade <crate> <version>
+#       Fetches that version, applies the patch of the crate to it and puts
+#       the result in vendor/<crate>. A hunk that does not apply stops the
+#       run with the half-made tree left in target/vendor-crates, where the
+#       `.rej` files say what to redo by hand. The .crate is checked against
+#       the checksum of the crates.io index, and the table gets the version.
+#       The crates of GPUI pin each other (`=0.3.4`): upgrade them together,
+#       with the versions in Cargo.toml.
+#
+# Needs curl, tar, diff, patch and shasum.
+dir=$(cd "$(dirname "$0")/.." && pwd)
+patches=$dir/vendor/patches
+table=$patches/crates.txt
+work=$dir/target/vendor-crates
+# Files of a published crate that the vendored copy leaves out.
+left_out="Cargo.toml.orig Cargo.lock .cargo_vcs_info.json"
+
+die() { echo "dev/vendor-crates: $*" >&2; exit 1; }
+
+# The checksum the index of crates.io has for a version.
+index_sum() { # name version
+  case ${#1} in
+    1) path=1/$1 ;;
+    2) path=2/$1 ;;
+    3) path=3/$(printf %.1s "$1")/$1 ;;
+    *) path=$(printf %.2s "$1")/$(printf %s "$1" | cut -c3-4)/$1 ;;
+  esac
+  curl -fsSL "https://index.crates.io/$path" |
+    sed -n "s/.*\"vers\":\"$2\".*\"cksum\":\"\\([0-9a-f]*\\)\".*/\\1/p" | head -1
+}
+
+# pristine <name> <version> <sha256>: the published crate, unpacked into
+# $work/<name>, without the files the vendored copy leaves out.
+pristine() {
+  mkdir -p "$work/crates"
+  crate=$work/crates/$1-$2.crate
+  [ -f "$crate" ] || curl -fsSL -o "$crate" "https://static.crates.io/crates/$1/$1-$2.crate" ||
+    die "cannot fetch $1 $2"
+  sum=$(shasum -a 256 "$crate" | cut -c1-64)
+  [ "$sum" = "$3" ] || { rm -f "$crate"; die "$1 $2: the checksum is $sum, not $3"; }
+  rm -rf "${work:?}/$1" "$work/$1-$2"
+  tar -xzf "$crate" -C "$work" || die "cannot unpack $1 $2"
+  mv "$work/$1-$2" "$work/$1"
+  for file in $left_out; do rm -f "$work/$1/$file"; done
+}
+
+# patched <name> <version> <sha256>: the published crate with the patch.
+patched() {
+  pristine "$1" "$2" "$3"
+  patch -p1 -s -N -d "$work/$1" < "$patches/$1.patch" ||
+    die "the patch of $1 does not apply to $2; see the .rej files in $work/$1"
+  find "$work/$1" -name '*.orig' -delete
+}
+
+each() { # function
+  [ -f "$table" ] || die "no table at $table"
+  while read -r name version sum; do
+    case $name in '' | '#'*) continue ;; esac
+    "$1" "$name" "$version" "$sum" || exit 1
+  done < "$table"
+}
+
+check_one() {
+  patched "$1" "$2" "$3"
+  if diff -r "$work/$1" "$dir/vendor/$1" >/dev/null; then
+    echo "ok    $1 $2"
+  else
+    echo "DIFF  $1 $2: vendor/$1 is not the published crate with vendor/patches/$1.patch"
+    diff -rq "$work/$1" "$dir/vendor/$1" | sed "s|$work/||; s|$dir/||"
+    return 1
+  fi
+}
+
+diff_one() {
+  pristine "$1" "$2" "$3"
+  # The paths in the patch start at the crate, as `patch -p1` reads them.
+  rm -rf "$work/a" "$work/b"
+  mv "$work/$1" "$work/a"
+  cp -R "$dir/vendor/$1" "$work/b"
+  (cd "$work" && LC_ALL=C diff -ruN a b | sed -E 's/^(---|\+\+\+) ([ab]\/[^[:space:]]+).*/\1 \2/') > "$patches/$1.patch"
+  rm -rf "$work/a" "$work/b"
+  echo "wrote vendor/patches/$1.patch ($(grep -cE '^[+-][^+-]' "$patches/$1.patch") changed lines)"
+}
+
+case ${1:-} in
+  check) each check_one ;;
+  diff) each diff_one ;;
+  upgrade)
+    name=${2:?usage: dev/vendor-crates upgrade <crate> <version>}
+    version=${3:?usage: dev/vendor-crates upgrade <crate> <version>}
+    grep -q "^$name " "$table" || die "$name is not in $table"
+    sum=$(index_sum "$name" "$version")
+    [ -n "$sum" ] || die "the index of crates.io has no $name $version"
+    patched "$name" "$version" "$sum"
+    rm -rf "$dir/vendor/$name"
+    mv "$work/$name" "$dir/vendor/$name"
+    sed "s/^$name .*/$name $version $sum/" "$table" > "$table.new" && mv "$table.new" "$table"
+    echo "vendor/$name is $version with the patch. Set the version in Cargo.toml, build, run dev/test,"
+    echo "then run dev/vendor-crates diff, so the patch is the one for $version."
+    ;;
+  *)
+    echo "usage: dev/vendor-crates check | diff | upgrade <crate> <version>" >&2
+    exit 1
+    ;;
+esac

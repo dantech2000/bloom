@@ -1,0 +1,1026 @@
+diff -ruN a/src/gpui_apple.rs b/src/gpui_apple.rs
+--- a/src/gpui_apple.rs
++++ b/src/gpui_apple.rs
+@@ -6,3 +6,5 @@
+ 
+ mod metal_atlas;
+ pub mod metal_renderer;
++// Bloom (vendor/README.md): the presented time of each draw.
++pub mod present_trace;
+diff -ruN a/src/metal_renderer.rs b/src/metal_renderer.rs
+--- a/src/metal_renderer.rs
++++ b/src/metal_renderer.rs
+@@ -16,7 +16,7 @@
+ use core_foundation::base::TCFType;
+ use core_video::{
+     metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
+-    pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
++    pixel_buffer::{kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange},
+ };
+ use foreign_types::{ForeignType, ForeignTypeRef};
+ use metal::{
+@@ -122,10 +122,16 @@
+     path_sprites_pipeline_state: metal::RenderPipelineState,
+     shadows_pipeline_state: metal::RenderPipelineState,
+     quads_pipeline_state: metal::RenderPipelineState,
++    /// Bloom: the quad pipeline with the liquid glass fragment function,
++    /// for liquid glass quads only; `quads_pipeline_state` and its shader
++    /// stay as they were, so every other quad renders as before.
++    liquid_quads_pipeline_state: metal::RenderPipelineState,
+     underlines_pipeline_state: metal::RenderPipelineState,
+     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
+     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
+     surfaces_pipeline_state: metal::RenderPipelineState,
++    /// Surfaces in BGRA need no colour conversion.
++    surfaces_bgra_pipeline_state: metal::RenderPipelineState,
+     unit_vertices: metal::Buffer,
+     #[allow(clippy::arc_with_non_send_sync)]
+     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+@@ -134,6 +140,20 @@
+     path_intermediate_texture: Option<metal::Texture>,
+     path_intermediate_msaa_texture: Option<metal::Texture>,
+     path_sample_count: u32,
++    /// Blurred copy of what the frame holds so far, sampled by backdrop-blur
++    /// quads. It is kept at a fraction of the frame size: a blur hides the
++    /// lost detail, and the small size keeps the pass cheap.
++    backdrop_blur_texture: Option<metal::Texture>,
++    /// The frame scaled down, before the blur.
++    backdrop_small_texture: Option<metal::Texture>,
++    /// `MPSImageBilinearScale` that fills `backdrop_small_texture`.
++    backdrop_scale_filter: *mut objc::runtime::Object,
++    /// `MPSImageGaussianBlur` that fills `backdrop_blur_texture`.
++    backdrop_blur_filter: *mut objc::runtime::Object,
++    /// A full-size copy of the frame so far, for the sharp refraction of
++    /// liquid glass quads that ask for it (`wants_full_backdrop`). Made
++    /// when the first such quad appears, never before.
++    backdrop_full_texture: Option<metal::Texture>,
+     /// Offscreen render target reused across `render_scene` calls when
+     /// rendering headlessly without reading pixels back.
+     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+@@ -291,6 +311,14 @@
+             "quad_fragment",
+             MTLPixelFormat::BGRA8Unorm,
+         );
++        let liquid_quads_pipeline_state = build_pipeline_state(
++            &device,
++            &library,
++            "liquid_quads",
++            "quad_vertex",
++            "quad_fragment_liquid",
++            MTLPixelFormat::BGRA8Unorm,
++        );
+         let underlines_pipeline_state = build_pipeline_state(
+             &device,
+             &library,
+@@ -323,12 +351,23 @@
+             "surface_fragment",
+             MTLPixelFormat::BGRA8Unorm,
+         );
++        let surfaces_bgra_pipeline_state = build_pipeline_state(
++            &device,
++            &library,
++            "surfaces_bgra",
++            "surface_vertex",
++            "surface_bgra_fragment",
++            MTLPixelFormat::BGRA8Unorm,
++        );
+ 
+         let command_queue = device.new_command_queue();
+         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
+         let core_video_texture_cache =
+             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
+ 
++        let (backdrop_scale_filter, backdrop_blur_filter) =
++            unsafe { new_backdrop_blur_filters(&device) };
++
+         Self {
+             device,
+             layer,
+@@ -341,10 +380,12 @@
+             path_sprites_pipeline_state,
+             shadows_pipeline_state,
+             quads_pipeline_state,
++            liquid_quads_pipeline_state,
+             underlines_pipeline_state,
+             monochrome_sprites_pipeline_state,
+             polychrome_sprites_pipeline_state,
+             surfaces_pipeline_state,
++            surfaces_bgra_pipeline_state,
+             unit_vertices,
+             instance_buffer_pool,
+             sprite_atlas,
+@@ -352,6 +393,11 @@
+             path_intermediate_texture: None,
+             path_intermediate_msaa_texture: None,
+             path_sample_count: PATH_SAMPLE_COUNT,
++            backdrop_blur_texture: None,
++            backdrop_small_texture: None,
++            backdrop_scale_filter,
++            backdrop_blur_filter,
++            backdrop_full_texture: None,
+             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+             headless_render_target: None,
+         }
+@@ -395,6 +441,27 @@
+         self.update_path_intermediate_textures(size);
+     }
+ 
++    /// The full-size copy of the frame for liquid glass, made at the first
++    /// use and after a resize (`update_path_intermediate_textures` drops it).
++    fn backdrop_full_texture(&mut self, size: Size<DevicePixels>) -> metal::Texture {
++        let (width, height) = (size.width.0.max(1) as u64, size.height.0.max(1) as u64);
++        if let Some(texture) = &self.backdrop_full_texture
++            && texture.width() == width
++            && texture.height() == height
++        {
++            return texture.clone();
++        }
++        let descriptor = metal::TextureDescriptor::new();
++        descriptor.set_width(width);
++        descriptor.set_height(height);
++        descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
++        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
++        descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
++        let texture = self.device.new_texture(&descriptor);
++        self.backdrop_full_texture = Some(texture.clone());
++        texture
++    }
++
+     fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
+         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
+         // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
+@@ -402,9 +469,24 @@
+         if size.width.0 <= 0 || size.height.0 <= 0 {
+             self.path_intermediate_texture = None;
+             self.path_intermediate_msaa_texture = None;
++            self.backdrop_blur_texture = None;
++            self.backdrop_small_texture = None;
++            self.backdrop_full_texture = None;
+             return;
+         }
++        // Made again at the new size when a liquid glass quad asks for it.
++        self.backdrop_full_texture = None;
+ 
++        let blur_descriptor = metal::TextureDescriptor::new();
++        blur_descriptor.set_width((size.width.0 as u64).div_ceil(BACKDROP_BLUR_DOWNSCALE));
++        blur_descriptor.set_height((size.height.0 as u64).div_ceil(BACKDROP_BLUR_DOWNSCALE));
++        blur_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
++        blur_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
++        blur_descriptor
++            .set_usage(metal::MTLTextureUsage::ShaderWrite | metal::MTLTextureUsage::ShaderRead);
++        self.backdrop_small_texture = Some(self.device.new_texture(&blur_descriptor));
++        self.backdrop_blur_texture = Some(self.device.new_texture(&blur_descriptor));
++
+         let texture_descriptor = metal::TextureDescriptor::new();
+         texture_descriptor.set_width(size.width.0 as u64);
+         texture_descriptor.set_height(size.height.0 as u64);
+@@ -459,6 +541,10 @@
+             (viewport_size.width.ceil() as i32).into(),
+             (viewport_size.height.ceil() as i32).into(),
+         );
++        // Bloom (vendor/README.md): ground truth for frame pacing, when it
++        // was asked for.
++        let trace = crate::present_trace::active();
++        let acquire_started = if trace { crate::present_trace::media_time() } else { 0. };
+         let drawable = if let Some(drawable) = layer.next_drawable() {
+             drawable
+         } else {
+@@ -466,17 +552,46 @@
+                 "failed to retrieve next drawable, drawable size: {:?}",
+                 viewport_size
+             );
++            // Bloom: the number this draw would have had is used up, so
++            // that what was noted for it (`present_trace::next_draw_id`)
++            // can never be matched with the times of another draw.
++            if trace {
++                crate::present_trace::DRAW_ID.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
++            }
+             return;
+         };
++        let acquire_wait = if trace { crate::present_trace::media_time() - acquire_started } else { 0. };
+ 
+         let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
+             Ok(command_buffer) => command_buffer,
+             Err(error) => {
+                 log::error!("failed to render: {error:#}");
++                // Bloom: as above, the number of a draw that failed is used up.
++                if trace {
++                    crate::present_trace::DRAW_ID.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
++                }
+                 return;
+             }
+         };
+ 
++        if trace {
++            use crate::present_trace::{self, DRAW_ID, media_time};
++            let id = DRAW_ID.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
++            present_trace::submitted(id, media_time(), acquire_wait);
++            let presented = ConcreteBlock::new(move |d: &metal::DrawableRef| {
++                present_trace::presented(id, d.presented_time());
++            })
++            .copy();
++            drawable.add_presented_handler(&presented);
++            let completed = ConcreteBlock::new(move |cb: &metal::CommandBufferRef| {
++                let start: f64 = unsafe { msg_send![cb, GPUStartTime] };
++                let end: f64 = unsafe { msg_send![cb, GPUEndTime] };
++                present_trace::completed(id, start, end);
++            })
++            .copy();
++            command_buffer.add_completed_handler(&completed);
++        }
++
+         if self.presents_with_transaction {
+             command_buffer.commit();
+             command_buffer.wait_until_scheduled();
+@@ -667,13 +782,120 @@
+             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
+         );
+ 
++        // Bloom: whether a copy of the backdrop was made in this frame, for
++        // the glass quads that can share one (`shares_backdrop`).
++        let mut backdrop_copied = false;
+         for batch in scene.batches() {
+             match batch {
+                 PrimitiveBatch::Shadows(range) => {
+                     self.draw_shadows(range, instance_bindings, viewport_size, command_encoder)
+                 }
+                 PrimitiveBatch::Quads(range) => {
+-                    self.draw_quads(range, instance_bindings, viewport_size, command_encoder)
++                    // A quad that asks for a backdrop blur samples a blurred
++                    // copy of everything drawn before it. The batch is split
++                    // there, so the copy holds the quads under the glass too.
++                    // Bloom: liquid glass quads are drawn by their own
++                    // pipeline, so the batch is split where that changes too.
++                    let mut start = range.start;
++                    let mut previous_was_blur = false;
++                    let mut previous_was_liquid = false;
++                    for index in range.clone() {
++                        let is_blur = is_backdrop_blur_quad(&scene.quads[index]);
++                        let is_liquid = is_blur && is_liquid_glass_quad(&scene.quads[index]);
++                        // A run of page cards takes the copy the frame
++                        // already has: each card on a page of twenty would
++                        // otherwise scale and blur the whole frame again.
++                        let reuse = is_blur
++                            && !previous_was_blur
++                            && backdrop_copied
++                            && scene.quads[index..range.end]
++                                .iter()
++                                .take_while(|quad| is_backdrop_blur_quad(quad))
++                                .all(shares_backdrop);
++                        if is_blur
++                            && !previous_was_blur
++                            && !reuse
++                            && let Some(blurred) = self.backdrop_blur_texture.as_ref()
++                            && let Some(small) = self.backdrop_small_texture.as_ref()
++                        {
++                            self.draw_quads(
++                                start..index,
++                                instance_bindings,
++                                viewport_size,
++                                command_encoder,
++                                previous_was_liquid,
++                            );
++                            start = index;
++                            backdrop_copied = true;
++                            command_encoder.end_encoding();
++                            unsafe {
++                                let _: () = msg_send![
++                                    self.backdrop_scale_filter,
++                                    encodeToCommandBuffer: command_buffer.as_ptr()
++                                    sourceTexture: texture.as_ptr()
++                                    destinationTexture: small.as_ptr()
++                                ];
++                                let _: () = msg_send![
++                                    self.backdrop_blur_filter,
++                                    encodeToCommandBuffer: command_buffer.as_ptr()
++                                    sourceTexture: small.as_ptr()
++                                    destinationTexture: blurred.as_ptr()
++                                ];
++                            }
++                            // Liquid glass with a sharp bezel: a full-size
++                            // copy as well, only when a quad of this run
++                            // asks for it.
++                            let full_wanted = scene.quads[index..range.end]
++                                .iter()
++                                .take_while(|quad| is_backdrop_blur_quad(quad))
++                                .any(|quad| is_liquid_glass_quad(quad) && wants_full_backdrop(quad));
++                            if full_wanted {
++                                let full = self.backdrop_full_texture(viewport_size);
++                                let blit = command_buffer.new_blit_command_encoder();
++                                blit.copy_from_texture(
++                                    texture,
++                                    0,
++                                    0,
++                                    metal::MTLOrigin { x: 0, y: 0, z: 0 },
++                                    metal::MTLSize {
++                                        width: full.width().min(texture.width()),
++                                        height: full.height().min(texture.height()),
++                                        depth: 1,
++                                    },
++                                    &full,
++                                    0,
++                                    0,
++                                    metal::MTLOrigin { x: 0, y: 0, z: 0 },
++                                );
++                                blit.end_encoding();
++                            }
++                            command_encoder = new_command_encoder_for_texture(
++                                command_buffer,
++                                texture,
++                                viewport_size,
++                                None,
++                            );
++                        }
++                        else if is_liquid != previous_was_liquid {
++                            self.draw_quads(
++                                start..index,
++                                instance_bindings,
++                                viewport_size,
++                                command_encoder,
++                                previous_was_liquid,
++                            );
++                            start = index;
++                        }
++                        previous_was_blur = is_blur;
++                        previous_was_liquid = is_liquid;
++                    }
++                    self.draw_quads(
++                        start..range.end,
++                        instance_bindings,
++                        viewport_size,
++                        command_encoder,
++                        previous_was_liquid,
++                    )
+                 }
+                 PrimitiveBatch::Paths(range) => {
+                     let paths = &scene.paths[range];
+@@ -858,12 +1080,21 @@
+         instance_bindings: &InstanceBindings,
+         viewport_size: Size<DevicePixels>,
+         command_encoder: &metal::RenderCommandEncoderRef,
++        liquid: bool,
+     ) {
+         if quads.is_empty() {
+             return;
+         }
+ 
+-        command_encoder.set_render_pipeline_state(&self.quads_pipeline_state);
++        // Bloom: liquid glass quads take the pipeline with the liquid
++        // fragment function and the sharp copies of the frame.
++        if liquid {
++            command_encoder.set_render_pipeline_state(&self.liquid_quads_pipeline_state);
++            command_encoder.set_fragment_texture(1, self.backdrop_small_texture.as_deref());
++            command_encoder.set_fragment_texture(2, self.backdrop_full_texture.as_deref());
++        } else {
++            command_encoder.set_render_pipeline_state(&self.quads_pipeline_state);
++        }
+         command_encoder.set_vertex_buffer(
+             QuadInputIndex::Vertices as u64,
+             Some(&self.unit_vertices),
+@@ -879,6 +1110,7 @@
+             Some(&instance_bindings.quads.buffer),
+             instance_bindings.quads.offset as u64,
+         );
++        command_encoder.set_fragment_texture(0, self.backdrop_blur_texture.as_deref());
+         command_encoder.set_vertex_bytes(
+             QuadInputIndex::ViewportSize as u64,
+             mem::size_of_val(&viewport_size) as u64,
+@@ -1150,6 +1382,41 @@
+                 DevicePixels::from(surface.image_buffer.get_height() as i32),
+             );
+ 
++            command_encoder.set_vertex_bytes(
++                SurfaceInputIndex::TextureSize as u64,
++                mem::size_of_val(&texture_size) as u64,
++                &texture_size as *const Size<DevicePixels> as *const _,
++            );
++
++            // A BGRA surface is one plane that is drawn as it is.
++            if surface.image_buffer.get_pixel_format() == kCVPixelFormatType_32BGRA {
++                let texture = self
++                    .core_video_texture_cache
++                    .create_texture_from_image(
++                        surface.image_buffer.as_concrete_TypeRef(),
++                        None,
++                        MTLPixelFormat::BGRA8Unorm,
++                        surface.image_buffer.get_width(),
++                        surface.image_buffer.get_height(),
++                        0,
++                    )
++                    .unwrap();
++                command_encoder.set_render_pipeline_state(&self.surfaces_bgra_pipeline_state);
++                command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
++                    let texture = CVMetalTextureGetTexture(texture.as_concrete_TypeRef());
++                    Some(metal::TextureRef::from_ptr(texture as *mut _))
++                });
++                command_encoder.draw_primitives_instanced_base_instance(
++                    metal::MTLPrimitiveType::Triangle,
++                    0,
++                    6,
++                    1,
++                    (first_surface + index) as u64,
++                );
++                command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
++                continue;
++            }
++
+             assert_eq!(
+                 surface.image_buffer.get_pixel_format(),
+                 kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+@@ -1178,11 +1445,6 @@
+                 )
+                 .unwrap();
+ 
+-            command_encoder.set_vertex_bytes(
+-                SurfaceInputIndex::TextureSize as u64,
+-                mem::size_of_val(&texture_size) as u64,
+-                &texture_size as *const Size<DevicePixels> as *const _,
+-            );
+             // let y_texture = y_texture.get_texture().unwrap().
+             command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
+                 let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
+@@ -1202,6 +1464,67 @@
+             );
+         }
+     }
++}
++
++/// Standard deviation of the backdrop blur, in device pixels.
++const BACKDROP_BLUR_SIGMA: f32 = 30.;
++/// The blur runs on a copy of the frame this many times smaller per side.
++/// `quad_fragment` in shaders.metal uses the same factor.
++const BACKDROP_BLUR_DOWNSCALE: u64 = 4;
++
++#[link(name = "MetalPerformanceShaders", kind = "framework")]
++unsafe extern "C" {}
++
++/// Creates the scale and Gaussian filters for backdrop blur. Edges repeat the
++/// border pixels, so panels at the window edge do not darken.
++unsafe fn new_backdrop_blur_filters(
++    device: &metal::Device,
++) -> (*mut objc::runtime::Object, *mut objc::runtime::Object) {
++    unsafe {
++        let class = objc::runtime::Class::get("MPSImageBilinearScale")
++            .expect("MetalPerformanceShaders is linked");
++        let scale: *mut objc::runtime::Object = msg_send![class, alloc];
++        let scale: *mut objc::runtime::Object = msg_send![scale, initWithDevice: device.as_ptr()];
++
++        let class = objc::runtime::Class::get("MPSImageGaussianBlur")
++            .expect("MetalPerformanceShaders is linked");
++        let blur: *mut objc::runtime::Object = msg_send![class, alloc];
++        let sigma = BACKDROP_BLUR_SIGMA / BACKDROP_BLUR_DOWNSCALE as f32;
++        let blur: *mut objc::runtime::Object =
++            msg_send![blur, initWithDevice: device.as_ptr() sigma: sigma];
++        // MPSImageEdgeModeClamp
++        let _: () = msg_send![blur, setEdgeMode: 1u64];
++        (scale, blur)
++    }
++}
++
++/// A quad asks for a backdrop blur with a dashed border style and no border.
++/// That pair draws nothing else, so it is free to carry this meaning.
++fn is_backdrop_blur_quad(quad: &gpui::Quad) -> bool {
++    quad.border_style == gpui::BorderStyle::Dashed
++        && quad.border_widths.top.0 == 0.
++        && quad.border_widths.right.0 == 0.
++        && quad.border_widths.bottom.0 == 0.
++        && quad.border_widths.left.0 == 0.
++}
++
++/// A backdrop-blur quad whose (unused) border colour carries the parameters
++/// of liquid glass (`liquid_glass` in shaders.metal): a bezel width in `h`.
++fn is_liquid_glass_quad(quad: &gpui::Quad) -> bool {
++    quad.border_color.h > 0.
++}
++
++/// A liquid glass quad whose sharp sample comes from the full-size copy of
++/// the frame (`border_color.l` 1) and not from the quarter-size one (0).
++fn wants_full_backdrop(quad: &gpui::Quad) -> bool {
++    quad.border_color.l >= 0.75
++}
++
++/// A liquid glass quad that is a card of the page (`border_color.l` 0.5):
++/// cards do not lie over each other, so one copy of the backdrop in a frame
++/// serves them all. Its sharp sample is the quarter-size copy.
++fn shares_backdrop(quad: &gpui::Quad) -> bool {
++    is_liquid_glass_quad(quad) && quad.border_color.l >= 0.25 && quad.border_color.l < 0.75
+ }
+ 
+ fn new_command_encoder_for_texture<'a>(
+diff -ruN a/src/present_trace.rs b/src/present_trace.rs
+--- a/src/present_trace.rs
++++ b/src/present_trace.rs
+@@ -0,0 +1,288 @@
++//! Bloom (vendor/README.md): when the display showed each draw, for frame
++//! pacing measurements (`dev/jctl pacing`). Off until [`enable`]: before
++//! that `draw` records nothing and allocates nothing. The id the next draw
++//! gets is `DRAW_ID + 1`. Times are seconds of `CACurrentMediaTime` (the
++//! domain of `presentedTime` and `GPUEndTime`).
++//!
++//! A draw has two completions that come in either order on their own
++//! threads: the command buffer's completed handler (GPU times) and the
++//! drawable's presented handler (the time on the glass). A record is handed
++//! out ([`take_done`]) once both are in, or, after [`TIMEOUT`], with what
++//! came (`complete` false): a drawable that is never presented has no
++//! presented handler run. A record once handed out is never made again: a
++//! completion for an id that is not in the map is dropped.
++use parking_lot::Mutex;
++use std::{
++    collections::BTreeMap,
++    sync::atomic::{AtomicBool, AtomicU64, Ordering},
++};
++
++#[derive(Clone, Copy, Default, Debug, PartialEq)]
++pub struct Draw {
++    /// How long `nextDrawable` waited for a free drawable, in seconds.
++    pub acquire_wait: f64,
++    /// When the command buffer was committed.
++    pub submitted: f64,
++    /// When the GPU started and finished it (0 until the completed handler ran).
++    pub gpu_start: f64,
++    pub gpu_end: f64,
++    /// When the display showed it (0 until the presented handler ran).
++    pub presented: f64,
++    /// Both handlers ran; false for a record handed out at the timeout.
++    pub complete: bool,
++}
++
++#[derive(Clone, Copy, Default, Debug)]
++struct Pending {
++    draw: Draw,
++    has_gpu: bool,
++    has_presented: bool,
++}
++
++impl Pending {
++    fn done(&self) -> bool {
++        self.has_gpu && self.has_presented
++    }
++}
++
++static ENABLED: AtomicBool = AtomicBool::new(false);
++pub static DRAW_ID: AtomicU64 = AtomicU64::new(0);
++static DRAWS: Mutex<BTreeMap<u64, Pending>> = Mutex::new(BTreeMap::new());
++/// Called with each draw once both completions are in (any thread), for
++/// a consumer that wants them as they come (Bloom's phase loop). While
++/// only the feedback is on, a record goes once it was handed to it.
++static FEEDBACK: Mutex<Option<fn(u64, Draw)>> = Mutex::new(None);
++static FEEDBACK_ON: AtomicBool = AtomicBool::new(false);
++/// Records kept at most; the oldest goes when a new one comes.
++const KEEP: usize = 8192;
++/// A record whose second completion has not come this long after its
++/// commit is handed out as it is.
++pub const TIMEOUT: f64 = 2.0;
++
++#[link(name = "QuartzCore", kind = "framework")]
++unsafe extern "C" {
++    fn CACurrentMediaTime() -> f64;
++}
++
++/// Starts the recording; it runs until the process ends.
++pub fn enable() {
++    ENABLED.store(true, Ordering::Release);
++}
++
++pub fn enabled() -> bool {
++    ENABLED.load(Ordering::Relaxed)
++}
++
++/// Sets the consumer of complete records, and turns the recording on for
++/// it; `None` turns the feedback off (the trace, if on, goes on).
++pub fn set_feedback(f: Option<fn(u64, Draw)>) {
++    FEEDBACK_ON.store(f.is_some(), Ordering::Release);
++    *FEEDBACK.lock() = f;
++}
++
++/// Whether `draw` records anything: the trace or the feedback is on.
++pub fn active() -> bool {
++    enabled() || FEEDBACK_ON.load(Ordering::Relaxed)
++}
++
++/// A completion came for `id`: `fill` puts it in; a record with both
++/// completions goes to the feedback (with no lock held, the consumer may
++/// take locks of its own), and out of the map unless the trace keeps it
++/// for a report.
++fn completion(id: u64, fill: impl FnOnce(&mut Pending)) {
++    let done = {
++        let mut draws = DRAWS.lock();
++        let Some(p) = draws.get_mut(&id) else { return };
++        let was_done = p.done();
++        fill(p);
++        if was_done || !p.done() {
++            return;
++        }
++        let mut draw = p.draw;
++        draw.complete = true;
++        if !enabled() {
++            draws.remove(&id);
++        }
++        draw
++    };
++    let feedback = *FEEDBACK.lock();
++    if let Some(f) = feedback {
++        f(id, done);
++    }
++}
++
++/// Seconds, in the domain of `presentedTime` (`mach_absolute_time`).
++pub fn media_time() -> f64 {
++    unsafe { CACurrentMediaTime() }
++}
++
++/// The id the next draw gets.
++pub fn next_draw_id() -> u64 {
++    DRAW_ID.load(Ordering::Acquire) + 1
++}
++
++/// A draw was committed: starts its record.
++pub fn submitted(id: u64, submitted: f64, acquire_wait: f64) {
++    let mut draws = DRAWS.lock();
++    while draws.len() >= KEEP {
++        draws.pop_first();
++    }
++    draws.insert(
++        id,
++        Pending {
++            draw: Draw { submitted, acquire_wait, ..Default::default() },
++            ..Default::default()
++        },
++    );
++}
++
++/// The command buffer's completed handler ran.
++pub fn completed(id: u64, gpu_start: f64, gpu_end: f64) {
++    completion(id, |p| {
++        p.draw.gpu_start = gpu_start;
++        p.draw.gpu_end = gpu_end;
++        p.has_gpu = true;
++    });
++}
++
++/// The drawable's presented handler ran.
++pub fn presented(id: u64, presented: f64) {
++    completion(id, |p| {
++        p.draw.presented = presented;
++        p.has_presented = true;
++    });
++}
++
++/// Takes the draws with both completions in, and those older than
++/// [`TIMEOUT`] with what they have (`complete` false).
++pub fn take_done() -> Vec<(u64, Draw)> {
++    take_done_at(media_time())
++}
++
++pub fn take_done_at(now: f64) -> Vec<(u64, Draw)> {
++    let mut draws = DRAWS.lock();
++    let done: Vec<u64> = draws
++        .iter()
++        .filter(|(_, p)| p.done() || now - p.draw.submitted >= TIMEOUT)
++        .map(|(id, _)| *id)
++        .collect();
++    done.into_iter()
++        .filter_map(|id| {
++            draws.remove(&id).map(|p| {
++                let mut draw = p.draw;
++                draw.complete = p.done();
++                (id, draw)
++            })
++        })
++        .collect()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// The tests share one static map: each uses ids of its own, and
++    /// turns the trace on (it never goes off), so records stay for a take.
++    #[test]
++    fn a_record_is_handed_out_once_both_completions_are_in_either_order() {
++        enable();
++        // GPU first, then presented.
++        submitted(1_000, 10.0, 0.001);
++        completed(1_000, 10.001, 10.003);
++        assert!(take_done_at(10.01).iter().all(|(id, _)| *id != 1_000), "not before the presented handler");
++        presented(1_000, 10.02);
++        let got: Vec<_> = take_done_at(10.03).into_iter().filter(|(id, _)| *id == 1_000).collect();
++        assert_eq!(got.len(), 1);
++        assert_eq!(
++            got[0].1,
++            Draw { acquire_wait: 0.001, submitted: 10.0, gpu_start: 10.001, gpu_end: 10.003, presented: 10.02, complete: true }
++        );
++
++        // Presented first, a take in between, then the GPU times: the take
++        // hands out nothing, and the record keeps both when it comes.
++        submitted(1_001, 20.0, 0.0);
++        presented(1_001, 20.02);
++        assert!(take_done_at(20.03).iter().all(|(id, _)| *id != 1_001), "not before the completed handler");
++        completed(1_001, 20.001, 20.004);
++        let got: Vec<_> = take_done_at(20.04).into_iter().filter(|(id, _)| *id == 1_001).collect();
++        assert_eq!(got.len(), 1);
++        assert!(got[0].1.complete);
++        assert_eq!(got[0].1.gpu_end, 20.004);
++        assert_eq!(got[0].1.presented, 20.02);
++    }
++
++    #[test]
++    fn a_completion_after_the_record_went_does_not_make_it_again() {
++        enable();
++        submitted(2_000, 30.0, 0.0);
++        completed(2_000, 30.001, 30.003);
++        presented(2_000, 30.02);
++        assert_eq!(take_done_at(30.03).into_iter().filter(|(id, _)| *id == 2_000).count(), 1);
++        // A stray completion, and one for an id that never started.
++        completed(2_000, 30.001, 30.003);
++        presented(2_001, 30.05);
++        assert!(take_done_at(100.0).iter().all(|(id, _)| *id != 2_000 && *id != 2_001));
++    }
++
++    #[test]
++    fn the_feedback_gets_each_draw_once_with_both_completions() {
++        static GOT: Mutex<Vec<(u64, Draw)>> = Mutex::new(Vec::new());
++        fn take(id: u64, draw: Draw) {
++            if (4_000..5_000).contains(&id) {
++                GOT.lock().push((id, draw));
++            }
++        }
++        set_feedback(Some(take));
++        assert!(active());
++        submitted(4_000, 70.0, 0.0);
++        presented(4_000, 70.02);
++        assert!(GOT.lock().is_empty(), "not before the second completion");
++        completed(4_000, 70.001, 70.003);
++        submitted(4_001, 71.0, 0.0);
++        completed(4_001, 71.001, 71.003);
++        presented(4_001, 71.02);
++        // Stray completions after.
++        presented(4_000, 70.02);
++        completed(4_001, 71.001, 71.003);
++        let got = GOT.lock().clone();
++        assert_eq!(got.len(), 2);
++        assert_eq!(got[0].0, 4_000);
++        assert!(got[0].1.complete && got[0].1.presented == 70.02 && got[0].1.gpu_end == 70.003);
++        assert_eq!(got[1].0, 4_001);
++        set_feedback(None);
++    }
++
++    #[test]
++    fn a_record_with_one_completion_is_handed_out_incomplete_at_the_timeout() {
++        enable();
++        // Presented, never completed (the GPU times are 0).
++        submitted(3_000, 40.0, 0.0);
++        presented(3_000, 40.02);
++        assert!(take_done_at(40.0 + TIMEOUT - 0.1).iter().all(|(id, _)| *id != 3_000));
++        let got: Vec<_> = take_done_at(40.0 + TIMEOUT).into_iter().filter(|(id, _)| *id == 3_000).collect();
++        assert_eq!(got.len(), 1);
++        assert!(!got[0].1.complete);
++        assert_eq!(got[0].1.gpu_end, 0.);
++        assert_eq!(got[0].1.presented, 40.02);
++        // Completed, never presented (a drawable that was not shown).
++        submitted(3_001, 50.0, 0.0);
++        completed(3_001, 50.001, 50.003);
++        let got: Vec<_> = take_done_at(50.0 + TIMEOUT).into_iter().filter(|(id, _)| *id == 3_001).collect();
++        assert_eq!(got.len(), 1);
++        assert!(!got[0].1.complete);
++        assert_eq!(got[0].1.presented, 0.);
++    }
++
++    #[test]
++    fn the_map_is_bounded() {
++        // The lowest ids of all the tests, so the pops here take only
++        // these records.
++        for i in 0..KEEP as u64 + 10 {
++            submitted(i, 60.0, 0.0);
++        }
++        assert!(DRAWS.lock().len() <= KEEP);
++        // The oldest went first.
++        assert!(!DRAWS.lock().contains_key(&0));
++        assert!(DRAWS.lock().contains_key(&(KEEP as u64 + 9)));
++    }
++}
+diff -ruN a/src/shaders.metal b/src/shaders.metal
+--- a/src/shaders.metal
++++ b/src/shaders.metal
+@@ -97,13 +97,171 @@
+       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+ }
+ 
++// Bloom: liquid glass, the refraction of the bezel of a backdrop quad
++// (see `liquid_glass` below). Refractive index of the glass; air is 1.
++constant float LIQUID_INDEX = 1.5;
++// The bezel takes at most this share of the shorter half of a quad, so a
++// small control keeps a flat middle; the glass gets thinner with it.
++constant float LIQUID_BEZEL_SHARE = 0.6;
++// Saturation of the backdrop under the specular rim (kube.io's "specular
++// saturation", 4 to 9 in its components).
++constant float LIQUID_RIM_SATURATION = 6.0;
++// Over a bright picture a dark tint grows to this opacity, that of the
++// frosted popups, so light text on the glass stays readable; over a dark
++// or mid picture the tint is the light one asked for.
++constant float LIQUID_BRIGHT_ALPHA = 0.72;
++
++/// The colour of a liquid glass quad at `position`, before the corner is
++/// rounded. The quad's `border_color` and gradient background carry the
++/// parameters (vendor/README.md, "liquid glass"):
++///   border_color.h  width of the bezel, device pixels
++///   border_color.s  thickness of the slab under the bezel, device pixels
++///   border_color.l  source of the sharp sample: 0 the quarter-size copy,
++///                   1 the full-size copy; 0.5 the quarter-size copy the
++///                   frame already has (a card of the page)
++///   background      a linear gradient: the angle is the blur share in the
++///                   bezel (0 sharp, 1 the full blur); stop 0 is the tint,
++///                   its percentage the width of the specular rim in
++///                   device pixels; stop 1's colour is (h: saturation,
++///                   s: rim strength, l: counter-light strength), its
++///                   percentage the blur share in the flat middle.
++/// The model is that of kube.io's "Liquid Glass in CSS and SVG", from its
++/// code: a slab of glass with a curved bezel at its edge. The height of the
++/// bezel is the convex squircle y = (1 - (1 - x)^4)^(1/4), x from 0 at the
++/// border to 1 where the glass is flat. A ray orthogonal to the background
++/// meets the surface at the angle t1 of the normal, with
++/// sin t1 = y' / sqrt(1 + y'^2); Snell's law gives sin t2 = sin t1 / n; the
++/// ray then crosses the bezel and the slab under it and lands
++/// (y * bezel + thickness) * tan(t1 - t2) further in, along the inward
++/// normal of the border. The slab is what bends the picture most at the
++/// very edge, where the surface is steepest.
++float4 liquid_glass(Quad quad, float2 position, float4 tint,
++                    float sdf, float2 corner_center_to_point,
++                    float2 center_to_point,
++                    texture2d<float> blurred, texture2d<float> small,
++                    texture2d<float> full) {
++  constexpr sampler backdrop_sampler(mag_filter::linear, min_filter::linear,
++                                     address::clamp_to_edge);
++  float half_side = min(quad.bounds.size.width, quad.bounds.size.height) / 2.0;
++  float asked_bezel = max(quad.border_color.h, 1.0);
++  float bezel = min(asked_bezel, half_side * LIQUID_BEZEL_SHARE);
++  float thickness = quad.border_color.s * bezel / asked_bezel;
++  bool full_source = quad.border_color.l >= 0.75;
++  float bezel_blur = quad.background.gradient_angle_or_pattern_height;
++  float rim_width = max(quad.background.colors[0].percentage, 0.5);
++  float saturation = quad.background.colors[1].color.h;
++  float rim = quad.background.colors[1].color.s;
++  float counter = quad.background.colors[1].color.l;
++  float middle_blur = quad.background.colors[1].percentage;
++
++  // Outward normal of the rounded rectangle at this point: radial in a
++  // corner, else the axis of the nearest side; back from the mirrored
++  // quadrant.
++  float2 q = corner_center_to_point;
++  float2 normal;
++  if (q.x > 0.0 && q.y > 0.0) {
++    normal = q / max(length(q), 1e-4);
++  } else {
++    normal = q.x > q.y ? float2(1.0, 0.0) : float2(0.0, 1.0);
++  }
++  normal *= float2(center_to_point.x < 0.0 ? -1.0 : 1.0,
++                   center_to_point.y < 0.0 ? -1.0 : 1.0);
++
++  // Position in the bezel: 0 at the border, 1 where the glass is flat.
++  float depth = max(-sdf, 0.0);
++  float x = saturate(depth / bezel);
++  float u = 1.0 - x;
++  float u3 = u * u * u;
++  float v = max(1.0 - u3 * u, 0.0);
++  float height = pow(v, 0.25);
++  // sin t1 = y' / sqrt(1 + y'^2) with y' = u^3 (1 - u^4)^(-3/4), written so
++  // that the border (y' infinite) gives 1 and not NaN.
++  float sin1 = u3 / sqrt(v * sqrt(v) + u3 * u3);
++  float t1 = asin(min(sin1, 1.0));
++  float t2 = asin(sin1 / LIQUID_INDEX);
++  float displacement = (height * bezel + thickness) * tan(t1 - t2);
++  // A convex bezel bends inwards; the ray never crosses the middle.
++  displacement = min(displacement, max(half_side - depth, 0.0));
++  float2 sample_at = position - normal * displacement;
++
++  // The blurred and the quarter-size copies are a quarter of the frame per
++  // side (BACKDROP_BLUR_DOWNSCALE in metal_renderer.rs).
++  float2 quarter_scale = 1.0 / (float2(blurred.get_width(), blurred.get_height()) * 4.0);
++  float3 soft = blurred.sample(backdrop_sampler, sample_at * quarter_scale).rgb;
++  float3 sharp;
++  if (full_source) {
++    float2 full_scale = 1.0 / float2(full.get_width(), full.get_height());
++    sharp = full.sample(backdrop_sampler, sample_at * full_scale).rgb;
++  } else {
++    sharp = small.sample(backdrop_sampler, sample_at * quarter_scale).rgb;
++  }
++  // A sharp lens in the bezel, more blur in the flat middle; both shares
++  // are parameters.
++  float blur_mix = mix(bezel_blur, middle_blur, smoothstep(0.3, 1.0, x));
++  float3 behind = mix(sharp, soft, blur_mix);
++
++  // Specular rim: a thin line on the border, a half circle in section,
++  // brightest where the border faces the light (top left) and, weaker, on
++  // the far side; none where the border runs along the light.
++  float2 light = float2(-0.5, -0.866);
++  float facing = dot(normal, light);
++  float across = 1.0 - depth / rim_width;
++  float line = sqrt(saturate(1.0 - across * across));
++  float specular = line * (max(facing, 0.0) + counter * max(-facing, 0.0));
++  float lit = specular * specular;
++
++  // More saturation under the glass (1 leaves it as it is), and much more
++  // under the rim, which is what gives the edge its colour.
++  float luma = dot(behind, float3(0.2126, 0.7152, 0.0722));
++  float3 grey = float3(luma);
++  behind = mix(grey, behind, saturation);
++  behind = mix(behind, saturate(mix(grey, behind, LIQUID_RIM_SATURATION)), lit);
++
++  float tint_alpha = tint.a;
++  if (dot(tint.rgb, float3(0.2126, 0.7152, 0.0722)) < 0.5) {
++    float bright = smoothstep(0.3, 0.8, dot(soft, float3(0.2126, 0.7152, 0.0722)));
++    tint_alpha = max(tint_alpha, mix(tint_alpha, LIQUID_BRIGHT_ALPHA, bright));
++  }
++  float3 glass = mix(behind, tint.rgb, tint_alpha);
++  glass = mix(glass, float3(1.0), saturate(lit * rim));
++  return float4(glass, 1.0);
++}
++
+ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
+                               constant Quad *quads
+-                              [[buffer(QuadInputIndex_Quads)]]) {
++                              [[buffer(QuadInputIndex_Quads)]],
++                              texture2d<float> backdrop [[texture(0)]]) {
+   Quad quad = quads[input.quad_id];
+   float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
+     input.background_solid, input.background_color0, input.background_color1);
+ 
++  // Backdrop blur: a dashed border style with no border marks a quad that
++  // shows the blurred frame behind it, tinted by its background.
++  if (quad.border_style == BorderStyle_Dashed &&
++      quad.border_widths.top == 0.0 && quad.border_widths.left == 0.0 &&
++      quad.border_widths.right == 0.0 && quad.border_widths.bottom == 0.0) {
++    constexpr sampler backdrop_sampler(mag_filter::linear, min_filter::linear,
++                                       address::clamp_to_edge);
++    // The blurred copy is a quarter of the frame per side
++    // (BACKDROP_BLUR_DOWNSCALE in metal_renderer.rs).
++    float2 uv = input.position.xy /
++      (float2(backdrop.get_width(), backdrop.get_height()) * 4.0);
++    float4 behind = backdrop.sample(backdrop_sampler, uv);
++    float3 glass = mix(behind.rgb, background_color.rgb, background_color.a);
++
++    // Round the corners here and return: the dashed-border code below
++    // divides by the border width, which is zero for this quad.
++    float2 blur_half_size =
++      float2(quad.bounds.size.width, quad.bounds.size.height) / 2.0;
++    float2 blur_center_to_point = input.position.xy -
++      float2(quad.bounds.origin.x, quad.bounds.origin.y) - blur_half_size;
++    float blur_radius = pick_corner_radius(blur_center_to_point, quad.corner_radii);
++    float2 blur_corner_center_to_point =
++      fabs(blur_center_to_point) - blur_half_size + blur_radius;
++    float blur_sdf = quad_sdf_impl(blur_corner_center_to_point, blur_radius);
++    return float4(glass, saturate(0.5 - blur_sdf));
++  }
++
+   bool unrounded = quad.corner_radii.top_left == 0.0 &&
+     quad.corner_radii.bottom_left == 0.0 &&
+     quad.corner_radii.top_right == 0.0 &&
+@@ -396,6 +554,32 @@
+   return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
+ }
+ 
++// Bloom: the fragment function of the liquid glass pipeline
++// (`liquid_quads_pipeline_state` in metal_renderer.rs), used for liquid
++// glass quads only: a backdrop quad (dashed border style, no border) with a
++// bezel width in its border colour. `quad_fragment` above is untouched, so
++// every other quad renders as before.
++fragment float4 quad_fragment_liquid(QuadFragmentInput input [[stage_in]],
++                              constant Quad *quads
++                              [[buffer(QuadInputIndex_Quads)]],
++                              texture2d<float> backdrop [[texture(0)]],
++                              texture2d<float> backdrop_small [[texture(1)]],
++                              texture2d<float> backdrop_full [[texture(2)]]) {
++  Quad quad = quads[input.quad_id];
++  float2 half_size =
++    float2(quad.bounds.size.width, quad.bounds.size.height) / 2.0;
++  float2 center_to_point = input.position.xy -
++    float2(quad.bounds.origin.x, quad.bounds.origin.y) - half_size;
++  float radius = pick_corner_radius(center_to_point, quad.corner_radii);
++  float2 corner_center_to_point = fabs(center_to_point) - half_size + radius;
++  float sdf = quad_sdf_impl(corner_center_to_point, radius);
++  // The tint is the first stop of the gradient background.
++  float4 liquid = liquid_glass(quad, input.position.xy, input.background_color0,
++                               sdf, corner_center_to_point, center_to_point,
++                               backdrop, backdrop_small, backdrop_full);
++  return float4(liquid.rgb, saturate(0.5 - sdf));
++}
++
+ // Returns the dash velocity of a corner given the dash velocity of the two
+ // sides, by returning the slower velocity (larger dashes).
+ //
+@@ -897,6 +1081,15 @@
+       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
+ 
+   return ycbcrToRGBTransform * ycbcr;
++}
++
++// A BGRA surface, such as a frame an app rendered on the GPU.
++fragment float4 surface_bgra_fragment(SurfaceFragmentInput input [[stage_in]],
++                                      texture2d<float> texture
++                                      [[texture(SurfaceInputIndex_YTexture)]]) {
++  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
++  float4 color = texture.sample(texture_sampler, input.texture_position);
++  return float4(color.rgb, 1.0);
+ }
+ 
+ float4 hsla_to_rgba(Hsla hsla) {
