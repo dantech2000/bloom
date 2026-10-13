@@ -1,0 +1,88 @@
+#!/bin/sh
+# Plays a clip in a test instance and fails when a frame is shown late.
+#
+#   dev/pacing-check [seconds]        (default 20, at most 50)
+#
+# The instance is one of dev/run-test on the mock server (no network; set
+# BLOOM_TEST_SERVER for another), muted, with its own socket and log
+# (/tmp/bloom-pacing.*). The clip is made by ffmpeg, PACING_FPS frames a
+# second (default 24), and played from its file, so no server sees a play.
+# The window opens on the screen and closes at the end.
+#
+# The numbers are those of `dev/jctl pacing`: `lag bins` says how many
+# refreshes after its tick each frame was shown (1 is the design), and
+# `gt_jumps` counts the breaks of the cadence, the thing the eye sees. The
+# check fails on more than PACING_LATE frames with a lag of 2 or more
+# (default 0), on a jump, and on a run with too few frames.
+#
+# Run it on a quiet machine: a build in another terminal makes frames late.
+# Keep the window of the instance in view: macOS shows no frames of a
+# window that is covered, and the run then has too few of them.
+# The load of the machine is printed with the result. Run a release build
+# first. It needs a display, so it is not for CI.
+dir=$(cd "$(dirname "$0")/.." && pwd)
+seconds=${1:-20}
+fps=${PACING_FPS:-24}
+allowed=${PACING_LATE:-0}
+name=${BLOOM_TEST_NAME:-pacing}
+sock=/tmp/bloom-$name.sock
+clip=$dir/target/pacing-check/clip-$fps.mkv
+
+die() { echo "dev/pacing-check: $*" >&2; exit 1; }
+ctl() { BLOOM_DEBUG_SOCK=$sock "$dir/dev/jctl" "$@"; }
+# wait_for <tries> <text> <command...>: until the answer has the text.
+wait_for() {
+  tries=$1 text=$2
+  shift 2
+  while [ "$tries" -gt 0 ]; do
+    case $("$@" 2>/dev/null) in *"$text"*) return 0 ;; esac
+    tries=$((tries - 1))
+    sleep 0.25
+  done
+  return 1
+}
+
+[ "$seconds" -le 50 ] 2>/dev/null || die "at most 50 seconds: the clip has 60"
+[ -x "$dir/target/release/bloom" ] || die "no release build; run cargo build --release"
+if [ ! -f "$clip" ]; then
+  command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg is not in PATH; the clip needs it"
+  mkdir -p "$(dirname "$clip")"
+  ffmpeg -loglevel error -y -f lavfi -i "testsrc2=size=1920x1080:rate=$fps:duration=60" \
+    -f lavfi -i sine=frequency=440:duration=60 -c:v libx264 -preset veryfast -pix_fmt yuv420p \
+    -c:a aac -shortest "$clip" || die "ffmpeg could not make $clip"
+fi
+
+stop() {
+  ctl stop >/dev/null 2>&1
+  sleep 0.5
+  BLOOM_TEST_NAME=$name BLOOM_TEST_SERVER=${BLOOM_TEST_SERVER:-mock} "$dir/dev/run-test" stop
+}
+trap stop EXIT
+BLOOM_TEST_NAME=$name BLOOM_TEST_SERVER=${BLOOM_TEST_SERVER:-mock} "$dir/dev/run-test" 2 || die "the test instance did not start"
+wait_for 60 "home" ctl state || die "no signed-in session; see /tmp/bloom-$name.log"
+wait_for 20 "playing" ctl pacing file "$clip" || die "the clip did not start"
+wait_for 60 "player=Playing" ctl state || die "the player did not play; see /tmp/bloom-$name.log"
+# The first frames of a play are not the steady state; the trace starts
+# with the first report, which is thrown away.
+sleep 3
+ctl pacing >/dev/null
+sleep "$seconds"
+report=$(ctl pacing)
+trace=$(echo "$report" | grep 'trace: frames=')
+[ -n "$trace" ] || die "no trace in the report: $report"
+
+frames=$(echo "$trace" | sed -n 's/.*trace: frames=\([0-9]*\).*/\1/p')
+bins=$(echo "$trace" | sed -n 's/.*bins\[[^]]*\]=\[\([0-9, ]*\)\].*/\1/p' | tr -d ' ')
+jumps=$(echo "$trace" | sed -n 's/.*gt_jumps=\([0-9]*\).*/\1/p')
+on_time=$(echo "$bins" | cut -d, -f2)
+late=$(echo "$bins" | cut -d, -f3- | tr ',' '+' | bc)
+wanted=$((seconds * fps * 9 / 10))
+echo "frames=$frames lag bins[<=0,1,2,3,4,5+]=[$bins] on_time=$on_time late=$late gt_jumps=$jumps"
+echo "load:$(uptime | sed 's/.*load averages*://')"
+
+failed=0
+[ "$frames" -ge "$wanted" ] || { echo "FAIL  $frames frames in $seconds s; $wanted or more are the clip at $fps a second (was the window covered?)"; failed=1; }
+[ "$late" -le "$allowed" ] || { echo "FAIL  $late frames were shown late (allowed: $allowed)"; failed=1; }
+[ "$jumps" -eq 0 ] || { echo "FAIL  $jumps breaks of the cadence"; failed=1; }
+[ "$failed" -eq 0 ] && echo "ok    every frame on time"
+exit "$failed"
