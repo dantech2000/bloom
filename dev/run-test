@@ -8,6 +8,8 @@
 # BLOOM_TEST_SERVER=live|mock|container chooses the server (dev/test-server);
 # live, the server of the user's config, is the default.
 # With BLOOM_CONFIG_PATH set, the instance uses (and may write) that config.
+# BLOOM_BIN=<path> runs another build than target/release/bloom (a build of
+# another checkout, to compare two).
 dir=$(cd "$(dirname "$0")/.." && pwd)
 name=${BLOOM_TEST_NAME:-test}
 # Stops the process of a pid file when it is still Bloom: after a quit by
@@ -47,6 +49,6 @@ export BLOOM_MUTED=1
 # The window shows "TEST INSTANCE" with this name.
 export BLOOM_TEST_NAME=$name
 BLOOM_DEBUG_SOCK=/tmp/bloom-$name.sock RUST_LOG=${RUST_LOG:-bloom=info} RUST_BACKTRACE=1 \
-  nohup "$dir/target/release/bloom" > /tmp/bloom-$name.log 2>&1 &
+  nohup "${BLOOM_BIN:-$dir/target/release/bloom}" > /tmp/bloom-$name.log 2>&1 &
 echo $! > /tmp/bloom-$name.pid
 sleep "${1:-5}"
