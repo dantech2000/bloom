@@ -43,6 +43,25 @@ type Answer = dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync;
 /// A server that answers what `answer(method, path, body)` says, and keeps
 /// every request it saw. It ends with the test: the drop stops the
 /// listener and joins its threads.
+/// The connections to the listener of a test server, until `stop` is set.
+/// The listener does not block: the loop looks at `stop` between two
+/// tries, so it ends with no last connection. A server that waited for one
+/// to stop hung its test when that connect failed (seen on 2026-10-12: ten
+/// tests at once, for good).
+pub(crate) fn connections(listener: TcpListener, stop: Arc<AtomicBool>) -> impl Iterator<Item = TcpStream> {
+    listener.set_nonblocking(true).expect("nonblocking");
+    std::iter::from_fn(move || {
+        while !stop.load(Ordering::Acquire) {
+            match listener.accept() {
+                // A stream takes the mode of its listener on macOS.
+                Ok((stream, _)) if stream.set_nonblocking(false).is_ok() => return Some(stream),
+                _ => std::thread::sleep(std::time::Duration::from_micros(500)),
+            }
+        }
+        None
+    })
+}
+
 pub(crate) struct MockServer {
     pub url: String,
     seen: Arc<Mutex<Vec<Seen>>>,
@@ -62,10 +81,7 @@ impl MockServer {
         let accept = {
             let (stop, workers) = (stop.clone(), workers.clone());
             std::thread::spawn(move || {
-                for stream in listener.incoming().flatten() {
-                    if stop.load(Ordering::Acquire) {
-                        break;
-                    }
+                for stream in connections(listener, stop) {
                     let (log, answer) = (log.clone(), answer.clone());
                     let worker = std::thread::spawn(move || serve(stream, log, answer));
                     workers.lock().expect("workers").push(worker);
@@ -99,10 +115,8 @@ impl MockServer {
 
 impl Drop for MockServer {
     fn drop(&mut self) {
+        // The listener sees the flag at its next try (`connections`).
         self.stop.store(true, Ordering::Release);
-        // The listener wakes from `accept` once more and sees the flag.
-        let address = self.url.trim_start_matches("http://").to_string();
-        let _ = TcpStream::connect(address);
         if let Some(accept) = self.accept.take() {
             let _ = accept.join();
         }
@@ -232,5 +246,20 @@ pub(crate) fn add_server(this: &mut Bloom, id: &str, url: &str, user: &str) {
     this.config.upsert_profile(
         id,
         crate::config::Profile { user_id: user.into(), name: user.to_uppercase(), token: "t".into(), image_tag: None },
+    );
+}
+
+/// A mock server stops with the test, also when nothing can connect to it
+/// at that moment: a test must not wait for ever on its own server.
+#[test]
+fn a_mock_server_stops_without_a_connection_to_it() {
+    let (done, waited) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        drop(MockServer::start(|method, path, _| plain(method, path)));
+        let _ = done.send(());
+    });
+    assert!(
+        waited.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+        "the mock server did not stop within 5 seconds"
     );
 }

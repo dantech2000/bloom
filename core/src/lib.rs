@@ -16,3 +16,5 @@ pub mod options;
 pub mod realtime;
 pub mod search_index;
 pub mod syncplay;
+#[cfg(test)]
+mod test_net;
