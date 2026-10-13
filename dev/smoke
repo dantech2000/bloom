@@ -10,6 +10,9 @@
 # debug channel, or a page that does not finish its load. A page whose frames
 # take longer than SMOKE_DRAW_MS (default 8) to draw gets a warning.
 #
+# BLOOM_TEST_SERVER=live|mock|container chooses the server (dev/test-server);
+# live, the server of the user's config, is the default.
+#
 # The instance is separate from the one of dev/run and of dev/run-test: its
 # own socket, pid file and log (/tmp/bloom-smoke.*, or
 # /tmp/bloom-<name>.* with BLOOM_TEST_NAME=<name>, so several agents can
@@ -117,7 +120,15 @@ page() {
   echo "$mark $page: $(echo "$perf" | sed 's/^perf: //; s/ main_cpu.*//')"
 }
 
-start BLOOM_CONFIG_READONLY=1 || exit 1
+# The server: the live one of the user (the default), the mock or the
+# container; see dev/test-server.
+mode=${BLOOM_TEST_SERVER:-live}
+server_config=$("$dir/dev/test-server" "$name") || exit 1
+if [ -n "$server_config" ]; then
+  start BLOOM_CONFIG_PATH="$server_config" || exit 1
+else
+  start BLOOM_CONFIG_READONLY=1 || exit 1
+fi
 case $(settle) in
   home*) ;;
   *) fail "no signed-in session; sign in with the app first"; stop; exit 1 ;;
@@ -146,15 +157,18 @@ if [ -n "$series" ]; then
   [ -n "$season" ] && page season item "$season"
 fi
 page search search the
-for section in dashboard general branding users libraries display metadata nfo transcoding resume \
-  streaming trickplay devices activity plugins networking tasks logs keys; do
-  page "admin-$section" admin "$section"
-done
-# The dialogs are only opened; nothing in them is pressed.
-for dialog in newkey newuser secret; do
-  page "dialog-$dialog" admin-dialog "$dialog"
-  ctl admin-dialog close >/dev/null
-done
+# The user of the mock is no administrator: it has no dashboard.
+if [ "$mode" != mock ]; then
+  for section in dashboard general branding users libraries display metadata nfo transcoding resume \
+    streaming trickplay devices activity plugins networking tasks logs keys; do
+    page "admin-$section" admin "$section"
+  done
+  # The dialogs are only opened; nothing in them is pressed.
+  for dialog in newkey newuser secret; do
+    page "dialog-$dialog" admin-dialog "$dialog"
+    ctl admin-dialog close >/dev/null
+  done
+fi
 page dialog-authorize authorize
 ctl authorize-close >/dev/null 2>&1
 for section in profile playback subtitles home display automation; do
@@ -169,11 +183,12 @@ config="${TMPDIR:-/tmp}/bloom-smoke-config.$$.json"
 rm -f "$config"
 if start BLOOM_CONFIG_PATH="$config"; then
   page sign-in-server state
-  server=$(sed -n 's/.*"url": *"\([^"]*\)".*/\1/p' "$HOME/Library/Application Support/bloom/config.json" 2>/dev/null | head -1)
+  server=$(sed -n 's/.*"url": *"\([^"]*\)".*/\1/p' "${server_config:-$HOME/Library/Application Support/bloom/config.json}" 2>/dev/null | head -1)
   [ -n "$server" ] && page sign-in-user connect add "$server"
 fi
 stop
 rm -f "$config"
+"$dir/dev/test-server" "$name" stop
 
 echo
 echo "$failures failed, $warnings slow (over $limit ms a frame); screenshots in $out"

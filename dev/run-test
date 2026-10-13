@@ -5,6 +5,8 @@
 # Stop it with:   dev/run-test stop
 # BLOOM_TEST_NAME=<name> gives the instance its own files
 # (/tmp/bloom-<name>.sock, .pid, .log), so several tests can run at once.
+# BLOOM_TEST_SERVER=live|mock|container chooses the server (dev/test-server);
+# live, the server of the user's config, is the default.
 # With BLOOM_CONFIG_PATH set, the instance uses (and may write) that config.
 dir=$(cd "$(dirname "$0")/.." && pwd)
 name=${BLOOM_TEST_NAME:-test}
@@ -17,8 +19,19 @@ stop_old() {
 }
 stop_old /tmp/bloom-$name.pid
 rm -f /tmp/bloom-$name.pid
-[ "$1" = stop ] && exit 0
+if [ "$1" = stop ]; then
+  "$dir/dev/test-server" "$name" stop
+  exit 0
+fi
 sleep 1
+# The server: the live one of the user (the default), the mock or the
+# container; see dev/test-server. The last two come with a config file of
+# their own, and no socket to the server: the mock has none.
+if [ -z "$BLOOM_CONFIG_PATH" ]; then
+  config=$("$dir/dev/test-server" "$name") || exit 1
+  [ -z "$config" ] || export BLOOM_CONFIG_PATH=$config
+  [ "${BLOOM_TEST_SERVER:-live}" != mock ] || export BLOOM_NO_SOCKET=1
+fi
 [ -n "$BLOOM_CONFIG_PATH" ] || export BLOOM_CONFIG_READONLY=1
 # Its own download folder: the index, the part files and the positions of
 # offline plays are written at every start, and the user's folder is the
