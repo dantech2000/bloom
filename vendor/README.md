@@ -4,11 +4,36 @@
 `dev/build-mpv` (the versions, sources and checksums are in that script;
 `mpv/build` is its cache). `sparkle` is the updater framework. The two `gpui-pre-*` crates are copies of the published crates
 (crates.io, version 0.3.4, Apache-2.0, license file carried) with small
-local changes, wired in by `[patch.crates-io]` in `Cargo.toml`. An upgrade
-of GPUI copies the new crate from the registry
-(`~/.cargo/registry/src/*/gpui-pre-<name>-<version>/`: `Cargo.toml`,
-`LICENSE-APACHE`, `src/`) and applies the changes below again. Most changes
+local changes, wired in by `[patch.crates-io]` in `Cargo.toml`. Most changes
 are marked `Bloom` in the source; the list says where one is not.
+
+## The changes as patches
+
+`vendor/patches/<crate>.patch` is the whole local change of a crate, and
+`vendor/patches/crates.txt` names the version and the SHA-256 of the
+published `.crate` it applies to. `dev/vendor-crates` keeps the three in
+step:
+
+- `dev/vendor-crates check` builds each crate again from crates.io and its
+  patch and compares the result with `vendor/`. It changes nothing.
+- `dev/vendor-crates diff` writes the patches again from `vendor/`. Run it
+  after an edit of vendored code and commit the patch with the edit.
+- `dev/vendor-crates upgrade <crate> <version>` fetches that version,
+  checks it against the index of crates.io, applies the patch and puts the
+  result in `vendor/<crate>`. A hunk that does not apply stops the run and
+  leaves `vendor/` as it was; the `.rej` files in `target/vendor-crates`
+  say what to redo by hand.
+
+Tried on 2026-10-12, with nothing kept: against `gpui-pre-apple` 0.3.9, 14
+of the 17 hunks of `metal_renderer.rs` apply and 4 hunks in all need a
+hand; `gpui-pre-macos` 0.3.9 needs one. `taffy` 0.15.0 has the change of
+the patch below already (`unwrap_or_else`), so the vendored `taffy` can go
+once GPUI builds with that version.
+
+The parameters of the liquid glass ride in fields of the quad that the blur
+path does not draw (see below, and `encode` in `src/ui/glass.rs`). A field
+of their own would be in `Quad`, which is in `gpui-pre` itself: that crate
+is not vendored, and it is not worth a third copy.
 
 ## gpui-pre-apple 0.3.4
 

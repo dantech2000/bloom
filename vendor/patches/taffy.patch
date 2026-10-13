@@ -1,0 +1,17 @@
+diff -ruN a/src/compute/flexbox.rs b/src/compute/flexbox.rs
+--- a/src/compute/flexbox.rs
++++ b/src/compute/flexbox.rs
+@@ -830,7 +830,12 @@
+         let style_min_main_size =
+             child.min_size.or(child.overflow.map(Overflow::maybe_into_automatic_min_size).into()).main(dir);
+ 
+-        child.resolved_minimum_main_size = style_min_main_size.unwrap_or({
++        // Bloom (vendor/README.md): `unwrap_or_else`, where the published
++        // crate has `unwrap_or`. That one measures the item at its
++        // smallest width also when the style names a least size and the
++        // result is thrown away: a second layout of the item's subtree
++        // for every flex item with `min_w`.
++        child.resolved_minimum_main_size = style_min_main_size.unwrap_or_else(|| {
+             let min_content_main_size = {
+                 let child_available_space = Size::MIN_CONTENT.with_cross(dir, cross_axis_available_space);
+ 

@@ -1,0 +1,49 @@
+diff -ruN a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -269,3 +269,8 @@
+ [lints.rust.unexpected_cfgs]
+ level = "allow"
+ priority = 0
++
++# Bloom (vendor/README.md): the published crate lost its workspace lints;
++# the deprecations of the cocoa crate are upstream's to fix.
++[lints.rust]
++deprecated = "allow"
+diff -ruN a/src/display_link.rs b/src/display_link.rs
+--- a/src/display_link.rs
++++ b/src/display_link.rs
+@@ -102,6 +102,21 @@
+     REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
+ }
+ 
++/// Bloom (vendor/README.md): runs the frame step of every window on the
++/// main queue now, as a tick of the display link would. A video frame is
++/// drawn at a set phase of the refresh period, not at the tick, so the GPU
++/// has time before the compositor's deadline (Bloom's `pacing.rs`). Safe
++/// from any thread: it only merges data into the dispatch sources, as the
++/// output callback does from the link's io thread.
++pub fn wake_frame_sources() {
++    let registry = lock_registry();
++    for entry in registry.displays.values() {
++        for (_, frame_requests) in &entry.subscribers {
++            frame_requests.merge_data(1);
++        }
++    }
++}
++
+ fn debug_assert_main_thread() {
+     #[cfg(debug_assertions)]
+     {
+diff -ruN a/src/gpui_macos.rs b/src/gpui_macos.rs
+--- a/src/gpui_macos.rs
++++ b/src/gpui_macos.rs
+@@ -48,6 +48,8 @@
+ pub(crate) use dispatcher::*;
+ pub(crate) use display::*;
+ pub(crate) use display_link::*;
++// Bloom (vendor/README.md): the frame step on demand.
++pub use display_link::wake_frame_sources;
+ pub(crate) use keyboard::*;
+ pub(crate) use platform::*;
+ pub(crate) use window::*;
