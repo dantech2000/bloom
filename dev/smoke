@@ -11,7 +11,8 @@
 # take longer than SMOKE_DRAW_MS (default 8) to draw gets a warning.
 #
 # BLOOM_TEST_SERVER=live|mock|container chooses the server (dev/test-server);
-# live, the server of the user's config, is the default.
+# live, the server of the user's config, is the default. BLOOM_BIN=<path>
+# runs another build than target/release/bloom.
 #
 # The instance is separate from the one of dev/run and of dev/run-test: its
 # own socket, pid file and log (/tmp/bloom-smoke.*, or
@@ -47,7 +48,7 @@ start() {
   # person at the Mac, and BLOOM_MUTED keeps the instance silent.
   env "$@" BLOOM_TEST_NAME=$name BLOOM_MUTED=1 BLOOM_NO_REPORT=1 BLOOM_NO_SOCKET=1 BLOOM_DEBUG_SOCK=$sock RUST_LOG=bloom=info RUST_BACKTRACE=1 \
     BLOOM_DOWNLOAD_DIR="${BLOOM_DOWNLOAD_DIR:-/tmp/bloom-$name-downloads}" \
-    nohup "$dir/target/release/bloom" >> "$log" 2>&1 &
+    nohup "${BLOOM_BIN:-$dir/target/release/bloom}" >> "$log" 2>&1 &
   echo $! > "$pid_file"
   # The debug channel answers once the window is up.
   for _ in $(seq 1 40); do
