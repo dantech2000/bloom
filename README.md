@@ -94,6 +94,21 @@ Servers, profiles, access tokens and downloads are in
 | `dev/jctl <command>` | Drives an instance through its debug socket (`dev/jctl state`) |
 | `dev/shot <file>` | Captures the window of an instance |
 | `dev/jctl perf`, `dev/jctl pacing` | Frame cost, and how evenly video frames reach the screen |
+| `cargo test --release -p bloom-core` | The tests of the crate with no window alone: a few seconds, no player |
+| `dev/vendor-crates check` | Says whether the vendored crates are the published ones with the patches of `vendor/patches`; `diff` and `upgrade` are in [vendor/README.md](vendor/README.md) |
+
+### The server of a test instance
+
+`dev/run-test` and `dev/smoke` take the server from `BLOOM_TEST_SERVER`:
+
+| Value | Server | For |
+| --- | --- | --- |
+| `live` (default) | The server of your config, read-only | How pages load and paint with a real library |
+| `mock` | `dev/mock-jellyfin`: a fixed library on this Mac, no network, no media files, no dashboard | A check with no server at all; needs `python3` |
+| `container` | `dev/jellyfin-local`: a Jellyfin in a container, with clips that ffmpeg makes | A test that writes to the server, or plays; needs a container engine that answers `docker` |
+
+`dev/jellyfin-local up`, `down` and `reset` start, stop and remove the
+container; its data is in `target/jellyfin-local`.
 
 ### Layout
 
