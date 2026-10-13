@@ -1695,10 +1695,7 @@ mod tests {
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stopping = stop.clone();
             let thread = std::thread::spawn(move || {
-                for mut stream in listener.incoming().flatten() {
-                    if stopping.load(Ordering::SeqCst) {
-                        return;
-                    }
+                for mut stream in crate::test_net::connections(listener, stopping) {
                     let mut buffer = [0u8; 4096];
                     let _ = stream.read(&mut buffer);
                     let _ = stream.write_all(head.as_bytes());
@@ -1718,7 +1715,6 @@ mod tests {
     impl Drop for Sender {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::SeqCst);
-            let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }

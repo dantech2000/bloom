@@ -1400,10 +1400,7 @@ mod tests {
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (count, stopping) = (requests.clone(), stop.clone());
             let thread = std::thread::spawn(move || {
-                for mut stream in listener.incoming().flatten() {
-                    if stopping.load(SeqCst) {
-                        return;
-                    }
+                for mut stream in crate::app::race_harness::connections(listener, stopping) {
                     let mut buf = [0u8; 4096];
                     let _ = stream.read(&mut buf);
                     let n = count.fetch_add(1, SeqCst);
@@ -1427,7 +1424,6 @@ mod tests {
     impl Drop for ImageServer {
         fn drop(&mut self) {
             self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }

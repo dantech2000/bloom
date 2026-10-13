@@ -351,10 +351,7 @@ mod tests {
             let (kept, stopping) = (seen.clone(), stop.clone());
             let thread = thread::spawn(move || {
                 let mut workers = Vec::new();
-                for (n, stream) in listener.incoming().flatten().enumerate() {
-                    if stopping.load(SeqCst) {
-                        break;
-                    }
+                for (n, stream) in crate::test_net::connections(listener, stopping).enumerate() {
                     let kept = kept.clone();
                     let delay = if n == 0 { delay } else { Duration::ZERO };
                     workers.push(thread::spawn(move || serve(stream, kept, delay)));
@@ -380,7 +377,6 @@ mod tests {
     impl Drop for Recorder {
         fn drop(&mut self) {
             self.stop.store(true, SeqCst);
-            let _ = TcpStream::connect(("127.0.0.1", self.port));
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }
