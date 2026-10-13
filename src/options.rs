@@ -52,10 +52,6 @@ pub struct Options {
     /// download stops at this size, and runs no faster than this.
     pub download_limit_bytes: Option<u64>,
     pub download_throttle_bps: Option<u64>,
-    /// `BLOOM_OLD_PACING`, `BLOOM_AUDIO_PACING`: the frame timings of
-    /// before (`src/pacing.rs`); the first wins.
-    pub old_pacing: bool,
-    pub audio_pacing: bool,
     /// `BLOOM_FRAME_PHASE_MS`: when after its tick a video frame is drawn.
     pub frame_phase_ms: Option<u64>,
     /// `BLOOM_PACING_TRACE`: the pacing trace is on from the start.
@@ -91,8 +87,6 @@ impl Options {
             download_dir: path("BLOOM_DOWNLOAD_DIR"),
             download_limit_bytes: number("BLOOM_DOWNLOAD_LIMIT_BYTES"),
             download_throttle_bps: number("BLOOM_DOWNLOAD_THROTTLE_BPS"),
-            old_pacing: set("BLOOM_OLD_PACING"),
-            audio_pacing: set("BLOOM_AUDIO_PACING"),
             frame_phase_ms: number("BLOOM_FRAME_PHASE_MS"),
             pacing_trace: set("BLOOM_PACING_TRACE"),
             pacing_log: path("BLOOM_PACING_LOG"),

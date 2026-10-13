@@ -34,7 +34,7 @@ use serde::Deserialize;
 
 use crate::{
     jellyfin::{Client, Progress, TICKS_PER_SECOND},
-    pacing::{self, DisplayClock, Mode},
+    pacing::{self, DisplayClock},
     video_surface::{self, GlRenderer, VideoFrame},
 };
 
@@ -447,13 +447,6 @@ pub(crate) fn clock_ns() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }
 
-/// `BLOOM_OLD_PACING=1` gives the timing of two changes ago (frames wait
-/// for the timers of the worker and of the UI), to compare with
-/// `dev/jctl pacing`. See `pacing::mode` for the other switches.
-pub fn old_pacing() -> bool {
-    pacing::mode() == Mode::Old
-}
-
 impl Shared {
     fn wake(&self) {
         *self.wake.0.lock().unwrap() = true;
@@ -601,7 +594,7 @@ impl Player {
 
     /// The display drives the frames (see `pacing.rs`), and the clock runs.
     pub fn display_pacing(&self) -> bool {
-        pacing::mode() == Mode::Display && self.shared.clock.lock().unwrap().is_some()
+        self.shared.clock.lock().unwrap().is_some()
     }
 
     /// The UI draws the frames right now: call it from each draw. The
@@ -1162,9 +1155,7 @@ unsafe extern "C" fn on_render_update(ctx: *mut c_void) {
     if !signal.needed.swap(true, Ordering::AcqRel) {
         signal.asked_ns.store(clock_ns(), Ordering::Release);
     }
-    if !old_pacing() {
-        signal.wake();
-    }
+    signal.wake();
 }
 
 /// Makes the next worker fail before it has a core, for a test.
@@ -1245,7 +1236,7 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>) -> Result<()> {
     }));
     let _render = RenderThread::start(mpv.ctx.as_ptr() as usize, signal)?;
     let display_pacing = shared.clock.lock().unwrap().is_some();
-    let _ = mpv.set_property("video-sync", pacing::video_sync(pacing::mode(), false));
+    let _ = mpv.set_property("video-sync", pacing::video_sync(false));
     let mut in_group = false;
     let mut display_fps = 0.;
     let mut sync_checked = Instant::now();
@@ -1485,7 +1476,7 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>) -> Result<()> {
                     let group = shared.in_group.load(Ordering::Relaxed);
                     if in_group != group {
                         in_group = group;
-                        let _ = mpv.set_property("video-sync", pacing::video_sync(pacing::mode(), group));
+                        let _ = mpv.set_property("video-sync", pacing::video_sync(group));
                     }
                     worker.subtitles = req.subtitles.clone();
                     worker.scheduled = None;
@@ -1606,7 +1597,7 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>) -> Result<()> {
                 Cmd::SetGroup(group) => {
                     if in_group != group {
                         in_group = group;
-                        let _ = mpv.set_property("video-sync", pacing::video_sync(pacing::mode(), group));
+                        let _ = mpv.set_property("video-sync", pacing::video_sync(group));
                     }
                 }
                 Cmd::Stop(generation) => {
@@ -1788,16 +1779,14 @@ fn render_loop(mpv_handle: usize, signal: &'static RenderSignal, ready: mpsc::Se
     };
     // The clock of the display: at each tick the swap is reported to mpv,
     // which then hands over the frame for the next refresh.
-    if pacing::mode() == Mode::Display {
-        let on_tick = Box::new(move || {
-            signal.swap_due.store(true, Ordering::Release);
-            signal.wake();
-        });
-        match DisplayClock::start(on_tick) {
-            Ok(clock) => *shared.clock.lock().unwrap() = Some(clock),
-            // Without the clock the frames keep the audio timing.
-            Err(err) => log::warn!("no display link, audio timing for the frames: {err:#}"),
-        }
+    let on_tick = Box::new(move || {
+        signal.swap_due.store(true, Ordering::Release);
+        signal.wake();
+    });
+    match DisplayClock::start(on_tick) {
+        Ok(clock) => *shared.clock.lock().unwrap() = Some(clock),
+        // Without the clock the frames keep the audio timing.
+        Err(err) => log::warn!("no display link, audio timing for the frames: {err:#}"),
     }
     let display_pacing = shared.clock.lock().unwrap().is_some();
     if display_pacing {
@@ -1856,13 +1845,11 @@ fn render_loop(mpv_handle: usize, signal: &'static RenderSignal, ready: mpsc::Se
             }
         }
 
-        // Sleep until mpv asks or the display ticks; only the old timing
-        // wakes this thread with nothing, so only it needs a short wait.
-        let wait = if old_pacing() { Duration::from_millis(4) } else { IDLE_WAIT };
+        // Sleep until mpv asks or the display ticks.
         let (lock, cvar) = &signal.wake;
         let mut flag = lock.lock().unwrap();
         if !*flag && !signal.needed.load(Ordering::Acquire) {
-            let (guard, _) = cvar.wait_timeout(flag, wait).unwrap();
+            let (guard, _) = cvar.wait_timeout(flag, IDLE_WAIT).unwrap();
             flag = guard;
         }
         *flag = false;
@@ -2068,9 +2055,7 @@ fn render_frame(renderer: &mut Renderer, shared: &Shared, skip: bool, synced: bo
     });
     crate::perf::video_frame_rendered(now.saturating_sub(asked) as f64 / 1e6);
     shared.frame_done_ns.store(now, Ordering::Release);
-    if !old_pacing() {
-        let _ = shared.frames.0.try_send(());
-    }
+    let _ = shared.frames.0.try_send(());
     Ok(())
 }
 

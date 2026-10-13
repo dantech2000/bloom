@@ -40,21 +40,19 @@
 //! does not touch the speed of the sound (`display-vdrop`), so the group
 //! correction, which measures the sound, is not fought.
 //!
-//! Switches: `BLOOM_FRAME_PHASE_MS=<ms>` sets the phase (0: the draw at the
-//! next tick, the timing before), `BLOOM_OLD_PACING=1` gives the timing of
-//! two changes ago, `BLOOM_AUDIO_PACING=1` the one before this change
-//! (audio sync, a blocking render call, no display link). `dev/jctl pacing`
-//! measures: the ruler is the time the display showed each frame
-//! ([`trace`]), the `jumps` figure of before counts the draw requests.
+//! One switch: `BLOOM_FRAME_PHASE_MS=<ms>` sets the phase (0: the draw at
+//! the next tick, the timing before). The two timings before that (the
+//! timers of the worker and the UI, and audio sync with a blocking render
+//! call) had switches until 2026-10-12; `git log -S BLOOM_OLD_PACING` finds
+//! their code. `dev/jctl pacing` measures: the ruler is the time the
+//! display showed each frame ([`trace`]), the `jumps` figure of before
+//! counts the draw requests.
 
 use std::{
     cell::Cell,
     ffi::c_void,
     ptr,
-    sync::{
-        OnceLock,
-        atomic::{AtomicU32, AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -62,31 +60,6 @@ use anyhow::{Result, anyhow};
 use gpui_kit::{Context, Window};
 
 use crate::{app::Bloom, macos::send};
-
-/// How the frames are timed; see the module doc.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    /// Timers of the worker and of the UI (two changes ago).
-    Old,
-    /// Audio sync, a blocking render call, a draw on each frame.
-    Audio,
-    /// The display drives: display sync and the display link.
-    Display,
-}
-
-pub fn mode() -> Mode {
-    static MODE: OnceLock<Mode> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        let options = crate::options::options();
-        if options.old_pacing {
-            Mode::Old
-        } else if options.audio_pacing {
-            Mode::Audio
-        } else {
-            Mode::Display
-        }
-    })
-}
 
 /// Where in the refresh period the UI draws a new frame, as a fraction of
 /// the period after the tick of the frame. Measured at 60 Hz: the display
@@ -441,12 +414,8 @@ pub mod phase {
 /// repeats or drops a frame when the two clocks drift (`display-vdrop`).
 /// Alone, mpv resamples the sound by a fraction of a percent instead
 /// (`display-resample`), which is not heard, and no frame is ever dropped.
-pub fn video_sync(mode: Mode, in_group: bool) -> &'static str {
-    match (mode, in_group) {
-        (Mode::Display, false) => "display-resample",
-        (Mode::Display, true) => "display-vdrop",
-        _ => "audio",
-    }
+pub fn video_sync(in_group: bool) -> &'static str {
+    if in_group { "display-vdrop" } else { "display-resample" }
 }
 
 /// The refresh rate to tell mpv, in Hz: the measured one, unless it is more
@@ -548,8 +517,7 @@ pub fn count_rendered(display_synced: bool) {
 /// The counters since the last call.
 pub fn report() -> String {
     format!(
-        "{:?} pacing: held={} late={} repeats_skipped={} unseen={} no_size={} rendered synced={} audio={} | draw phase by ms {:?} | tick intervals by ms {:?} | link lead by ms {:?} | link wake by ms {:?}",
-        mode(),
+        "Display pacing: held={} late={} repeats_skipped={} unseen={} no_size={} rendered synced={} audio={} | draw phase by ms {:?} | tick intervals by ms {:?} | link lead by ms {:?} | link wake by ms {:?}",
         HELD.swap(0, Ordering::Relaxed),
         LATE.swap(0, Ordering::Relaxed),
         REPEATS.swap(0, Ordering::Relaxed),
@@ -1492,10 +1460,8 @@ mod tests {
 
     #[test]
     fn the_sync_mode_follows_the_group() {
-        assert_eq!(video_sync(Mode::Display, false), "display-resample");
-        assert_eq!(video_sync(Mode::Display, true), "display-vdrop");
-        assert_eq!(video_sync(Mode::Audio, false), "audio");
-        assert_eq!(video_sync(Mode::Old, true), "audio");
+        assert_eq!(video_sync(false), "display-resample");
+        assert_eq!(video_sync(true), "display-vdrop");
     }
 
     #[test]
