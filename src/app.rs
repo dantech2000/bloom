@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Root view: session, navigation, background fetching, player polling.
 
+use crate::quality::QualityApi as _;
 use std::{cell::RefCell, collections::HashMap, time::Duration};
 
 use anyhow::Result;
@@ -1152,7 +1153,7 @@ impl Bloom {
         let opened = user_id.to_string();
         self.fetch(
             cx,
-            |client| Ok(client.quality_tag_settings()),
+            |client| Ok(client.quality_prefs()),
             move |this, result, cx| {
                 if let (Ok(Some(settings)), Some(session)) = (result, this.session.as_ref())
                     && session.user_id == opened

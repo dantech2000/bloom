@@ -200,10 +200,11 @@ pub fn request_body(tmdb_id: i64, seasons: &[i64]) -> Value {
     json!({ "mediaType": "tv", "mediaId": tmdb_id, "seasons": seasons })
 }
 
-impl Client {
+#[easy_ext::ext(SeasonsApi)]
+pub(crate) impl Client {
     /// The seasons of a library series against Seerr. `None` when Seerr has
     /// no series for it, or the user has no Seerr account.
-    pub fn season_data(&self, series_id: &str) -> anyhow::Result<Option<Data>> {
+    fn season_data(&self, series_id: &str) -> anyhow::Result<Option<Data>> {
         if !self.seerr_active() {
             return Ok(None);
         }
@@ -246,7 +247,7 @@ impl Client {
     }
 
     /// Asks Seerr for seasons of a series. This starts downloads.
-    pub fn request_seasons(&self, tmdb_id: i64, seasons: &[i64]) -> anyhow::Result<()> {
+    fn request_seasons(&self, tmdb_id: i64, seasons: &[i64]) -> anyhow::Result<()> {
         self.post("/JellyfinEnhanced/jellyseerr/request", &request_body(tmdb_id, seasons))
             .map(drop)
     }

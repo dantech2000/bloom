@@ -107,17 +107,17 @@ impl Client {
     }
 
     /// The HTTP agent, for a request this client has no method for.
-    pub(crate) fn agent(&self) -> &ureq::Agent {
+    pub fn agent(&self) -> &ureq::Agent {
         &self.agent
     }
 
-    pub(crate) fn user(&self) -> Result<&str> {
+    pub fn user(&self) -> Result<&str> {
         self.user_id
             .as_deref()
             .ok_or_else(|| anyhow!("not signed in"))
     }
 
-    pub(crate) fn auth_header(&self) -> String {
+    pub fn auth_header(&self) -> String {
         let device = hostname();
         let mut value = format!(
             "MediaBrowser Client=\"{APP_NAME}\", Device=\"{device}\", DeviceId=\"{}\", Version=\"{APP_VERSION}\"",
@@ -138,7 +138,7 @@ impl Client {
         }
     }
 
-    pub(crate) fn url(&self, path: &str, query: &[(&str, String)]) -> String {
+    pub fn url(&self, path: &str, query: &[(&str, String)]) -> String {
         let mut url = format!("{}{}", self.base, path);
         let mut first = true;
         for (k, v) in query {
@@ -154,7 +154,7 @@ impl Client {
         url
     }
 
-    pub(crate) fn get<T: serde::de::DeserializeOwned>(
+    pub fn get<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
         query: &[(&str, String)],
@@ -173,7 +173,7 @@ impl Client {
             .map_err(|e| map_body_err(e, "decode", path))
     }
 
-    pub(crate) fn post<B: Serialize>(&self, path: &str, body: &B) -> Result<ureq::Body> {
+    pub fn post<B: Serialize>(&self, path: &str, body: &B) -> Result<ureq::Body> {
         let url = self.url(path, &[]);
         let response = self
             .agent
@@ -186,7 +186,7 @@ impl Client {
     }
 
     /// Body-less request (POST/DELETE) that decodes a JSON response.
-    pub(crate) fn send<T: serde::de::DeserializeOwned>(
+    pub fn send<T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
         path: &str,
@@ -209,7 +209,7 @@ impl Client {
     }
 
     /// POST or DELETE with no body, for calls whose answer is empty.
-    pub(crate) fn call(&self, method: &str, path: &str, query: &[(&str, String)]) -> Result<()> {
+    pub fn call(&self, method: &str, path: &str, query: &[(&str, String)]) -> Result<()> {
         let url = self.url(path, query);
         let request = match method {
             "DELETE" => self.agent.delete(&url).force_send_body(),
@@ -223,7 +223,7 @@ impl Client {
     }
 
     /// GET that returns the body as text (log files).
-    pub(crate) fn get_text(&self, path: &str, query: &[(&str, String)]) -> Result<String> {
+    pub fn get_text(&self, path: &str, query: &[(&str, String)]) -> Result<String> {
         let url = self.url(path, query);
         let mut response = self
             .agent
@@ -581,12 +581,6 @@ impl Client {
         }
         let page: Page = self.get(&format!("/MediaSegments/{item_id}"), &[])?;
         Ok(page.items)
-    }
-
-    /// The quality tag settings of the user in the Jellyfin Enhanced plugin:
-    /// tags on, resolution tag, dynamic range tag. `None` without the plugin.
-    pub fn quality_tag_settings(&self) -> Option<(bool, bool, bool)> {
-        self.quality_prefs()
     }
 
     // ----- Seerr, through the Jellyfin Enhanced plugin -----------------------
@@ -975,7 +969,7 @@ pub fn reconnected() {
 /// True when two URLs have the same scheme, host and port; false when one
 /// of them is no `http(s)` URL. The session header goes with a request only
 /// when its URL has the origin of the server.
-pub(crate) fn same_origin(a: &str, b: &str) -> bool {
+pub fn same_origin(a: &str, b: &str) -> bool {
     match (origin_of(a), origin_of(b)) {
         (Some(x), Some(y)) => x == y,
         _ => false,
@@ -1534,12 +1528,6 @@ impl Item {
             Some(end) if end != start => Some(format!("{start} - {end}")),
             _ => Some(start.to_string()),
         }
-    }
-
-    /// Quality tags of the file, as Jellyfin Enhanced shows them on a poster
-    /// (resolution, codec, range, audio, ...); the rules are in `quality`.
-    pub fn quality_labels(&self) -> Vec<String> {
-        crate::quality::labels(self)
     }
 
     /// The streams of one kind ("Video", "Audio", "Subtitle") in file order.

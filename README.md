@@ -103,13 +103,13 @@ Servers, profiles, access tokens and downloads are in
 | `src/views/` | Screens: sign-in, shell, home, library, detail, player |
 | `src/player.rs`, `src/pacing.rs`, `src/video_surface.rs` | The libmpv worker, the render thread and display sync |
 | `src/stream.rs`, `src/adaptive.rs` | Playback negotiation, quality, transcoding |
-| `src/syncplay/` | SyncPlay: protocol, clock, drift control, session |
+| `src/syncplay/` | SyncPlay: the session with the player, and the panel |
 | `src/cast/`, `src/chromecast/`, `src/airplay/` | Playing on other devices |
 | `src/downloads/` | Offline downloads |
 | `src/admin/`, `src/settings/`, `src/metadata/` | Dashboard, user settings, metadata editor |
-| `src/jellyfin.rs`, `src/realtime.rs` | REST client and the server socket |
+| `core/` | The crate with no window: REST client (`jellyfin.rs`), the server socket, the config, and the state machines of SyncPlay, Cast and the connection |
 | `src/ui/` | Components from the gpuicn registry, as editable source |
-| `src/brand.rs` | The name of the app, in one place |
+| `core/src/brand.rs` | The name of the app, in one place |
 | `src/debug.rs` | The debug channel |
 | `dev/` | Scripts |
 | `vendor/gpui-pre-apple` | GPUI's macOS backend with two patches (backdrop blur, BGRA surfaces) |

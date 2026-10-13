@@ -136,10 +136,11 @@ pub struct State {
     remote_activity: Option<Instant>,
 }
 
-impl Client {
+#[easy_ext::ext(EnhancedApi)]
+pub(crate) impl Client {
     /// Settings of the user in the Jellyfin Enhanced plugin. `None` when the
     /// server has no such plugin.
-    pub fn enhanced_settings(&self) -> Option<Settings> {
+    fn enhanced_settings(&self) -> Option<Settings> {
         let public: Value = self.get("/JellyfinEnhanced/public-config", &[]).ok()?;
         let user = self.user().ok()?.to_string();
         let own: Value = self
@@ -613,7 +614,7 @@ impl Bloom {
             .map(|extras| extras.links.as_slice())
             .unwrap_or_default();
         let tags = if crate::jellyfin::quality_tags() {
-            item.quality_labels()
+            crate::quality::labels(item)
         } else {
             Vec::new()
         };

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Builds target/<name>.app from the binary of the `ship` profile (the name
-# is in src/brand.rs), so the app has its icon and name in the Dock,
+# is in core/src/brand.rs), so the app has its icon and name in the Dock,
 # Launchpad and the menu bar. Build it first: `cargo build --profile ship`
 # (`BLOOM_BUNDLE_BIN` names another binary, such as target/release/bloom).
 # libmpv (one library with FFmpeg and the rest linked in, see dev/build-mpv)
@@ -8,14 +8,14 @@
 dir=$(cd "$(dirname "$0")/.." && pwd)
 bin=${BLOOM_BUNDLE_BIN:-$dir/target/ship/bloom}
 [ -f "$bin" ] || { echo "no binary at $bin; run: cargo build --profile ship" >&2; exit 1; }
-name=$(sed -n 's/^pub const NAME: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
-folder=$(sed -n 's/^pub const FOLDER: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
-tagline=$(sed -n 's/^pub const TAGLINE: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
-# The updater: the feed and the public key of src/brand.rs. The two
+name=$(sed -n 's/^pub const NAME: &str = "\(.*\)";/\1/p' "$dir/core/src/brand.rs")
+folder=$(sed -n 's/^pub const FOLDER: &str = "\(.*\)";/\1/p' "$dir/core/src/brand.rs")
+tagline=$(sed -n 's/^pub const TAGLINE: &str = "\(.*\)";/\1/p' "$dir/core/src/brand.rs")
+# The updater: the feed and the public key of core/src/brand.rs. The two
 # variables replace them for a test with a feed on this Mac.
-feed=${BLOOM_UPDATE_FEED:-$(sed -n 's/^pub const UPDATE_FEED: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")}
-key=${BLOOM_UPDATE_KEY:-$(sed -n 's/^pub const UPDATE_PUBLIC_KEY: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")}
-[ -n "$name" ] && [ -n "$folder" ] || { echo "no name in src/brand.rs" >&2; exit 1; }
+feed=${BLOOM_UPDATE_FEED:-$(sed -n 's/^pub const UPDATE_FEED: &str = "\(.*\)";/\1/p' "$dir/core/src/brand.rs")}
+key=${BLOOM_UPDATE_KEY:-$(sed -n 's/^pub const UPDATE_PUBLIC_KEY: &str = "\(.*\)";/\1/p' "$dir/core/src/brand.rs")}
+[ -n "$name" ] && [ -n "$folder" ] || { echo "no name in core/src/brand.rs" >&2; exit 1; }
 app="$dir/target/$name.app"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$dir/Cargo.toml" | head -1)
 rm -rf "$app"

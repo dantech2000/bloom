@@ -33,7 +33,7 @@ steals it, that person can push an update to every installed app.
    ```sh
    echo check > /tmp/key-check.txt
    sig=$(vendor/sparkle/bin/sign_update --ed-key-file ~/sparkle-ed-key.txt -p /tmp/key-check.txt)
-   pub=$(sed -n 's/^pub const UPDATE_PUBLIC_KEY: &str = "\(.*\)";/\1/p' src/brand.rs)
+   pub=$(sed -n 's/^pub const UPDATE_PUBLIC_KEY: &str = "\(.*\)";/\1/p' core/src/brand.rs)
    swift dev/verify-update.swift "$pub" /tmp/key-check.txt "$sig" && echo MATCH
    rm /tmp/key-check.txt
    ```
@@ -235,7 +235,7 @@ number.
 - Never make a test release "latest". A test is a draft or a run on a branch.
 - Never print the private key, paste it in a chat, an issue, or a commit, or
   save it in the repository.
-- Never change `UPDATE_PUBLIC_KEY` in `src/brand.rs` without a plan. Installed
+- Never change `UPDATE_PUBLIC_KEY` in `core/src/brand.rs` without a plan. Installed
   apps reject updates that the new key signs.
 - Never change a workflow to start on `pull_request_target` or on a tag push,
   or to give a secret to a pull request.
@@ -255,7 +255,7 @@ number.
 - A tag push does not start a release. The workflow makes the tag.
 - The workflow checks that CI passed on the commit, that the version is new
   and in `Cargo.toml`, and that the signature verifies with the public key in
-  `src/brand.rs`. A wrong key stops the run before it publishes.
+  `core/src/brand.rs`. A wrong key stops the run before it publishes.
 - Anyone with write access to the repository can start a run on `main`, but
   the run waits for your approval.
 

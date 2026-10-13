@@ -5,9 +5,9 @@
 # a copy of the binary, the icon, and a link to vendor/ for the libraries
 # (dev/bundle makes the complete app).
 dir=$(cd "$(dirname "$0")/.." && pwd)
-name=$(sed -n 's/^pub const NAME: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
-folder=$(sed -n 's/^pub const FOLDER: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
-[ -n "$name" ] && [ -n "$folder" ] || { echo "no name in src/brand.rs" >&2; exit 1; }
+name=$(sed -n 's/^pub const NAME: &str = "\(.*\)";/\1/p' "$dir/core/src/brand.rs")
+folder=$(sed -n 's/^pub const FOLDER: &str = "\(.*\)";/\1/p' "$dir/core/src/brand.rs")
+[ -n "$name" ] && [ -n "$folder" ] || { echo "no name in core/src/brand.rs" >&2; exit 1; }
 app="$dir/target/dev/$name.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 /bin/cp -c "$dir/target/release/bloom" "$app/Contents/MacOS/$name" 2>/dev/null ||

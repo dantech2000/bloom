@@ -178,7 +178,8 @@ struct Created {
     id: String,
 }
 
-impl Client {
+#[easy_ext::ext(ListsApi)]
+pub(crate) impl Client {
     fn list_query(&self, kind: &str) -> Result<Vec<Item>> {
         let user = self.user()?.to_string();
         let result: crate::jellyfin::ItemsResult = self.get(
@@ -195,15 +196,15 @@ impl Client {
         Ok(result.items)
     }
 
-    pub fn playlists(&self) -> Result<Vec<Item>> {
+    fn playlists(&self) -> Result<Vec<Item>> {
         self.list_query("Playlist")
     }
 
-    pub fn collections(&self) -> Result<Vec<Item>> {
+    fn collections(&self) -> Result<Vec<Item>> {
         self.list_query("BoxSet")
     }
 
-    pub fn playlist_entries(&self, list: &str) -> Result<Vec<Entry>> {
+    fn playlist_entries(&self, list: &str) -> Result<Vec<Entry>> {
         let user = self.user()?.to_string();
         let entries: Entries = self.get(
             &format!("/Playlists/{list}/Items"),
@@ -220,7 +221,7 @@ impl Client {
         self.call(req.method, &req.path, &req.query)
     }
 
-    pub fn create_playlist(&self, name: &str, ids: &[String]) -> Result<String> {
+    fn create_playlist(&self, name: &str, ids: &[String]) -> Result<String> {
         let user = self.user()?.to_string();
         let mut body = self.post("/Playlists", &create_playlist_body(name, ids, &user))?;
         let created: Created = body.read_json()?;
@@ -228,42 +229,42 @@ impl Client {
         Ok(created.id)
     }
 
-    pub fn add_to_playlist(&self, list: &str, ids: &[String]) -> Result<()> {
+    fn add_to_playlist(&self, list: &str, ids: &[String]) -> Result<()> {
         let user = self.user()?.to_string();
         self.run(add_to_playlist_req(list, ids, &user))
     }
 
-    pub fn remove_from_playlist(&self, list: &str, entry_ids: &[String]) -> Result<()> {
+    fn remove_from_playlist(&self, list: &str, entry_ids: &[String]) -> Result<()> {
         self.run(remove_from_playlist_req(list, entry_ids))
     }
 
-    pub fn move_in_playlist(&self, list: &str, entry_id: &str, new_index: usize) -> Result<()> {
+    fn move_in_playlist(&self, list: &str, entry_id: &str, new_index: usize) -> Result<()> {
         self.run(move_in_playlist_req(list, entry_id, new_index))
     }
 
-    pub fn rename_playlist(&self, list: &str, name: &str) -> Result<()> {
+    fn rename_playlist(&self, list: &str, name: &str) -> Result<()> {
         self.post(&format!("/Playlists/{list}"), &rename_playlist_body(name))?;
         Ok(())
     }
 
-    pub fn create_collection(&self, name: &str, ids: &[String]) -> Result<String> {
+    fn create_collection(&self, name: &str, ids: &[String]) -> Result<String> {
         let req = create_collection_req(name, ids);
         let created: Created = self.send(req.method, &req.path, &req.query)?;
         ensure!(!created.id.is_empty(), "the server sent no id for the collection");
         Ok(created.id)
     }
 
-    pub fn add_to_collection(&self, list: &str, ids: &[String]) -> Result<()> {
+    fn add_to_collection(&self, list: &str, ids: &[String]) -> Result<()> {
         self.run(add_to_collection_req(list, ids))
     }
 
-    pub fn remove_from_collection(&self, list: &str, ids: &[String]) -> Result<()> {
+    fn remove_from_collection(&self, list: &str, ids: &[String]) -> Result<()> {
         self.run(remove_from_collection_req(list, ids))
     }
 
     /// Deletes a playlist or a collection, and nothing else. The server
     /// says what the item is; the caller's word for it is not trusted.
-    pub fn delete_list(&self, id: &str) -> Result<()> {
+    fn delete_list(&self, id: &str) -> Result<()> {
         let item = self.item(id)?;
         ensure!(
             is_deletable_kind(&item.kind),
@@ -275,7 +276,7 @@ impl Client {
     }
 
     /// Whether the user may make collections.
-    pub fn can_collect(&self) -> Result<bool> {
+    fn can_collect(&self) -> Result<bool> {
         #[derive(Deserialize)]
         #[serde(rename_all = "PascalCase")]
         struct Me {

@@ -3,7 +3,7 @@
 # person on a Mac and the release workflow of GitHub Actions both run.
 #
 #   dev/release key                  prints the public key for UPDATE_PUBLIC_KEY
-#                                    in src/brand.rs. The private key is made
+#                                    in core/src/brand.rs. The private key is made
 #                                    once and stays in the macOS Keychain.
 #   dev/release <version> [options]  sets the version in Cargo.toml, builds the
 #                                    app bundle, and writes into target/dist the
@@ -18,7 +18,7 @@
 #
 # Options:
 #   --appcast <path|https url|latest>  The feed so far ("latest": the feed of
-#                               the newest release, UPDATE_FEED of src/brand.rs): the entries in it are kept
+#                               the newest release, UPDATE_FEED of core/src/brand.rs): the entries in it are kept
 #                               as they are and the new one is added. Use the
 #                               address of the feed of the newest release.
 #                               Fails when <version> is in it already, or is
@@ -47,12 +47,12 @@
 # the file is missing or empty.
 # Nothing is committed, tagged or uploaded. BLOOM_UPDATE_URL_PREFIX names the
 # place the archive is served from, BLOOM_UPDATE_KEY and BLOOM_UPDATE_FEED
-# replace the public key and the feed of src/brand.rs (all three for a test).
+# replace the public key and the feed of core/src/brand.rs (all three for a test).
 dir=$(cd "$(dirname "$0")/.." && pwd)
 "$dir/dev/vendor-sparkle" || exit 1
 tools="$dir/vendor/sparkle/bin"
-name=$(sed -n 's/^pub const NAME: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
-feed=$(sed -n 's/^pub const UPDATE_FEED: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")
+name=$(sed -n 's/^pub const NAME: &str = "\(.*\)";/\1/p' "$dir/core/src/brand.rs")
+feed=$(sed -n 's/^pub const UPDATE_FEED: &str = "\(.*\)";/\1/p' "$dir/core/src/brand.rs")
 # https://github.com/<owner>/<repo>/releases/latest/download/appcast.xml
 repo=$(echo "$feed" | sed -n 's|^https://github.com/\([^/]*/[^/]*\)/releases/.*|\1|p')
 dist="$dir/target/dist"
@@ -102,8 +102,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ "$appcast" = latest ] && appcast=$feed
-key=${BLOOM_UPDATE_KEY:-$(sed -n 's/^pub const UPDATE_PUBLIC_KEY: &str = "\(.*\)";/\1/p' "$dir/src/brand.rs")}
-[ -n "$key" ] || die "UPDATE_PUBLIC_KEY in src/brand.rs is empty; run dev/release key first"
+key=${BLOOM_UPDATE_KEY:-$(sed -n 's/^pub const UPDATE_PUBLIC_KEY: &str = "\(.*\)";/\1/p' "$dir/core/src/brand.rs")}
+[ -n "$key" ] || die "UPDATE_PUBLIC_KEY in core/src/brand.rs is empty; run dev/release key first"
 if [ -n "$keyfile" ] && [ "$stage" != build ] && [ "$stage" != check ]; then
   [ -f "$keyfile" ] || die "no key file at $keyfile"
   case $(/usr/bin/stat -f %Lp "$keyfile") in

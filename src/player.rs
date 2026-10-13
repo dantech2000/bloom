@@ -11,6 +11,7 @@
 //! server does not hold up the playback loop. The timing of the frames is
 //! described in `pacing.rs`.
 
+use crate::stream::StreamApi as _;
 use std::{
     ffi::c_void,
     ptr,

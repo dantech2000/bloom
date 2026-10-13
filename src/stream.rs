@@ -440,16 +440,17 @@ fn request_body(client: &Client, load: &Load, max_bitrate: Option<u64>) -> serde
     body
 }
 
-impl Client {
+#[easy_ext::ext(StreamApi)]
+pub(crate) impl Client {
     /// Asks the server how to play an item.
-    pub fn playback_info(&self, load: &Load, max_bitrate: Option<u64>) -> Result<PlaybackInfo> {
+    fn playback_info(&self, load: &Load, max_bitrate: Option<u64>) -> Result<PlaybackInfo> {
         let path = format!("/Items/{}/PlaybackInfo", load.item_id);
         let mut body = self.post(&path, &request_body(self, load, max_bitrate))?;
         body.read_json().context("decode PlaybackInfo")
     }
 
     /// Ends the transcode of a play session on the server.
-    pub fn stop_encoding(&self, play_session_id: &str) -> Result<()> {
+    fn stop_encoding(&self, play_session_id: &str) -> Result<()> {
         self.call(
             "DELETE",
             "/Videos/ActiveEncodings",

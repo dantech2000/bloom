@@ -17,13 +17,11 @@
 
 pub mod debug;
 pub mod jellyfin;
-pub mod mdns;
-pub mod messages;
+pub use bloom_core::chromecast::{mdns, messages, proto};
 /// The fake device of the tests; the app runs it as well when
 /// `BLOOM_CHROMECAST_MOCK` is set, so the panel can be driven against it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod mock;
-pub mod proto;
 pub mod session;
 
 /// What the app keeps: the search, the one connection, and the last events

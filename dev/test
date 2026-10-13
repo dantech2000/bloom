@@ -6,7 +6,10 @@ cd "$(dirname "$0")/.." || exit 1
 # early without it: a run with no ffmpeg would pass without playing a frame.
 command -v ffmpeg >/dev/null 2>&1 ||
   { echo "dev/test: ffmpeg is not in PATH; the playback tests need it" >&2; exit 1; }
-# The lights helper (lights/) is a program of its own with its own tests:
-# they run first, in a run of everything.
+# The lights helper (lights/) is a program of its own with its own tests,
+# and the parts of the app with no window are a crate of their own (core/):
+# both run first, in a run of everything. A filter runs in the app and in
+# the core, as a test of either can match it.
 [ $# -gt 0 ] || cargo test --release -p bloom-lights || exit 1
+cargo test --release -p bloom-core "$@" || exit 1
 exec cargo test --release --bin bloom "$@"

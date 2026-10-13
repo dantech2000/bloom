@@ -311,6 +311,7 @@ struct Loaded {
     last_login: Option<String>,
 }
 
+#[easy_ext::ext(SettingsApi)]
 impl Client {
     fn user_prefs(&self) -> Result<Loaded> {
         let user = self.user()?.to_string();
