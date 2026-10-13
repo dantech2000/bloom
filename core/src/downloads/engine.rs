@@ -2244,6 +2244,11 @@ mod tests {
         // Once for each width a page asks for, each time with the file.
         assert_eq!(seeded("art1"), 6);
         assert!(SEEDED.lock().unwrap().iter().all(|(_, path)| *path == poster));
+        // The image loader asks for the file by the URL of the server.
+        let url = |id: &str, kind: &str| format!("http://127.0.0.1:{}/Items/{id}/Images/{kind}?tag=t1&fillWidth=320", mock.port);
+        assert_eq!(kept.local_image(&url("art1", "Primary")), Some(poster));
+        assert_eq!(kept.local_image(&url("art1", "Logo")), None, "a kind the engine does not keep");
+        assert_eq!(kept.local_image(&url("art9", "Primary")), None, "an item that is not downloaded");
         let _ = fs::remove_dir_all(dir);
 
         let dir = temp_dir("art-refused");
@@ -2252,6 +2257,7 @@ mod tests {
         refused.add(&item("art2")).unwrap();
         wait_state(&refused, "art2", EntryState::Done);
         assert!(!refused.folder("art2").unwrap().join(POSTER_FILE).exists(), "a refused answer was kept");
+        assert_eq!(refused.local_image(&url("art2", "Primary")), None);
         assert_eq!(seeded("art2"), 0);
         let _ = fs::remove_dir_all(dir);
     }

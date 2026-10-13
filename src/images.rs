@@ -455,7 +455,88 @@ pub fn prewarm(urls: Vec<String>, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    use gpui_kit::TestAppContext;
+
     use super::*;
+    use crate::app::race_harness::MockServer;
+
+    /// A sheet of two tiles side by side, red and blue. The loader draws
+    /// it 800 by 400.
+    const SHEET: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><rect width="2" height="2" fill="#ff0000"/><rect x="2" width="2" height="2" fill="#0000ff"/></svg>"##;
+    const RED: [u8; 4] = [0, 0, 255, 255];
+    const BLUE: [u8; 4] = [255, 0, 0, 255];
+
+    /// Answers a path under `/art/` with the sheet and all else with 404.
+    /// The URLs have no tag, so nothing goes to the cache on disk.
+    fn art_server() -> MockServer {
+        MockServer::start(|_, path, _| match path.starts_with("/art/") {
+            true => (200, SHEET.to_string()),
+            false => (404, String::new()),
+        })
+    }
+
+    fn size(image: &RenderImage) -> (i32, i32) {
+        (image.size(0).width.0, image.size(0).height.0)
+    }
+
+    /// The path of a poster on a page: the first ask starts one download,
+    /// a paint meanwhile starts no second one, and the next ask has the
+    /// image, as the pixels GPUI paints.
+    #[gpui_kit::test]
+    fn an_image_asked_for_arrives_after_one_request(cx: &mut TestAppContext) {
+        let server = art_server();
+        let url = format!("{}/art/poster", server.url);
+        assert!(cx.update(|cx| image(&url, cx)).is_none());
+        assert!(cx.update(|cx| image(&url, cx)).is_none());
+        cx.run_until_parked();
+        let poster = cx.update(|cx| image(&url, cx)).expect("the image after its download");
+        assert_eq!(size(&poster), (800, 400));
+        assert_eq!(&poster.as_bytes(0).unwrap()[..4], &RED);
+        assert_eq!(server.count("GET", "/art/poster"), 1);
+    }
+
+    /// A 404 does not get better: the image is not asked for again.
+    #[gpui_kit::test]
+    fn an_image_the_server_does_not_have_is_asked_for_once(cx: &mut TestAppContext) {
+        let server = art_server();
+        let url = format!("{}/none/poster", server.url);
+        for _ in 0..3 {
+            assert!(cx.update(|cx| image(&url, cx)).is_none());
+            cx.run_until_parked();
+        }
+        assert_eq!(server.count("GET", "/none/poster"), 1);
+    }
+
+    /// The preview frames of the timeline: the sheet is fetched once, and
+    /// each tile is its own part of it.
+    #[gpui_kit::test]
+    fn the_tiles_of_a_sheet_come_from_one_download(cx: &mut TestAppContext) {
+        let server = art_server();
+        let url = format!("{}/art/sheet", server.url);
+        assert!(cx.update(|cx| tile(&url, (2, 1), (1, 0), cx)).is_none());
+        cx.run_until_parked();
+        for (column, colour) in [(1, BLUE), (0, RED)] {
+            let frame = cx.update(|cx| tile(&url, (2, 1), (column, 0), cx)).expect("a tile of the sheet");
+            assert_eq!(size(&frame), (400, 400));
+            assert!(frame.as_bytes(0).unwrap().chunks_exact(4).all(|pixel| pixel == colour), "tile {column}");
+        }
+        assert_eq!(server.count("GET", "/art/sheet"), 1);
+    }
+
+    /// The preload of the sheets: the bytes are fetched ahead, and the ask
+    /// for the image then needs no request.
+    #[gpui_kit::test]
+    fn a_preloaded_image_needs_no_second_request(cx: &mut TestAppContext) {
+        let server = art_server();
+        let url = format!("{}/art/ahead", server.url);
+        cx.update(|cx| preload(vec![url.clone()], cx));
+        cx.run_until_parked();
+        assert_eq!(server.count("GET", "/art/ahead"), 1);
+        assert!(cx.update(|cx| image(&url, cx)).is_none());
+        cx.run_until_parked();
+        assert!(cx.update(|cx| image(&url, cx)).is_some());
+        assert_eq!(server.count("GET", "/art/ahead"), 1);
+    }
 
     /// `prewarm` and `cancel_prewarm` move the number of the app on: the
     /// run before them is not the current one any more.

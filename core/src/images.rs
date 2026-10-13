@@ -1281,6 +1281,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The artwork of a download shows without the server: the loader asks
+    /// the lookup of the app before the network. Nothing listens on the
+    /// port, so an image the lookup does not know fails.
+    #[test]
+    fn the_artwork_of_a_download_comes_from_its_file_without_the_server() {
+        static POSTER: OnceLock<PathBuf> = OnceLock::new();
+        fn lookup(url: &str) -> Option<PathBuf> {
+            url.contains("/Items/downloaded/").then(|| POSTER.get().cloned()).flatten()
+        }
+        let dir = cache_dir("local");
+        let poster = dir.join("poster.png");
+        std::fs::write(&poster, png(4)).unwrap();
+        POSTER.set(poster).unwrap();
+        set_local_image(lookup);
+        let agent = plain_agent();
+        let image = download_in(&agent, "http://127.0.0.1:9/Items/downloaded/Images/Primary?tag=t1", None)
+            .expect("the poster of the download");
+        assert_eq!(image.dimensions(), (4, 4));
+        assert_eq!(fetch_bytes_in(&agent, "http://127.0.0.1:9/Items/downloaded/Images/Primary", None).unwrap(), png(4));
+        assert!(download_in(&agent, "http://127.0.0.1:9/Items/other/Images/Primary?tag=t1", None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The bytes for the Now Playing tile and the preload: a page under
     /// the name of an image in the cache goes, and a page of the network
     /// is not kept.
