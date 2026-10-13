@@ -281,7 +281,7 @@ fn create(app: &mut Bloom, name: String, cx: &mut Context<Bloom>) {
         move |this, result, cx| {
             match result {
                 Ok(Some(value)) if matches!(this.page, crate::app::Page::Admin(_)) => {
-                    this.admin_secret = Some(Secret {
+                    this.dialogs.secret = Some(Secret {
                         title: format!("API key for {shown}"),
                         message: "Copy the key now and keep it in a safe place.".to_string(),
                         value,

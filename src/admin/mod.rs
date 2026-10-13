@@ -184,6 +184,20 @@ enum Loaded {
     Config(Section, config::Data),
 }
 
+/// The loads of the live part of the dashboard. One timer serves the app,
+/// whichever dashboard page is open, so this is the app's and not a page's.
+#[derive(Default)]
+pub struct Live {
+    /// A load is on its way: the timer starts no second one behind it, so a
+    /// slow server does not collect requests.
+    pub(crate) busy: bool,
+    /// Names the load on its way: only its own answer ends the wait, not a
+    /// late one of a session or a page before.
+    pub(crate) load: u64,
+    /// Timer that loads the live part again.
+    pub(crate) tick: Option<gpui_kit::Task<()>>,
+}
+
 /// State of the admin page. The data of a section stays when the user goes to
 /// another section, so a visit back shows it at once while it loads again.
 pub struct AdminData {
@@ -292,10 +306,10 @@ impl Bloom {
                 data.section = section;
                 data.error = None;
                 // A question of the section before goes with it.
-                self.admin_confirm = None;
-                self.admin_prompt = None;
-                self.admin_prompt_fresh = false;
-                self.admin_secret = None;
+                self.dialogs.confirm = None;
+                self.dialogs.prompt = None;
+                self.dialogs.prompt_fresh = false;
+                self.dialogs.secret = None;
                 // A click in the list of sections shows the list of the
                 // section; an editor with edits that are not saved stays.
                 data.triggers = None;
@@ -373,10 +387,10 @@ impl Bloom {
     /// Keeps the dashboard current while it is open. The loop ends by itself
     /// when the user leaves the admin page.
     pub fn start_admin_tick(&mut self, cx: &mut Context<Self>) {
-        if self.admin_tick.is_some() {
+        if self.admin_live.tick.is_some() {
             return;
         }
-        self.admin_tick = Some(cx.spawn(async move |this, cx| {
+        self.admin_live.tick = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(LIVE_INTERVAL).await;
                 let open = this.update(cx, |this, cx| {
@@ -384,7 +398,7 @@ impl Bloom {
                     if open && this.playing.is_none() {
                         this.refresh_admin(cx);
                     } else if !open {
-                        this.admin_tick = None;
+                        this.admin_live.tick = None;
                     }
                     open
                 });
@@ -402,7 +416,7 @@ impl Bloom {
             return;
         };
         // The poll waits while the server is offline; recovery loads the page.
-        if data.loading || crate::connection::is_offline() || self.admin_live_busy {
+        if data.loading || crate::connection::is_offline() || self.admin_live.busy {
             return;
         }
         // The sections with a live part; each of their loads below ends
@@ -415,9 +429,9 @@ impl Bloom {
         if !live || self.session.is_none() {
             return;
         }
-        self.admin_live_busy = true;
-        self.admin_live_load += 1;
-        let load = self.admin_live_load;
+        self.admin_live.busy = true;
+        self.admin_live.load += 1;
+        let load = self.admin_live.load;
         let generation = self.generation;
         // A load that brings the same data back causes no redraw; see
         // `AdminData::redraw_due`.
@@ -429,8 +443,8 @@ impl Bloom {
                     cx,
                     |client| tasks::load(&client),
                     move |this, result, cx| {
-                        if this.admin_live_load == load {
-                    this.admin_live_busy = false;
+                        if this.admin_live.load == load {
+                    this.admin_live.busy = false;
                 }
                         if let (Page::Admin(data), Ok(tasks)) = (&mut this.page, result)
                             && this.generation == generation
@@ -454,8 +468,8 @@ impl Bloom {
                     cx,
                     move |client| libraries::refresh(&client, &previous),
                     move |this, result, cx| {
-                        if this.admin_live_load == load {
-                    this.admin_live_busy = false;
+                        if this.admin_live.load == load {
+                    this.admin_live.busy = false;
                 }
                         if let (Page::Admin(data), Ok(libraries)) = (&mut this.page, result)
                             && this.generation == generation
@@ -475,8 +489,8 @@ impl Bloom {
             cx,
             |client| dashboard::refresh(&client),
             move |this, result, cx| {
-                if this.admin_live_load == load {
-                    this.admin_live_busy = false;
+                if this.admin_live.load == load {
+                    this.admin_live.busy = false;
                 }
                 if this.generation != generation {
                     return;
@@ -498,7 +512,7 @@ impl Bloom {
     pub fn ask_confirm(&mut self, confirm: Confirm, cx: &mut Context<Self>) {
         // One popup at a time: a panel does not stay beside the question.
         self.close_panels();
-        self.admin_confirm = Some(confirm);
+        self.dialogs.confirm = Some(confirm);
         cx.notify();
     }
 
@@ -660,7 +674,7 @@ impl Bloom {
 
     /// The question dialog over the page.
     pub(crate) fn render_confirm(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
-        let confirm = self.admin_confirm.clone()?;
+        let confirm = self.dialogs.confirm.clone()?;
         let t = UiTheme::read(cx).clone();
         let run = confirm.run.clone();
         Some(
@@ -677,7 +691,7 @@ impl Bloom {
                 .occlude()
                 // A click beside the dialog closes it.
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.admin_confirm = None;
+                    this.dialogs.confirm = None;
                     cx.notify();
                 }))
                 .child(
@@ -716,7 +730,7 @@ impl Bloom {
                                 .child(
                                     button("admin.confirm.cancel", "Cancel", ButtonKind::Plain, cx)
                                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            this.admin_confirm = None;
+                                            this.dialogs.confirm = None;
                                             cx.notify();
                                         })),
                                 )
@@ -733,7 +747,7 @@ impl Bloom {
                                     )
                                     .on_click(cx.listener(
                                         move |this, _: &ClickEvent, _, cx| {
-                                            this.admin_confirm = None;
+                                            this.dialogs.confirm = None;
                                             run(this, cx);
                                             cx.notify();
                                         },
@@ -1063,13 +1077,13 @@ mod live_tests {
             this.refresh_admin(cx);
             this.refresh_admin(cx);
             this.refresh_admin(cx);
-            assert!(this.admin_live_busy);
+            assert!(this.admin_live.busy);
         });
         cx.run_until_parked();
         assert_eq!(server.count("GET", "/ScheduledTasks"), 1);
         // The answer is in: the next tick loads again.
         bloom.update(cx, |this, cx| {
-            assert!(!this.admin_live_busy);
+            assert!(!this.admin_live.busy);
             this.refresh_admin(cx);
         });
         cx.run_until_parked();
