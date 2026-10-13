@@ -9,6 +9,7 @@ pub mod brand;
 pub mod chromecast;
 pub mod config;
 pub mod connection;
+pub mod downloads;
 pub mod jellyfin;
 pub mod news;
 pub mod options;
