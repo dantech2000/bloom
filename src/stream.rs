@@ -576,9 +576,11 @@ pub fn resolve(
         .filter(|s| s.kind == "Subtitle" && s.delivery_method.as_deref() == Some("External"))
         .filter_map(|s| {
             let url = s.delivery_url.as_deref()?;
+            // The player sends the token in a header; the key in the
+            // address would show in a log.
             Some(ExternalSub {
                 index: s.index,
-                url: format!("{}{url}", client.base),
+                url: format!("{}{}", client.base, without_key(url)),
                 title: s.title(),
                 language: s.language.clone().unwrap_or_default(),
             })
@@ -1227,6 +1229,7 @@ mod tests {
         assert_eq!(resolved.external_subs.len(), 1);
         assert_eq!(resolved.external_subs[0].index, 2);
         assert!(resolved.external_subs[0].url.starts_with("https://media.example.com/Videos/"));
+        assert!(!resolved.external_subs[0].url.contains("ApiKey="), "the key stays out of the address");
         assert_eq!(resolved.selected_external, Some(2));
         assert_eq!(resolved.sid_of_external(2), Some(1));
         assert_eq!(resolved.subtitle_of(1), Some(2));

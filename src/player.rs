@@ -14,6 +14,7 @@
 use crate::stream::StreamApi as _;
 use std::{
     ffi::c_void,
+    path::PathBuf,
     ptr,
     sync::{
         Arc, Condvar, Mutex, OnceLock,
@@ -236,6 +237,8 @@ enum Cmd {
     SetGroup(bool),
     /// Stops the item, with the load count at the stop (see [`Player::stop`]).
     Stop(u64),
+    /// A subtitle file of the load `generation` came (see `fetch_subtitles`).
+    AddSubtitle { generation: u64, path: PathBuf, select: bool, title: String, lang: String },
     /// Reads an mpv property on the worker (`dev/jctl mpv <name>`, tests).
     Probe(String, mpsc::Sender<String>),
 }
@@ -846,6 +849,7 @@ impl Player {
         for cmd in settings {
             let _ = tx.send(cmd);
         }
+        let worker_tx = tx.clone();
         *slot = Some(tx);
         {
             let mut players = PLAYERS.lock().unwrap();
@@ -857,7 +861,7 @@ impl Player {
         thread::Builder::new()
             .name("mpv".into())
             .spawn(move || {
-                if let Err(err) = run(shared.clone(), &rx) {
+                if let Err(err) = run(shared.clone(), &rx, worker_tx) {
                     log::error!("mpv worker failed: {err:#}");
                     let mut status = shared.status.lock().unwrap();
                     status.error = Some(format!("{err:#}"));
@@ -1058,6 +1062,82 @@ pub(crate) fn spawn_reporter() -> mpsc::Sender<Report> {
     tx
 }
 
+/// How long a subtitle file may take to come. The server makes a text
+/// subtitle of a transcode at the first request for it, out of the whole
+/// file: about 80 s for a 9 GB episode (measured 2026-10-17).
+const SUBTITLE_WAIT: Duration = Duration::from_secs(180);
+/// A subtitle file larger than this is not one.
+const SUBTITLE_LIMIT: u64 = 32 * 1024 * 1024;
+
+/// Fetches the subtitle files of a load on a thread of its own and hands
+/// each to the worker as `Cmd::AddSubtitle`, in their order. mpv's own
+/// `sub-add` of an address holds its caller until the file is there, and
+/// gives up after a minute: on the worker that held every event and
+/// command for the time of a slow server, the stop of the user among them
+/// (2026-10-17, a transcode of an episode whose subtitles the server
+/// first had to make). A load that was replaced or stopped meanwhile gets
+/// no files.
+fn fetch_subtitles(
+    shared: Arc<Shared>,
+    tx: mpsc::Sender<Cmd>,
+    client: Client,
+    generation: u64,
+    subtitles: Vec<SubtitleFile>,
+) {
+    let _ = thread::Builder::new().name("subtitles".into()).spawn(move || {
+        let dir = std::env::temp_dir().join("bloom-subtitles");
+        for (n, sub) in subtitles.into_iter().enumerate() {
+            if shared.load_gen.load(Ordering::Acquire) != generation {
+                return;
+            }
+            let bytes = match fetch_subtitle(&client, &sub.url) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    log::warn!("subtitle {:?} not fetched: {err:#}", sub.title);
+                    continue;
+                }
+            };
+            // The extension tells mpv the format ahead of the content.
+            let extension = sub
+                .url
+                .split('?')
+                .next()
+                .and_then(|path| path.rsplit('.').next().filter(|ext| ext.len() <= 4))
+                .unwrap_or("srt");
+            let path = dir.join(format!("{}-{generation}-{n}.{extension}", std::process::id()));
+            if let Err(err) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &bytes)) {
+                log::warn!("subtitle file not written: {err}");
+                continue;
+            }
+            let sent = tx.send(Cmd::AddSubtitle {
+                generation,
+                path,
+                select: sub.select,
+                title: sub.title,
+                lang: sub.lang,
+            });
+            if sent.is_err() {
+                return;
+            }
+            // The worker sleeps between rounds.
+            shared.wake();
+        }
+    });
+}
+
+/// One subtitle file, with the token in the header as every request.
+fn fetch_subtitle(client: &Client, url: &str) -> Result<Vec<u8>> {
+    let mut response = client
+        .agent()
+        .get(url)
+        .config()
+        .timeout_global(Some(SUBTITLE_WAIT))
+        .build()
+        .header("Authorization", client.auth_header())
+        .call()?;
+    Ok(response.body_mut().with_config().limit(SUBTITLE_LIMIT).read_to_vec()?)
+}
+
 /// How long the player may be out of data before it counts as a stall.
 const STALL_AFTER: Duration = Duration::from_secs(3);
 /// Time between two position measurements while following.
@@ -1111,9 +1191,23 @@ struct Worker {
     keep_delays: Option<(f64, f64)>,
     /// The size of the picture changed (see `RenderSignal::redraw`).
     size_changed: bool,
+    /// The way to this worker, for the thread that fetches the subtitles.
+    tx: mpsc::Sender<Cmd>,
+    /// The load count of the item that plays (`Cmd::Load`).
+    generation: u64,
+    /// The subtitle files added to the item that plays.
+    sub_files: Vec<PathBuf>,
 }
 
 impl Worker {
+    /// Removes the subtitle files of the item: with a new item or at the
+    /// end they have no use.
+    fn forget_subtitles(&mut self) {
+        for path in self.sub_files.drain(..) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     fn apply_speed(&self, mpv: &Mpv) {
         let speed = (self.user_speed * self.sync_speed).clamp(0.25, 4.);
         let _ = mpv.set_property("speed", speed);
@@ -1163,7 +1257,7 @@ unsafe extern "C" fn on_render_update(ctx: *mut c_void) {
 #[cfg(test)]
 pub(crate) static FAIL_INIT: AtomicBool = AtomicBool::new(false);
 
-fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>) -> Result<()> {
+fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> Result<()> {
     #[cfg(test)]
     if FAIL_INIT.load(Ordering::Relaxed) {
         return Err(anyhow!("test: the worker fails to start"));
@@ -1278,6 +1372,9 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>) -> Result<()> {
         item_id: None,
         keep_delays: None,
         size_changed: false,
+        tx,
+        generation: 0,
+        sub_files: Vec::new(),
     };
 
     loop {
@@ -1367,21 +1464,26 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>) -> Result<()> {
             signal.wake();
         }
 
-        // Subtitles in files of their own, once the item is loaded. The
-        // one that starts shown is added first, so its id in mpv is the
-        // one the app expects.
+        // Subtitles in files of their own, once the item is loaded. They
+        // are fetched on a thread of their own and come back as
+        // `Cmd::AddSubtitle`, in their order, so the one that starts shown
+        // is added first and its id in mpv is the one the app expects.
         if std::mem::take(&mut worker.add_subtitles) {
             if let Some((sub, audio)) = worker.keep_delays.take() {
                 let _ = mpv.set_property("sub-delay", sub);
                 let _ = mpv.set_property("audio-delay", audio);
             }
-            for sub in std::mem::take(&mut worker.subtitles) {
-                let flag = if sub.select { "select" } else { "auto" };
-                if let Err(err) =
-                    mpv.command("sub-add", &[sub.url.as_str(), flag, &sub.title, &sub.lang])
-                {
-                    log::warn!("sub-add failed: {err}");
-                }
+            let subtitles = std::mem::take(&mut worker.subtitles);
+            if !subtitles.is_empty()
+                && let Some(active) = session.as_ref()
+            {
+                fetch_subtitles(
+                    shared.clone(),
+                    worker.tx.clone(),
+                    active.client.clone(),
+                    worker.generation,
+                    subtitles,
+                );
             }
         }
 
@@ -1480,6 +1582,8 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>) -> Result<()> {
                         let _ = mpv.set_property("video-sync", pacing::video_sync(group));
                     }
                     worker.subtitles = req.subtitles.clone();
+                    worker.generation = generation;
+                    worker.forget_subtitles();
                     worker.scheduled = None;
                     worker.sync_speed = 1.;
                     worker.apply_speed(&mpv);
@@ -1618,7 +1722,23 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>) -> Result<()> {
                         rest(&shared);
                     }
                 }
-                Cmd::Quit => return Ok(()),
+                Cmd::AddSubtitle { generation, path, select, title, lang } => {
+                    // Of an item that is over, or of a load a later one replaced.
+                    if generation != worker.generation || session.is_none() {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    let flag = if select { "select" } else { "auto" };
+                    let file = path.to_string_lossy().into_owned();
+                    if let Err(err) = mpv.command("sub-add", &[file.as_str(), flag, &title, &lang]) {
+                        log::warn!("sub-add failed: {err}");
+                    }
+                    worker.sub_files.push(path);
+                }
+                Cmd::Quit => {
+                    worker.forget_subtitles();
+                    return Ok(());
+                }
                 Cmd::Probe(name, reply) => {
                     let _ = reply.send(mpv.get_property::<String>(&name).unwrap_or_default());
                 }
@@ -2202,6 +2322,7 @@ fn finish(shared: &Shared, session: &mut Option<Session>, worker: &mut Worker) {
     worker.item_id = None;
     worker.stall_since = None;
     worker.stalled = false;
+    worker.forget_subtitles();
     // A load that ended before the item could play has failed.
     if let Some(pending) = worker.pending.take()
         && pending.target.is_none()
@@ -2858,6 +2979,76 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         false
+    }
+
+    /// A subtitle file that takes long to come (the server makes the text
+    /// subtitles of a transcode at the first request, over a minute for a
+    /// large file) must not hold the worker: the item plays on, a stop
+    /// takes effect at once, and the subtitle shows when it comes. Before
+    /// 2026-10-17 mpv fetched the file itself, inside `sub-add`, and the
+    /// worker stood still for the time it took.
+    #[test]
+    fn a_slow_subtitle_file_does_not_hold_the_player() {
+        let Some(_one) = real_player_turn() else { return };
+        let Some(clip) = silent_clip("bloom-test-slow-sub.mp4") else { return };
+        const DELAY: Duration = Duration::from_secs(8);
+        // A server that answers a request for the subtitle after `DELAY`.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                thread::spawn(move || {
+                    let mut request = [0u8; 4096];
+                    let _ = std::io::Read::read(&mut stream, &mut request);
+                    thread::sleep(DELAY);
+                    let body = "1\n00:00:00,000 --> 00:00:30,000\nslow\n";
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = std::io::Write::write_all(&mut stream, format!("{head}{body}").as_bytes());
+                });
+            }
+        });
+        let player = Player::default();
+        let _closer = Closer(player.clone());
+        let mut request = request(&clip.to_string_lossy(), "slow subtitle", 1);
+        request.subtitles = vec![SubtitleFile {
+            url: format!("http://127.0.0.1:{port}/Subtitles/2/0/Stream.srt"),
+            title: "slow".into(),
+            lang: "eng".into(),
+            select: true,
+        }];
+        let started = Instant::now();
+        player.play(request);
+        // The item plays on while the file is on its way.
+        let deadline = started + DELAY * 3 / 4;
+        loop {
+            let status = player.status();
+            assert!(status.error.is_none(), "{status:?}");
+            if status.state == PlayState::Playing && status.position >= 1. {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the player stood still while the subtitle was fetched: {status:?}");
+            thread::sleep(Duration::from_millis(50));
+        }
+        // The subtitle comes when the server answers.
+        let deadline = started + DELAY + Duration::from_secs(10);
+        while !player.status().tracks.iter().any(|t| t.kind == "sub" && t.title.as_deref() == Some("slow")) {
+            assert!(Instant::now() < deadline, "the subtitle never came: {:?}", player.status().tracks);
+            thread::sleep(Duration::from_millis(50));
+        }
+        // The clip has two subtitles of its own: the file is mpv's third.
+        let slow = player.status().tracks.into_iter().find(|t| t.title.as_deref() == Some("slow")).unwrap();
+        assert!(slow.selected, "the subtitle that starts shown is selected: {slow:?}");
+        assert_eq!(slow.id, 3);
+        // A stop takes effect at once.
+        player.stop();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while player.status().state != PlayState::Ended {
+            assert!(Instant::now() < deadline, "the stop waited: {:?}", player.status());
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Finding P1: a stop while the server is still asked cancels the
