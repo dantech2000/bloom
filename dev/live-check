@@ -1,0 +1,63 @@
+#!/bin/sh
+# Plays items of the live server in a test instance and prints how each
+# played: the play method the server chose, the time to the first frame,
+# the pacing of 45 s (late frames, cadence breaks, GPU time of the draws),
+# stalls, the cache, and a seek timed by mpv's own state.
+#
+#   dev/live-check <item id> [<item id> ...]
+#
+# Env: LIVE_SECONDS=45     the length of the measured stretch
+#      LIVE_CAP=<kbps>     a quality cap, to force a transcode
+#      BLOOM_SERVER_URL    another address of the server (its LAN address)
+#
+# The instance is dev/run-test on the live server, muted, no playback
+# report, no socket to the server (BLOOM_NO_SOCKET=1). Its window is put
+# in front of the others (`pacing front`): a covered window draws no frame.
+# Only play items you have not started: the rule of CLAUDE.md.
+# Measure on a quiet Mac; the load is printed with each result.
+dir=$(cd "$(dirname "$0")/.." && pwd)
+cd "$dir" || exit 1
+[ $# -gt 0 ] || { echo "usage: dev/live-check <item id> [<item id> ...]" >&2; exit 1; }
+[ -x target/release/bloom ] || { echo "dev/live-check: no release build; run cargo build --release" >&2; exit 1; }
+T=${LIVE_SECONDS:-45}
+export BLOOM_DEBUG_SOCK=/tmp/bloom-livecheck.sock
+ctl() { dev/jctl "$@"; }
+ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
+wait_for() { tries=$1 text=$2; shift 2; while [ "$tries" -gt 0 ]; do case $("$@" 2>/dev/null) in *"$text"*) return 0;; esac; tries=$((tries-1)); sleep 0.1; done; return 1; }
+prop() { ctl mpv "$1" | tr -d '\n' | cut -c1-40; }
+settled() { # until mpv is not seeking, not waiting for its cache, and near the target
+  target=$1; t=$(ms); tries=600
+  while [ "$tries" -gt 0 ]; do
+    s=$(prop seeking); c=$(prop paused-for-cache); p=$(prop time-pos | cut -d. -f1)
+    if [ "$s" = no ] && [ "$c" = no ] && [ -n "$p" ] && [ "$p" -ge $((target-2)) ] && [ "$p" -le $((target+8)) ]; then echo "$(( $(ms)-t )) ms"; return 0; fi
+    tries=$((tries-1)); sleep 0.1
+  done
+  echo "not settled after 60 s"
+}
+stop() { ctl stop >/dev/null 2>&1; sleep 1; BLOOM_TEST_NAME=livecheck dev/run-test stop >/dev/null 2>&1; }
+trap stop EXIT
+for item in "$@"; do
+  BLOOM_TEST_NAME=livecheck BLOOM_NO_SOCKET=1 dev/run-test 8 >/dev/null || { echo "the instance did not start"; exit 1; }
+  wait_for 100 "home" ctl state || { echo "no signed-in session; see /tmp/bloom-livecheck.log"; exit 1; }
+  ctl item "$item" >/dev/null
+  wait_for 100 "history=1" ctl state || echo "(the item's page did not open)"
+  sleep 1
+  [ -z "$LIVE_CAP" ] || ctl quality set "$LIVE_CAP" >/dev/null
+  t0=$(ms); ctl play >/dev/null
+  if ! wait_for 600 "player=Playing" ctl state; then echo "### $item: did not play"; ctl state | cut -c1-200; stop; continue; fi
+  t1=$(ms)
+  ctl resize 1900 1180 >/dev/null; ctl pacing front >/dev/null
+  sleep 4
+  echo "### $item | start to playing: $((t1-t0)) ms | $(uptime | sed 's/.*load/load/')"
+  ctl quality | sed 's/ cap=[a-z0-9]* session=yes//; s/ audio=.*url=/ url=/; s/ pos=.*//' | cut -c1-200
+  echo "mpv: codec=$(prop video-codec | cut -c1-12) size=$(prop video-params/w)x$(prop video-params/h) hwdec=$(prop hwdec-current) format=$(prop file-format) primaries=$(prop video-params/primaries)"
+  ctl perf >/dev/null; ctl pacing >/dev/null
+  sleep "$T"
+  report=$(ctl pacing)
+  echo "$report" | grep -E "^  trace:" | sed 's/frames=[0-9]* shown=[0-9]* skipped=[0-9]* incomplete=[0-9]* //; s/ | cadence.*gt_jumps/ gt_jumps/; s/ | drawable wait.*//; s/late_from\[render,wake,draw,held,gpu\]/late_from/'
+  echo "$report" | grep -E "^    (ok|LATE)" | sed -n 's/.*gpu=+\([0-9.]*\)\.\.+\([0-9.]*\).*/\1 \2/p' | awk '{d=$2-$1; s+=d; if(d>m)m=d; n++} END{if(n) printf "  gpu span of %d sampled draws: mean %.1f ms max %.1f\n", n, s/n, m}'
+  echo "  after $T s: drops=$(prop frame-drop-count) paused-for-cache=$(prop paused-for-cache) cache=$(prop demuxer-cache-duration | cut -d. -f1) s | $(ctl quality | sed 's/.*stalls=/stalls=/' | cut -c1-40)"
+  ctl seek 600 >/dev/null; echo "  seek to 600 s: $(settled 600)"
+  stop
+done
+trap - EXIT

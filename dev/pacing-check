@@ -16,8 +16,8 @@
 # (default 0), on a jump, and on a run with too few frames.
 #
 # Run it on a quiet machine: a build in another terminal makes frames late.
-# Keep the window of the instance in view: macOS shows no frames of a
-# window that is covered, and the run then has too few of them.
+# The window of the instance is put in front of the others (`pacing
+# front`), as macOS shows no frames of a window that is covered.
 # The load of the machine is printed with the result. Run a release build
 # first. It needs a display, so it is not for CI.
 dir=$(cd "$(dirname "$0")/.." && pwd)
@@ -62,6 +62,9 @@ BLOOM_TEST_NAME=$name BLOOM_TEST_SERVER=${BLOOM_TEST_SERVER:-mock} "$dir/dev/run
 wait_for 60 "home" ctl state || die "no signed-in session; see /tmp/bloom-$name.log"
 wait_for 20 "playing" ctl pacing file "$clip" || die "the clip did not start"
 wait_for 60 "player=Playing" ctl state || die "the player did not play; see /tmp/bloom-$name.log"
+# In front of the other windows (without the focus): macOS shows no frame
+# of a covered window, and a covered run has too few frames.
+ctl pacing front >/dev/null
 # The first frames of a play are not the steady state; the trace starts
 # with the first report, which is thrown away.
 sleep 3

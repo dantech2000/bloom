@@ -54,6 +54,14 @@ pub struct Options {
     pub download_throttle_bps: Option<u64>,
     /// `BLOOM_FRAME_PHASE_MS`: when after its tick a video frame is drawn.
     pub frame_phase_ms: Option<u64>,
+    /// `BLOOM_SERVER_URL`: the address the session uses in place of the
+    /// server's, for a test of another path to the same server (its LAN
+    /// address, its Tailscale address) with the stored session.
+    pub server_url: Option<String>,
+    /// `BLOOM_MPV_OPTS=name=value,name=value`: mpv options set at the start
+    /// of each player core after the app's own, for a test of an option
+    /// that only takes effect at the start (a shader cache, a renderer).
+    pub mpv_opts: Vec<(String, String)>,
     /// `BLOOM_PACING_TRACE`: the pacing trace is on from the start.
     pub pacing_trace: bool,
     /// `BLOOM_PACING_LOG`: every settled frame is written to this file.
@@ -88,6 +96,15 @@ impl Options {
             download_limit_bytes: number("BLOOM_DOWNLOAD_LIMIT_BYTES"),
             download_throttle_bps: number("BLOOM_DOWNLOAD_THROTTLE_BPS"),
             frame_phase_ms: number("BLOOM_FRAME_PHASE_MS"),
+            server_url: std::env::var("BLOOM_SERVER_URL").ok().filter(|v| !v.is_empty()),
+            mpv_opts: std::env::var("BLOOM_MPV_OPTS")
+                .ok()
+                .map(|list| {
+                    list.split(',')
+                        .filter_map(|pair| pair.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
+                        .collect()
+                })
+                .unwrap_or_default(),
             pacing_trace: set("BLOOM_PACING_TRACE"),
             pacing_log: path("BLOOM_PACING_LOG"),
         }

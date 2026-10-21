@@ -1040,7 +1040,8 @@ impl Bloom {
         let Some(profile) = server.profiles.iter().find(|p| p.user_id == user_id) else {
             return false;
         };
-        let client = Client::new(&server.url, &self.config.device_id)
+        let url = crate::options::options().server_url.as_deref().unwrap_or(&server.url);
+        let client = Client::new(url, &self.config.device_id)
             .with_server(&server.id)
             .with_session(&profile.token, &profile.user_id);
         let (id, server_name, profile) = (server.id.clone(), server.name.clone(), profile.clone());
