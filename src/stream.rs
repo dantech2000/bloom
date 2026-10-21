@@ -766,7 +766,16 @@ pub fn start(player: &Player, client: Client, load: Load) {
             }
             Err(err) => {
                 log::warn!("playback info for {}: {err:#}", load.item_id);
-                player.fail_load(generation, load.token, &format!("{err:#}"));
+                // 404: the server no longer has the item. A file replaced
+                // by a new release gets a new id (seen on 2026-10-21: the
+                // next episode of a queue, swapped while the one before
+                // it played); the app looks for the replacement.
+                let gone = crate::jellyfin::status_of(&err) == Some(404);
+                let message = match gone {
+                    true => "the server no longer has this item".to_string(),
+                    false => format!("{err:#}"),
+                };
+                player.fail_load(generation, load.token, &message, gone);
             }
         });
 }

@@ -110,6 +110,9 @@ pub struct PlayerStatus {
     /// Bumped whenever `tracks` changes so menus can be rebuilt lazily.
     pub tracks_version: u64,
     pub error: Option<String>,
+    /// The load failed because the server no longer has the item (it
+    /// answered 404): the app may look for the item's replacement.
+    pub item_gone: bool,
     /// The file played to its end; a stop by the user leaves this false.
     pub reached_end: bool,
     /// What mpv opened: the URL of the stream, or the path of a local file.
@@ -785,12 +788,13 @@ impl Player {
 
     /// A prepared load that got no address: the item ends with the error,
     /// unless a later load was prepared since.
-    pub fn fail_load(&self, generation: u64, token: u64, message: &str) {
+    pub fn fail_load(&self, generation: u64, token: u64, message: &str, gone: bool) {
         if self.shared.load_gen.load(Ordering::Acquire) != generation {
             return;
         }
         let mut status = self.shared.status.lock().unwrap();
         status.error = Some(format!("Could not start playback: {message}"));
+        status.item_gone = gone;
         status.state = PlayState::Ended;
         self.shared.emit(PlayerEvent::LoadFailed { token });
     }
@@ -3174,7 +3178,7 @@ mod tests {
         assert!(player.play_prepared(generation, request(&media.display().to_string(), "First", 61)));
         expect(&player, "first loaded", |e| *e == PlayerEvent::Loaded { token: 61 });
         let generation = player.prepare("Again", 0., false);
-        player.fail_load(generation, 62, "the server did not answer");
+        player.fail_load(generation, 62, "the server did not answer", false);
         assert_eq!(player.status().state, PlayState::Ended);
         assert_eq!(player.probe("idle-active").as_deref(), Some("no"), "the item should still play here");
         // What the app does when it closes the player.

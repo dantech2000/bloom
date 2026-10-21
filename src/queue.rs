@@ -50,6 +50,13 @@ pub struct PlayQueue {
     /// The preview frame painted last. It stays up while the sheet of the
     /// next one is not decoded yet.
     pub preview_last: Rc<RefCell<Option<std::sync::Arc<gpui_kit::RenderImage>>>>,
+    /// The replacement of an episode the server no longer has is being
+    /// looked for; the player stays open meanwhile.
+    pub refinding: bool,
+    /// The episode a replacement was last looked for, or the replacement
+    /// itself once it plays: one look per episode, so a replacement that
+    /// is gone as well does not start the search again.
+    pub refind_tried: Option<String>,
 }
 
 /// One frame of the preview images: the sheet it is on and its cell there.
@@ -254,6 +261,70 @@ impl Bloom {
         self.begin(&previous, false, cx);
     }
 
+    /// The server no longer has the episode the player was to play (the
+    /// load answered 404): a file replaced by a new release gets a new id,
+    /// and the queue, made when the episode before it started, holds the
+    /// old one. The episode with the same numbers in the same series takes
+    /// its place, and the episodes after it replace the rest of the queue
+    /// of that series. True while the replacement is looked for, or
+    /// starts; false when there is nothing to look for, and the player
+    /// closes with the error as before.
+    pub fn refind_lost_episode(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.queue.refinding {
+            return true;
+        }
+        if !self.player_status.item_gone {
+            return false;
+        }
+        let Some(lost) = self.playing.clone() else { return false };
+        let Some(series_id) = lost.series_id.clone().filter(|_| lost.kind == ItemKind::Episode) else {
+            return false;
+        };
+        if lost.index_number.is_none() || self.queue.refind_tried.as_deref() == Some(&lost.id) {
+            return false;
+        }
+        self.queue.refinding = true;
+        self.queue.refind_tried = Some(lost.id.clone());
+        let epoch = self.queue.epoch;
+        log::info!("{} is gone from the server; looking for its replacement", lost.display_title());
+        self.fetch(
+            cx,
+            {
+                let lost = lost.clone();
+                let series_id = series_id.clone();
+                move |client| {
+                    let episodes = client.season_episodes(&series_id, lost.parent_index_number)?;
+                    let Some(found) = replacement(&lost, &episodes).cloned() else {
+                        return Ok(None);
+                    };
+                    let after = client.episodes_after(&series_id, &found.id).unwrap_or_default();
+                    Ok(Some((found, after)))
+                }
+            },
+            move |this, result, cx| {
+                this.queue.refinding = false;
+                if this.queue.epoch != epoch || this.playing.as_ref().is_none_or(|i| i.id != lost.id) {
+                    return;
+                }
+                match result {
+                    Ok(Some((found, after))) => {
+                        log::info!("{} plays as {}", lost.display_title(), found.id);
+                        // The rest of the queue of that series is as stale.
+                        this.queue.upcoming.retain(|i| i.series_id.as_deref() != Some(&series_id));
+                        this.queue.upcoming.splice(0..0, after);
+                        this.queue.refind_tried = Some(found.id.clone());
+                        this.begin(&found, false, cx);
+                    }
+                    Ok(None) => log::warn!("no replacement of {} on the server", lost.display_title()),
+                    Err(err) => log::warn!("looking for a replacement of {}: {err:#}", lost.display_title()),
+                }
+                // With no replacement, the player closes at its next poll.
+                cx.notify();
+            },
+        );
+        true
+    }
+
     /// The player reached the end of a file: the next item of the queue
     /// starts. False when playback is over and the player must close.
     pub fn advance_at_end(&mut self, cx: &mut Context<Self>) -> bool {
@@ -331,5 +402,45 @@ impl Bloom {
             rows: trickplay.tile_height,
             aspect: trickplay.height as f32 / trickplay.width as f32,
         })
+    }
+}
+
+/// The episode that stands where `lost` stood: the same season and episode
+/// numbers, under another id.
+fn replacement<'a>(lost: &Item, episodes: &'a [Item]) -> Option<&'a Item> {
+    episodes.iter().find(|e| {
+        e.id != lost.id
+            && e.index_number == lost.index_number
+            && e.parent_index_number == lost.parent_index_number
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn episode(id: &str, season: Option<i32>, number: i32) -> Item {
+        let mut value = serde_json::json!({"Id": id, "Name": id, "Type": "Episode", "IndexNumber": number});
+        if let Some(season) = season {
+            value["ParentIndexNumber"] = season.into();
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn the_replacement_has_the_numbers_of_the_lost_episode_under_another_id() {
+        let lost = episode("old2", Some(2), 2);
+        let episodes = [episode("new1", Some(2), 1), episode("new2", Some(2), 2), episode("new3", Some(2), 3)];
+        assert_eq!(replacement(&lost, &episodes).map(|e| e.id.as_str()), Some("new2"));
+        // An episode of another season with the same number is not it.
+        let other_season = [episode("s1e2", Some(1), 2)];
+        assert!(replacement(&lost, &other_season).is_none());
+        // The lost episode itself, listed still, is no replacement.
+        let itself = [episode("old2", Some(2), 2)];
+        assert!(replacement(&lost, &itself).is_none());
+        // A series with no seasons matches on the episode number alone.
+        let flat_lost = episode("old7", None, 7);
+        let flat = [episode("new7", None, 7)];
+        assert_eq!(replacement(&flat_lost, &flat).map(|e| e.id.as_str()), Some("new7"));
     }
 }
