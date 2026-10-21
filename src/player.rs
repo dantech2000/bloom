@@ -1277,6 +1277,14 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
         init.set_option("config", "no")?;
         init.set_option("sub-auto", "no")?;
         init.set_option("audio-display", "no")?;
+        // The chroma planes are upscaled with bilinear filtering, not with
+        // the lanczos of `scale`. Chroma is a quarter of the picture and
+        // the difference is not seen; the two lanczos passes over a full
+        // 4K frame were. Measured 2026-10-20 on Dune (3840x2160 HEVC Dolby
+        // Vision, direct play): mpv's render took 15 ms of GPU a frame and
+        // 130 of 962 frames were shown a refresh late; with bilinear, 9 ms
+        // and none late.
+        init.set_option("cscale", "bilinear")?;
         // In a test the sound goes to mpv's null output, which keeps the
         // time of a real one. The CoreAudio output listens for changes of
         // the audio devices of the Mac, and that listener of libmpv
