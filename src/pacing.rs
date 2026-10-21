@@ -783,6 +783,17 @@ impl Bloom {
                 }
                 Err(_) => "error: pacing speed <x>".into(),
             },
+            // In front of every other window, without the focus: a test
+            // instance that other windows cover draws no frame (macOS
+            // shows none of a covered window), and a measurement needs
+            // the window in view.
+            "front" => {
+                let Some(ns_window) = crate::pip::ns_window(window) else {
+                    return "error: no window".into();
+                };
+                send!((), ns_window, c"orderFrontRegardless");
+                "in front".into()
+            }
             "hide" | "show" => {
                 let Some(ns_window) = crate::pip::ns_window(window) else {
                     return "error: no window".into();
@@ -836,7 +847,7 @@ impl Bloom {
             // screen <display id>` moves the window onto that display
             // (a test with a virtual display of another refresh rate).
             "screen" => screen_verb(arg, window),
-            _ => "error: pacing [clock | file <path> | poke | screen [<display>]]".into(),
+            _ => "error: pacing [clock | file <path> | front | poke | screen [<display>]]".into(),
         }
     }
 }

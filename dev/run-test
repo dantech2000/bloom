@@ -10,6 +10,9 @@
 # With BLOOM_CONFIG_PATH set, the instance uses (and may write) that config.
 # BLOOM_BIN=<path> runs another build than target/release/bloom (a build of
 # another checkout, to compare two).
+# BLOOM_SERVER_URL=<url> makes the session use another address of the same
+# server (its LAN or Tailscale address) with the stored token: the live
+# server by its LAN path, against the Cloudflare path of its host name.
 dir=$(cd "$(dirname "$0")/.." && pwd)
 name=${BLOOM_TEST_NAME:-test}
 # Stops the process of a pid file when it is still Bloom: after a quit by

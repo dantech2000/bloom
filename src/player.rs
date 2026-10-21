@@ -1320,6 +1320,12 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
         ] {
             let _ = init.set_option(script, "no");
         }
+        // Options of a test (`BLOOM_MPV_OPTS`), after the app's own.
+        for (name, value) in &crate::options::options().mpv_opts {
+            if let Err(err) = init.set_option(name.as_str(), value.as_str()) {
+                log::warn!("BLOOM_MPV_OPTS {name}={value}: {err}");
+            }
+        }
         Ok(())
     })
     .map_err(|e| anyhow!("could not create libmpv core: {e}"))?;
