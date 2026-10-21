@@ -356,6 +356,10 @@ impl Bloom {
     /// a trailer plays, so a new frame reaches the screen without delay.
     pub fn start_hero_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.hero.video.scale = window.scale_factor();
+        // The field starts as "active"; a window that opens behind another
+        // (a test instance never becomes active) otherwise runs the
+        // slideshow and its redraws (7 a second) until the first change.
+        self.hero.video.window_active = window.is_window_active();
         self.hero.video._activation =
             Some(cx.observe_window_activation(window, |this, window, cx| {
                 this.hero.video.window_active = window.is_window_active();
