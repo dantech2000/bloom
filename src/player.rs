@@ -1329,6 +1329,15 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
         let shared = shared.clone();
         mpv.set_wakeup_callback(move || shared.wake());
     }
+    // mpv's own warnings and errors come as events and go to the app's log
+    // (`handle_event`): an audio output that fails to open, a stream that
+    // ends in an error. Without them the app saw none of it (on macOS 27
+    // the CoreAudio output failed for every file and mpv fell back to
+    // AVFoundation in silence; found on 2026-10-20).
+    let code = unsafe { sys::mpv_request_log_messages(mpv.ctx.as_ptr(), c"warn".as_ptr()) };
+    if code < 0 {
+        log::debug!("mpv_request_log_messages failed ({code})");
+    }
     // The frames are rendered on a thread of their own (see `render_loop`).
     // It ends before the core does: it is declared after `mpv`.
     let signal: &'static RenderSignal = Box::leak(Box::new(RenderSignal {
@@ -1434,6 +1443,14 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
         // Events from mpv.
         while let Some(event) = mpv.wait_event(0.0) {
             match event {
+                Ok(Event::LogMessage { prefix, level, text, .. }) => {
+                    let text = text.trim_end();
+                    if level == "error" || level == "fatal" {
+                        log::warn!("mpv [{prefix}] {text}");
+                    } else {
+                        log::info!("mpv [{prefix}] {text}");
+                    }
+                }
                 // The end of a file that a new load replaced.
                 Ok(Event::EndFile(_)) if stale_ends > 0 => stale_ends -= 1,
                 Ok(event) => {
