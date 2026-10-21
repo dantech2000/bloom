@@ -112,7 +112,7 @@ jobs:
           path: |
             ${{ env.MPV_CACHE_DIR }}
             vendor/mpv/lib
-          key: mpv-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.id }}-${{ hashFiles('dev/build-mpv') }}
+          key: mpv-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.id }}-${{ hashFiles('dev/build-mpv', 'vendor/mpv/patches/**') }}
 
       - name: Build libmpv
         if: steps.mpv-cache.outputs.cache-hit != 'true'
