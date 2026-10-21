@@ -1282,7 +1282,10 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
         // the audio devices of the Mac, and that listener of libmpv
         // crashed the test process when a device came or went while a
         // core of a test closed (two runs on 2026-10-07, in
-        // `HALSystem::ObjectsPublishedAndDied`). The tests are muted in any
+        // `HALSystem::ObjectsPublishedAndDied`). That was mpv-player/mpv#18274
+        // (a listener left behind by an output whose setup failed), and the
+        // upstream fix is in `vendor/mpv/patches` since 2026-10-20; it hit
+        // Daniel's own app on 2026-10-20 as well. The tests are muted in any
         // case. `BLOOM_TEST_REAL_AUDIO=1` gives a test the real output.
         #[cfg(test)]
         if std::env::var_os("BLOOM_TEST_REAL_AUDIO").is_none() {

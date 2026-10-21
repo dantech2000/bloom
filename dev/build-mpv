@@ -10,7 +10,9 @@ the app bundle needs no Nix store and no Homebrew.
     dev/build-mpv --clean    deletes the build folder first
 
 Every source is a release tarball with its SHA-256 below, or a git tag
-with its commit; a mismatch stops the build. The build folder
+with its commit; a mismatch stops the build. The patches in
+vendor/mpv/patches/<component>/ are applied to the extracted source, in
+name order; each is an upstream commit not yet in a release. The build folder
 (BLOOM_MPV_BUILD_DIR, default vendor/mpv/build) keeps the tarballs, the
 install prefix and a stamp per component, so a second run builds only
 the components whose recipe changed. CI caches that folder keyed on this
@@ -32,6 +34,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = Path(os.environ.get("BLOOM_MPV_BUILD_DIR") or ROOT / "vendor" / "mpv" / "build").resolve()
 OUT = ROOT / "vendor" / "mpv" / "lib"
+PATCHES = ROOT / "vendor" / "mpv" / "patches"
 PREFIX = BUILD / "prefix"
 DL = BUILD / "dl"
 SRC = BUILD / "src"
@@ -196,7 +199,18 @@ def extract(name):
     shutil.rmtree(dest, ignore_errors=True)
     dest.mkdir(parents=True)
     subprocess.run(["tar", "xf", str(tarball), "-C", str(dest), "--strip-components=1"], check=True)
+    for patch in patches_of(name):
+        say(f"  applying {patch.name}")
+        result = subprocess.run(["patch", "-p1", "--forward", "--no-backup-if-mismatch", "-i", str(patch)],
+                                cwd=dest, capture_output=True, text=True)
+        if result.returncode != 0:
+            die(f"{patch.name} does not apply to {name} {version}:\n{result.stdout}{result.stderr}")
     return dest
+
+
+def patches_of(name):
+    """The patches of a component, in name order."""
+    return sorted((PATCHES / name).glob("*.patch")) if (PATCHES / name).is_dir() else []
 
 
 def clone_libplacebo():
@@ -218,7 +232,10 @@ def tools():
     py = VENV / "bin" / "python3"
     wanted = sorted(PIP_TOOLS)
     marker = VENV / "bloom-tools.json"
-    if not py.exists() or not marker.exists() or json.loads(marker.read_text()) != wanted:
+    # A venv is tied to the Python that made it; after an upgrade of that
+    # Python (Homebrew removes the old one) its interpreter does not start.
+    runs = py.exists() and subprocess.run([str(py), "-c", "pass"], capture_output=True).returncode == 0
+    if not runs or not marker.exists() or json.loads(marker.read_text()) != wanted:
         say("setting up the build tools (meson, ninja, cmake, pkgconf) in a venv")
         shutil.rmtree(VENV, ignore_errors=True)
         venv.EnvBuilder(with_pip=True).create(VENV)
@@ -409,6 +426,9 @@ def recipe_key(name, keys):
              # The build function's source, so a changed recipe rebuilds.
              inspect.getsource(COMPONENTS_BY_NAME[name])]
     parts += [keys[dep] for dep in DEPS_BY_NAME[name]]
+    # Only a patched component names its patches, so the others keep
+    # their stamps.
+    parts += [f"{p.name} {sha256_of(p)}" for p in patches_of(name)]
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()
 
 

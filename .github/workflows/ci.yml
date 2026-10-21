@@ -75,7 +75,7 @@ jobs:
             vendor/mpv/lib
           # The script holds every pinned version, checksum and option; the
           # compiler is the other input.
-          key: mpv-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.id }}-${{ hashFiles('dev/build-mpv') }}
+          key: mpv-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.id }}-${{ hashFiles('dev/build-mpv', 'vendor/mpv/patches/**') }}
 
       - name: Build libmpv
         if: steps.mpv-cache.outputs.cache-hit != 'true'
@@ -140,7 +140,7 @@ jobs:
           path: |
             ${{ env.MPV_CACHE_DIR }}
             vendor/mpv/lib
-          key: mpv-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.id }}-${{ hashFiles('dev/build-mpv') }}
+          key: mpv-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.id }}-${{ hashFiles('dev/build-mpv', 'vendor/mpv/patches/**') }}
 
   # The job with the real player is switched off (2026-10-07): a test of the
   # Chromecast mock failed in it once in nine runs on the hosted runner, for
@@ -204,7 +204,7 @@ jobs:
   #         path: |
   #           ${{ env.MPV_CACHE_DIR }}
   #           vendor/mpv/lib
-  #         key: mpv-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.id }}-${{ hashFiles('dev/build-mpv') }}
+  #         key: mpv-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.id }}-${{ hashFiles('dev/build-mpv', 'vendor/mpv/patches/**') }}
   #
   #     - name: Build libmpv
   #       if: steps.mpv-cache.outputs.cache-hit != 'true'

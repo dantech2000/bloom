@@ -2,7 +2,15 @@
 
 `mpv/lib` is libmpv, one library built from pinned sources by
 `dev/build-mpv` (the versions, sources and checksums are in that script;
-`mpv/build` is its cache). `sparkle` is the updater framework. The two `gpui-pre-*` crates are copies of the published crates
+`mpv/build` is its cache). `mpv/patches/<component>/` holds upstream
+commits not yet in a release, applied to the extracted source in name
+order; drop a patch when a version bump contains it. The mpv patches of
+2026-10-20: two are the fix of mpv-player/mpv#18274 (a use after free of
+the CoreAudio hotplug listener when an audio output failed to
+initialize), the third is pull request #18637 (open when taken), which
+makes the CoreAudio output open at all on macOS 27 (mpv#18384: a channel
+map set with the wrong type, refused with -50, after which mpv fell back
+to AVFoundation for every file). `sparkle` is the updater framework. The two `gpui-pre-*` crates are copies of the published crates
 (crates.io, version 0.3.4, Apache-2.0, license file carried) with small
 local changes, wired in by `[patch.crates-io]` in `Cargo.toml`. Most changes
 are marked `Bloom` in the source; the list says where one is not.

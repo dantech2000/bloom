@@ -1,7 +1,9 @@
 /target
 .DS_Store
-# libmpv, built by dev/build-mpv (vendor/mpv/lib), and its build folder
-/vendor/mpv
+# libmpv, built by dev/build-mpv (vendor/mpv/lib), and its build folder;
+# the patches it applies are in the repository
+/vendor/mpv/*
+!/vendor/mpv/patches
 *.rej
 *.orig
 # Working notes for Claude Code; local only
