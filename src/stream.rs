@@ -367,9 +367,16 @@ pub struct Load {
 const NO_LIMIT: u64 = 1_000_000_000;
 
 /// What mpv plays: every container and codec (the profile names none, so
-/// the server matches them all), and for a transcode h264 with aac or
-/// ac3 in MPEG-TS segments over HLS, as the web client asks for on
-/// macOS. Text subtitles can come as files; the server burns in the rest.
+/// the server matches them all), and for a transcode HEVC or H.264 with
+/// aac, ac3 or eac3 in fragmented MP4 segments over HLS. HEVC first: a
+/// file the server must transcode (over its limit for a remote client)
+/// keeps its codec, which gives more picture for the same bitrate, and the
+/// server's QSV encoder makes both. Measured on 2026-10-20 with Jellyfin
+/// 12.1.0: a Dolby Vision file (The Agency, 4K at 25.8 Mbps over a 25 Mbps
+/// limit) came as HEVC instead of H.264, but still tone mapped to SDR
+/// (bt.709) with the HDR ranges declared below; the server tone maps a
+/// Dolby Vision source whatever the client says. Text subtitles can come
+/// as files; the server burns in the rest.
 pub fn device_profile(max_bitrate: Option<u64>) -> serde_json::Value {
     const TEXT: [&str; 4] = ["srt", "ass", "ssa", "vtt"];
     const EMBEDDED: [&str; 24] = [
@@ -395,17 +402,43 @@ pub fn device_profile(max_bitrate: Option<u64>) -> serde_json::Value {
             { "Type": "Audio" }
         ],
         "TranscodingProfiles": [{
-            "Container": "ts",
+            "Container": "mp4",
             "Type": "Video",
-            "VideoCodec": "h264",
+            "VideoCodec": "hevc,h264",
             "AudioCodec": "aac,ac3,eac3,mp3",
             "Context": "Streaming",
             "Protocol": "hls",
             "MaxAudioChannels": "6",
             "MinSegments": "2",
-            "BreakOnNonKeyFrames": true
+            "BreakOnNonKeyFrames": true,
+            // A transcode is at most 1080p. The server tone maps it to
+            // 8-bit SDR in any case, and on the screens of a Mac a 1080p
+            // HEVC picture at the same bitrate is as good as a 4K one
+            // while the encoder does a quarter of the work and the stream
+            // is easier on a weak link. A direct play is not touched.
+            // Measured 2026-10-20: the server answers with MaxWidth=1920
+            // and scales (scale_vaapi 1920x802 for a 3832x1600 source); the
+            // bitrate stays at the cap asked for.
+            "Conditions": [
+                { "Condition": "LessThanEqual", "Property": "Width", "Value": "1920", "IsRequired": false },
+                { "Condition": "LessThanEqual", "Property": "Height", "Value": "1080", "IsRequired": false }
+            ]
         }],
-        "CodecProfiles": [],
+        // The HDR ranges the client plays, for an HEVC transcode: a server
+        // tone maps to SDR what the client does not name. Every type the
+        // server knows is here, so a direct play is judged as before. (The
+        // server of 2026-10-20 tone mapped its Dolby Vision sources all the
+        // same; see `device_profile`.)
+        "CodecProfiles": [{
+            "Type": "Video",
+            "Codec": "hevc",
+            "Conditions": [{
+                "Condition": "EqualsAny",
+                "Property": "VideoRangeType",
+                "Value": "SDR|HDR10|HLG|HDR10Plus|DOVI|DOVIWithHDR10|DOVIWithHDR10Plus|DOVIWithHLG|DOVIWithSDR|DOVIWithEL|DOVIWithELHDR10|DOVIInvalid",
+                "IsRequired": false
+            }]
+        }],
         "ContainerProfiles": [],
         "SubtitleProfiles": subtitles,
     });
@@ -1164,9 +1197,15 @@ mod tests {
         assert_eq!(profile["DirectPlayProfiles"][0]["Type"], "Video");
         let hls = &profile["TranscodingProfiles"][0];
         assert_eq!(hls["Protocol"], "hls");
-        assert_eq!(hls["VideoCodec"], "h264");
-        assert_eq!(hls["Container"], "ts");
+        assert_eq!(hls["VideoCodec"], "hevc,h264");
+        assert_eq!(hls["Container"], "mp4");
         assert_eq!(hls["BreakOnNonKeyFrames"], true);
+        assert_eq!(hls["Conditions"][0]["Property"], "Width");
+        assert_eq!(hls["Conditions"][0]["Value"], "1920");
+        let hdr = &profile["CodecProfiles"][0];
+        assert_eq!(hdr["Codec"], "hevc");
+        assert_eq!(hdr["Conditions"][0]["Property"], "VideoRangeType");
+        assert!(hdr["Conditions"][0]["Value"].as_str().unwrap().contains("DOVIWithHDR10Plus"));
         assert!(profile["SubtitleProfiles"]
             .as_array()
             .unwrap()
