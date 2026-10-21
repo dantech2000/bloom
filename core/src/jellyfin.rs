@@ -872,6 +872,20 @@ impl RequestError {
     fn from_ureq(verdict: crate::connection::Verdict, text: String, source: ureq::Error) -> Self {
         Self { verdict, text, source: Some(source) }
     }
+
+    /// The status code of the answer, when the server answered.
+    pub fn status(&self) -> Option<u16> {
+        match self.source {
+            Some(ureq::Error::StatusCode(code)) => Some(code),
+            _ => None,
+        }
+    }
+}
+
+/// The status code of the answer behind a failed request, when the error
+/// came from a request of [`Client`] and the server answered.
+pub fn status_of(err: &anyhow::Error) -> Option<u16> {
+    err.downcast_ref::<RequestError>().and_then(RequestError::status)
 }
 
 impl std::fmt::Display for RequestError {
@@ -2064,6 +2078,18 @@ impl Client {
             .into_iter()
             .filter(|item| item.id != episode_id)
             .collect())
+    }
+
+    /// The episodes of one season of a series, by the number of the season;
+    /// every episode of the series with no number.
+    pub fn season_episodes(&self, series_id: &str, season: Option<i32>) -> Result<Vec<Item>> {
+        let user = self.user()?.to_string();
+        let mut query = vec![("userId", user), ("fields", ITEM_FIELDS.to_string())];
+        if let Some(season) = season {
+            query.push(("season", season.to_string()));
+        }
+        let result: ItemsResult = self.get(&format!("/Shows/{series_id}/Episodes"), &query)?;
+        Ok(result.items)
     }
 
     /// The episodes a series stands for in a play queue: the next unwatched

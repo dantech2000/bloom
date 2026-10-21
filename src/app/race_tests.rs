@@ -801,3 +801,77 @@ fn the_user_is_asked_for_once_by_callers_at_the_same_time() {
     }
     assert_eq!(slow.count("GET", "/Users/Me"), 1, "each caller sent a request of its own");
 }
+
+// ----- a queue whose episode the server replaced ---------------------------
+
+fn episode_json(id: &str, season: i32, number: i32) -> serde_json::Value {
+    serde_json::json!({
+        "Id": id, "Name": format!("Episode {number}"), "Type": "Episode",
+        "SeriesId": "s1", "ParentIndexNumber": season, "IndexNumber": number,
+    })
+}
+
+fn episodes_json(episodes: &[(&str, i32)]) -> String {
+    let items: Vec<serde_json::Value> = episodes.iter().map(|(id, n)| episode_json(id, 2, *n)).collect();
+    serde_json::json!({"Items": items, "TotalRecordCount": items.len()}).to_string()
+}
+
+/// Waits, in real time, for the thread that asks the server how an item
+/// plays: its answer is not a task of the test scheduler.
+fn wait_for_load_to_fail(bloom: &gpui_kit::Entity<super::Bloom>, cx: &mut gpui_kit::VisualTestContext) {
+    for _ in 0..1000 {
+        if bloom.read_with(cx, |this, _| this.player.status().state == crate::player::PlayState::Ended) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("the load did not fail in 5 s");
+}
+
+/// The next episode of a queue was replaced on the server while the one
+/// before it played (a new release of a file gets a new id; seen on
+/// 2026-10-21): the server answers 404 for the old id, and the episode
+/// with its numbers plays in its place, with the episodes after it as the
+/// queue. A replacement that is gone as well is not looked for again.
+#[gpui_kit::test]
+fn a_queued_episode_the_server_lost_plays_as_its_replacement(cx: &mut TestAppContext) {
+    let server = MockServer::start(|method, path, _| match (method, path) {
+        ("POST", p) if p.starts_with("/Items/old2/PlaybackInfo") => (404, String::new()),
+        ("POST", p) if p.starts_with("/Items/new2/PlaybackInfo") => (404, String::new()),
+        ("GET", p) if p.starts_with("/Shows/s1/Episodes") && p.contains("startItemId=new2") => {
+            (200, episodes_json(&[("new2", 2), ("new3", 3)]))
+        }
+        ("GET", p) if p.starts_with("/Shows/s1/Episodes") && p.contains("season=2") => {
+            (200, episodes_json(&[("new1", 1), ("new2", 2), ("new3", 3)]))
+        }
+        _ => plain(method, path),
+    });
+    let (bloom, cx) = app(cx);
+    bloom.update(cx, |this, cx| {
+        this.session = Some(session(&server.url, "u1"));
+        this.screen = Screen::Main;
+        // The queue made when episode 1 started: the ids of that time.
+        this.queue.upcoming = vec![serde_json::from_value(episode_json("old2", 2, 2)).unwrap()];
+        assert!(this.play_next(cx));
+        this.start_player_poll(cx);
+    });
+    wait_for_load_to_fail(&bloom, cx);
+    assert_eq!(server.count("POST", "/Items/old2/PlaybackInfo"), 1);
+    // The poll sees the failed load and asks for the replacement.
+    cx.executor().advance_clock(std::time::Duration::from_millis(50));
+    cx.run_until_parked();
+    bloom.read_with(cx, |this, _| {
+        assert!(this.player_open, "the player closed instead of looking for the replacement");
+        assert_eq!(this.playing.as_ref().map(|i| i.id.as_str()), Some("new2"), "the replacement does not play");
+        let upcoming: Vec<&str> = this.queue.upcoming.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(upcoming, ["new3"], "the queue is not the episodes after the replacement");
+    });
+    assert_eq!(server.count("GET", "season=2"), 1);
+    // The replacement is gone as well: one look, then the player closes.
+    wait_for_load_to_fail(&bloom, cx);
+    assert_eq!(server.count("POST", "/Items/new2/PlaybackInfo"), 1);
+    cx.executor().advance_clock(std::time::Duration::from_millis(50));
+    cx.run_until_parked();
+    bloom.read_with(cx, |this, _| assert!(!this.player_open, "the player stays open with nothing to play"));
+    assert_eq!(server.count("GET", "season=2"), 1, "the replacement was looked for again");
+}

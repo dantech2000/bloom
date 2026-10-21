@@ -3193,7 +3193,10 @@ impl Bloom {
                         this.events_tick(cx);
                         // At the end of a file the queue goes on.
                         // In a group the group decides what comes after an item.
-                        let ended = ended && !this.sync.holds_player() && !this.advance_at_end(cx);
+                        let ended = ended
+                            && !this.sync.holds_player()
+                            && !this.advance_at_end(cx)
+                            && !this.refind_lost_episode(cx);
                         if ended {
                             this.player_open = false;
                             if let Some(err) = this.player_status.error.clone() {
