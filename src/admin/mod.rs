@@ -978,8 +978,12 @@ pub fn button(
         ButtonKind::Danger => (rgb(0xc62828), rgb(0xffffff)),
     };
     let (accent, ink) = (t.colors.primary, t.colors.primary_foreground);
+    let label = label.into();
     div()
         .id(id.into())
+        // For assistive tech and the tests that tap by label.
+        .role(gpui_kit::Role::Button)
+        .aria_label(label.clone())
         .h(px(38.))
         .px(px(16.))
         .rounded(px(12.))
@@ -995,7 +999,7 @@ pub fn button(
             ButtonKind::Plain => s.bg(accent).text_color(ink),
             _ => s.opacity(0.88),
         })
-        .child(label.into())
+        .child(label)
 }
 
 /// A server date ("2026-10-03T09:56:25.8420000Z") as a timestamp.

@@ -7,10 +7,10 @@ use gpui_icons::{LucideIcon, lucide};
 use std::time::Duration;
 
 use gpui_kit::{
-    App, ClickEvent, Context, Div, ElementId, InteractiveElement as _, MouseButton, MouseDownEvent,
-    ObjectFit, ParentElement as _,
-    ScrollHandle, SharedString, Stateful, StatefulInteractiveElement as _, Styled, Svg, Window,
-    div, prelude::FluentBuilder as _, px, rgb, rgba,
+    App, Bounds, ClickEvent, Context, DispatchPhase, Div, ElementId, InteractiveElement as _,
+    LongPressEvent, MouseButton, MouseDownEvent, ObjectFit, ParentElement as _, Pixels,
+    ScrollHandle, SharedString, Stateful, StatefulInteractiveElement as _, Styled, Svg,
+    TouchPhase, Window, canvas, div, prelude::FluentBuilder as _, px, rgb, rgba,
 };
 
 use crate::{
@@ -352,8 +352,35 @@ fn card(
         .is_some_and(|h| h.0.as_ref() == Some(&key));
     let target = item.clone();
     let menu_target = item.clone();
+    // A finger: a long press on the card opens its menu, as the right
+    // button does; the hover layer with "More" never shows on a touch
+    // screen. The press is claimed (`prevent_default`), or GPUI takes the
+    // release for a tap and opens the item under the menu.
+    let press_target = item.clone();
+    let press: std::rc::Rc<dyn Fn(&LongPressEvent, &mut Window, &mut App)> =
+        std::rc::Rc::new(cx.listener(move |this, event: &LongPressEvent, window, cx| {
+            this.open_card_menu(&press_target, row, event.start_position, window, cx);
+        }));
+    let long_press = canvas(
+        |_, _, _| {},
+        move |bounds: Bounds<Pixels>, _, window, _| {
+            let press = press.clone();
+            window.on_mouse_event(move |event: &LongPressEvent, phase, window, cx| {
+                if phase == DispatchPhase::Bubble
+                    && event.phase == TouchPhase::Started
+                    && bounds.contains(&event.start_position)
+                {
+                    window.prevent_default();
+                    press(event, window, cx);
+                }
+            });
+        },
+    )
+    .absolute()
+    .inset_0();
     div()
         .id(ElementId::from(key.clone()))
+        .relative()
         // For assistive tech and the tests that tap by label.
         .role(gpui_kit::Role::Button)
         .aria_label(title.clone())
@@ -390,6 +417,7 @@ fn card(
                 .when(hovered, |el| el.child(hover_overlay(item, row, cx))),
         )
         .child(card_text(title, subtitle, cx))
+        .child(long_press)
         .on_click(cx.listener(move |this, _, _, cx| this.open_item(target.clone(), cx)))
         .on_mouse_down(
             MouseButton::Right,

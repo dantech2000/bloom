@@ -521,6 +521,10 @@ impl Bloom {
                 .flex()
                 .items_center()
                 .justify_center()
+                // A phone: the name field raises the keyboard, and the
+                // dialog centres in the room above it (the buttons were
+                // under the keyboard on 2026-10-22).
+                .pb(px(crate::views::shell::keyboard_inset()))
                 .bg(rgba(0x00000099))
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                     if event.keystroke.key == "escape" {

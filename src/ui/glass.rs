@@ -221,20 +221,38 @@ pub fn ground() -> Option<Rgba> {
     settings().ground
 }
 
+/// What a piece of glass is part of; the look follows it.
+#[derive(Clone, Copy, PartialEq)]
+enum Surface {
+    /// A popup over the page: a menu, a panel, a dialog, a toast.
+    Popup,
+    /// A card that is part of the page (a group of Settings, a card of
+    /// the dashboard): many are on screen at once and none lies over
+    /// another, so in a frame they share one copy of the backdrop.
+    Card,
+    /// A bar of the shell (the tab bar of a phone).
+    Bar,
+}
+
 /// A layer that fills its parent with blurred backdrop, tinted by `tint`.
 /// Put it first in a `relative()` parent, under the panel's content.
 pub fn glass(radius: Pixels, tint: Rgba) -> Canvas<()> {
-    layer(radius, tint, false)
+    layer(radius, tint, Surface::Popup)
 }
 
-/// The glass of a card that is part of the page, as a group of Settings or
-/// a card of the dashboard: many are on screen at once and none lies over
-/// another, so in a frame they share one copy of the backdrop.
+/// The glass of a card that is part of the page (`Surface::Card`).
 pub fn card_glass(radius: Pixels, tint: Rgba) -> Canvas<()> {
-    layer(radius, tint, true)
+    layer(radius, tint, Surface::Card)
 }
 
-fn layer(radius: Pixels, tint: Rgba, card: bool) -> Canvas<()> {
+/// The glass of a bar of the shell: the lens of the theme's tuning, even
+/// on a phone, where popups frost over.
+pub fn bar_glass(radius: Pixels, tint: Rgba) -> Canvas<()> {
+    layer(radius, tint, Surface::Bar)
+}
+
+fn layer(radius: Pixels, tint: Rgba, surface: Surface) -> Canvas<()> {
+    let card = surface == Surface::Card;
     canvas(
         |_, _, _| {},
         move |bounds: Bounds<Pixels>, _, window, cx| {
@@ -253,6 +271,14 @@ fn layer(radius: Pixels, tint: Rgba, card: bool) -> Canvas<()> {
                 .then(|| {
                     let mut set = *settings.for_mode(UiTheme::read(cx).mode);
                     set.full &= !OVER_VIDEO.load(Ordering::Relaxed);
+                    // A popup on a phone is a sheet over the page's text,
+                    // not a card over posters: with the half-clear middle
+                    // and the sharp lens of the bezel the text read through
+                    // (2026-10-22). The sheet frosts over, bezel included.
+                    if surface == Surface::Popup && crate::views::shell::compact_now() {
+                        set.frost = 1.;
+                        set.blur = 1.;
+                    }
                     set
                 });
             if OVER_VIDEO.load(Ordering::Relaxed) {

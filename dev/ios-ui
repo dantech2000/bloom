@@ -9,6 +9,7 @@
 #
 #   dev/ios-ui setup                   installs the client
 #   dev/ios-ui tap <x> <y>             a tap
+#   dev/ios-ui press <x> <y> [ms]      a long press, 800 ms by default
 #   dev/ios-ui swipe <x1> <y1> <x2> <y2> [ms]   a drag, 300 ms by default
 #   dev/ios-ui text "<text>"           types on the keyboard that is up
 #   dev/ios-ui key <hid code>          one key (40 is return, 42 delete)
@@ -17,6 +18,7 @@
 #                                      tree with that label (role, bounds);
 #                                      a role (Tab, Button, MenuItem) narrows
 #   dev/ios-ui tap-label <label> [role] a tap at the middle of the first one
+#   dev/ios-ui press-label <label> [role] a long press there
 #   dev/ios-ui describe                the tree UIKit sees (bare today)
 #   BLOOM_IOS_SIM=<udid>               another simulator than iPhone 17 Pro
 set -e
@@ -30,12 +32,13 @@ case $cmd in
     [ -x "$idb" ] || { python3 -m venv "$dir/target/ios/idb-venv"; "$dir/target/ios/idb-venv/bin/pip" install -q fb-idb; }
     "$idb" list-targets | grep -i "$sim" ;;
   tap) "$idb" ui tap --udid "$sim" "$1" "$2" ;;
+  press) "$idb" ui tap --udid "$sim" --duration "$(echo "${3:-800} / 1000" | bc -l)" "$1" "$2" ;;
   swipe) "$idb" ui swipe --udid "$sim" --duration "$(echo "${5:-300} / 1000" | bc -l)" "$1" "$2" "$3" "$4" ;;
   text) "$idb" ui text --udid "$sim" "$1" ;;
   key) "$idb" ui key --udid "$sim" "$1" ;;
   shot) "$idb" screenshot --udid "$sim" "$1" >/dev/null ;;
   describe) "$idb" ui describe-all --udid "$sim" ;;
-  find|tap-label)
+  find|tap-label|press-label)
     # The app's own tree, over its debug channel (dev/ios starts it with
     # BLOOM_A11Y_TREE=1 and the socket); bounds are in points. A label
     # matches whole, or as a prefix when nothing matches whole.
@@ -57,7 +60,7 @@ if not hits:
 hits.sort(key=lambda n: (n["bounds"]["y"], n["bounds"]["x"]))
 # The window is the root node; a target outside it (scrolled away) is no tap.
 root = next((n for n in nodes if n.get("role") == "Window"), None)
-if mode == "tap-label" and root:
+if mode in ("tap-label", "press-label") and root:
     w, h = root["bounds"]["w"], root["bounds"]["h"]
     b = hits[0]["bounds"]
     cx, cy = b["x"] + b["w"] / 2, b["y"] + b["h"] / 2
@@ -73,6 +76,10 @@ print(f"{b[chr(120)] + b[chr(119)] / 2:.0f} {b[chr(121)] + b[chr(104)] / 2:.0f}"
       # shellcheck disable=SC2086
       "$idb" ui tap --udid "$sim" $at
       echo "tapped $1 at $at"
+    elif [ "$cmd" = press-label ]; then
+      # shellcheck disable=SC2086
+      "$idb" ui tap --udid "$sim" --duration 0.8 $at
+      echo "pressed $1 at $at"
     fi ;;
   *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

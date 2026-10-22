@@ -326,6 +326,9 @@ fn backdrop(id: &'static str, card: Stateful<Div>, cx: &mut Context<Bloom>) -> S
         .flex()
         .items_center()
         .justify_center()
+        // A phone: a field of the dialog raises the keyboard, and the
+        // dialog centres in the room above it.
+        .pb(px(crate::views::shell::keyboard_inset()))
         .bg(rgba(0x00000099))
         // The page behind takes no click while the dialog is open: a
         // hitbox does not block by itself, and the click that closes the

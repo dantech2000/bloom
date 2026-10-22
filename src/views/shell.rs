@@ -335,7 +335,7 @@ impl Bloom {
             .rounded(px(24.))
             .border_1()
             .border_color(gpui_kit::rgba(0xf5f5f733))
-            .child(glass(px(24.), crate::ui::glass::POPUP_TINT))
+            .child(crate::ui::glass::bar_glass(px(24.), crate::ui::glass::POPUP_TINT))
             .flex()
             .items_center()
             .child(
