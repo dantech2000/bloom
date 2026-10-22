@@ -561,25 +561,68 @@ impl Bloom {
                 handle.update(cx, |this, cx| this.show_connect(cx)).ok();
             }),
         );
-        let handle = this.clone();
-        items.push(
-            MenuItem::new("menu.trailers", "Trailer backdrops")
-                .icon(LucideIcon::Clapperboard)
-                .checked(self.config.hero_video.unwrap_or(true))
-                .on_click(move |_, _, cx| {
-                    handle.update(cx, |this, cx| this.toggle_hero_video(cx)).ok();
-                }),
-        );
-        let handle = this.clone();
-        items.push(
-            MenuItem::new("menu.quality", "Quality tags")
-                .icon(LucideIcon::BadgeCheck)
-                .checked(self.quality_tags())
-                .on_click(move |_, _, cx| {
-                    handle.update(cx, |this, cx| this.toggle_quality_tags(cx)).ok();
-                }),
-        );
+        // A phone keeps the sheet short: these two switches are in
+        // Settings > Display there.
+        if !self.compact_w() {
+            let handle = this.clone();
+            items.push(
+                MenuItem::new("menu.trailers", "Trailer backdrops")
+                    .icon(LucideIcon::Clapperboard)
+                    .checked(self.config.hero_video.unwrap_or(true))
+                    .on_click(move |_, _, cx| {
+                        handle.update(cx, |this, cx| this.toggle_hero_video(cx)).ok();
+                    }),
+            );
+            let handle = this.clone();
+            items.push(
+                MenuItem::new("menu.quality", "Quality tags")
+                    .icon(LucideIcon::BadgeCheck)
+                    .checked(self.quality_tags())
+                    .on_click(move |_, _, cx| {
+                        handle.update(cx, |this, cx| this.toggle_quality_tags(cx)).ok();
+                    }),
+            );
+        }
         items.extend(self.enhanced_menu(cx));
+        // A phone's top bar has no room for these; the sheet has them.
+        if self.compact_w() && self.session.is_some() {
+            items.push(MenuItem::separator());
+            let handle = this.clone();
+            let casting = self.cast.active();
+            items.push(
+                MenuItem::new("menu.cast", "Play on")
+                    .icon(LucideIcon::Cast)
+                    .detail(if casting {
+                        "Another device plays".to_string()
+                    } else {
+                        "A device of yours, a Chromecast or AirPlay".to_string()
+                    })
+                    .on_click(move |_, window, cx| {
+                        handle.update(cx, |this, cx| this.toggle_cast_panel(window, cx)).ok();
+                    }),
+            );
+            if self.sync.allowed() && self.sync.session.is_some() {
+                let handle = this.clone();
+                let in_group = self.sync.in_group();
+                items.push(
+                    MenuItem::new("menu.syncplay", "SyncPlay")
+                        .icon(LucideIcon::Users)
+                        .detail(if in_group { "In a group" } else { "Watch together with others" })
+                        .on_click(move |_, window, cx| {
+                            handle.update(cx, |this, cx| this.toggle_sync_panel(window, cx)).ok();
+                        }),
+                );
+            }
+            let handle = this.clone();
+            items.push(
+                MenuItem::new("menu.random", "Random item")
+                    .icon(LucideIcon::Dices)
+                    .on_click(move |_, _, cx| {
+                        handle.update(cx, |this, cx| this.open_random(cx)).ok();
+                    }),
+            );
+            items.push(MenuItem::separator());
+        }
         if self.session.is_some() {
             let handle = this.clone();
             items.push(

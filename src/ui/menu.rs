@@ -476,7 +476,9 @@ impl Render for MenuState {
                 .id((popup_id.clone(), "entries"))
                 .max_h(gpui_kit::px(
                     if compact {
-                        window_h * 0.6
+                        // The sheet's header takes the rest; a longer list
+                        // scrolls inside.
+                        window_h * 0.72
                     } else if depth == 0 && !self.pointer {
                         beside_trigger.max(200.)
                     } else {
