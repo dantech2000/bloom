@@ -703,9 +703,13 @@ impl Bloom {
                 el.child(
                     div()
                         .id("connect.back")
+                        .role(gpui_kit::Role::Button)
+                        .aria_label("Back")
                         .absolute()
-                        .top(px(14.))
-                        .left(px(92.))
+                        // A phone: under the status bar, at the edge; the
+                        // Mac: right of the traffic lights.
+                        .top(px(if cfg!(target_os = "macos") { 14. } else { crate::views::shell::top_inset() + 8. }))
+                        .left(px(if cfg!(target_os = "macos") { 92. } else { 16. }))
                         .h(px(36.))
                         .px(px(14.))
                         .rounded(px(18.))
@@ -1370,8 +1374,11 @@ fn action(
     } else {
         (rgba(0xffffff1f), rgb(0xf5f5f7))
     };
+    let text = text.into();
     div()
         .id(id)
+        .role(gpui_kit::Role::Button)
+        .aria_label(text.clone())
         .flex_1()
         .min_h(px(FIELD_H))
         .h(px(FIELD_H))
@@ -1386,13 +1393,15 @@ fn action(
         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
         .when(busy, |el| el.opacity(0.6).occlude())
         .when(!busy, |el| el.cursor_pointer().hover(|s| s.opacity(0.88)))
-        .child(text.into())
+        .child(text)
 }
 
 /// A quiet text button.
 fn link(id: &'static str, text: &'static str) -> Stateful<Div> {
     div()
         .id(id)
+        .role(gpui_kit::Role::Button)
+        .aria_label(text)
         .cursor_pointer()
         .text_size(px(13.))
         .text_color(rgba(0xf5f5f799))
@@ -1409,6 +1418,8 @@ fn person(id: SharedString, name: &str, image: Option<String>) -> Stateful<Div> 
         .unwrap_or_default();
     div()
         .id(id)
+        .role(gpui_kit::Role::Button)
+        .aria_label(name.to_string())
         .relative()
         .w(px(104.))
         .py(px(12.))

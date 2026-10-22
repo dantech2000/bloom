@@ -59,6 +59,11 @@ $ui tap 437 201 >/dev/null; sleep 0.5; shot player-controls
 # A drag along the timeline (y of the Seek slider in landscape) seeks.
 $ui swipe 250 314 600 314 800 >/dev/null 2>&1
 expect "a drag on the timeline seeks" 'player=Playing pos=[1-9][0-9]{2,}'
+# The episode picker: a row plays that episode (the series is one the
+# account never started, so the second episode is as safe as the first).
+sleep 4; $ui tap 437 201 >/dev/null 2>&1; sleep 0.7
+tap episodes; sleep 1.5; shot episode-picker
+tap "2. Part 2"; expect "a row of the picker plays that episode" 'player=Playing pos=[0-9]+ playing="Part 2"'
 # The controls hide a few seconds after the last touch: wait for that,
 # then a tap on the video brings them back fresh for the close.
 sleep 4; $ui tap 437 201 >/dev/null 2>&1; sleep 0.7

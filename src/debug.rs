@@ -1158,11 +1158,12 @@ impl Bloom {
         };
         let viewport = window.viewport_size();
         format!(
-            "{page} | history={} forward={} player={:?} pos={:.0} window={}x{} scroll={} source={}",
+            "{page} | history={} forward={} player={:?} pos={:.0} playing={:?} window={}x{} scroll={} source={}",
             self.history.len(),
             self.forward.len(),
             self.player_status.state,
             self.player_status.position,
+            self.playing.as_ref().map(|item| item.name.as_str()).unwrap_or(""),
             f32::from(viewport.width),
             f32::from(viewport.height),
             -f32::from(self.page_scroll.offset().y),

@@ -461,6 +461,8 @@ impl Bloom {
                 );
             }
         }
+        // The trailer opens in the browser (iOS hands the link to Safari or
+        // the YouTube app through `UIApplication openURL:`).
         if let Some(url) = item.remote_trailers.iter().find_map(|t| t.url.clone()) {
             row = row.child(
                 round("detail.trailer", filled(Filled::Trailer, 25., fg))
@@ -620,8 +622,12 @@ impl Bloom {
         l: &Layout,
         cx: &mut Context<Self>,
     ) -> Vec<Div> {
-        let w = (self.viewport_w * 0.10 - 9.).round();
-        let h = (self.viewport_w * 0.14 - 9.).round();
+        // A phone: about three and a half tiles across, so a name reads.
+        let (w, h) = if self.compact_w() {
+            (96., 134.)
+        } else {
+            ((self.viewport_w * 0.10 - 9.).round(), (self.viewport_w * 0.14 - 9.).round())
+        };
         let mut rows = Vec::new();
         for (id, title, guests) in [
             ("detail.cast", "Cast & Crew", false),
@@ -1067,8 +1073,14 @@ impl Element for EpisodeRows {
 /// One episode of a season: still, number and name, details, overview.
 fn episode_row(ep: &Item, client: &Client, vw: f32, cx: &mut Context<Bloom>) -> Stateful<Div> {
     let t = UiTheme::read(cx).clone();
-    let w = (vw * 0.195).round();
-    let h = 160.;
+    // A phone: a wide still, as the episode's picture is, with the text
+    // beside it; the Mac's column is taller than wide.
+    let (w, h) = if vw < crate::views::shell::COMPACT_W {
+        let w = (vw * 0.36).round();
+        (w, (w * 9. / 16.).round())
+    } else {
+        ((vw * 0.195).round(), 160.)
+    };
     let still = ep
         .image_tags
         .primary

@@ -284,7 +284,12 @@ impl Bloom {
     fn render_tabbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = UiTheme::read(cx).clone();
         let fg = t.colors.foreground;
-        let active = self.active_tab();
+        // A page that is no library and has no library behind it lights no
+        // tab but its own (search), as the tab bars of iOS do.
+        let active = match &self.page {
+            Page::Search(_) | Page::Settings(_) | Page::Admin(_) | Page::Downloads => None,
+            _ => self.active_tab(),
+        };
         let is_home = matches!(self.page, Page::Home(_)) && self.history.is_empty();
         let is_search = matches!(self.page, Page::Search(_));
         let item = |id: SharedString, label: String, glyph: LucideIcon, selected: bool| {

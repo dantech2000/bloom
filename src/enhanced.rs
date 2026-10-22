@@ -489,9 +489,11 @@ impl Bloom {
             return None;
         }
         let this = cx.weak_entity();
+        // A phone has no keyboard: its shortcuts and their help stay out.
+        let compact = self.compact_w();
         let mut entries: Vec<MenuItem> = TOGGLES
             .iter()
-            .filter(|(key, _)| self.enhanced_toggle_shown(key))
+            .filter(|(key, _)| self.enhanced_toggle_shown(key) && !(compact && *key == "shortcuts"))
             .map(|(key, label)| {
                 let handle = this.clone();
                 let key: &'static str = key;
@@ -502,13 +504,15 @@ impl Bloom {
                     })
             })
             .collect();
-        entries.push(MenuItem::separator());
-        entries.push(
-            MenuItem::new("menu.je.keys", "Keyboard shortcuts…").on_click(move |_, window, cx| {
-                this.update(cx, |this, cx| this.open_panel(Panel::Help, window, cx))
-                .ok();
-            }),
-        );
+        if !compact {
+            entries.push(MenuItem::separator());
+            entries.push(
+                MenuItem::new("menu.je.keys", "Keyboard shortcuts…").on_click(move |_, window, cx| {
+                    this.update(cx, |this, cx| this.open_panel(Panel::Help, window, cx))
+                    .ok();
+                }),
+            );
+        }
         Some(MenuItem::submenu("menu.je", "Jellyfin Enhanced", entries).icon(LucideIcon::Sparkles))
     }
 

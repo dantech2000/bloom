@@ -530,7 +530,10 @@ impl Bloom {
         // skip button.
         let up_next = self.render_up_next(cx);
         // "Skip Intro" and its relatives, from the server's marked ranges.
-        let skip = self.current_segment().filter(|_| up_next.is_none()).map(|segment| {
+        // A phone's panels take the same corner: the button waits while one
+        // is open.
+        let corner_taken = self.phone() && self.panel_open();
+        let skip = self.current_segment().filter(|_| up_next.is_none() && !corner_taken).map(|segment| {
             let end = segment.end_secs();
             let text = match segment.kind.as_str() {
                 "Intro" => "Skip Intro",

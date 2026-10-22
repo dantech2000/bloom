@@ -55,6 +55,14 @@ if not hits:
 if not hits:
     sys.exit(f"no element labelled {sys.argv[2]!r}")
 hits.sort(key=lambda n: (n["bounds"]["y"], n["bounds"]["x"]))
+# The window is the root node; a target outside it (scrolled away) is no tap.
+root = next((n for n in nodes if n.get("role") == "Window"), None)
+if mode == "tap-label" and root:
+    w, h = root["bounds"]["w"], root["bounds"]["h"]
+    b = hits[0]["bounds"]
+    cx, cy = b["x"] + b["w"] / 2, b["y"] + b["h"] / 2
+    if not (0 <= cx <= w and 0 <= cy <= h):
+        sys.exit(f"{sys.argv[2]!r} is off screen at {cx:.0f} {cy:.0f} (window {w:.0f}x{h:.0f}); scroll first")
 for n in hits:
     b = n["bounds"]
     print(f"{n[chr(114)+chr(111)+chr(108)+chr(101)]:12} {n[chr(108)+chr(97)+chr(98)+chr(101)+chr(108)]!r:34} x={b[chr(120)]:.0f} y={b[chr(121)]:.0f} w={b[chr(119)]:.0f} h={b[chr(104)]:.0f}", file=sys.stderr)
