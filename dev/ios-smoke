@@ -70,8 +70,22 @@ expect "typing and return search" 'search "dune" loading=false results=[1-9]'
 shot search
 
 tap Account; sleep 1; shot account-sheet
-dev/jctl menu close >/dev/null 2>&1
-tap Home; expect "the Home tab goes home" 'home loading=false'
+# The dashboard on a phone: the list of sections first, a row opens one,
+# the back arrow returns to the list.
+tap Dashboard; expect "Dashboard opens its list of sections" 'admin section=Dashboard list=true'
+shot admin-list
+tap Users; expect "a row opens the Users section" 'admin section=Users list=false loading=false'
+shot admin-users
+tap Back; expect "Back returns to the list" 'admin section=Users list=true'
+# Settings the same way.
+tap Account; sleep 1; tap Settings; expect "Settings opens its list of sections" 'settings section=Profile list=true'
+shot settings-list
+tap Playback; expect "a row opens the Playback section" 'settings section=Playback list=false'
+shot settings-playback
+tap Back; expect "Back returns to the list of settings" 'settings section=Playback list=true'
+# The list has a "Home" row too: the tab by its role.
+$ui tap-label Home Tab >/dev/null 2>&1 || true
+expect "the Home tab goes home" 'home loading=false'
 
 echo "---"
 if [ $fails = 0 ]; then echo "smoke: all steps passed; shots in $out"; else echo "smoke: $fails step(s) failed; shots in $out"; exit 1; fi

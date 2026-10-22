@@ -743,12 +743,13 @@ impl Bloom {
             (_, 1) => "1 change is not saved.".to_string(),
             (_, n) => format!("{n} changes are not saved."),
         };
+        let (left, right, bottom) = self.admin_bar_edges();
         Some(
             div()
                 .absolute()
-                .left(px(super::SIDEBAR_W + 28.))
-                .right(px(28.))
-                .bottom(px(20.))
+                .left(px(left))
+                .right(px(right))
+                .bottom(px(bottom))
                 .h(px(64.))
                 .rounded(px(24.))
                 .border_1()

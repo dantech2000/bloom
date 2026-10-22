@@ -329,8 +329,8 @@ pub fn refresh(client: &Client) -> Result<Live> {
 }
 
 pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
-    // Width of the page content: the window less the sidebar and the padding.
-    let width = (app.viewport_w - super::SIDEBAR_W - 56.).max(320.);
+    // Width of the page content (`admin_content_w`).
+    let width = app.admin_content_w();
     let wide = width >= 860.;
     let live = &data.live;
     let half = ((width - GAP) / 2.).floor();
@@ -494,6 +494,8 @@ fn server_card(data: &Data, wide: bool, cx: &mut Context<Bloom>) -> Div {
                 .child(
                     div()
                         .flex()
+                        // A phone: the state goes under a long name.
+                        .flex_wrap()
                         .items_center()
                         .gap(px(12.))
                         .child(
@@ -567,7 +569,9 @@ fn count_tiles(data: &Data, width: f32, cx: &mut Context<Bloom>) -> Div {
         (LucideIcon::Activity, "Active Streams", streams, 0x5fd38a, true),
     ];
     let tiles: Vec<_> = all.into_iter().filter(|t| t.4 || t.2 > 0).collect();
-    let columns = ((width + GAP) / (190. + GAP)).floor().clamp(1., tiles.len() as f32);
+    // A phone fits two tiles a row.
+    let tile_min = if crate::views::shell::compact_now() { 150. } else { 190. };
+    let columns = ((width + GAP) / (tile_min + GAP)).floor().clamp(1., tiles.len() as f32);
     let tile_w = (width - GAP * (columns - 1.)) / columns - 0.5;
 
     div()

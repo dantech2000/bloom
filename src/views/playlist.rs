@@ -344,7 +344,8 @@ impl Bloom {
         let mut card = div()
             .id("lists.card")
             .relative()
-            .w(px(440.))
+            // A phone: the width of the window less the margins.
+            .w(px((self.viewport_w - 32.).min(440.)))
             .rounded(px(24.))
             .border_1()
             .border_color(rgba(0xf5f5f733))

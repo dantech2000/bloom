@@ -463,9 +463,10 @@ fn ask_delete(app: &mut Bloom, user: &User, cx: &mut Context<Bloom>) {
 
 // ----- widgets shared with the devices, activity and API key pages ------------
 
-/// Width the page content has, beside the sidebar and inside the padding.
+/// Width the page content has, beside the sidebar and inside the padding
+/// (`Bloom::admin_content_w`; on a phone the window less the margins).
 pub(super) fn content_width(app: &Bloom) -> f32 {
-    (app.viewport_w - 236. - 56.).max(320.)
+    app.admin_content_w()
 }
 
 /// False for the "year 1" date the server sends for "never".

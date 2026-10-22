@@ -895,6 +895,7 @@ impl Bloom {
         }
         let changes = data.changes(&spec(section, &data.options));
         Some(bar_shell(
+            self.admin_bar_edges(),
             changes,
             button("config.discard", "Discard", ButtonKind::Plain, cx)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.config_discard(cx))),
@@ -908,6 +909,7 @@ impl Bloom {
 /// The bar at the bottom of a page with unsaved changes: the count, and the
 /// two buttons the caller made.
 pub(super) fn bar_shell(
+    (left, right, bottom): (f32, f32, f32),
     changes: usize,
     discard: Stateful<Div>,
     save: Stateful<Div>,
@@ -916,9 +918,9 @@ pub(super) fn bar_shell(
     let t = UiTheme::read(cx).clone();
     div()
         .absolute()
-        .left(px(super::SIDEBAR_W + 28.))
-        .right(px(28.))
-        .bottom(px(20.))
+        .left(px(left))
+        .right(px(right))
+        .bottom(px(bottom))
         .h(px(64.))
         .rounded(px(24.))
         .border_1()
@@ -962,7 +964,7 @@ pub(super) fn value_button(id: SharedString, value: String, cx: &Context<Bloom>)
     div()
         .id(id)
         .min_w(px(120.))
-        .max_w(px(340.))
+        .max_w(px(crate::settings::control_max_w()))
         .h(px(38.))
         .pl(px(12.))
         .pr(px(10.))

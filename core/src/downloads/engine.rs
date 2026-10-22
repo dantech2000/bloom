@@ -1807,9 +1807,11 @@ pub fn free_space(path: &Path) -> Option<u64> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt as _;
-        // The layout of `struct statvfs` on Darwin: the block counts are
-        // 32 bits there (`__darwin_fsblkcnt_t` is an unsigned int).
-        #[cfg(target_os = "macos")]
+        // The layout of `struct statvfs` on Darwin (macOS and iOS): the block
+        // counts are 32 bits there (`__darwin_fsblkcnt_t` is an unsigned int).
+        // With the other layout the fields read garbage, and the multiply
+        // below overflowed on 2026-10-21 (the iOS build checks overflows).
+        #[cfg(target_vendor = "apple")]
         #[repr(C)]
         struct Statvfs {
             f_bsize: std::ffi::c_ulong,
@@ -1824,7 +1826,7 @@ pub fn free_space(path: &Path) -> Option<u64> {
             f_flag: std::ffi::c_ulong,
             f_namemax: std::ffi::c_ulong,
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(target_vendor = "apple"))]
         #[repr(C)]
         struct Statvfs {
             f_bsize: std::ffi::c_ulong,
@@ -1855,7 +1857,7 @@ pub fn free_space(path: &Path) -> Option<u64> {
             return None;
         }
         let buf = unsafe { buf.assume_init() };
-        Some(buf.f_bavail as u64 * buf.f_frsize as u64)
+        (buf.f_bavail as u64).checked_mul(buf.f_frsize as u64)
     }
     #[cfg(not(unix))]
     {

@@ -19,8 +19,6 @@ use crate::{
     views::cards::icon,
 };
 
-/// Width of the sidebar plus the page padding at both sides.
-const PAGE_CHROME: f32 = 236. + 56.;
 /// The schedule column shows only when the page is at least this wide.
 const SCHEDULE_MIN_W: f32 = 900.;
 /// Height of a task row: the line above it, the padding and two lines of text.
@@ -152,11 +150,13 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
     let mut page = div().flex().flex_col().gap(px(18.)).child(summary);
     for (group, (category, list)) in data.groups.iter().enumerate() {
         // Only the rows in view are built; see `rows`.
-        let list = rows(cx, list.len(), ROW_H, move |this, range, cx| {
+        // A phone's row has the state on a third line (`row`).
+        let row_h = if crate::views::shell::compact_now() { ROW_H + 24. } else { ROW_H };
+        let list = rows(cx, list.len(), row_h, move |this, range, cx| {
             let Some(data) = this.admin_data().and_then(|d| d.tasks.as_ref()) else {
                 return Vec::new();
             };
-            let show_schedule = this.viewport_w - PAGE_CHROME >= SCHEDULE_MIN_W;
+            let show_schedule = this.admin_content_w() >= SCHEDULE_MIN_W;
             data.groups[group].1[range.clone()]
                 .iter()
                 .zip(range)
@@ -291,11 +291,14 @@ fn row(task: &Task, index: usize, show_schedule: bool, cx: &mut Context<Bloom>) 
         }))
     };
 
+    // A phone: the state goes under the name, and the row grows with it.
+    let compact = crate::views::shell::compact_now();
+    let mut status = Some(status);
     div()
-            .h(px(ROW_H))
+            .h(px(if compact { ROW_H + 24. } else { ROW_H }))
             .flex()
             .items_center()
-            .gap(px(20.))
+            .gap(px(if compact { 10. } else { 20. }))
             // The line above a row; the first row keeps the space.
             .border_t_1()
             .when(index > 0, |el| el.border_color(rgba(0xf5f5f714)))
@@ -320,9 +323,10 @@ fn row(task: &Task, index: usize, show_schedule: bool, cx: &mut Context<Bloom>) 
                             .text_size(px(13.))
                             .text_color(t.colors.muted_foreground)
                             .child(one_line(&task.description)),
-                    ),
+                    )
+                    .when(compact, |el| el.child(div().pt(px(4.)).children(status.take()))),
             )
-            .child(div().w(px(210.)).flex_shrink_0().child(status))
+            .when(!compact, |el| el.child(div().w(px(210.)).flex_shrink_0().children(status.take())))
             .when(show_schedule, |el| {
                 el.child(
                     div()
@@ -364,6 +368,6 @@ fn row(task: &Task, index: usize, show_schedule: bool, cx: &mut Context<Bloom>) 
                                 this.triggers_open(&id, &name, &description, cx)
                             })),
                     )
-                    .child(div().w(px(92.)).flex_shrink_0().flex().justify_end().child(action))
+                    .child(div().when(!compact, |el| el.w(px(92.))).flex_shrink_0().flex().justify_end().child(action))
             })
 }

@@ -391,7 +391,7 @@ impl Bloom {
         if active > 0 {
             facts.push(format!("{active} downloading"));
         }
-        facts.push(format!("{} on this Mac", format_bytes(used)));
+        facts.push(format!("{} on {}", format_bytes(used), crate::brand::THIS_DEVICE));
         if let Some(free) = free {
             facts.push(format!("{} free", format_bytes(free)));
         }
@@ -414,8 +414,9 @@ impl Bloom {
                             Confirm {
                                 title: "Remove all downloads?".to_string(),
                                 message: format!(
-                                    "The files take {} on this Mac. They can be downloaded again.",
-                                    format_bytes(super::engine().used_bytes())
+                                    "The files take {} on {}. They can be downloaded again.",
+                                    format_bytes(super::engine().used_bytes()),
+                                    crate::brand::THIS_DEVICE
                                 ),
                                 action: "Remove all".to_string(),
                                 danger: true,
@@ -430,27 +431,34 @@ impl Bloom {
                 )),
             );
         }
-        let dir = engine.dir();
-        actions = actions.child(
-            raised("downloads.reveal", "Show in Finder", cx)
-                .on_click(move |_: &ClickEvent, _, cx| cx.reveal_path(&dir)),
-        );
+        // A phone has no Finder; the files are the app's own.
+        if cfg!(target_os = "macos") {
+            let dir = engine.dir();
+            actions = actions.child(
+                raised("downloads.reveal", "Show in Finder", cx)
+                    .on_click(move |_: &ClickEvent, _, cx| cx.reveal_path(&dir)),
+            );
+        }
 
+        // A phone has the title in the top bar.
+        let compact = self.compact_w();
         let mut page = div()
             .max_w(px(980.))
-            .px(px(if narrow { 20. } else { 28. }))
+            .px(px(if compact { 16. } else if narrow { 20. } else { 28. }))
             .pt(px(8.))
             .pb(px(72.))
             .flex()
             .flex_col()
             .gap(px(18.))
-            .child(
-                div()
-                    .text_size(px(30.))
-                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                    .text_color(t.colors.foreground)
-                    .child("Downloads"),
-            );
+            .when(!compact, |el| {
+                el.child(
+                    div()
+                        .text_size(px(30.))
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .text_color(t.colors.foreground)
+                        .child("Downloads"),
+                )
+            });
         if self.downloads.offline {
             page = page.child(
                 div()
@@ -468,7 +476,7 @@ impl Bloom {
                         div()
                             .text_size(px(15.))
                             .text_color(t.colors.foreground)
-                            .child("The server cannot be reached. Your downloads play from this Mac."),
+                            .child(format!("The server cannot be reached. Your downloads play from {}.", crate::brand::THIS_DEVICE)),
                     ),
             );
         }
@@ -610,7 +618,7 @@ impl Bloom {
                 let (play, server) = (id.clone(), server.clone());
                 buttons = buttons.child(
                     icon_button(button_id("play"), LucideIcon::Play, true, cx)
-                        .tooltip(tip("Play from this Mac"))
+                        .tooltip(tip(format!("Play from {}", crate::brand::THIS_DEVICE)))
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             cx.stop_propagation();
                             this.play_download(Some(&server), &play, window, cx);
@@ -648,7 +656,7 @@ impl Bloom {
         let remove = id.clone();
         buttons = buttons.child(
             icon_button(button_id("remove"), LucideIcon::Trash, true, cx)
-                .tooltip(tip("Remove from this Mac"))
+                .tooltip(tip(format!("Remove from {}", crate::brand::THIS_DEVICE)))
                 .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
                     cx.stop_propagation();
                     super::engine().remove_of(Some(&server), &remove);
@@ -692,13 +700,16 @@ impl Bloom {
         };
         let reveal = dir.clone();
         let mut card = group("Downloads", cx)
-            .child(field(
-                "Location",
-                dir_text,
-                raised("settings.downloads.reveal", "Show in Finder", cx)
-                    .on_click(move |_: &ClickEvent, _, cx| cx.reveal_path(&reveal)),
-                cx,
-            ))
+            // A phone has no Finder, and the folder is the app's own.
+            .when(cfg!(target_os = "macos"), |card| {
+                card.child(field(
+                    "Location",
+                    dir_text,
+                    raised("settings.downloads.reveal", "Show in Finder", cx)
+                        .on_click(move |_: &ClickEvent, _, cx| cx.reveal_path(&reveal)),
+                    cx,
+                ))
+            })
             .child(field(
                 "Storage limit",
                 format!("Space all downloads may take. A download stops before it goes over. {} always stay free.", format_bytes(super::engine::MIN_FREE_BYTES)),

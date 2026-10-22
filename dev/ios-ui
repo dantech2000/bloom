@@ -13,9 +13,10 @@
 #   dev/ios-ui text "<text>"           types on the keyboard that is up
 #   dev/ios-ui key <hid code>          one key (40 is return, 42 delete)
 #   dev/ios-ui shot <png>              a screenshot
-#   dev/ios-ui find <label>            the nodes of the app's accessibility
-#                                      tree with that label (role, bounds)
-#   dev/ios-ui tap-label <label>       a tap at the middle of the first one
+#   dev/ios-ui find <label> [role]     the nodes of the app's accessibility
+#                                      tree with that label (role, bounds);
+#                                      a role (Tab, Button, MenuItem) narrows
+#   dev/ios-ui tap-label <label> [role] a tap at the middle of the first one
 #   dev/ios-ui describe                the tree UIKit sees (bare today)
 #   BLOOM_IOS_SIM=<udid>               another simulator than iPhone 17 Pro
 set -e
@@ -44,7 +45,10 @@ case $cmd in
     at=$(python3 -I -c '
 import json, sys
 mode, wanted, path = sys.argv[1], sys.argv[2].lower(), sys.argv[3]
+role = sys.argv[4].lower() if len(sys.argv) > 4 and sys.argv[4] else ""
 nodes = [n for n in json.load(open(path)).get("nodes", []) if n.get("bounds")]
+if role:
+    nodes = [n for n in nodes if (n.get("role") or "").lower() == role]
 hits = [n for n in nodes if (n.get("label") or "").lower() == wanted]
 if not hits:
     hits = [n for n in nodes if (n.get("label") or "").lower().startswith(wanted)]
@@ -56,7 +60,7 @@ for n in hits:
     print(f"{n[chr(114)+chr(111)+chr(108)+chr(101)]:12} {n[chr(108)+chr(97)+chr(98)+chr(101)+chr(108)]!r:34} x={b[chr(120)]:.0f} y={b[chr(121)]:.0f} w={b[chr(119)]:.0f} h={b[chr(104)]:.0f}", file=sys.stderr)
 b = hits[0]["bounds"]
 print(f"{b[chr(120)] + b[chr(119)] / 2:.0f} {b[chr(121)] + b[chr(104)] / 2:.0f}")
-' "$cmd" "$1" "$tree") || exit 1
+' "$cmd" "$1" "$tree" "${2:-}") || exit 1
     if [ "$cmd" = tap-label ]; then
       # shellcheck disable=SC2086
       "$idb" ui tap --udid "$sim" $at

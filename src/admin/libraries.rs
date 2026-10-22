@@ -22,8 +22,6 @@ use crate::{
 /// Smallest width of a library card; the grid fits as many as the page holds.
 const CARD_MIN_W: f32 = 340.;
 const CARD_GAP: f32 = 18.;
-/// Width of the sidebar plus the page padding at both sides.
-const PAGE_CHROME: f32 = 236. + 56.;
 
 #[derive(Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "PascalCase")]
@@ -157,7 +155,7 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
     let Some(client) = app.session.as_ref().map(|s| s.client.clone()) else {
         return div();
     };
-    let content_w = (app.viewport_w - PAGE_CHROME).max(CARD_MIN_W);
+    let content_w = app.admin_content_w().max(CARD_MIN_W);
     let columns = (((content_w + CARD_GAP) / (CARD_MIN_W + CARD_GAP)).floor() as usize)
         .clamp(1, data.libraries.len().max(1));
     let card_w = ((content_w - CARD_GAP * (columns - 1) as f32) / columns as f32).floor();

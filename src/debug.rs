@@ -364,7 +364,13 @@ impl Bloom {
             } else {
                 rest
             }) {
-                Some(section) => self.open_admin(section, cx),
+                Some(section) => {
+                    self.open_admin(section, cx);
+                    // The section itself, also on a phone (not its list).
+                    if let Page::Admin(data) = &mut self.page {
+                        data.list = false;
+                    }
+                }
                 None => return format!("error: no dashboard section named {rest:?}"),
             },
             // Opens the metadata manager for the item of the detail page, to
@@ -663,7 +669,11 @@ impl Bloom {
                 } else {
                     rest
                 }) {
-                    Some(section) => self.open_settings(section, cx),
+                    Some(section) => {
+                        self.open_settings(section, cx);
+                        // The section itself, also on a phone (not its list).
+                        self.settings_list = false;
+                    }
                     None => return format!("error: no settings section named {rest:?}"),
                 },
             },
@@ -1123,12 +1133,13 @@ impl Bloom {
                     .unwrap_or_default()
             ),
             Page::Settings(section) => format!(
-                "settings section={section:?} loading={} error=None",
+                "settings section={section:?} list={} loading={} error=None",
+                self.settings_list,
                 !self.prefs.loaded
             ),
             Page::Admin(d) => format!(
-                "admin section={:?} loading={} error={:?}",
-                d.section, d.loading, d.error
+                "admin section={:?} list={} loading={} error={:?}",
+                d.section, d.list, d.loading, d.error
             ),
             Page::Playlist(d) => format!(
                 "playlist {:?} loading={} entries={}",

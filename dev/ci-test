@@ -13,7 +13,7 @@ expect=
 log=${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ci-test.log
 # The crate with no window first: its tests need no player.
 cargo test --release --locked -p bloom-core || exit 1
-BLOOM_CI_NO_PLAYER=1 cargo test --release --bin bloom -- --nocapture >"$log" 2>&1
+BLOOM_CI_NO_PLAYER=1 cargo test --release -p bloom --lib -- --nocapture >"$log" 2>&1
 status=$?
 tail -n 5 "$log"
 passed=$(sed -n 's/^test result: [a-zA-Z]*\. \([0-9]*\) passed.*/\1/p' "$log" | tail -n 1)

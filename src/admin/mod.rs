@@ -202,6 +202,9 @@ pub struct Live {
 /// another section, so a visit back shows it at once while it loads again.
 pub struct AdminData {
     pub section: Section,
+    /// A phone shows the list of sections as a page of its own, and the
+    /// section when a row is tapped; the back arrow returns to the list.
+    pub list: bool,
     pub loading: bool,
     pub error: Option<String>,
     pub dashboard: Option<dashboard::Data>,
@@ -237,6 +240,7 @@ impl AdminData {
     pub fn new(section: Section) -> Self {
         Self {
             section,
+            list: false,
             loading: true,
             error: None,
             dashboard: None,
@@ -304,6 +308,7 @@ impl Bloom {
             // Inside the dashboard a section change keeps the loaded data.
             Page::Admin(data) => {
                 data.section = section;
+                data.list = false;
                 data.error = None;
                 // A question of the section before goes with it.
                 self.dialogs.confirm = None;
@@ -321,7 +326,50 @@ impl Bloom {
                 self.load_page(cx);
                 cx.notify();
             }
-            _ => self.navigate(Page::Admin(AdminData::new(section)), cx),
+            _ => {
+                let mut data = AdminData::new(section);
+                // A phone starts at the list of sections, as Settings does.
+                data.list = self.compact_w();
+                self.navigate(Page::Admin(data), cx)
+            }
+        }
+    }
+
+    /// On a phone, with a section open: back to the list of sections.
+    /// False when the back arrow has to leave the dashboard instead.
+    pub fn admin_back_to_list(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.compact_w() {
+            return false;
+        }
+        let Page::Admin(data) = &mut self.page else {
+            return false;
+        };
+        if data.list {
+            return false;
+        }
+        data.list = true;
+        self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+        cx.notify();
+        true
+    }
+
+    /// Width of the content of a section: the window less the sidebar and
+    /// the padding; on a phone the window less the side margins.
+    pub(crate) fn admin_content_w(&self) -> f32 {
+        if self.compact_w() {
+            self.viewport_w - 32.
+        } else {
+            (self.viewport_w - SIDEBAR_W - 56.).max(320.)
+        }
+    }
+
+    /// The edges of a bar at the foot of a section (the save bar of an
+    /// editor): left, right and bottom. On a phone it sits over the tab bar.
+    pub(crate) fn admin_bar_edges(&self) -> (f32, f32, f32) {
+        if self.compact_w() {
+            (16., 16., crate::views::shell::bottom_inset() + crate::views::shell::TABBAR_H + 12.)
+        } else {
+            (SIDEBAR_W + 28., 28., 20.)
         }
     }
 
@@ -541,6 +589,10 @@ impl Bloom {
             unreachable!()
         };
         let t = UiTheme::read(cx).clone();
+        let compact = self.compact_w();
+        // A phone: the rows have the size of a touch target, and the list
+        // fills the page.
+        let row_h = if compact { 44. } else { 0. };
 
         let mut sidebar = div().py(px(8.)).flex().flex_col();
         for (heading, sections) in Section::GROUPS {
@@ -567,10 +619,13 @@ impl Bloom {
                 sidebar = sidebar.child(
                     div()
                         .id(SharedString::from(format!("admin.nav.{section:?}")))
+                        .role(gpui_kit::Role::Button)
+                        .aria_label(section.label())
                         .mx(px(12.))
                         .mb(px(2.))
                         .px(px(14.))
                         .py(px(7.))
+                        .min_h(px(row_h))
                         .rounded(px(12.))
                         .flex()
                         .items_center()
@@ -629,40 +684,56 @@ impl Bloom {
             }
         };
 
+        // A phone shows one of the two: the list, or the section with the
+        // top bar's title (the back arrow returns to the list).
+        let (show_list, show_page) = if compact { (data.list, !data.list) } else { (true, true) };
         div()
             .relative()
             .size_full()
             .flex()
             // The list is longer than a small window; it scrolls by itself.
-            .child(
-                div().w(px(SIDEBAR_W)).h_full().flex_shrink_0().child(
-                    ScrollArea::new("admin.nav.scroll").size_full().child(sidebar),
-                ),
-            )
-            .child(
-                div().flex_1().min_w_0().h_full().child(
-                    ScrollArea::new("admin.scroll")
-                        .track(&self.page_scroll)
-                        .size_full()
+            .when(show_list, |el| {
+                el.child(
+                    div()
+                        .when(!compact, |el| el.w(px(SIDEBAR_W)))
+                        .when(compact, |el| el.flex_1().min_w_0())
+                        .h_full()
+                        .flex_shrink_0()
                         .child(
-                            div()
-                                .px(px(28.))
-                                .pt(px(8.))
-                                .pb(px(72.))
-                                .flex()
-                                .flex_col()
-                                .gap(px(20.))
-                                .child(
-                                    div()
-                                        .text_size(px(26.))
-                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                        .text_color(t.colors.foreground)
-                                        .child(data.section.label()),
-                                )
-                                .child(page),
+                            ScrollArea::new("admin.nav.scroll")
+                                .size_full()
+                                .child(sidebar.when(compact, |el| el.px(px(4.)).pb(px(72.)))),
                         ),
-                ),
-            )
+                )
+            })
+            .when(show_page, |el| {
+                el.child(
+                    div().flex_1().min_w_0().h_full().child(
+                        ScrollArea::new("admin.scroll")
+                            .track(&self.page_scroll)
+                            .size_full()
+                            .child(
+                                div()
+                                    .px(px(if compact { 16. } else { 28. }))
+                                    .pt(px(8.))
+                                    .pb(px(72.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(20.))
+                                    .when(!compact, |el| {
+                                        el.child(
+                                            div()
+                                                .text_size(px(26.))
+                                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                                .text_color(t.colors.foreground)
+                                                .child(data.section.label()),
+                                        )
+                                    })
+                                    .child(page),
+                            ),
+                    ),
+                )
+            })
             .children(self.render_config_bar(cx))
             .children(self.render_plugin_bar(cx))
             .children(self.render_access_bar(cx))

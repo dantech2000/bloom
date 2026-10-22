@@ -139,7 +139,7 @@ impl PlatformTextSystem for IosTextSystem {
 
             let candidate_properties: SmallVec<[font_kit::properties::Properties; 4]> = candidates
                 .iter()
-                .map(|font_id| lock.fonts[font_id.0].properties())
+                .map(|font_id| safe_properties(&lock.fonts[font_id.0]))
                 .collect();
 
             let ix = font_kit::matching::find_best_match(
@@ -235,10 +235,29 @@ impl IosTextSystemState {
         // to their concrete equivalents, just like the macOS text system does.
         // On iOS, ".AppleSystemUIFont" resolves to San Francisco via Core Text.
         let name = gpui::font_name_with_fallbacks(name, ".AppleSystemUIFont");
-        let family = self
+        let family = match self
             .memory_source
             .select_family_by_name(name)
-            .or_else(|_| self.system_source.select_family_by_name(name))?;
+            .or_else(|_| self.system_source.select_family_by_name(name))
+        {
+            Ok(family) => family,
+            Err(err) => {
+                // font-kit's system source knows none of the device's fonts
+                // on iOS (on 2026-10-21 "Menlo" and "Helvetica" both failed
+                // and the app aborted). Core Text resolves the name itself;
+                // it answers with a substitute for a name it does not know,
+                // so the family name has to match.
+                let Ok(ct_font) = core_text::font::new_from_name(name, 16.0) else {
+                    return Err(err.into());
+                };
+                if ct_font.family_name() != name && !name.starts_with('.') {
+                    return Err(err.into());
+                }
+                let font = unsafe { font_kit::font::Font::from_native_font(&ct_font) };
+                font_ids.push(self.register(font));
+                return Ok(font_ids);
+            }
+        };
         for font in family.fonts() {
             let mut font = font.load()?;
 
@@ -267,43 +286,25 @@ impl IosTextSystemState {
                 }
             }
 
-            // Validate font traits to avoid panics from malformed fonts
-            let traits = font.native_font().all_traits();
-            if unsafe {
-                !(traits
-                    .get(kCTFontSymbolicTrait)
-                    .downcast::<CFNumber>()
-                    .is_some()
-                    && traits
-                        .get(kCTFontWidthTrait)
-                        .downcast::<CFNumber>()
-                        .is_some()
-                    && traits
-                        .get(kCTFontWeightTrait)
-                        .downcast::<CFNumber>()
-                        .is_some()
-                    && traits
-                        .get(kCTFontSlantTrait)
-                        .downcast::<CFNumber>()
-                        .is_some())
-            } {
-                log::error!(
-                    "Failed to read traits for font {:?}",
-                    font.postscript_name().unwrap()
-                );
-                continue;
-            }
-
-            let font_id = FontId(self.fonts.len());
-            font_ids.push(font_id);
-            let postscript_name = font.postscript_name().unwrap();
-            self.font_ids_by_postscript_name
-                .insert(postscript_name.clone(), font_id);
-            self.postscript_names_by_font_id
-                .insert(font_id, postscript_name);
-            self.fonts.push(font);
+            // The traits are not checked here: on iOS every system font
+            // (Menlo, Helvetica, Arial, on 2026-10-21) comes with an
+            // incomplete trait dictionary, and font-kit's `properties`
+            // would panic on it; `safe_properties` reads what is there.
+            font_ids.push(self.register(font));
         }
         Ok(font_ids)
+    }
+
+    /// Keeps a loaded font and gives its id.
+    fn register(&mut self, font: font_kit::font::Font) -> FontId {
+        let font_id = FontId(self.fonts.len());
+        let postscript_name = font.postscript_name().unwrap_or_default();
+        self.font_ids_by_postscript_name
+            .insert(postscript_name.clone(), font_id);
+        self.postscript_names_by_font_id
+            .insert(font_id, postscript_name);
+        self.fonts.push(font);
+        font_id
     }
 
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
@@ -774,4 +775,49 @@ mod lenient_font_attributes {
             TCFType::wrap_under_create_rule(reference)
         }
     }
+}
+
+/// The properties of a font (style, weight, stretch) from the traits its
+/// Core Text font has. font-kit's `properties` reads four numbers of the
+/// trait dictionary and panics on a missing one; on iOS the dictionary of
+/// a system font misses them (2026-10-21), so a missing number falls back
+/// to the symbolic traits, which every font has.
+fn safe_properties(font: &font_kit::font::Font) -> font_kit::properties::Properties {
+    use core_text::font_descriptor::SymbolicTraitAccessors as _;
+    use font_kit::properties::{Properties, Stretch, Style, Weight};
+    let ct_font = font.native_font();
+    let symbolic = ct_font.symbolic_traits();
+    let traits = ct_font.all_traits();
+    let number = |key: core_foundation::string::CFStringRef| -> Option<f32> {
+        unsafe {
+            traits
+                .find(key)
+                .and_then(|value| value.downcast::<CFNumber>())
+                .and_then(|number| number.to_f64())
+                .map(|number| number as f32)
+        }
+    };
+    let slant = unsafe { number(kCTFontSlantTrait) }.unwrap_or(0.);
+    let style = if symbolic.is_italic() {
+        Style::Italic
+    } else if slant > 0. {
+        Style::Oblique
+    } else {
+        Style::Normal
+    };
+    // Core Text's weight runs from -1 to 1 with 0 regular; CSS from 100
+    // to 900 with 400 regular.
+    let weight = match unsafe { number(kCTFontWeightTrait) } {
+        Some(w) if w < 0. => Weight((400. + w * 300.).clamp(100., 900.)),
+        Some(w) => Weight((400. + w * 500.).clamp(100., 900.)),
+        None if symbolic.is_bold() => Weight::BOLD,
+        None => Weight::NORMAL,
+    };
+    // Core Text's width runs from -1 to 1 with 0 normal; CSS from 0.5 to 2.
+    let stretch = match unsafe { number(kCTFontWidthTrait) } {
+        Some(w) if w < 0. => Stretch((1. + w * 0.5).max(0.5)),
+        Some(w) => Stretch((1. + w).min(2.)),
+        None => Stretch::NORMAL,
+    };
+    Properties { style, weight, stretch }
 }

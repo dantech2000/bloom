@@ -672,6 +672,7 @@ impl Bloom {
         let editor = self.plugin_editor().filter(|e| e.dirty() && on_plugins)?;
         let changes = editor.changed().len().max(1);
         Some(bar_shell(
+            self.admin_bar_edges(),
             changes,
             button("plugin.discard", "Discard", ButtonKind::Plain, cx)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.plugin_discard(cx))),

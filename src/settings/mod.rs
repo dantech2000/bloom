@@ -452,13 +452,30 @@ impl Bloom {
         match &mut self.page {
             Page::Settings(open) => {
                 *open = section;
+                self.settings_list = false;
                 self.forget_admin_dialogs();
                 self.page_scroll
                     .set_offset(gpui_kit::point(px(0.), px(0.)));
                 cx.notify();
             }
-            _ => self.navigate(Page::Settings(section), cx),
+            _ => {
+                // A phone starts at the list of sections.
+                self.settings_list = self.compact_w();
+                self.navigate(Page::Settings(section), cx)
+            }
         }
+    }
+
+    /// On a phone, with a section open: back to the list of sections.
+    /// False when the back arrow has to leave the page instead.
+    pub fn settings_back_to_list(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.compact_w() || !matches!(self.page, Page::Settings(_)) || self.settings_list {
+            return false;
+        }
+        self.settings_list = true;
+        self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+        cx.notify();
+        true
     }
 
     /// Changes one field of the user's configuration on the server. The page
@@ -671,8 +688,11 @@ impl Bloom {
         let open = *open;
         let t = UiTheme::read(cx).clone();
         // A narrow window has no room for the list beside the page; the
-        // sections then show as a row of pills over it.
+        // sections then show as a row of pills over it. A phone shows the
+        // list as a page of its own (`settings_list`), or the section.
         let narrow = self.viewport_w < 860.;
+        let compact = self.compact_w();
+        let (show_list, show_page) = if compact { (self.settings_list, !self.settings_list) } else { (true, true) };
 
         let nav_item = |section: Section, cx: &mut Context<Self>| {
             let selected = section == open;
@@ -681,10 +701,13 @@ impl Bloom {
             // accent fill and dark text when selected or under the pointer.
             div()
                 .id(SharedString::from(format!("settings.nav.{section:?}")))
+                .role(gpui_kit::Role::Button)
+                .aria_label(section.label())
                 .group("settings-nav")
                 .mb(px(2.))
                 .px(px(14.))
                 .py(px(8.))
+                .when(compact, |el| el.min_h(px(44.)))
                 .rounded(px(12.))
                 .flex()
                 .flex_shrink_0()
@@ -713,7 +736,9 @@ impl Bloom {
                 }))
         };
         let mut nav = div().flex().flex_shrink_0();
-        nav = if narrow {
+        nav = if compact {
+            nav.w_full().flex_col().px(px(16.)).pt(px(8.)).pb(px(72.))
+        } else if narrow {
             nav.w_full().flex_wrap().gap(px(6.)).px(px(20.)).pb(px(10.))
         } else {
             nav.w(px(NAV_W)).h_full().flex_col().px(px(12.)).pt(px(8.))
@@ -755,21 +780,23 @@ impl Bloom {
                 .child(
                     div()
                         .max_w(px(880.))
-                        .px(px(if narrow { 20. } else { 28. }))
+                        .px(px(if compact { 16. } else if narrow { 20. } else { 28. }))
                         .pt(px(8.))
                         .pb(px(72.))
                         .flex()
                         .flex_col()
                         .gap(px(18.))
                         // The theme sets the title of a settings page large
-                        // and at weight 600.
-                        .child(
-                            div()
-                                .text_size(px(30.))
-                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                .text_color(t.colors.foreground)
-                                .child(open.label()),
-                        )
+                        // and at weight 600. A phone has it in the top bar.
+                        .when(!compact, |el| {
+                            el.child(
+                                div()
+                                    .text_size(px(30.))
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .text_color(t.colors.foreground)
+                                    .child(open.label()),
+                            )
+                        })
                         .child(page),
                 ),
         );
@@ -779,8 +806,14 @@ impl Bloom {
             .size_full()
             .flex()
             .when(narrow, |el| el.flex_col())
-            .child(nav)
-            .child(content)
+            .when(show_list, |el| {
+                el.child(if compact {
+                    ScrollArea::new("settings.nav.scroll").size_full().child(nav).into_any_element()
+                } else {
+                    nav.into_any_element()
+                })
+            })
+            .when(show_page, |el| el.child(content))
             .children(self.render_confirm(cx))
             .children(self.render_prompt(cx))
     }
@@ -829,16 +862,21 @@ pub fn field(
 ) -> Div {
     let t = UiTheme::read(cx);
     let description: SharedString = description.into();
+    // A phone: a wide control (a choice, a value) goes under the label
+    // instead of squeezing it to a letter a line.
+    let compact = crate::views::shell::compact_now();
     div()
         .py(px(11.))
         .flex()
         .items_center()
         .justify_between()
         .gap(px(20.))
+        .when(compact, |el| el.flex_wrap().gap(px(10.)))
         .child(
             div()
                 .flex_1()
                 .min_w_0()
+                .when(compact, |el| el.min_w(px(230.)))
                 .flex()
                 .flex_col()
                 .gap(px(2.))
@@ -895,8 +933,19 @@ pub fn select(
     longest: &str,
     cx: &Context<Bloom>,
 ) -> Stateful<Div> {
+    select_capped(id, value, longest, control_max_w(), cx)
+}
+
+/// `select` with its own most width (a row that has buttons beside it).
+pub fn select_capped(
+    id: impl Into<SharedString>,
+    value: impl Into<SharedString>,
+    longest: &str,
+    max_w: f32,
+    cx: &Context<Bloom>,
+) -> Stateful<Div> {
     let t = UiTheme::read(cx);
-    let width = (longest.chars().count() as f32 * 8.2 + 58.).clamp(120., 340.);
+    let width = (longest.chars().count() as f32 * 8.2 + 58.).clamp(120., max_w.max(120.));
     div()
         .id(id.into())
         .w(px(width))
@@ -917,6 +966,13 @@ pub fn select(
         .hover(|s| s.border_color(rgba(0xf5f5f766)))
         .child(div().min_w_0().truncate().child(value.into()))
         .child(icon(LucideIcon::ChevronDown, 18., t.colors.foreground.opacity(0.7)))
+}
+
+/// The most width a control of a field takes: 340, or on a phone the
+/// window less the margins of the page and the group.
+pub fn control_max_w() -> f32 {
+    let w = crate::views::shell::viewport_w_now();
+    if crate::views::shell::compact_now() { (w - 80.).max(120.) } else { 340. }
 }
 
 /// The theme's `.raised` button: dark fill; accent fill and dark, bold text

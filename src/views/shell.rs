@@ -86,6 +86,21 @@ pub fn compact(window: &Window) -> bool {
 /// Below this width the window is compact.
 pub const COMPACT_W: f32 = 700.;
 
+/// The width of the window at its last frame, for a widget that has no
+/// window at hand (the fields of the settings and dashboard pages).
+static VIEWPORT_W: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The width of the window at its last frame.
+pub fn viewport_w_now() -> f32 {
+    f32::from_bits(VIEWPORT_W.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// `compact`, from the width of the last frame.
+pub fn compact_now() -> bool {
+    let w = viewport_w_now();
+    w > 0. && w < COMPACT_W
+}
+
 impl Bloom {
     /// `compact`, from the viewport the app keeps (`viewport_w`).
     pub fn compact_w(&self) -> bool {
@@ -149,6 +164,10 @@ impl Bloom {
         let overlay = matches!(self.page, Page::Home(_) | Page::Detail(_));
         let scrolled = f32::from(self.page_scroll.offset().y) < -8.;
         let compact = compact(window);
+        VIEWPORT_W.store(
+            f32::from(window.viewport_size().width).to_bits(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let keyboard = keyboard_inset();
         use gpui_kit::{MouseButton, NavigationDirection};
         div()
@@ -218,12 +237,17 @@ impl Bloom {
                                 ))
                             })
                             // Content scrolls under the bar; fade it out there.
-                            .when(overlay && scrolled, |el| {
+                            .when(overlay && scrolled && !compact, |el| {
                                 el.pb(px(28.)).bg(linear_gradient(
                                     180.,
                                     linear_color_stop(gpui_kit::black().alpha(0.55), 0.0),
                                     linear_color_stop(gpui_kit::black().alpha(0.0), 1.0),
                                 ))
+                            })
+                            // A phone: the bar turns to glass once the page
+                            // scrolls under it, as the bars of iOS do.
+                            .when(overlay && scrolled && compact, |el| {
+                                el.child(glass(px(0.), crate::ui::glass::POPUP_TINT))
                             })
                             .child(self.render_topbar(scrolled, compact, cx)),
                     )
@@ -243,7 +267,11 @@ impl Bloom {
             Page::Library(data) => data.view.name.clone(),
             Page::Detail(data) => data.item.name.clone(),
             Page::Search(_) => "Search".into(),
+            // On a phone the list of sections is "Dashboard", the section
+            // open has its own name.
+            Page::Admin(d) if !d.list && self.compact_w() => d.section.label().into(),
             Page::Admin(_) => "Dashboard".into(),
+            Page::Settings(open) if !self.settings_list && self.compact_w() => open.label().into(),
             Page::Settings(_) => "Settings".into(),
             Page::Playlist(_) => "Playlist".into(),
             Page::Downloads => "Downloads".into(),
@@ -571,7 +599,7 @@ impl Bloom {
                 items.push(
                     MenuItem::new("menu.downloads", "Downloads")
                         .icon(LucideIcon::Download)
-                        .detail("Movies and episodes kept on this Mac")
+                        .detail(format!("Movies and episodes kept on {}", crate::brand::THIS_DEVICE))
                         .on_click(move |_, _, cx| {
                             handle.update(cx, |this, cx| this.open_downloads(cx)).ok();
                         }),
@@ -765,7 +793,9 @@ impl Bloom {
                 .when(!is_home, |el| {
                     el.child(round("top.back", "Back", LucideIcon::ArrowLeft).on_click(
                         cx.listener(|this, _, _, cx| {
-                            if this.history.is_empty() {
+                            if this.admin_back_to_list(cx) || this.settings_back_to_list(cx) {
+                                // The page went back to its list of sections.
+                            } else if this.history.is_empty() {
                                 this.open_home(cx)
                             } else {
                                 this.back(cx)

@@ -10,6 +10,10 @@ use std::path::Path;
 pub const NAME: &str = "Bloom";
 /// The line under the name.
 pub const TAGLINE: &str = "Jellyfin client";
+
+/// The machine the app runs on, as a sentence names it ("...plays from
+/// this Mac"). A phone or a tablet is "this device".
+pub const THIS_DEVICE: &str = if cfg!(target_os = "ios") { "this device" } else { "this Mac" };
 /// The folder of the app in `~/Library/Application Support` and
 /// `~/Library/Caches`.
 pub const FOLDER: &str = "bloom";

@@ -28,8 +28,6 @@ const LINE_H: f32 = 20.;
 /// Smallest width of a file tile; the grid fits as many as the page holds.
 const FILE_MIN_W: f32 = 320.;
 const FILE_GAP: f32 = 10.;
-/// Width of the sidebar plus the page padding at both sides, and the panel's.
-const PAGE_CHROME: f32 = 236. + 56. + 38.;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -183,7 +181,7 @@ fn level_style(level: Level) -> (&'static str, Rgba, Rgba) {
 
 pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
     let t = UiTheme::read(cx).clone();
-    let content_w = (app.viewport_w - PAGE_CHROME).max(FILE_MIN_W);
+    let content_w = (app.admin_content_w() - 38.).max(FILE_MIN_W);
     let columns = (((content_w + FILE_GAP) / (FILE_MIN_W + FILE_GAP)).floor() as usize).max(1);
     let file_w = ((content_w - FILE_GAP * (columns - 1) as f32) / columns as f32).floor();
 

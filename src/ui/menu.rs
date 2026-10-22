@@ -441,6 +441,9 @@ impl Render for MenuState {
         // sheet over, with a row at the top to go back.
         let compact = crate::views::shell::compact(window);
         let sheet_bottom = window_h - crate::views::shell::bottom_inset() - 12.;
+        // A phone in landscape is wide: the menu stays a popup there, with
+        // rows a finger can hit.
+        let touch = compact || window_h.min(window_w) < crate::views::shell::PHONE_SHORT_SIDE;
         let mut root = div()
             .id(("menu", cx.entity_id()))
             .track_focus(&self.focus)
@@ -596,7 +599,7 @@ impl Render for MenuState {
                     .accessibility_label(item.label.clone())
                     .relative()
                     .w_full()
-                    .min_h(gpui_kit::px(match (compact, item.detail.is_some()) {
+                    .min_h(gpui_kit::px(match (touch, item.detail.is_some()) {
                         (true, true) => 58.,
                         (true, false) => 44.,
                         (false, true) => 52.,

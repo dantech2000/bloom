@@ -173,6 +173,13 @@ fn row(
         .filter(|d| is_real_date(d));
     let app_line = format!("{} {}", device.app_name, device.app_version);
     let user = device.last_user_name.clone().unwrap_or_default();
+    let when = match (is_active, date) {
+        (true, _) => "Active now".to_string(),
+        (false, Some(date)) => ago(date),
+        (false, None) => "Never".to_string(),
+    };
+    // A phone: the time goes on the second line, the name keeps the width.
+    let compact = crate::views::shell::compact_now();
 
     let mut row = div()
         .h(px(64.))
@@ -237,7 +244,9 @@ fn row(
                         .truncate()
                         .text_size(px(13.))
                         .text_color(t.colors.foreground.opacity(0.55))
-                        .child(if show_app {
+                        .child(if compact {
+                            format!("{app_line} · {when}")
+                        } else if show_app {
                             date.map(absolute).unwrap_or_default()
                         } else {
                             app_line.clone()
@@ -275,24 +284,22 @@ fn row(
                 }),
         );
     }
-    row = row.child(
-        div()
-            .w(px(120.))
-            .flex_shrink_0()
-            .text_size(px(13.))
-            .text_color(if is_active {
-                rgba(0x6ee7a0ff)
-            } else {
-                t.colors.foreground.opacity(0.6)
-            })
-            .child(match (is_active, date) {
-                (true, _) => "Active now".to_string(),
-                (false, Some(date)) => ago(date),
-                (false, None) => "Never".to_string(),
-            }),
-    );
+    if !compact {
+        row = row.child(
+            div()
+                .w(px(120.))
+                .flex_shrink_0()
+                .text_size(px(13.))
+                .text_color(if is_active {
+                    rgba(0x6ee7a0ff)
+                } else {
+                    t.colors.foreground.opacity(0.6)
+                })
+                .child(when),
+        );
+    }
     // This device cannot delete itself: that signs the app out.
-    row = row.child(div().w(px(92.)).flex_shrink_0().flex().justify_end().when(
+    row = row.child(div().when(!compact, |el| el.w(px(92.))).flex_shrink_0().flex().justify_end().when(
         !current,
         |el| {
             let target = device.clone();

@@ -146,9 +146,8 @@ impl Bloom {
             .when(!self.compact_w(), |el| el.gap(px(24.)))
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .when(self.compact_w(), |el| el.w_full().flex_shrink_0())
+                    .when(!self.compact_w(), |el| el.flex_1().min_w_0())
+                    .when(self.compact_w(), |el| el.w_full())
                     .flex()
                     .flex_col()
                     .gap(px(8.))
@@ -190,7 +189,7 @@ impl Bloom {
 
         let mut rows: Vec<Div> = Vec::new();
         if let Some(next) = &data.next_up {
-            let w = (vw * 0.173).round();
+            let w = (vw * if self.compact_w() { 0.56 } else { 0.173 }).round();
             rows.push(plain_section(
                 "Next Up",
                 l.content_left,
@@ -200,7 +199,7 @@ impl Bloom {
             ));
         }
         if !data.seasons.is_empty() {
-            let w = (vw * 0.09).round();
+            let w = (vw * if self.compact_w() { 0.28 } else { 0.09 }).round();
             let cards = data
                 .seasons
                 .iter()
@@ -216,7 +215,7 @@ impl Bloom {
         }
         if item.kind == ItemKind::Episode && data.episodes.len() > 1 {
             // The other episodes of the season, with this one marked.
-            let w = (vw * 0.173).round();
+            let w = (vw * if self.compact_w() { 0.56 } else { 0.173 }).round();
             let current = item.id.clone();
             let cards = Cards::new(w, data.episodes.len(), |i, cx| {
                 let episode = &data.episodes[i];

@@ -359,6 +359,9 @@ pub struct Bloom {
     pub search_input: Entity<InputState>,
     /// Scroll position of the current page.
     pub page_scroll: ScrollHandle,
+    /// A phone shows the Settings page as a list of its sections first;
+    /// a row opens the section, and the back arrow returns to the list.
+    pub settings_list: bool,
     /// Scroll positions of the horizontal rows, by row id.
     row_scrolls: RefCell<HashMap<SharedString, ScrollHandle>>,
     /// Window width at the last render; card sizes follow it.
@@ -742,6 +745,7 @@ impl Bloom {
             panel_dismissed: None,
             search_input,
             page_scroll: ScrollHandle::new(),
+            settings_list: false,
             row_scrolls: RefCell::new(HashMap::new()),
             viewport_w: 1280.,
             viewport_h: 820.,

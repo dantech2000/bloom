@@ -291,7 +291,7 @@ impl Bloom {
             ))
             .child(field(
                 "Sign out",
-                "Ends this session on the server and forgets it on this Mac.",
+                format!("Ends this session on the server and forgets it on {}.", crate::brand::THIS_DEVICE),
                 sign_out,
                 cx,
             ));
@@ -688,10 +688,17 @@ impl Bloom {
             if !last {
                 down = down.on_click(cx.listener(swap(slot + 1)));
             }
-            let pick = select(
+            // A phone: the choice leaves room for the two arrows beside it.
+            let pick_max = if crate::views::shell::compact_now() {
+                super::control_max_w() - 84.
+            } else {
+                340.
+            };
+            let pick = super::select_capped(
                 SharedString::from(format!("settings.home.{slot}")),
                 name_of(&kind),
                 longest,
+                pick_max,
                 cx,
             )
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {

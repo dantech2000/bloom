@@ -824,7 +824,7 @@ impl Bloom {
 
         let panel = div()
             .absolute()
-            .right(px(24.))
+            .right(px(if top.is_some() { 24. } else { if self.phone() { self.panel_corner().0 } else { 24. } }))
             .w(px(PANEL_W.min(self.viewport_w - 48.)))
             .rounded(px(24.))
             .border_1()
@@ -852,7 +852,7 @@ impl Bloom {
             .child(body);
         Some(match top {
             Some(top) => panel.top(px(top)),
-            None => panel.bottom(px(134.)),
+            None => panel.bottom(px(self.panel_corner().1)),
         })
     }
 }

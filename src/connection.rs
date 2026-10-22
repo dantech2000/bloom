@@ -151,7 +151,7 @@ impl Bloom {
         engine().set_client(None, "");
         let mut text = plain_words(why);
         if self.has_downloads() {
-            text.push_str(" Your downloads play from this Mac.");
+            text.push_str(&format!(" Your downloads play from {}.", crate::brand::THIS_DEVICE));
             if !matches!(self.page, Page::Downloads) {
                 self.connection.sent_to_downloads = true;
                 self.navigate(Page::Downloads, cx);
