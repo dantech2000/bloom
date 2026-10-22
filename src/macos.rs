@@ -287,6 +287,14 @@ pub fn after_event(work: impl FnOnce() + 'static) {
 /// that starts an app) is logged and ignored.
 pub fn open_web_url(cx: &mut gpui_kit::App, url: &str) {
     if is_web_url(url) {
+        // iOS shows the page in a sheet of the app (Safari's view
+        // controller); the Mac hands it to the browser.
+        #[cfg(target_os = "ios")]
+        {
+            gpui_ios::present_web(url);
+            let _ = cx;
+        }
+        #[cfg(not(target_os = "ios"))]
         cx.open_url(url);
     } else {
         // The query can hold a token; keep it out of the log.

@@ -106,6 +106,14 @@ pub fn show_keyboard_with_type(keyboard_type: KeyboardType) {
     }
 }
 
+/// Shows a web page in a sheet inside the app (`SFSafariViewController`:
+/// Safari's engine with a Done button, so a trailer plays without leaving
+/// the app). A page that is not http(s) is refused by the caller.
+pub fn present_web(url: &str) {
+    let Some(window) = ffi::last_window() else { return };
+    window.present_web(url);
+}
+
 /// Hides the software keyboard.
 pub fn hide_keyboard() {
     if let Some(window) = ffi::last_window() {

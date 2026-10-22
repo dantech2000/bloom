@@ -55,21 +55,29 @@ dev/jctl mute >/dev/null 2>&1
 tap play; expect "Play starts playback" 'player=Playing'
 expect "the phone turned to landscape" 'window=874x402'
 sleep 2; shot player
-$ui tap 437 201 >/dev/null; sleep 0.5; shot player-controls
+# The controls hide a few seconds after the last touch; a tap on the
+# video brings them back. Up to four tries: a tap during the hide
+# animation is swallowed, and the accessibility tree lags the frame.
+controls() {
+  for try in 1 2 3 4; do
+    $ui find close >/dev/null 2>&1 && return 0
+    $ui tap 437 201 >/dev/null 2>&1; sleep 1.2
+  done
+}
+controls; shot player-controls
 # A drag along the timeline (y of the Seek slider in landscape) seeks.
 $ui swipe 250 314 600 314 800 >/dev/null 2>&1
 expect "a drag on the timeline seeks" 'player=Playing pos=[1-9][0-9]{2,}'
 # The episode picker: a row plays that episode (the series is one the
 # account never started, so the second episode is as safe as the first).
-# The controls hide a few seconds after the last touch; a tap on the
-# video brings them back (up to three tries: a tap during the hide
-# animation is swallowed).
-for try in 1 2 3; do $ui find close >/dev/null 2>&1 && break; $ui tap 437 201 >/dev/null 2>&1; sleep 0.8; done
-tap episodes; sleep 1.5; shot episode-picker
+controls
+tap episodes
+for try in 1 2 3 4; do $ui find "2. Part 2" >/dev/null 2>&1 && break; sleep 0.7; done
+shot episode-picker
 tap "2. Part 2"; expect "a row of the picker plays that episode" 'player=Playing pos=[0-9]+ playing="Part 2"'
 # The controls hide a few seconds after the last touch: wait for that,
 # then a tap on the video brings them back fresh for the close.
-for try in 1 2 3; do $ui find close >/dev/null 2>&1 && break; $ui tap 437 201 >/dev/null 2>&1; sleep 0.8; done
+controls
 tap close; expect "Back ends playback" 'player=Idle'
 expect "the phone turned back to portrait" 'window=402x874'
 shot after-player

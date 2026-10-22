@@ -13,8 +13,8 @@
 //! glass" in vendor/README.md).
 
 use std::sync::{
-    LazyLock, RwLock,
-    atomic::{AtomicBool, Ordering},
+    Arc, LazyLock, Mutex, RwLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use gpui_kit::{
@@ -158,6 +158,47 @@ pub fn set_over_video(on: bool) {
     OVER_VIDEO.store(on, Ordering::Relaxed);
 }
 
+/// A copy of the video frame, where the video is not in GPUI's frame (iOS:
+/// mpv draws into a layer under GPUI's, and the page is a hole over it).
+/// The player's worker sets it every tenth of a second while a popup is
+/// open over the player (`Player::set_backdrop`); each glass over the
+/// video paints it under itself, so the blur has the picture to blur.
+static VIDEO_BACKDROP: Mutex<Option<Arc<gpui_kit::RenderImage>>> = Mutex::new(None);
+static VIDEO_BACKDROP_VERSION: AtomicU64 = AtomicU64::new(0);
+
+/// Sets the copy of the video frame, or clears it.
+pub fn set_video_backdrop(image: Option<Arc<gpui_kit::RenderImage>>) {
+    *VIDEO_BACKDROP.lock().unwrap() = image;
+    VIDEO_BACKDROP_VERSION.fetch_add(1, Ordering::Release);
+}
+
+/// Changes with each copy of the video frame (the player's poll redraws
+/// when it moved).
+pub fn video_backdrop_version() -> u64 {
+    VIDEO_BACKDROP_VERSION.load(Ordering::Acquire)
+}
+
+/// Paints the copy of the video frame under a glass quad: the video
+/// fitted into the window (mpv letterboxes the same way), clipped to the
+/// quad's bounds.
+fn paint_video_backdrop(bounds: Bounds<Pixels>, window: &mut gpui_kit::Window) {
+    let Some(image) = VIDEO_BACKDROP.lock().unwrap().clone() else { return };
+    let size = image.size(0);
+    let (iw, ih) = (size.width.0 as f32, size.height.0 as f32);
+    if iw <= 0. || ih <= 0. {
+        return;
+    }
+    let viewport = window.viewport_size();
+    let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
+    let scale = (vw / iw).min(vh / ih);
+    let (w, h) = (iw * scale, ih * scale);
+    let fitted = Bounds::new(
+        gpui_kit::point(gpui_kit::px((vw - w) / 2.), gpui_kit::px((vh - h) / 2.)),
+        gpui_kit::size(gpui_kit::px(w), gpui_kit::px(h)),
+    );
+    let _ = window.paint_image(bounds, fitted, Corners::default(), image, 0, false);
+}
+
 /// The current settings.
 pub fn settings() -> Settings {
     *SETTINGS.read().unwrap()
@@ -214,6 +255,9 @@ fn layer(radius: Pixels, tint: Rgba, card: bool) -> Canvas<()> {
                     set.full &= !OVER_VIDEO.load(Ordering::Relaxed);
                     set
                 });
+            if OVER_VIDEO.load(Ordering::Relaxed) {
+                paint_video_backdrop(bounds, window);
+            }
             let quad = match liquid {
                 Some(liquid) => encode(bounds, radius, tint, &liquid, card, window.scale_factor()),
                 None => PaintQuad {

@@ -3,6 +3,8 @@
 #
 #   dev/ios                 build (debug) and run in the simulator
 #   dev/ios --release       the release profile
+#   dev/ios --no-xcode      the Rust library and its prelink alone (CI)
+#   dev/ios --device <id>   a real device (BLOOM_IOS_TEAM=<team id>; see below)
 #   dev/ios --no-run        build only
 #   dev/ios --shot <png>    run, wait, and save a screenshot
 #
@@ -13,11 +15,13 @@
 # available iPhone 17 Pro).
 set -e
 dir=$(cd "$(dirname "$0")/.." && pwd)
-profile=debug; config=Debug; cargo_flag=""; run=1; shot=""
+profile=debug; config=Debug; cargo_flag=""; run=1; shot=""; xcode=1; device=""
 while [ $# -gt 0 ]; do
   case $1 in
     --release) profile=release; config=Release; cargo_flag=--release ;;
     --no-run) run=0 ;;
+    --no-xcode) xcode=0; run=0 ;;
+    --device) device=${2:-}; shift ;;
     --shot) shot=$2; shift ;;
     *) echo "dev/ios: unknown option $1" >&2; exit 2 ;;
   esac
@@ -25,7 +29,16 @@ while [ $# -gt 0 ]; do
 done
 
 cd "$dir"
-target=aarch64-apple-ios-sim
+# A real device (`--device <id>`, an id of `xcrun devicectl list devices`)
+# needs the signing team in BLOOM_IOS_TEAM (the ten characters of the
+# Apple Developer account); Xcode makes the profile. Not run on a device
+# yet (2026-10-22): the simulator is the tested path.
+if [ -n "$device" ]; then
+  [ -n "${BLOOM_IOS_TEAM:-}" ] || { echo "dev/ios: --device needs BLOOM_IOS_TEAM=<team id>" >&2; exit 2; }
+  target=aarch64-apple-ios; sdk_name=iphoneos; platform_version=ios; destination='generic/platform=iOS'
+else
+  target=aarch64-apple-ios-sim; sdk_name=iphonesimulator; platform_version=ios-simulator; destination='generic/platform=iOS Simulator'
+fi
 echo "== cargo build -p bloom-ios ($profile, $target)"
 # The minimum iOS of the Rust objects, the same as the Xcode project's.
 IPHONEOS_DEPLOYMENT_TARGET=17.0 cargo build --target $target -p bloom-ios $cargo_flag
@@ -42,11 +55,12 @@ obj=target/$target/$profile/bloom_ios.o
 # members of the archive in, so an object nothing calls stays out.
 exports=ios/host/exports.txt
 roots=$(sed 's/^/-u /' "$exports" | tr '\n' ' ')
-sdk=$(xcrun --sdk iphonesimulator --show-sdk-version)
+sdk=$(xcrun --sdk $sdk_name --show-sdk-version)
 echo "== prelink ($(wc -l < "$exports" | tr -d ' ') entry points)"
 # shellcheck disable=SC2086
-xcrun ld -r -arch arm64 -platform_version ios-simulator 17.0 "$sdk" -o "$obj" \
+xcrun ld -r -arch arm64 -platform_version $platform_version 17.0 "$sdk" -o "$obj" \
   $roots -exported_symbols_list "$exports" "$lib"
+[ $xcode = 1 ] || { echo "prelinked $obj"; exit 0; }
 
 echo "== xcodegen"
 (cd ios/host && xcodegen generate --spec project.yml --quiet)
@@ -54,8 +68,20 @@ echo "== xcodegen"
 echo "== xcodebuild ($config)"
 derived=$dir/target/ios/DerivedData
 mkdir -p "$dir/target/ios"
+if [ -n "$device" ]; then
+  xcodebuild -project ios/host/Bloom.xcodeproj -scheme Bloom -configuration "$config" \
+    -sdk iphoneos -destination "$destination" -allowProvisioningUpdates \
+    -derivedDataPath "$derived" DEVELOPMENT_TEAM="$BLOOM_IOS_TEAM" build -quiet
+  app=$derived/Build/Products/$config-iphoneos/Bloom.app
+  echo "built $app"
+  [ $run = 1 ] || exit 0
+  echo "== install and launch on $device"
+  xcrun devicectl device install app --device "$device" "$app"
+  xcrun devicectl device process launch --device "$device" dev.bloom.ios
+  exit 0
+fi
 xcodebuild -project ios/host/Bloom.xcodeproj -scheme Bloom -configuration "$config" \
-  -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+  -sdk iphonesimulator -destination "$destination" \
   -derivedDataPath "$derived" CODE_SIGNING_ALLOWED=NO build -quiet
 app=$derived/Build/Products/$config-iphonesimulator/Bloom.app
 echo "built $app"

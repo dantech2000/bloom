@@ -316,7 +316,30 @@ fn register_metal_view_class() -> &'static AnyClass {
             handle_touches(this, touches, event);
         }
 
+        // VoiceOver: the view is a container of the elements of the tree.
+        extern "C" fn is_a11y_element(_this: *mut AnyObject, _sel: Sel) -> Bool {
+            Bool::NO
+        }
+        extern "C" fn a11y_elements(this: *mut AnyObject, _sel: Sel) -> *mut AnyObject {
+            unsafe {
+                #[allow(deprecated)]
+                let window_ptr: *mut std::ffi::c_void = *(*this).get_ivar(GPUI_WINDOW_IVAR);
+                match (window_ptr as *const IosWindow).as_ref() {
+                    Some(window) => window.a11y_elements_array(),
+                    None => ptr::null_mut(),
+                }
+            }
+        }
+
         unsafe {
+            decl.add_method(
+                sel!(isAccessibilityElement),
+                is_a11y_element as extern "C" fn(*mut AnyObject, Sel) -> Bool,
+            );
+            decl.add_method(
+                sel!(accessibilityElements),
+                a11y_elements as extern "C" fn(*mut AnyObject, Sel) -> *mut AnyObject,
+            );
             decl.add_method(
                 sel!(didMoveToWindow),
                 did_move_to_window as extern "C" fn(*mut AnyObject, Sel),
@@ -663,6 +686,19 @@ pub(crate) struct IosWindow {
     /// `a11y_json`. Kept only with `BLOOM_A11Y_TREE`.
     a11y_nodes: RefCell<HashMap<gpui::accesskit::NodeId, gpui::accesskit::Node>>,
     a11y_root: Cell<Option<gpui::accesskit::NodeId>>,
+    /// GPUI's callbacks: the activation (asked when VoiceOver first asks
+    /// for the elements) and the action (a VoiceOver activation of an
+    /// element goes back as a click of its node).
+    a11y_callbacks: RefCell<Option<gpui::A11yCallbacks>>,
+    /// The tree is built: GPUI sends updates after each frame.
+    a11y_active: Cell<bool>,
+    /// The `GPUIA11yElement` objects VoiceOver reads (retained), and the
+    /// NSArray of them the view answers `accessibilityElements` with.
+    a11y_elements: RefCell<Vec<*mut AnyObject>>,
+    a11y_array: Cell<*mut AnyObject>,
+    /// A hash of the ids, roles and labels of the elements, so the list is
+    /// built again only when it changed (the frames are read live).
+    a11y_signature: Cell<u64>,
 }
 
 // Required for raw_window_handle
@@ -800,6 +836,11 @@ impl IosWindow {
                 keyboard_shown: Cell::new(false),
                 a11y_nodes: RefCell::new(HashMap::new()),
                 a11y_root: Cell::new(None),
+                a11y_callbacks: RefCell::new(None),
+                a11y_active: Cell::new(false),
+                a11y_elements: RefCell::new(Vec::new()),
+                a11y_array: Cell::new(ptr::null_mut()),
+                a11y_signature: Cell::new(0),
             };
 
             Ok(ios_window)
@@ -1639,44 +1680,335 @@ impl PlatformWindow for IosWindow {
         // iOS handles IME positioning automatically
     }
 
-    /// No bridge to UIAccessibility yet. With `BLOOM_A11Y_TREE=1` the tree
-    /// is built anyway, for the debug channel of the app (`a11y`): a test
-    /// reads the labels and bounds of the elements from it and taps them.
+    /// The bridge to UIAccessibility (VoiceOver): the tree is built when
+    /// VoiceOver runs at the start, or the first time it asks the view for
+    /// its elements (`accessibilityElements`), or with `BLOOM_A11Y_TREE=1`
+    /// (the debug channel of the app, `a11y`: a test reads the labels and
+    /// bounds of the elements from it and taps them).
     fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
-        if std::env::var_os("BLOOM_A11Y_TREE").is_some_and(|v| !v.is_empty()) {
-            if let Some(initial) = (callbacks.activation)() {
-                self.a11y_tree_update(initial);
-            }
-            log::info!("GPUI iOS: the accessibility tree is built (BLOOM_A11Y_TREE)");
+        *self.a11y_callbacks.borrow_mut() = Some(callbacks);
+        let wanted = std::env::var_os("BLOOM_A11Y_TREE").is_some_and(|v| !v.is_empty())
+            || unsafe { UIAccessibilityIsVoiceOverRunning() }.as_bool();
+        if wanted {
+            self.a11y_activate();
         }
     }
 
     fn a11y_tree_update(&self, tree_update: gpui::accesskit::TreeUpdate) {
-        let mut nodes = self.a11y_nodes.borrow_mut();
-        if let Some(tree) = tree_update.tree {
-            self.a11y_root.set(Some(tree.root));
-        }
-        for (id, node) in tree_update.nodes {
-            nodes.insert(id, node);
-        }
-        // What the tree does not reach any more is gone.
-        if let Some(root) = self.a11y_root.get() {
-            let mut keep = std::collections::HashSet::new();
-            let mut stack = vec![root];
-            while let Some(id) = stack.pop() {
-                if !keep.insert(id) {
-                    continue;
-                }
-                if let Some(node) = nodes.get(&id) {
-                    stack.extend(node.children().iter().copied());
-                }
+        {
+            let mut nodes = self.a11y_nodes.borrow_mut();
+            if let Some(tree) = tree_update.tree {
+                self.a11y_root.set(Some(tree.root));
             }
-            nodes.retain(|id, _| keep.contains(id));
+            for (id, node) in tree_update.nodes {
+                nodes.insert(id, node);
+            }
+            // What the tree does not reach any more is gone.
+            if let Some(root) = self.a11y_root.get() {
+                let mut keep = std::collections::HashSet::new();
+                let mut stack = vec![root];
+                while let Some(id) = stack.pop() {
+                    if !keep.insert(id) {
+                        continue;
+                    }
+                    if let Some(node) = nodes.get(&id) {
+                        stack.extend(node.children().iter().copied());
+                    }
+                }
+                nodes.retain(|id, _| keep.contains(id));
+            }
+        }
+        self.a11y_rebuild_elements();
+    }
+}
+
+// UIKit's accessibility functions and the traits of an element.
+#[link(name = "UIKit", kind = "framework")]
+unsafe extern "C" {
+    fn UIAccessibilityConvertFrameToScreenCoordinates(rect: ObjcCGRect, view: *mut AnyObject) -> ObjcCGRect;
+    fn UIAccessibilityPostNotification(notification: u32, argument: *mut AnyObject);
+    fn UIAccessibilityIsVoiceOverRunning() -> Bool;
+    static UIAccessibilityLayoutChangedNotification: u32;
+    static UIAccessibilityTraitButton: u64;
+    static UIAccessibilityTraitLink: u64;
+    static UIAccessibilityTraitImage: u64;
+    static UIAccessibilityTraitSelected: u64;
+    static UIAccessibilityTraitStaticText: u64;
+    static UIAccessibilityTraitNotEnabled: u64;
+    static UIAccessibilityTraitSearchField: u64;
+    static UIAccessibilityTraitAdjustable: u64;
+    static UIAccessibilityTraitHeader: u64;
+}
+
+const A11Y_NODE_IVAR: &str = "gpui_node_id";
+static A11Y_ELEMENT_CLASS_REGISTERED: std::sync::Once = std::sync::Once::new();
+
+/// The `UIAccessibilityElement` subclass that stands for one node of the
+/// tree. Its frame, label, value and traits are read from the node at
+/// each ask, so a scroll moves the elements without a new list; an
+/// activation goes back to GPUI as a click of the node, and the increment
+/// and decrement of a slider as its actions.
+fn register_a11y_element_class() -> &'static AnyClass {
+    A11Y_ELEMENT_CLASS_REGISTERED.call_once(|| {
+        let mut decl = ClassBuilder::new(c"GPUIA11yElement", class!(UIAccessibilityElement)).unwrap();
+        decl.add_ivar::<*mut std::ffi::c_void>(c"gpui_window_ptr");
+        decl.add_ivar::<u64>(c"gpui_node_id");
+
+        fn with_node<R>(this: *mut AnyObject, f: impl FnOnce(&IosWindow, &gpui::accesskit::Node) -> R) -> Option<R> {
+            unsafe {
+                #[allow(deprecated)]
+                let window_ptr: *mut std::ffi::c_void = *(*this).get_ivar(GPUI_WINDOW_IVAR);
+                #[allow(deprecated)]
+                let id: u64 = *(*this).get_ivar(A11Y_NODE_IVAR);
+                let window = (window_ptr as *const IosWindow).as_ref()?;
+                let nodes = window.a11y_nodes.borrow();
+                let node = nodes.get(&gpui::accesskit::NodeId(id))?;
+                Some(f(window, node))
+            }
+        }
+
+        extern "C" fn frame(this: *mut AnyObject, _sel: Sel) -> ObjcCGRect {
+            with_node(this, |window, node| {
+                let scale = window.scale_factor.get() as f64;
+                let rect = match node.bounds() {
+                    Some(r) => ObjcCGRect::new(r.x0 / scale, r.y0 / scale, (r.x1 - r.x0) / scale, (r.y1 - r.y0) / scale),
+                    None => ObjcCGRect::new(0., 0., 0., 0.),
+                };
+                unsafe { UIAccessibilityConvertFrameToScreenCoordinates(rect, window.view) }
+            })
+            .unwrap_or_else(|| ObjcCGRect::new(0., 0., 0., 0.))
+        }
+
+        extern "C" fn label(this: *mut AnyObject, _sel: Sel) -> *mut AnyObject {
+            with_node(this, |_, node| {
+                // A label that is the last part of an id ("play", "close")
+                // is spoken with a capital, as a button's title would be.
+                let label = node.label().map(|l| {
+                    let mut chars = l.chars();
+                    match chars.next() {
+                        Some(first) if l.chars().all(|c| c.is_ascii_lowercase()) => {
+                            first.to_ascii_uppercase().to_string() + chars.as_str()
+                        }
+                        _ => l.to_string(),
+                    }
+                });
+                nsstring_or_nil(label.as_deref())
+            })
+            .unwrap_or(ptr::null_mut())
+        }
+
+        extern "C" fn value(this: *mut AnyObject, _sel: Sel) -> *mut AnyObject {
+            with_node(this, |_, node| {
+                if let Some(value) = node.value() {
+                    return nsstring_or_nil(Some(value));
+                }
+                // A slider says its share in percent, as the sliders of iOS do.
+                match (node.numeric_value(), node.min_numeric_value(), node.max_numeric_value()) {
+                    (Some(v), Some(min), Some(max)) if max > min => {
+                        nsstring_or_nil(Some(&format!("{:.0}%", (v - min) / (max - min) * 100.)))
+                    }
+                    (Some(v), _, _) => nsstring_or_nil(Some(&format!("{v:.0}"))),
+                    _ => ptr::null_mut(),
+                }
+            })
+            .unwrap_or(ptr::null_mut())
+        }
+
+        extern "C" fn traits(this: *mut AnyObject, _sel: Sel) -> u64 {
+            use gpui::accesskit::Role;
+            with_node(this, |_, node| unsafe {
+                let mut traits = match node.role() {
+                    Role::Button | Role::MenuItem | Role::Tab | Role::CheckBox | Role::RadioButton | Role::Switch => {
+                        UIAccessibilityTraitButton
+                    }
+                    Role::Link => UIAccessibilityTraitLink,
+                    Role::Image => UIAccessibilityTraitImage,
+                    Role::Slider => UIAccessibilityTraitAdjustable,
+                    Role::TextInput => UIAccessibilityTraitSearchField,
+                    Role::Heading => UIAccessibilityTraitHeader,
+                    _ => UIAccessibilityTraitStaticText,
+                };
+                if node.is_selected() == Some(true) {
+                    traits |= UIAccessibilityTraitSelected;
+                }
+                if node.is_disabled() {
+                    traits |= UIAccessibilityTraitNotEnabled;
+                }
+                traits
+            })
+            .unwrap_or(0)
+        }
+
+        fn act(this: *mut AnyObject, action: gpui::accesskit::Action) -> bool {
+            unsafe {
+                #[allow(deprecated)]
+                let window_ptr: *mut std::ffi::c_void = *(*this).get_ivar(GPUI_WINDOW_IVAR);
+                #[allow(deprecated)]
+                let id: u64 = *(*this).get_ivar(A11Y_NODE_IVAR);
+                let Some(window) = (window_ptr as *const IosWindow).as_ref() else { return false };
+                let callbacks = window.a11y_callbacks.borrow();
+                let Some(callbacks) = callbacks.as_ref() else { return false };
+                (callbacks.action)(gpui::accesskit::ActionRequest {
+                    action,
+                    target_tree: gpui::accesskit::TreeId::ROOT,
+                    target_node: gpui::accesskit::NodeId(id),
+                    data: None,
+                });
+                super::ffi::request_frame(window);
+                true
+            }
+        }
+
+        extern "C" fn activate(this: *mut AnyObject, _sel: Sel) -> Bool {
+            Bool::new(act(this, gpui::accesskit::Action::Click))
+        }
+        extern "C" fn increment(this: *mut AnyObject, _sel: Sel) {
+            act(this, gpui::accesskit::Action::Increment);
+        }
+        extern "C" fn decrement(this: *mut AnyObject, _sel: Sel) {
+            act(this, gpui::accesskit::Action::Decrement);
+        }
+
+        unsafe {
+            decl.add_method(sel!(accessibilityFrame), frame as extern "C" fn(*mut AnyObject, Sel) -> ObjcCGRect);
+            decl.add_method(sel!(accessibilityLabel), label as extern "C" fn(*mut AnyObject, Sel) -> *mut AnyObject);
+            decl.add_method(sel!(accessibilityValue), value as extern "C" fn(*mut AnyObject, Sel) -> *mut AnyObject);
+            decl.add_method(sel!(accessibilityTraits), traits as extern "C" fn(*mut AnyObject, Sel) -> u64);
+            decl.add_method(sel!(accessibilityActivate), activate as extern "C" fn(*mut AnyObject, Sel) -> Bool);
+            decl.add_method(sel!(accessibilityIncrement), increment as extern "C" fn(*mut AnyObject, Sel));
+            decl.add_method(sel!(accessibilityDecrement), decrement as extern "C" fn(*mut AnyObject, Sel));
+        }
+        decl.register();
+    });
+    class!(GPUIA11yElement)
+}
+
+/// An autoreleased `NSString` of the text, or nil for none.
+fn nsstring_or_nil(text: Option<&str>) -> *mut AnyObject {
+    let Some(text) = text else { return ptr::null_mut() };
+    let Ok(c) = std::ffi::CString::new(text) else { return ptr::null_mut() };
+    unsafe { msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()] }
+}
+
+impl IosWindow {
+    /// Asks GPUI for the tree and keeps its updates from then on.
+    fn a11y_activate(&self) {
+        if self.a11y_active.replace(true) {
+            return;
+        }
+        let initial = self.a11y_callbacks.borrow().as_ref().and_then(|c| (c.activation)());
+        if let Some(initial) = initial {
+            self.a11y_tree_update(initial);
+        }
+        log::info!("GPUI iOS: the accessibility tree is built");
+    }
+
+    /// The array of elements the view answers VoiceOver with; nil before
+    /// the tree exists. The first ask starts the tree.
+    pub(crate) fn a11y_elements_array(&self) -> *mut AnyObject {
+        if !self.a11y_active.get() {
+            self.a11y_activate();
+            super::ffi::request_frame(self);
+        }
+        self.a11y_array.get()
+    }
+
+    /// Makes the list of elements again when the set of nodes changed, and
+    /// tells VoiceOver. The order is the reading order: top to bottom,
+    /// then left to right.
+    fn a11y_rebuild_elements(&self) {
+        use gpui::accesskit::Role;
+        let scale = self.scale_factor.get() as f64;
+        let nodes = self.a11y_nodes.borrow();
+        let mut wanted: Vec<(u64, f64, f64)> = nodes
+            .iter()
+            .filter(|(_, node)| {
+                let role = node.role();
+                let spoken = matches!(
+                    role,
+                    Role::Button | Role::MenuItem | Role::Tab | Role::Slider | Role::TextInput | Role::CheckBox
+                        | Role::RadioButton | Role::Switch | Role::Link | Role::Image | Role::Heading | Role::Label
+                );
+                spoken && node.label().is_some_and(|l| !l.is_empty()) && node.bounds().is_some_and(|r| r.x1 > r.x0 && r.y1 > r.y0)
+            })
+            .map(|(id, node)| {
+                let r = node.bounds().unwrap();
+                (id.0, (r.y0 / scale / 8.).round(), r.x0 / scale)
+            })
+            .collect();
+        // Rows of 8 points: the buttons of a bar read left to right.
+        wanted.sort_by(|a, b| (a.1, a.2).partial_cmp(&(b.1, b.2)).unwrap_or(std::cmp::Ordering::Equal));
+        let mut signature: u64 = 0xcbf29ce484222325;
+        for (id, _, _) in &wanted {
+            let node = &nodes[&gpui::accesskit::NodeId(*id)];
+            for byte in id.to_le_bytes().iter().chain(node.label().unwrap_or_default().as_bytes()) {
+                signature ^= u64::from(*byte);
+                signature = signature.wrapping_mul(0x100000001b3);
+            }
+            signature ^= node.role() as u64;
+            signature = signature.wrapping_mul(0x100000001b3);
+        }
+        drop(nodes);
+        if signature == self.a11y_signature.get() {
+            return;
+        }
+        self.a11y_signature.set(signature);
+        unsafe {
+            for old in self.a11y_elements.borrow_mut().drain(..) {
+                let _: () = msg_send![old, release];
+            }
+            let old = self.a11y_array.replace(ptr::null_mut());
+            if !old.is_null() {
+                let _: () = msg_send![old, release];
+            }
+            let class = register_a11y_element_class();
+            let mut elements = Vec::with_capacity(wanted.len());
+            for (id, _, _) in &wanted {
+                let element: *mut AnyObject = msg_send![class, alloc];
+                let element: *mut AnyObject = msg_send![element, initWithAccessibilityContainer: self.view];
+                #[allow(deprecated)]
+                {
+                    *(*element).get_mut_ivar::<*mut std::ffi::c_void>(GPUI_WINDOW_IVAR) = self as *const IosWindow as *mut _;
+                    *(*element).get_mut_ivar::<u64>(A11Y_NODE_IVAR) = *id;
+                }
+                elements.push(element);
+            }
+            let array: *mut AnyObject = msg_send![class!(NSArray), arrayWithObjects: elements.as_ptr(), count: elements.len()];
+            let _: *mut AnyObject = msg_send![array, retain];
+            self.a11y_array.set(array);
+            *self.a11y_elements.borrow_mut() = elements;
+            UIAccessibilityPostNotification(UIAccessibilityLayoutChangedNotification, ptr::null_mut());
         }
     }
 }
 
 impl IosWindow {
+    /// Presents an `SFSafariViewController` with the page over the app's
+    /// view controller (see `gpui_ios::present_web`).
+    pub fn present_web(&self, url: &str) {
+        let vc = self.view_controller;
+        if vc.is_null() {
+            return;
+        }
+        let Ok(c_url) = std::ffi::CString::new(url) else { return };
+        unsafe {
+            let string: *mut AnyObject = msg_send![class!(NSString), stringWithUTF8String: c_url.as_ptr()];
+            let ns_url: *mut AnyObject = msg_send![class!(NSURL), URLWithString: string];
+            if ns_url.is_null() {
+                return;
+            }
+            let Some(class) = AnyClass::get(c"SFSafariViewController") else {
+                log::warn!("GPUI iOS: SafariServices is not linked; the page is not shown");
+                return;
+            };
+            let safari: *mut AnyObject = msg_send![class, alloc];
+            let safari: *mut AnyObject = msg_send![safari, initWithURL: ns_url];
+            // Over the top of the app, the way a modal sheet of iOS is.
+            let _: () = msg_send![safari, setModalPresentationStyle: 2i64];
+            let _: () = msg_send![vc, presentViewController: safari, animated: true, completion: ptr::null::<AnyObject>()];
+        }
+    }
+
     /// The accessibility tree as JSON: a list of nodes with `id`, `role`,
     /// `label`, `value`, `bounds` (x, y, w, h in points of the window) and
     /// `children`. Empty without `BLOOM_A11Y_TREE`.

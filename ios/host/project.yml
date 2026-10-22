@@ -88,6 +88,8 @@ targets:
           - "-framework MediaPlayer"
           - "-framework AVFoundation"
           - "-framework Security"
+          # The in-app browser of trailers and links (SFSafariViewController).
+          - "-framework SafariServices"
           - "-ObjC"
       configs:
         Release:

@@ -362,6 +362,8 @@ pub struct Bloom {
     /// A phone shows the Settings page as a list of its sections first;
     /// a row opens the section, and the back arrow returns to the list.
     pub settings_list: bool,
+    /// The copy of the video frame the glass last drew (`video_backdrop_version`).
+    pub backdrop_seen: u64,
     /// Scroll positions of the horizontal rows, by row id.
     row_scrolls: RefCell<HashMap<SharedString, ScrollHandle>>,
     /// Window width at the last render; card sizes follow it.
@@ -746,6 +748,7 @@ impl Bloom {
             search_input,
             page_scroll: ScrollHandle::new(),
             settings_list: false,
+            backdrop_seen: 0,
             row_scrolls: RefCell::new(HashMap::new()),
             viewport_w: 1280.,
             viewport_h: 820.,
@@ -3187,7 +3190,11 @@ impl Bloom {
                             && status.state == PlayState::Playing
                             && !status.paused
                             && this.player.frame_wait_ms() < 100.;
+                        let backdrop = crate::ui::glass::video_backdrop_version();
+                        let backdrop_moved = backdrop != this.backdrop_seen;
+                        this.backdrop_seen = backdrop;
                         let changed = (position_moved && !frames_flow)
+                            || backdrop_moved
                             || status.paused != this.player_status.paused
                             || status.buffering != this.player_status.buffering
                             || status.state != this.player_status.state
@@ -3362,6 +3369,12 @@ impl Render for Bloom {
         self.hero.only_frame = !std::mem::take(&mut self.content_dirty);
         self.sync_frame(window);
         crate::ui::glass::set_over_video(self.player_open);
+        // iOS: the video is under GPUI's layer, so a glass over it needs a
+        // copy of the frame while a popup is open over the player.
+        if cfg!(target_os = "ios") {
+            let popup = self.panel_open() || self.menus().iter().any(|menu| menu.read(cx).is_open());
+            self.player.set_backdrop(self.player_open && popup);
+        }
         self.viewport_w = f32::from(window.viewport_size().width);
         self.viewport_h = f32::from(window.viewport_size().height);
         // Picture in picture ends with the player.

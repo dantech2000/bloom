@@ -142,6 +142,54 @@ jobs:
             vendor/mpv/lib
           key: mpv-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.id }}-${{ hashFiles('dev/build-mpv', 'vendor/mpv/patches/**') }}
 
+  # The iOS target: the Rust library and its prelink, which is where a
+  # change that names a Mac-only crate or a Mac-only layout breaks. The
+  # Xcode part (MPVKit from SwiftPM, a simulator) stays a local check,
+  # `dev/ios`.
+  ios-build:
+    name: Build for iOS
+    runs-on: macos-26
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+          rustup target add aarch64-apple-ios-sim --toolchain "$channel"
+
+      - name: Restore the cargo cache
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-ios-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-ios-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build the iOS library and prelink it
+        run: dev/ios --no-xcode
+
+      - name: Save the cargo cache
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-ios-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
   # The job with the real player is switched off (2026-10-07): a test of the
   # Chromecast mock failed in it once in nine runs on the hosted runner, for
   # a reason nobody has read yet, and a red run blocks a release. `dev/test`

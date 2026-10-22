@@ -239,6 +239,9 @@ enum Cmd {
     SetVolume(f64),
     SetMuted(bool),
     SetSpeed(f64),
+    /// Copies the video frame for the glass over it every tenth of a
+    /// second while on (iOS; see `glass::set_video_backdrop`).
+    Backdrop(bool),
     /// Sets an mpv property by name.
     SetProperty(String, String),
     /// Runs an mpv command with its arguments.
@@ -345,6 +348,8 @@ pub struct Published {
 
 struct Shared {
     status: Mutex<PlayerStatus>,
+    /// `Player::set_backdrop` sends a change alone.
+    backdrop_wanted: AtomicBool,
     frame: Mutex<Published>,
     /// `Published::seq`, for a check without the lock. Written under the
     /// `frame` lock only, so it never goes backwards.
@@ -504,6 +509,7 @@ impl Default for Player {
         Self {
             shared: Arc::new(Shared {
                 status: Mutex::new(PlayerStatus::default()),
+                backdrop_wanted: AtomicBool::new(false),
                 frame: Mutex::new(Published::default()),
                 frame_seq: AtomicU64::new(0),
                 target_w: AtomicU32::new(1280),
@@ -720,6 +726,16 @@ impl Player {
     }
     pub fn set_speed(&self, speed: f64) {
         self.send(Cmd::SetSpeed(speed));
+    }
+    /// Copies of the video frame for the glass over it, while on. A
+    /// change alone reaches the worker.
+    pub fn set_backdrop(&self, on: bool) {
+        if self.shared.backdrop_wanted.swap(on, Ordering::AcqRel) != on {
+            self.send(Cmd::Backdrop(on));
+            if !on {
+                crate::ui::glass::set_video_backdrop(None);
+            }
+        }
     }
     pub fn set_property(&self, name: &str, value: &str) {
         self.send(Cmd::SetProperty(name.to_string(), value.to_string()));
@@ -1211,6 +1227,8 @@ struct Worker {
     generation: u64,
     /// The subtitle files added to the item that plays.
     sub_files: Vec<PathBuf>,
+    /// Copies of the frame for the glass are wanted; the time of the last.
+    backdrop: Option<Instant>,
 }
 
 impl Worker {
@@ -1296,6 +1314,11 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
             init.set_option("gpu-api", "vulkan")?;
             init.set_option("gpu-context", "moltenvk")?;
             init.set_option("wid", layer as i64)?;
+            // The backdrop copy (`backdrop_copy`) takes the decoded frame
+            // on the CPU. The GPU path (`pl_tex_download` through MoltenVK)
+            // aborted the simulator's Metal driver on 2026-10-22, and it
+            // would block the vo thread on a real GPU as well.
+            init.set_option("screenshot-sw", "yes")?;
         }
         init.set_option("hwdec", "auto-safe")?;
         // A file with interlaced frames (a DVD rip, a TV recording) shows
@@ -1436,6 +1459,7 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
         tx,
         generation: 0,
         sub_files: Vec::new(),
+        backdrop: None,
     };
 
     loop {
@@ -1553,6 +1577,18 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
                     worker.generation,
                     subtitles,
                 );
+            }
+        }
+
+        // A copy of the frame for the glass over the video, while a popup
+        // is open over the player (iOS: the video is under GPUI's layer).
+        if let Some(last) = worker.backdrop
+            && last.elapsed() >= BACKDROP_INTERVAL
+            && session.is_some()
+        {
+            worker.backdrop = Some(Instant::now());
+            if let Some(image) = backdrop_copy(&mpv) {
+                crate::ui::glass::set_video_backdrop(Some(Arc::new(image)));
             }
         }
 
@@ -1757,6 +1793,9 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
                     worker.user_speed = speed;
                     worker.apply_speed(&mpv);
                 }
+                Cmd::Backdrop(on) => {
+                    worker.backdrop = on.then(|| Instant::now() - BACKDROP_INTERVAL);
+                }
                 Cmd::SetProperty(name, value) => {
                     if let Err(err) = mpv.set_property(name.as_str(), value) {
                         log::debug!("mpv property {name}: {err}");
@@ -1943,6 +1982,92 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
 /// How long an idle thread of the player sleeps between its rounds; a
 /// command, an event or a frame wakes it before.
 const IDLE_WAIT: Duration = Duration::from_secs(1);
+
+/// How often the frame is copied for the glass over the video.
+const BACKDROP_INTERVAL: Duration = Duration::from_millis(100);
+
+/// A copy of the video frame at a quarter of its size, as the image GPUI
+/// paints (BGRA): `screenshot-raw video` with `screenshot-sw`, which
+/// converts the decoded frame on the CPU (about 10 ms for 1080p; the GPU
+/// path crashed the simulator), then a 4x4 box downscale.
+/// The glass blurs it, so a quarter is plenty (the Mac samples its
+/// quarter-size copy of the frame too).
+fn backdrop_copy(mpv: &Mpv) -> Option<gpui_kit::RenderImage> {
+    let (w, h, stride, data) = screenshot_raw(mpv)?;
+    let (ow, oh) = ((w / 4).max(1), (h / 4).max(1));
+    let mut out = Vec::with_capacity((ow * oh * 4) as usize);
+    for y in 0..oh {
+        for x in 0..ow {
+            let (mut b, mut g, mut r) = (0u32, 0u32, 0u32);
+            for dy in 0..4 {
+                let row = ((y * 4 + dy).min(h - 1) as usize) * stride;
+                for dx in 0..4 {
+                    let i = row + ((x * 4 + dx).min(w - 1) as usize) * 4;
+                    b += u32::from(data[i]);
+                    g += u32::from(data[i + 1]);
+                    r += u32::from(data[i + 2]);
+                }
+            }
+            out.extend_from_slice(&[(b / 16) as u8, (g / 16) as u8, (r / 16) as u8, 255]);
+        }
+    }
+    let pixels = image::RgbaImage::from_raw(ow, oh, out)?;
+    Some(gpui_kit::RenderImage::new(smallvec::SmallVec::from_elem(image::Frame::new(pixels), 1)))
+}
+
+/// `screenshot-raw video` through the node API: the frame as `bgr0`
+/// (width, height, stride in bytes, the bytes). None when mpv has no frame.
+fn screenshot_raw(mpv: &Mpv) -> Option<(u32, u32, usize, Vec<u8>)> {
+    use std::ffi::{CStr, CString};
+    let (cmd, flag) = (CString::new("screenshot-raw").ok()?, CString::new("video").ok()?);
+    let mut args = [
+        sys::mpv_node { u: sys::mpv_node__bindgen_ty_1 { string: cmd.as_ptr() as *mut _ }, format: sys::mpv_format_MPV_FORMAT_STRING },
+        sys::mpv_node { u: sys::mpv_node__bindgen_ty_1 { string: flag.as_ptr() as *mut _ }, format: sys::mpv_format_MPV_FORMAT_STRING },
+    ];
+    let mut list = sys::mpv_node_list { num: 2, values: args.as_mut_ptr(), keys: std::ptr::null_mut() };
+    let mut node = sys::mpv_node { u: sys::mpv_node__bindgen_ty_1 { list: &mut list }, format: sys::mpv_format_MPV_FORMAT_NODE_ARRAY };
+    let mut result = sys::mpv_node { u: sys::mpv_node__bindgen_ty_1 { int64: 0 }, format: sys::mpv_format_MPV_FORMAT_NONE };
+    let code = unsafe { sys::mpv_command_node(mpv.ctx.as_ptr(), &mut node, &mut result) };
+    if code < 0 {
+        return None;
+    }
+    let mut out = None;
+    unsafe {
+        if result.format == sys::mpv_format_MPV_FORMAT_NODE_MAP {
+            let map = &*result.u.list;
+            let (mut w, mut h, mut stride, mut data) = (0i64, 0i64, 0i64, None::<&[u8]>);
+            let mut format_ok = false;
+            for i in 0..map.num as isize {
+                let key = CStr::from_ptr(*map.keys.offset(i)).to_string_lossy();
+                let value = &*map.values.offset(i);
+                match (key.as_ref(), value.format) {
+                    ("w", sys::mpv_format_MPV_FORMAT_INT64) => w = value.u.int64,
+                    ("h", sys::mpv_format_MPV_FORMAT_INT64) => h = value.u.int64,
+                    ("stride", sys::mpv_format_MPV_FORMAT_INT64) => stride = value.u.int64,
+                    ("format", sys::mpv_format_MPV_FORMAT_STRING) => {
+                        format_ok = CStr::from_ptr(value.u.string).to_bytes() == b"bgr0";
+                    }
+                    ("data", sys::mpv_format_MPV_FORMAT_BYTE_ARRAY) => {
+                        let bytes = &*value.u.ba;
+                        data = Some(std::slice::from_raw_parts(bytes.data as *const u8, bytes.size));
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(data) = data
+                && format_ok
+                && w > 0
+                && h > 0
+                && stride >= w * 4
+                && data.len() >= (stride * (h - 1) + w * 4) as usize
+            {
+                out = Some((w as u32, h as u32, stride as usize, data.to_vec()));
+            }
+        }
+        sys::mpv_free_node_contents(&mut result);
+    }
+    out
+}
 
 /// Nothing plays: the display link holds, so it does not wake the render
 /// thread sixty times a second for no frame.
