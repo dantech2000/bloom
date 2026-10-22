@@ -1781,13 +1781,14 @@ fn register_a11y_element_class() -> &'static AnyClass {
 
         extern "C" fn label(this: *mut AnyObject, _sel: Sel) -> *mut AnyObject {
             with_node(this, |_, node| {
-                // A label that is the last part of an id ("play", "close")
-                // is spoken with a capital, as a button's title would be.
+                // A label made of an id ("play", "remember audio selections")
+                // is spoken with a capital, as a button's title would be; a
+                // label with a capital of its own stays as it is.
                 let label = node.label().map(|l| {
                     let mut chars = l.chars();
                     match chars.next() {
-                        Some(first) if l.chars().all(|c| c.is_ascii_lowercase()) => {
-                            first.to_ascii_uppercase().to_string() + chars.as_str()
+                        Some(first) if first.is_lowercase() && !l.chars().any(char::is_uppercase) => {
+                            first.to_uppercase().to_string() + chars.as_str()
                         }
                         _ => l.to_string(),
                     }
@@ -1818,9 +1819,15 @@ fn register_a11y_element_class() -> &'static AnyClass {
             use gpui::accesskit::Role;
             with_node(this, |_, node| unsafe {
                 let mut traits = match node.role() {
-                    Role::Button | Role::MenuItem | Role::Tab | Role::CheckBox | Role::RadioButton | Role::Switch => {
-                        UIAccessibilityTraitButton
-                    }
+                    Role::Button
+                    | Role::MenuItem
+                    | Role::MenuItemCheckBox
+                    | Role::MenuItemRadio
+                    | Role::Tab
+                    | Role::CheckBox
+                    | Role::RadioButton
+                    | Role::Switch
+                    | Role::ComboBox => UIAccessibilityTraitButton,
                     Role::Link => UIAccessibilityTraitLink,
                     Role::Image => UIAccessibilityTraitImage,
                     Role::Slider => UIAccessibilityTraitAdjustable,
@@ -1828,7 +1835,8 @@ fn register_a11y_element_class() -> &'static AnyClass {
                     Role::Heading => UIAccessibilityTraitHeader,
                     _ => UIAccessibilityTraitStaticText,
                 };
-                if node.is_selected() == Some(true) {
+                // A checked box or a picked entry reads as selected.
+                if node.is_selected() == Some(true) || node.toggled() == Some(gpui::accesskit::Toggled::True) {
                     traits |= UIAccessibilityTraitSelected;
                 }
                 if node.is_disabled() {
@@ -1926,8 +1934,9 @@ impl IosWindow {
                 let role = node.role();
                 let spoken = matches!(
                     role,
-                    Role::Button | Role::MenuItem | Role::Tab | Role::Slider | Role::TextInput | Role::CheckBox
-                        | Role::RadioButton | Role::Switch | Role::Link | Role::Image | Role::Heading | Role::Label
+                    Role::Button | Role::MenuItem | Role::MenuItemCheckBox | Role::MenuItemRadio | Role::Tab
+                        | Role::Slider | Role::TextInput | Role::CheckBox | Role::RadioButton | Role::Switch
+                        | Role::ComboBox | Role::Link | Role::Image | Role::Heading | Role::Label
                 );
                 spoken && node.label().is_some_and(|l| !l.is_empty()) && node.bounds().is_some_and(|r| r.x1 > r.x0 && r.y1 > r.y0)
             })

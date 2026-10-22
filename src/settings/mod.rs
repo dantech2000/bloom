@@ -904,8 +904,16 @@ pub fn field(
 /// fill with a dark mark when checked. Add `.on_click(...)`.
 pub fn checkbox(id: impl Into<SharedString>, checked: bool, cx: &Context<Bloom>) -> Stateful<Div> {
     let t = UiTheme::read(cx);
+    let id: SharedString = id.into();
+    // For assistive tech and the tests that tap by label: the last part of
+    // the id in words, as the player's buttons ("RememberAudioSelections",
+    // a key of the server, reads as "Remember audio selections").
+    let label: SharedString = control_label(id.rsplit('.').next().unwrap_or(&id)).into();
     div()
-        .id(id.into())
+        .id(id)
+        .role(gpui_kit::Role::CheckBox)
+        .aria_label(label)
+        .aria_toggled(if checked { gpui_kit::accesskit::Toggled::True } else { gpui_kit::accesskit::Toggled::False })
         .size(px(26.))
         .rounded(px(8.))
         .border_1()
@@ -946,8 +954,12 @@ pub fn select_capped(
 ) -> Stateful<Div> {
     let t = UiTheme::read(cx);
     let width = (longest.chars().count() as f32 * 8.2 + 58.).clamp(120., max_w.max(120.));
+    let value: SharedString = value.into();
     div()
         .id(id.into())
+        // For assistive tech and the tests: a choice, named by its value.
+        .role(gpui_kit::Role::ComboBox)
+        .aria_label(value.clone())
         .w(px(width))
         .h(px(38.))
         .pl(px(12.))
@@ -964,8 +976,32 @@ pub fn select_capped(
         .text_size(px(15.))
         .text_color(t.colors.foreground)
         .hover(|s| s.border_color(rgba(0xf5f5f766)))
-        .child(div().min_w_0().truncate().child(value.into()))
+        .child(div().min_w_0().truncate().child(value))
         .child(icon(LucideIcon::ChevronDown, 18., t.colors.foreground.opacity(0.7)))
+}
+
+/// The words of a control's key, in lower case: "PlayDefaultAudioTrack"
+/// and "remember_audio" become "play default audio track" and "remember
+/// audio" (the accessibility bridge capitalizes the first letter).
+pub fn control_label(key: &str) -> String {
+    let mut out = String::with_capacity(key.len() + 4);
+    let mut prev_lower = false;
+    for c in key.chars() {
+        if c == '_' || c == '-' {
+            out.push(' ');
+            prev_lower = false;
+        } else if c.is_uppercase() {
+            if prev_lower {
+                out.push(' ');
+            }
+            out.extend(c.to_lowercase());
+            prev_lower = false;
+        } else {
+            out.push(c);
+            prev_lower = c.is_lowercase() || c.is_ascii_digit();
+        }
+    }
+    out
 }
 
 /// The most width a control of a field takes: 340, or on a phone the
@@ -1424,5 +1460,16 @@ mod race_tests {
         cx.run_until_parked();
         assert_eq!(one.count("GET", "/DisplayPreferences/usersettings"), 1);
         bloom.read_with(cx, |this, _| assert!(this.prefs.loaded));
+    }
+}
+
+#[cfg(test)]
+mod control_label_tests {
+    #[test]
+    fn keys_become_words() {
+        assert_eq!(super::control_label("PlayDefaultAudioTrack"), "play default audio track");
+        assert_eq!(super::control_label("remember_audio"), "remember audio");
+        assert_eq!(super::control_label("debug-channel"), "debug channel");
+        assert_eq!(super::control_label("upnext"), "upnext");
     }
 }
