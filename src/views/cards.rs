@@ -407,7 +407,7 @@ pub fn poster_card(
     cx: &mut Context<Bloom>,
 ) -> Stateful<Div> {
     let h = (w * 1.5).round();
-    let width = (w * 2.) as u32;
+    let width = image_px(w);
     let series_poster = match (&item.series_id, &item.series_primary_image_tag) {
         (Some(series), Some(tag)) if item.kind == ItemKind::Episode => {
             Some(client.image_url(series, "Primary", Some(tag), width))
@@ -478,7 +478,7 @@ pub fn wide_card(
     cx: &mut Context<Bloom>,
 ) -> Stateful<Div> {
     let h = (w * 9. / 16.).round();
-    let width = (w * 2.) as u32;
+    let width = image_px(w);
     let url = item
         .wide_url(client, width)
         .or_else(|| item.poster_url(client, width));
@@ -513,7 +513,7 @@ pub fn episode_card(
     cx: &mut Context<Bloom>,
 ) -> Stateful<Div> {
     let h = (w * 9. / 16.).round();
-    let width = (w * 2.) as u32;
+    let width = image_px(w);
     let url = item
         .image_tags
         .primary
@@ -546,7 +546,7 @@ pub fn library_tile(
         .image_tags
         .primary
         .as_deref()
-        .map(|tag| client.image_url(&view.id, "Primary", Some(tag), (w * 2.) as u32));
+        .map(|tag| client.image_url(&view.id, "Primary", Some(tag), image_px(w)));
     let target = view.clone();
     div()
         .id(card_id("tile", view))
@@ -876,4 +876,10 @@ pub fn empty_state(title: &str, hint: &str, cx: &Context<Bloom>) -> Div {
                 .text_color(t.colors.muted_foreground)
                 .child(hint.to_string()),
         )
+}
+
+/// Pixels to ask the server for an image shown at `w` points: the scale of
+/// the window (2 on a Mac, 3 on a phone), so a poster is sharp on both.
+fn image_px(w: f32) -> u32 {
+    (w * crate::views::shell::scale_now().max(2.)).round() as u32
 }

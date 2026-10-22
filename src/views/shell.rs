@@ -95,6 +95,16 @@ pub fn viewport_w_now() -> f32 {
     f32::from_bits(VIEWPORT_W.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// The scale of the window at its last frame (2 on a Mac, 3 on a phone):
+/// the pixels an image needs for a point of a card.
+static SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The scale of the window at its last frame; 2 before the first frame.
+pub fn scale_now() -> f32 {
+    let scale = f32::from_bits(SCALE.load(std::sync::atomic::Ordering::Relaxed));
+    if scale > 0. { scale } else { 2. }
+}
+
 /// `compact`, from the width of the last frame.
 pub fn compact_now() -> bool {
     let w = viewport_w_now();
@@ -168,6 +178,7 @@ impl Bloom {
             f32::from(window.viewport_size().width).to_bits(),
             std::sync::atomic::Ordering::Relaxed,
         );
+        SCALE.store(window.scale_factor().to_bits(), std::sync::atomic::Ordering::Relaxed);
         let keyboard = keyboard_inset();
         use gpui_kit::{MouseButton, NavigationDirection};
         div()
@@ -713,14 +724,20 @@ impl Bloom {
             .map(|s| s.server_name.clone())
             .unwrap_or_default();
 
-        let tab = |id: SharedString, label: String, glyph: Glyph, selected: bool| {
+        // An iPad held upright (834 px) has no room for the labels beside
+        // the buttons at the right: the tabs show their glyph alone there.
+        let icon_only = self.viewport_w < 900.;
+        let tab = move |id: SharedString, label: String, glyph: Glyph, selected: bool| {
             let color = if selected {
                 t.colors.primary_foreground
             } else {
                 fg
             };
+            let logo = matches!(glyph, Glyph::Logo);
             div()
                 .id(id)
+                .role(gpui_kit::Role::Tab)
+                .aria_label(label.clone())
                 .h(px(36.))
                 .px(px(14.))
                 .rounded_full()
@@ -738,7 +755,7 @@ impl Bloom {
                     // The web theme shows the mark in white, a little dimmed.
                     Glyph::Logo => crate::icons::logo(19., color.opacity(0.85).into()),
                 })
-                .child(label)
+                .when(!icon_only || logo, |el| el.child(label))
         };
 
         // The web gives the tab group a glass pill once the page scrolls.

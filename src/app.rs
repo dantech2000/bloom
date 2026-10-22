@@ -2795,7 +2795,10 @@ impl Bloom {
         self.load_timeline(item.id.clone(), cx);
         self.player_status = self.player.status();
         self.player_open = true;
-        crate::set_landscape(true);
+        // A phone turns for the video; an iPad keeps the orientation it has.
+        if self.phone() {
+            crate::set_landscape(true);
+        }
         self.show_controls();
         self.tracks_version = 0;
         self.rebuild_track_menus(cx);
@@ -2948,7 +2951,9 @@ impl Bloom {
 
     pub fn close_player_view(&mut self, cx: &mut Context<Self>) {
         self.player_open = false;
-        crate::set_landscape(false);
+        if self.phone() {
+            crate::set_landscape(false);
+        }
         // The end of the playback is an event, at once.
         self.events_tick(cx);
         // The preview sheets of the timeline are not needed any more.
@@ -3209,7 +3214,9 @@ impl Bloom {
                             && !this.refind_lost_episode(cx);
                         if ended {
                             this.player_open = false;
-                            crate::set_landscape(false);
+                            if this.phone() {
+                                crate::set_landscape(false);
+                            }
                             if let Some(err) = this.player_status.error.clone() {
                                 this.toast("Playback stopped", err, cx);
                             }
