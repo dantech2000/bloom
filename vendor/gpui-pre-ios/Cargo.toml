@@ -1,0 +1,39 @@
+# The iOS platform of GPUI for Bloom: UIKit window and touch input, the
+# CoreText text system, and the Apple Metal renderer of gpui-pre-apple
+# (vendor/README.md). The window, platform, dispatcher, display, text
+# system and FFI bridge come from longbridge/gpui-mobile (commit 73ebf86,
+# the last on gpui-pre 0.3.4), which rendered through wgpu; this crate
+# draws with the same Metal renderer as the Mac app, so Bloom's changes to
+# it (glass, BGRA surfaces, the presented time of a draw) hold on both.
+[package]
+name = "gpui-pre-ios"
+version = "0.3.4"
+edition = "2021"
+license = "Apache-2.0 OR GPL-3.0-or-later OR AGPL-3.0-or-later"
+description = "The iOS platform of GPUI (gpui-pre 0.3.4) with the Apple Metal renderer"
+publish = false
+
+[lib]
+name = "gpui_ios"
+path = "src/gpui_ios.rs"
+
+[dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.4", default-features = false }
+gpui_apple = { package = "gpui-pre-apple", version = "=0.3.4" }
+anyhow = "1"
+log = "0.4"
+parking_lot = "0.12"
+futures = "0.3"
+raw-window-handle = "0.6"
+objc2 = "0.6"
+block2 = "0.6"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+core-graphics = "0.24"
+core-text = "=21.0.0"
+font-kit = { package = "zed-font-kit", version = "0.14.1-zed" }
+pathfinder_geometry = "0.5"
+smallvec = { version = "1", features = ["union", "const_new"] }
+uuid = { version = "1", features = ["v5"] }
+metal = "0.33"
+serde_json = "1"

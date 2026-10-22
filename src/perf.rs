@@ -8,6 +8,9 @@
 //!   layout and paint to the build time,
 //! - process: CPU of all threads (decode, network, mpv).
 
+// Some counters are of the Mac's player; the iOS build keeps them unused.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use std::{
     sync::{
         Mutex, OnceLock,

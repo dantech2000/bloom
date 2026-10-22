@@ -18,6 +18,9 @@
 //! is made here at run time ([`delegate`]), because the app has no
 //! Objective-C code of its own.
 
+// The updater is the Mac's (Sparkle); the iOS build keeps the module unused.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use std::{
     ffi::{c_char, c_void},
     sync::{Mutex, OnceLock},
@@ -446,9 +449,9 @@ impl Bloom {
         let card = card.child(field(
             "Debug channel",
             if on {
-                format!("On. A tool on this Mac can drive the app and read its state through {}.", crate::debug::setting_socket())
+                format!("On. A tool on this device can drive the app and read its state through {}.", crate::debug::setting_socket())
             } else {
-                "Off. When on, a tool on this Mac can drive the app and read its state, for tests and for a look at a problem.".to_string()
+                "Off. When on, a tool on this device can drive the app and read its state, for tests and for a look at a problem.".to_string()
             },
             checkbox("about.debug-channel", on, cx).on_click(cx.listener(
                 move |this, _: &ClickEvent, _, cx| this.set_debug_channel(!on, cx),

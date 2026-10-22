@@ -1,0 +1,81 @@
+# The Xcode project of the iOS app, made by `xcodegen generate` (dev/ios).
+# It links the static library that `cargo build -p bloom-ios` makes for
+# the iOS target; the frameworks are the ones the Rust crates call.
+name: Bloom
+options:
+  bundleIdPrefix: dev.bloom
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+# libmpv and everything under it (FFmpeg, libass, libplacebo, MoltenVK,
+# dav1d) as the XCFrameworks of MPVKit, LGPL build. The Rust library
+# names the mpv symbols; this link resolves them.
+packages:
+  MPVKit:
+    url: https://github.com/mpvkit/MPVKit.git
+    exactVersion: 1.1.0-n9.0.2
+targets:
+  Bloom:
+    type: application
+    platform: iOS
+    sources:
+      - path: App.swift
+    dependencies:
+      - package: MPVKit
+        product: MPVKit
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: Bloom
+        CFBundleName: Bloom
+        UILaunchScreen: {}
+        UIRequiresFullScreen: true
+        UIViewControllerBasedStatusBarAppearance: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.bloom.ios
+        # The Rust library is arm64 only (the Mac and the simulator on it).
+        ARCHS: arm64
+        ONLY_ACTIVE_ARCH: YES
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_VERSION: "5.0"
+        SWIFT_OBJC_BRIDGING_HEADER: Bridging.h
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_BITCODE: NO
+        # The Rust library is linked statically; Xcode's debug dylib
+        # loader cannot load it.
+        ENABLE_DEBUG_DYLIB: NO
+        DEAD_CODE_STRIPPING: NO
+        BLOOM_PROFILE: debug
+        # The prelinked object dev/ios makes from the Rust archive.
+        "BLOOM_STATIC_LIB[sdk=iphonesimulator*]": "$(PROJECT_DIR)/../../target/aarch64-apple-ios-sim/$(BLOOM_PROFILE)/bloom_ios.o"
+        "BLOOM_STATIC_LIB[sdk=iphoneos*]": "$(PROJECT_DIR)/../../target/aarch64-apple-ios/$(BLOOM_PROFILE)/bloom_ios.o"
+        OTHER_LDFLAGS:
+          - "$(BLOOM_STATIC_LIB)"
+          - "-lc++"
+          - "-framework UIKit"
+          - "-framework Foundation"
+          - "-framework CoreFoundation"
+          - "-framework CoreGraphics"
+          - "-framework CoreText"
+          - "-framework CoreVideo"
+          - "-framework QuartzCore"
+          - "-framework Metal"
+          - "-framework MetalPerformanceShaders"
+          - "-framework CoreMedia"
+          - "-framework MediaPlayer"
+          - "-framework AVFoundation"
+          - "-framework Security"
+          - "-ObjC"
+      configs:
+        Release:
+          BLOOM_PROFILE: release

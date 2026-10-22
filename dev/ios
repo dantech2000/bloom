@@ -1,0 +1,91 @@
+#!/bin/sh
+# Builds Bloom for iOS and runs it in a simulator.
+#
+#   dev/ios                 build (debug) and run in the simulator
+#   dev/ios --release       the release profile
+#   dev/ios --no-run        build only
+#   dev/ios --shot <png>    run, wait, and save a screenshot
+#
+# The Rust library is `ios/` (crate bloom-ios), built for
+# aarch64-apple-ios-sim; the Xcode project is made from ios/host/project.yml
+# by xcodegen. The app's log (NSLog, where the Rust `log` goes) is in
+# target/ios/run.log. BLOOM_IOS_SIM names the simulator (default: the first
+# available iPhone 17 Pro).
+set -e
+dir=$(cd "$(dirname "$0")/.." && pwd)
+profile=debug; config=Debug; cargo_flag=""; run=1; shot=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    --release) profile=release; config=Release; cargo_flag=--release ;;
+    --no-run) run=0 ;;
+    --shot) shot=$2; shift ;;
+    *) echo "dev/ios: unknown option $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+cd "$dir"
+target=aarch64-apple-ios-sim
+echo "== cargo build -p bloom-ios ($profile, $target)"
+# The minimum iOS of the Rust objects, the same as the Xcode project's.
+IPHONEOS_DEPLOYMENT_TARGET=17.0 cargo build --target $target -p bloom-ios $cargo_flag
+
+# One object of the archive, exporting the C entry points alone. MPVKit's
+# Libdovi is a Rust library of its own with its own runtime; the two
+# archives define `rust_eh_personality` twice, and the final link stops.
+# With the runtime of ours private, there is no clash. The undefined
+# symbols (mpv, the frameworks) stay undefined for Xcode to resolve.
+lib=target/$target/$profile/libbloom_ios.a
+obj=target/$target/$profile/bloom_ios.o
+# The entry points (ios/host/exports.txt: the C functions of ios/src/lib.rs
+# and of vendor/gpui-pre-ios/src/ffi.rs) are also the roots that pull the
+# members of the archive in, so an object nothing calls stays out.
+exports=ios/host/exports.txt
+roots=$(sed 's/^/-u /' "$exports" | tr '\n' ' ')
+sdk=$(xcrun --sdk iphonesimulator --show-sdk-version)
+echo "== prelink ($(wc -l < "$exports" | tr -d ' ') entry points)"
+# shellcheck disable=SC2086
+xcrun ld -r -arch arm64 -platform_version ios-simulator 17.0 "$sdk" -o "$obj" \
+  $roots -exported_symbols_list "$exports" "$lib"
+
+echo "== xcodegen"
+(cd ios/host && xcodegen generate --spec project.yml --quiet)
+
+echo "== xcodebuild ($config)"
+derived=$dir/target/ios/DerivedData
+mkdir -p "$dir/target/ios"
+xcodebuild -project ios/host/Bloom.xcodeproj -scheme Bloom -configuration "$config" \
+  -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+  -derivedDataPath "$derived" CODE_SIGNING_ALLOWED=NO build -quiet
+app=$derived/Build/Products/$config-iphonesimulator/Bloom.app
+echo "built $app"
+[ $run = 1 ] || exit 0
+
+sim=${BLOOM_IOS_SIM:-$(xcrun simctl list devices available | grep 'iPhone 17 Pro (' | head -1 | sed -E 's/.*\(([A-F0-9-]+)\).*/\1/')}
+[ -n "$sim" ] || { echo "dev/ios: no simulator; set BLOOM_IOS_SIM" >&2; exit 1; }
+echo "== simulator $sim"
+xcrun simctl boot "$sim" 2>/dev/null || true
+xcrun simctl bootstatus "$sim" -b >/dev/null
+# The Simulator app is inside Xcode; a boot without its window works too.
+open -a "$(xcode-select -p)/Applications/Simulator.app" 2>/dev/null || true
+xcrun simctl terminate "$sim" dev.bloom.ios 2>/dev/null || true
+xcrun simctl install "$sim" "$app"
+log=$dir/target/ios/run.log
+: > "$log"
+# --console-pty hands the app's stdout and stderr (NSLog) to this shell;
+# in the background, into the log, so the script can go on.
+# As dev/run-test: a test instance on the user's own session must not take
+# the socket of the server from his app, report playback, or make a sound.
+# simctl hands SIMCTL_CHILD_* variables to the app without the prefix.
+# The debug channel on a socket of the Mac's /tmp (the simulator's app sees
+# the Mac's file system): BLOOM_DEBUG_SOCK=/tmp/bloom-ios.sock dev/jctl <cmd>.
+SIMCTL_CHILD_BLOOM_NO_SOCKET=1 SIMCTL_CHILD_BLOOM_NO_REPORT=1 SIMCTL_CHILD_BLOOM_MUTED=1 \
+  SIMCTL_CHILD_BLOOM_DEBUG_SOCK=/tmp/bloom-ios.sock SIMCTL_CHILD_BLOOM_A11Y_TREE=1 \
+  SIMCTL_CHILD_RUST_LOG=${RUST_LOG:-bloom=info} \
+  xcrun simctl launch --console-pty "$sim" dev.bloom.ios > "$log" 2>&1 &
+echo "running; log in $log"
+if [ -n "$shot" ]; then
+  sleep "${BLOOM_IOS_SHOT_WAIT:-4}"
+  xcrun simctl io "$sim" screenshot "$shot" >/dev/null
+  echo "screenshot $shot"
+fi

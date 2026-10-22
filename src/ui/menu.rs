@@ -433,8 +433,14 @@ impl Render for MenuState {
         // its trigger or over it, whichever is more, so it does not cover
         // the trigger. A fixed limit cut the last entry of a long menu off.
         let window_h = f32::from(window.viewport_size().height);
+        let window_w = f32::from(window.viewport_size().width);
         let (top, bottom) = (f32::from(self.anchor.top()), f32::from(self.anchor.bottom()));
         let beside_trigger = (window_h - bottom).max(top) - 24.;
+        // A phone: the menu is a sheet at the bottom of the window, the
+        // width of it, with rows a finger can hit; a submenu takes the
+        // sheet over, with a row at the top to go back.
+        let compact = crate::views::shell::compact(window);
+        let sheet_bottom = window_h - crate::views::shell::bottom_inset() - 12.;
         let mut root = div()
             .id(("menu", cx.entity_id()))
             .track_focus(&self.focus)
@@ -446,6 +452,9 @@ impl Render for MenuState {
         self.popup_bounds
             .resize(self.path.len() + 1, Default::default());
         for depth in 0..=self.path.len() {
+            if compact && depth != self.path.len() {
+                continue;
+            }
             let items = self.level(depth).to_vec();
             self.row_bounds[depth].resize(items.len(), Default::default());
             let entity = cx.entity();
@@ -463,19 +472,48 @@ impl Render for MenuState {
             let mut list = div()
                 .id((popup_id.clone(), "entries"))
                 .max_h(gpui_kit::px(
-                    if depth == 0 && !self.pointer {
+                    if compact {
+                        window_h * 0.6
+                    } else if depth == 0 && !self.pointer {
                         beside_trigger.max(200.)
                     } else {
                         (window_h - 48.).max(200.)
                     } - 24.,
                 ))
                 .overflow_y_scroll();
+            if compact && depth > 0 {
+                let parent = self.level(depth - 1)[self.path[depth - 1]].label.clone();
+                list = list.child(
+                    Button::new(("menu-sheet-back", depth))
+                        .focusable(false)
+                        .w_full()
+                        .min_h(gpui_kit::px(44.))
+                        .justify_start()
+                        .gap(gpui_kit::px(8.))
+                        .px(gpui_kit::px(8.))
+                        .rounded(gpui_kit::px(12.))
+                        .text_color(quiet)
+                        .child(
+                            lucide(LucideIcon::ChevronLeft)
+                                .size(t.space(4.))
+                                .text_color(quiet),
+                        )
+                        .child(parent)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.path.pop();
+                            this.highlighted.pop();
+                            cx.notify();
+                        })),
+                );
+            }
             let popup = div()
                 .id(popup_id)
                 .relative()
                 .role(Role::Menu)
                 // A menu under a trigger is at least as wide as the trigger.
-                .min_w(if depth == 0 && !self.pointer {
+                .min_w(if compact {
+                    gpui_kit::px(window_w - 24.)
+                } else if depth == 0 && !self.pointer {
                     self.anchor.size.width.max(t.space(40.))
                 } else {
                     t.space(40.)
@@ -558,7 +596,12 @@ impl Render for MenuState {
                     .accessibility_label(item.label.clone())
                     .relative()
                     .w_full()
-                    .min_h(gpui_kit::px(if item.detail.is_some() { 52. } else { 38. }))
+                    .min_h(gpui_kit::px(match (compact, item.detail.is_some()) {
+                        (true, true) => 58.,
+                        (true, false) => 44.,
+                        (false, true) => 52.,
+                        (false, false) => 38.,
+                    }))
                     .justify_start()
                     .gap(gpui_kit::px(12.))
                     .px(gpui_kit::px(12.))
@@ -637,7 +680,13 @@ impl Render for MenuState {
                 list = list.child(row);
             }
             let popup = popup.child(list);
-            let anchor = if depth == 0 {
+            let anchor = if compact {
+                // A line along the bottom of the window: the sheet sits on it.
+                Bounds::new(
+                    gpui_kit::point(gpui_kit::px(12.), gpui_kit::px(sheet_bottom)),
+                    gpui_kit::size(gpui_kit::px(window_w - 24.), gpui_kit::px(0.)),
+                )
+            } else if depth == 0 {
                 self.anchor
             } else {
                 self.row_bounds[depth - 1][self.path[depth - 1]]
@@ -646,12 +695,14 @@ impl Render for MenuState {
                 gpui_kit::deferred(
                     Positioner::side(anchor)
                         .align(Align::Start)
-                        .placement(if depth > 0 || self.pointer {
+                        .placement(if compact {
+                            Placement::Top
+                        } else if depth > 0 || self.pointer {
                             Placement::Right
                         } else {
                             Placement::Bottom
                         })
-                        .offset(gpui_kit::px(8.))
+                        .offset(gpui_kit::px(if compact { 0. } else { 8. }))
                         .occlude()
                         .child(popup),
                 )

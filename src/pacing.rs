@@ -48,6 +48,9 @@
 //! display showed each frame ([`trace`]), the `jumps` figure of before
 //! counts the draw requests.
 
+// The iOS build has no display clock: what only it used is unused there.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
+
 use std::{
     cell::Cell,
     ffi::c_void,
@@ -553,6 +556,7 @@ pub struct ClockState {
 /// The link is never released: `CVDisplayLinkStop` returns before its
 /// thread ends, and a release can race with a last callback (gpui leaks
 /// its links for the same reason).
+#[cfg(target_os = "macos")]
 pub struct DisplayClock {
     link: *mut sys::CVDisplayLink,
     state: &'static ClockState,
@@ -560,8 +564,10 @@ pub struct DisplayClock {
 }
 
 // The link is a thread-safe CoreVideo object; the state is atomics.
+#[cfg(target_os = "macos")]
 unsafe impl Send for DisplayClock {}
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn on_display_tick(
     _link: *mut sys::CVDisplayLink,
     cv_now: *const sys::CVTimeStamp,
@@ -598,6 +604,7 @@ unsafe extern "C" fn on_display_tick(
     0
 }
 
+#[cfg(target_os = "macos")]
 impl DisplayClock {
     /// Starts a link on the main display; `set_display` moves it.
     pub fn start(on_tick: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
@@ -692,10 +699,41 @@ impl DisplayClock {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl Drop for DisplayClock {
     fn drop(&mut self) {
         // Stopped, not released: see the struct doc.
         unsafe { sys::CVDisplayLinkStop(self.link) };
+    }
+}
+
+/// The display clock of a platform with no player yet (iOS): it never
+/// starts, and the player that would use it does not run.
+#[cfg(not(target_os = "macos"))]
+pub struct DisplayClock {
+    state: &'static ClockState,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl DisplayClock {
+    pub fn start(_on_tick: Box<dyn Fn() + Send + Sync>) -> Result<Self> {
+        Err(anyhow!("no display clock on this platform yet"))
+    }
+
+    pub fn state(&self) -> &'static ClockState {
+        self.state
+    }
+
+    pub fn set_running(&mut self, _on: bool) {}
+
+    pub fn set_display(&mut self, _display: u32) {}
+
+    pub fn fps(&self) -> Option<f64> {
+        None
+    }
+
+    pub fn describe(&self) -> String {
+        "no display clock".to_string()
     }
 }
 
@@ -1444,6 +1482,7 @@ mod sys {
         context: *mut c_void,
     ) -> i32;
 
+    #[cfg(target_os = "macos")]
     #[link(name = "CoreVideo", kind = "framework")]
     unsafe extern "C" {
         pub fn CVDisplayLinkCreateWithActiveCGDisplays(link: *mut *mut CVDisplayLink) -> i32;
@@ -1459,6 +1498,7 @@ mod sys {
         pub fn CVDisplayLinkGetNominalOutputVideoRefreshPeriod(link: *mut CVDisplayLink) -> CVTime;
     }
 
+    #[cfg(target_os = "macos")]
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
         pub fn CGMainDisplayID() -> u32;

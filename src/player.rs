@@ -11,6 +11,11 @@
 //! server does not hold up the playback loop. The timing of the frames is
 //! described in `pacing.rs`.
 
+// On iOS mpv draws into the video layer of the window itself (gpu-next
+// over MoltenVK); the render thread and the GL surfaces are the Mac's,
+// and what only they used is unused there.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
+
 use crate::stream::StreamApi as _;
 use std::{
     ffi::c_void,
@@ -37,8 +42,10 @@ use serde::Deserialize;
 use crate::{
     jellyfin::{Client, Progress, TICKS_PER_SECOND},
     pacing::{self, DisplayClock},
-    video_surface::{self, GlRenderer, VideoFrame},
+    video_surface::VideoFrame,
 };
+#[cfg(target_os = "macos")]
+use crate::video_surface::{self, GlRenderer};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PlayState {
@@ -417,11 +424,13 @@ impl RenderSignal {
 
 /// The render thread, ended and joined when the worker ends, before the
 /// core goes (see `render_loop`).
+#[cfg(target_os = "macos")]
 struct RenderThread {
     handle: Option<thread::JoinHandle<()>>,
     signal: &'static RenderSignal,
 }
 
+#[cfg(target_os = "macos")]
 impl RenderThread {
     /// Starts the thread and waits until mpv's render context exists, so
     /// a load that follows has a video output.
@@ -438,6 +447,7 @@ impl RenderThread {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl Drop for RenderThread {
     fn drop(&mut self) {
         self.signal.quit.store(true, Ordering::Release);
@@ -1232,6 +1242,7 @@ impl Worker {
     }
 }
 
+#[cfg(target_os = "macos")]
 struct Renderer {
     ctx: *mut sys::mpv_render_context,
     gl: GlRenderer,
@@ -1242,6 +1253,7 @@ struct Renderer {
     asked: Option<((u32, u32), Instant)>,
 }
 
+#[cfg(target_os = "macos")]
 impl Drop for Renderer {
     fn drop(&mut self) {
         // mpv frees its GL objects here, so the context in `gl` must outlive it.
@@ -1249,6 +1261,7 @@ impl Drop for Renderer {
     }
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn on_render_update(ctx: *mut c_void) {
     let signal = unsafe { &*(ctx as *const RenderSignal) };
     if !signal.needed.swap(true, Ordering::AcqRel) {
@@ -1267,7 +1280,23 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
         return Err(anyhow!("test: the worker fails to start"));
     }
     let mut mpv = Mpv::with_initializer(|init| {
+        // The Mac renders through the render API into surfaces the UI
+        // composites (`render_loop`). iOS: mpv's own output, Metal through
+        // MoltenVK, into the `CAMetalLayer` the window keeps under GPUI's
+        // (`gpui_ios::video_layer`); the page leaves a hole for it.
+        #[cfg(target_os = "macos")]
         init.set_option("vo", "libmpv")?;
+        #[cfg(target_os = "ios")]
+        {
+            let layer = gpui_ios::video_layer();
+            if layer.is_null() {
+                return Err(libmpv2::Error::Raw(-1));
+            }
+            init.set_option("vo", "gpu-next")?;
+            init.set_option("gpu-api", "vulkan")?;
+            init.set_option("gpu-context", "moltenvk")?;
+            init.set_option("wid", layer as i64)?;
+        }
         init.set_option("hwdec", "auto-safe")?;
         // A file with interlaced frames (a DVD rip, a TV recording) shows
         // comb lines unless its fields are put together; `auto` does that
@@ -1277,7 +1306,8 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
         init.set_option("keep-open", "no")?;
         init.set_option("idle", "yes")?;
         init.set_option("terminal", "no")?;
-        init.set_option("ytdl", "no")?;
+        // An mpv without Lua (MPVKit's build for iOS) has no `ytdl` option.
+        let _ = init.set_option("ytdl", "no");
         init.set_option("config", "no")?;
         init.set_option("sub-auto", "no")?;
         init.set_option("audio-display", "no")?;
@@ -1359,6 +1389,7 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
         quit: AtomicBool::new(false),
         wake: (Mutex::new(false), Condvar::new()),
     }));
+    #[cfg(target_os = "macos")]
     let _render = RenderThread::start(mpv.ctx.as_ptr() as usize, signal)?;
     let display_pacing = shared.clock.lock().unwrap().is_some();
     let _ = mpv.set_property("video-sync", pacing::video_sync(false));
@@ -1927,6 +1958,7 @@ fn rest(shared: &Shared) {
 /// to mpv (see `pacing.rs`). It calls only `mpv_render_*` functions, never
 /// the core: the sizes it needs come through `Shared`. The display link
 /// and mpv's render context live and die here.
+#[cfg(target_os = "macos")]
 fn render_loop(mpv_handle: usize, signal: &'static RenderSignal, ready: mpsc::Sender<Result<()>>) {
     let shared = &signal.shared;
     let mut renderer = match create_renderer(mpv_handle as *mut sys::mpv_handle, signal) {
@@ -2022,6 +2054,7 @@ fn render_loop(mpv_handle: usize, signal: &'static RenderSignal, ready: mpsc::Se
     drop(renderer);
 }
 
+#[cfg(target_os = "macos")]
 fn create_renderer(mpv_handle: *mut sys::mpv_handle, signal: &'static RenderSignal) -> Result<Renderer> {
     // The GL context becomes current on this thread; mpv renders with it.
     let gl = GlRenderer::new()?;
@@ -2069,6 +2102,7 @@ const SIZE_SETTLE: Duration = Duration::from_millis(150);
 /// in device pixels bounds it, a picture smaller than that keeps its
 /// aspect. A new file renders at its size at once; a change of the area
 /// after `SIZE_SETTLE`, and until then the UI stretches the frame.
+#[cfg(target_os = "macos")]
 fn frame_size(renderer: &mut Renderer, src: (u32, u32), target: (u32, u32)) -> (u32, u32) {
     let scale = (target.0 as f64 / src.0 as f64).min(target.1 as f64 / src.1 as f64);
     let even = |v: f64| ((v as u32).max(2) / 2) * 2;
@@ -2094,6 +2128,7 @@ fn frame_size(renderer: &mut Renderer, src: (u32, u32), target: (u32, u32)) -> (
 }
 
 /// What mpv says about the frame it asks to render.
+#[cfg(target_os = "macos")]
 fn next_frame_info(renderer: &Renderer) -> sys::mpv_render_frame_info {
     let mut info = sys::mpv_render_frame_info { flags: 0, target_time: 0 };
     let param = sys::mpv_render_param {
@@ -2116,6 +2151,7 @@ fn next_frame_info(renderer: &Renderer) -> sys::mpv_render_frame_info {
 pub const COLOUR_BANDS: usize = 14;
 const COLOURS_EVERY_NS: u64 = 75_000_000;
 
+#[cfg(target_os = "macos")]
 fn render_frame(renderer: &mut Renderer, shared: &Shared, skip: bool, synced: bool) -> Result<()> {
     // The time of the tick a frame in display sync is made after. A frame
     // with audio timing waits in the render call for its time instead and

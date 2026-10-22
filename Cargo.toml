@@ -7,6 +7,16 @@ license = "AGPL-3.0-or-later"
 description = "A native Jellyfin client built with GPUI and libmpv"
 default-run = "bloom"
 
+# The app is a library (src/lib.rs: the modules and the start of the app)
+# with the Mac binary (src/main.rs) and the iOS library (ios/) on top.
+[lib]
+name = "bloom"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bloom"
+path = "src/main.rs"
+
 [dependencies]
 # The parts with no window (core/).
 bloom-core = { path = "core" }
@@ -33,13 +43,10 @@ dirs = "6"
 uuid = { version = "1", features = ["v4"] }
 log = "0.4"
 env_logger = "0.11"
-libmpv2 = "6"
 image = { version = "0.25", default-features = false }
 smallvec = "1"
 # The version GPUI already builds; draws SVG images to pixels.
 resvg = "0.46"
-libmpv2-sys = "4"
-core-video = "0.5"
 core-foundation = "0.10"
 jiff = "0.2"
 raw-window-handle = "0.6"
@@ -49,7 +56,20 @@ block = "0.1"
 # here so the app can call into them: the frame step on demand, and the
 # presented time of each draw.
 gpui-pre-apple = "=0.3.4"
+
+# libmpv: on the Mac from vendor/mpv/lib, on iOS the XCFrameworks of
+# MPVKit that the Xcode project links (ios/host/project.yml).
+libmpv2 = "6"
+libmpv2-sys = "4"
+
+# The Mac's video path (OpenGL into CoreVideo surfaces) and platform.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-video = "0.5"
 gpui-pre-macos = "=0.3.4"
+
+# The video layer of the iOS window, for the player.
+[target.'cfg(target_os = "ios")'.dependencies]
+gpui-ios = { package = "gpui-pre-ios", path = "vendor/gpui-pre-ios" }
 
 [dev-dependencies]
 gpui-kit = { version = "=0.6.1", default-features = false, features = ["test-support"] }
@@ -71,6 +91,8 @@ ttf-parser = { opt-level = 3 }
 [patch.crates-io]
 gpui-pre-apple = { path = "vendor/gpui-pre-apple" }
 gpui-pre-macos = { path = "vendor/gpui-pre-macos" }
+# The shim that picks the platform, with an arm for iOS (vendor/gpui-pre-ios).
+gpui-pre-platform = { path = "vendor/gpui-pre-platform" }
 taffy = { path = "vendor/taffy" }
 
 # The build that ships (dev/bundle, dev/release): the whole program
@@ -86,8 +108,10 @@ strip = true
 
 # The helper that drives lights from the events of Bloom (experimental):
 # a program of its own, which shares no code with the app.
+# `ios` is the static library of the iOS app (dev/ios builds it for an
+# iOS target); it is not in the default set, which builds for the Mac.
 [workspace]
-members = ["core", "lights"]
+members = ["core", "lights", "ios"]
 default-members = [".", "core", "lights"]
 
 # The version of the app, for it and for `bloom-core`, which names it to the

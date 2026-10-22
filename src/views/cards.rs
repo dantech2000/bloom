@@ -55,9 +55,15 @@ impl Metrics {
             w if w >= 1600. => (11.6, 18.7, 8),
             w if w >= 1400. => (13.3, 23.1, 7),
             w if w >= 1200. => (15.5, 23.1, 6),
+            // A phone: three posters across, and a card a finger can hit.
+            w if w < crate::views::shell::COMPACT_W => (34., 64., 3),
             _ => (18.4, 30., 5),
         };
-        let side = (viewport * 0.033).round() + 9.;
+        let side = if viewport < crate::views::shell::COMPACT_W {
+            16.
+        } else {
+            (viewport * 0.033).round() + 9.
+        };
         let inner = viewport - side * 2.;
         let columns = grid_columns as f32;
         Self {
@@ -348,6 +354,9 @@ fn card(
     let menu_target = item.clone();
     div()
         .id(ElementId::from(key.clone()))
+        // For assistive tech and the tests that tap by label.
+        .role(gpui_kit::Role::Button)
+        .aria_label(title.clone())
         .w(px(w))
         // A set least and most width spares a layout pass (`Bloom::render_settings`).
         .min_w(px(w))

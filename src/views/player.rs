@@ -4,12 +4,14 @@
 //! the video fills the window, a title bar lies over its top, and the
 //! controls sit in a floating glass panel at the bottom.
 
+#[cfg(target_os = "macos")]
+use gpui_kit::surface;
 use gpui_icons::LucideIcon;
 use gpui_kit::{
     Bounds, ClickEvent, Context, Corners, Div, InteractiveElement as _, IntoElement, MouseButton,
     MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement as _, Stateful,
     StatefulInteractiveElement as _, Styled, Svg, Window, canvas, div, linear_color_stop,
-    linear_gradient, prelude::FluentBuilder as _, px, relative, rgb, rgba, surface,
+    linear_gradient, prelude::FluentBuilder as _, px, relative, rgb, rgba,
 };
 
 use crate::{
@@ -41,6 +43,15 @@ impl Bloom {
         let soft = rgba(0xffffffb3);
         let starting = s.state == PlayState::Starting;
         let fullscreen = window.is_fullscreen();
+        // A phone: fewer controls, each a finger wide, inside the safe
+        // area (in landscape the notch is at a side).
+        let phone = self.phone();
+        let (top_in, left_in, bottom_in, right_in) = crate::views::shell::safe_insets();
+        let (panel_left, panel_right, panel_bottom) = if phone {
+            (12. + left_in, 12. + right_in, 8. + bottom_in)
+        } else {
+            (PANEL_MARGIN, PANEL_MARGIN, PANEL_MARGIN)
+        };
 
         let player = self.player.clone();
         let scale = window.scale_factor();
@@ -66,23 +77,41 @@ impl Bloom {
             .justify_center()
             .child(measure)
             // A click on the video closes the episode list when it is open;
-            // otherwise it pauses or resumes.
+            // otherwise it pauses or resumes. On a phone a tap shows the
+            // controls, or hides them, as the players of iOS do; the pause
+            // is a button of the controls.
             .on_click(cx.listener(|this, _, _, cx| {
                 if this.close_panels() {
+                    cx.notify();
+                } else if cfg!(target_os = "ios") {
+                    if this.controls_visible {
+                        this.controls_visible = false;
+                    } else {
+                        this.show_controls();
+                    }
                     cx.notify();
                 } else {
                     this.request_toggle_pause(cx)
                 }
             }))
             .when_some(self.current_frame.clone(), |el, frame| {
-                el.child(
-                    surface(frame.buffer())
-                        .size_full()
-                        .object_fit(ObjectFit::Contain),
-                )
+                #[cfg(target_os = "macos")]
+                {
+                    el.child(
+                        surface(frame.buffer())
+                            .size_full()
+                            .object_fit(ObjectFit::Contain),
+                    )
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = frame;
+                    el
+                }
             })
             .when(
-                self.current_frame.is_none() || starting || s.buffering,
+                // iOS draws the video under the page: no frame comes here.
+                (cfg!(target_os = "macos") && self.current_frame.is_none()) || starting || s.buffering,
                 |el| {
                     el.child(
                         div()
@@ -118,6 +147,9 @@ impl Bloom {
         let button = |id: &'static str, glyph: Svg| {
             div()
                 .id(id)
+                // For assistive tech and the tests that tap by label.
+                .role(gpui_kit::Role::Button)
+                .aria_label(id.rsplit('.').next().unwrap_or(id))
                 .size(px(40.))
                 .rounded(px(12.))
                 .flex()
@@ -258,7 +290,7 @@ impl Bloom {
                         ),
                     )
                 });
-            if let Some(score) = rating {
+            if let Some(score) = rating.filter(|_| !phone) {
                 left = left.child(
                     div()
                         .ml(px(6.))
@@ -272,7 +304,7 @@ impl Bloom {
                         .child(format!("{score:.1}")),
                 );
             }
-            if s.duration > 0. {
+            if s.duration > 0. && !phone {
                 left = left.child(
                     div()
                         .ml(px(10.))
@@ -289,7 +321,7 @@ impl Bloom {
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .child(
+                .when(!phone, |el| el.child(
                     button(
                         "player.favorite",
                         filled(
@@ -304,13 +336,13 @@ impl Bloom {
                         "Add to favorites"
                     }))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_playing_favorite(cx))),
-                )
+                ))
                 .child(menu_button(
                     &self.subtitle_menu,
                     "Subtitles",
                     filled(Filled::Captions, 24., if has_subs { white } else { soft }),
                 ))
-                .child(
+                .when(!phone, |el| el.child(
                     button(
                         "player.mute",
                         filled(
@@ -325,15 +357,18 @@ impl Bloom {
                     )
                     .tooltip(tip(if silent { "Unmute (M)" } else { "Mute (M)" }))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_mute(cx))),
-                )
-                .child(
-                    div().w(px(120.)).mr(px(8.)).child(
-                        Slider::new(&self.volume_slider)
-                            .aria_label("Volume")
-                            .w_full(),
-                    ),
-                )
-                .children(self.bookmark_button(cx))
+                ))
+                // The volume is the phone's buttons; the bookmarks wait.
+                .when(!phone, |el| {
+                    el.child(
+                        div().w(px(120.)).mr(px(8.)).child(
+                            Slider::new(&self.volume_slider)
+                                .aria_label("Volume")
+                                .w_full(),
+                        ),
+                    )
+                    .children(self.bookmark_button(cx))
+                })
                 .when(self.can_pick_episode(), |el| {
                     el.child(
                         button("player.episodes", icon(LucideIcon::ListVideo, 22., white))
@@ -370,68 +405,81 @@ impl Bloom {
                             this.toggle_cast_panel(window, cx)
                         })),
                 )
-                .child(
-                    button(
-                        "player.pip",
-                        icon(LucideIcon::PictureInPicture2, 22., white),
+                // The small window and full screen are the Mac's: a phone
+                // has neither.
+                .when(cfg!(target_os = "macos"), |el| {
+                    el.child(
+                        button(
+                            "player.pip",
+                            icon(LucideIcon::PictureInPicture2, 22., white),
+                        )
+                        .tooltip(tip("Picture in picture"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.toggle_pip(window, cx)
+                        })),
                     )
-                    .tooltip(tip("Picture in picture"))
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.toggle_pip(window, cx)
-                    })),
-                )
-                .child(
-                    button(
-                        "player.fullscreen",
-                        filled(
-                            if fullscreen {
-                                Filled::FullscreenExit
-                            } else {
-                                Filled::Fullscreen
-                            },
-                            24.,
-                            white,
-                        ),
+                    .child(
+                        button(
+                            "player.fullscreen",
+                            filled(
+                                if fullscreen {
+                                    Filled::FullscreenExit
+                                } else {
+                                    Filled::Fullscreen
+                                },
+                                24.,
+                                white,
+                            ),
+                        )
+                        .tooltip(tip(if fullscreen {
+                            "Exit full screen (F)"
+                        } else {
+                            "Enter full screen (F)"
+                        }))
+                        .on_click(|_: &ClickEvent, window, _| window.toggle_fullscreen()),
                     )
-                    .tooltip(tip(if fullscreen {
-                        "Exit full screen (F)"
-                    } else {
-                        "Enter full screen (F)"
-                    }))
-                    .on_click(|_: &ClickEvent, window, _| window.toggle_fullscreen()),
-                );
+                });
 
             let panel = div()
                 .absolute()
-                .left(px(PANEL_MARGIN))
-                .right(px(PANEL_MARGIN))
-                .bottom(px(PANEL_MARGIN))
+                .left(px(panel_left))
+                .right(px(panel_right))
+                .bottom(px(panel_bottom))
                 .rounded(px(24.))
                 .opacity(visibility)
                 .on_mouse_down(MouseButton::Left, cx.listener(swallow))
                 .child(glass(px(24.), rgba(0x1c1c1cb8)))
-                .px(px(20.))
+                .px(px(if phone { 14. } else { 20. }))
                 .pt(px(10.))
                 .pb(px(8.))
                 .flex()
                 .flex_col()
                 .gap(px(2.))
                 .child(seek)
-                .child(
+                .child(if phone {
+                    // The transport in the middle, as the players of iOS;
+                    // the tools at the right.
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(div().flex_1())
+                        .child(left)
+                        .child(div().flex_1().flex().justify_end().child(right))
+                } else {
                     div()
                         .flex()
                         .items_center()
                         .justify_between()
                         .child(left)
-                        .child(right),
-                );
+                        .child(right)
+                });
 
             let header = div()
                 .absolute()
                 .top_0()
                 .left_0()
                 .right_0()
-                .h(px(110.))
+                .h(px(if phone { 84. } else { 110. }))
                 .opacity(visibility)
                 .bg(linear_gradient(
                     180.,
@@ -441,10 +489,17 @@ impl Bloom {
                 .child(
                     div()
                         .absolute()
-                        .top(px(12.))
-                        // The traffic lights sit at the left edge of a window.
-                        .left(px(if fullscreen { 20. } else { 84. }))
-                        .right(px(24.))
+                        .top(px(if phone { 8. + top_in } else { 12. }))
+                        // The traffic lights sit at the left edge of a Mac
+                        // window; the notch at a side of a phone.
+                        .left(px(if phone {
+                            16. + left_in
+                        } else if fullscreen || cfg!(not(target_os = "macos")) {
+                            20.
+                        } else {
+                            84.
+                        }))
+                        .right(px(if phone { 16. + right_in } else { 24. }))
                         .flex()
                         .items_center()
                         .gap(px(6.))
@@ -487,8 +542,8 @@ impl Bloom {
             div()
                 .id("player.skip")
                 .absolute()
-                .right(px(PANEL_MARGIN + 24.))
-                .bottom(px(PANEL_MARGIN + 110.))
+                .right(px(self.panel_corner().0))
+                .bottom(px(self.panel_corner().1))
                 .h(px(44.))
                 .px(px(20.))
                 .rounded(px(12.))
@@ -513,7 +568,8 @@ impl Bloom {
             .track_focus(&self.player_focus)
             .relative()
             .size_full()
-            .bg(gpui_kit::black())
+            // On iOS the page is a hole over the video layer of the window.
+            .when(cfg!(target_os = "macos"), |el| el.bg(gpui_kit::black()))
             .on_key_down(
                 cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
                     let shift = event.keystroke.modifiers.shift;
@@ -570,7 +626,7 @@ impl Bloom {
                 el.children(skip)
                     .children(up_next)
                     .when_some(chrome, |el, (header, panel)| el.child(header).child(panel))
-                    .children(self.render_episode_picker(PANEL_MARGIN + 110., cx))
+                    .children(self.render_episode_picker(self.panel_corner().1, cx))
                     .children(self.render_bookmarks_panel(cx))
                     .children(self.render_sync_panel(None, cx))
                     .children(self.render_cast_panel(None, cx))
@@ -580,6 +636,18 @@ impl Bloom {
             .when(self.pause_screen, |el| {
                 el.children(self.render_pause_screen(window, cx))
             })
+    }
+
+    /// Where a panel of the player sits over the control bar: its distance
+    /// from the right edge, and from the bottom. On a phone the bar is
+    /// lower and inside the safe area.
+    pub fn panel_corner(&self) -> (f32, f32) {
+        if self.phone() {
+            let (_, _, bottom_in, right_in) = crate::views::shell::safe_insets();
+            (12. + right_in, bottom_in + 8. + 100.)
+        } else {
+            (PANEL_MARGIN + 24., PANEL_MARGIN + 110.)
+        }
     }
 
     /// The seek slider with its chapter marks, and over it the preview of
@@ -735,9 +803,9 @@ impl Bloom {
             div()
                 .id("player.up-next")
                 .absolute()
-                .right(px(PANEL_MARGIN + 24.))
-                .bottom(px(PANEL_MARGIN + 110.))
-                .w(px(440.))
+                .right(px(self.panel_corner().0))
+                .bottom(px(self.panel_corner().1))
+                .w(px(440f32.min(self.viewport_w - 48.)))
                 .p(px(12.))
                 .rounded(px(16.))
                 .border_1()
@@ -960,7 +1028,8 @@ impl Bloom {
             .track_focus(&self.player_focus)
             .relative()
             .size_full()
-            .bg(gpui_kit::black())
+            // On iOS the page is a hole over the video layer of the window.
+            .when(cfg!(target_os = "macos"), |el| el.bg(gpui_kit::black()))
             .on_key_down(
                 cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
                     match event.keystroke.key.as_str() {
@@ -987,13 +1056,21 @@ impl Bloom {
             .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
             .child(measure)
             .when_some(self.current_frame.clone(), |el, frame| {
-                el.child(
-                    div().absolute().inset_0().child(
-                        surface(frame.buffer())
-                            .size_full()
-                            .object_fit(ObjectFit::Contain),
-                    ),
-                )
+                #[cfg(target_os = "macos")]
+                {
+                    el.child(
+                        div().absolute().inset_0().child(
+                            surface(frame.buffer())
+                                .size_full()
+                                .object_fit(ObjectFit::Contain),
+                        ),
+                    )
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = frame;
+                    el
+                }
             })
             .when(self.controls_visible || visibility > 0., |el| {
                 el.child(controls)

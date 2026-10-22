@@ -2,6 +2,9 @@
 //! Calls into AppKit through the Objective-C runtime, for the few things gpui
 //! has no call for: the window level and frame, and the Dock icon.
 
+// Some calls are the Mac's; the iOS build keeps them unused.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use std::ffi::{CStr, c_void};
 
 pub type Id = *mut c_void;
@@ -55,6 +58,47 @@ macro_rules! send {
     }};
 }
 pub(crate) use send;
+
+/// The top of the safe area of the key window of the app, in points: the
+/// status bar and the notch of an iPhone. 0 without a window yet.
+#[cfg(not(target_os = "macos"))]
+pub fn safe_area_top() -> f32 {
+    safe_area_insets().0
+}
+
+/// The top and the bottom of the safe area of the key window, in points:
+/// the status bar, and the home indicator. Zeros without a window yet.
+#[cfg(not(target_os = "macos"))]
+pub fn safe_area_insets() -> (f32, f32) {
+    let (top, _, bottom, _) = safe_area();
+    (top, bottom)
+}
+
+/// The safe area of the key window on every side, in points: top, left,
+/// bottom, right. In landscape the notch is at a side. Zeros without a
+/// window yet.
+#[cfg(not(target_os = "macos"))]
+pub fn safe_area() -> (f32, f32, f32, f32) {
+    /// `UIEdgeInsets`: four doubles, returned in registers on arm64.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Insets {
+        top: f64,
+        left: f64,
+        bottom: f64,
+        right: f64,
+    }
+    let app = send!(Id, class(c"UIApplication"), c"sharedApplication");
+    if app.is_null() {
+        return (0., 0., 0., 0.);
+    }
+    let window = send!(Id, app, c"keyWindow");
+    if window.is_null() {
+        return (0., 0., 0., 0.);
+    }
+    let insets = send!(Insets, window, c"safeAreaInsets");
+    (insets.top as f32, insets.left as f32, insets.bottom as f32, insets.right as f32)
+}
 
 /// Hides the pointer until the mouse moves, or gives it back.
 pub fn hide_pointer_until_it_moves(hidden: bool) {

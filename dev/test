@@ -12,4 +12,6 @@ command -v ffmpeg >/dev/null 2>&1 ||
 # the core, as a test of either can match it.
 [ $# -gt 0 ] || cargo test --release -p bloom-lights || exit 1
 cargo test --release -p bloom-core "$@" || exit 1
-exec cargo test --release --bin bloom "$@"
+# The tests of the app are in its library (src/lib.rs, since the iOS build
+# of 2026-10-21); the binary has none.
+exec cargo test --release -p bloom --lib "$@"

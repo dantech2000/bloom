@@ -336,6 +336,8 @@ pub struct Bloom {
     /// The AirPlay sender; idle until an item is sent.
     pub airplay: crate::airplay::AirPlay,
     pub connect: ConnectState,
+    /// The splash at the start (src/views/splash.rs).
+    pub splash: crate::views::splash::Splash,
     pub views: Vec<Item>,
     pub page: Page,
     pub history: Vec<Page>,
@@ -698,6 +700,7 @@ impl Bloom {
                     break;
                 }
                 if wait.is_some() {
+                    #[cfg(target_os = "macos")]
                     gpui_macos::wake_frame_sources();
                 }
             }
@@ -725,6 +728,7 @@ impl Bloom {
             nowplaying: Default::default(),
             airplay: Default::default(),
             connect,
+            splash: Default::default(),
             views: Vec::new(),
             page: Page::Home(HomeData::default()),
             history: Vec::new(),
@@ -2787,6 +2791,7 @@ impl Bloom {
         self.load_timeline(item.id.clone(), cx);
         self.player_status = self.player.status();
         self.player_open = true;
+        crate::set_landscape(true);
         self.show_controls();
         self.tracks_version = 0;
         self.rebuild_track_menus(cx);
@@ -2939,6 +2944,7 @@ impl Bloom {
 
     pub fn close_player_view(&mut self, cx: &mut Context<Self>) {
         self.player_open = false;
+        crate::set_landscape(false);
         // The end of the playback is an event, at once.
         self.events_tick(cx);
         // The preview sheets of the timeline are not needed any more.
@@ -3199,6 +3205,7 @@ impl Bloom {
                             && !this.refind_lost_episode(cx);
                         if ended {
                             this.player_open = false;
+                            crate::set_landscape(false);
                             if let Some(err) = this.player_status.error.clone() {
                                 this.toast("Playback stopped", err, cx);
                             }
@@ -3487,7 +3494,9 @@ impl Render for Bloom {
                     this.toggle_pip(window, cx)
                 }
             }))
-            .bg(theme.colors.background)
+            // On iOS the player page is a hole over the video layer of
+            // the window: nothing under it may paint.
+            .when(!(cfg!(target_os = "ios") && self.player_open), |el| el.bg(theme.colors.background))
             .text_color(theme.colors.foreground)
             .font_family(theme.fonts.body.clone())
             .text_size(px(14.))
@@ -3533,6 +3542,8 @@ impl Render for Bloom {
                     .child(format!("TEST INSTANCE · {name}"))
             }))
             .child(self.toasts.clone())
+            // The splash at the start lies over every page, the player too.
+            .children(self.render_splash(window, cx))
             // Painted last, so its paint marks the end of the frame's work.
             .child(gpui_kit::canvas(
                 |_, _, _| {},

@@ -36,6 +36,8 @@ pub struct Options {
     /// `BLOOM_HERO_PLAY_INACTIVE`: the trailer of the hero plays while the
     /// app is not the active one.
     pub hero_play_inactive: bool,
+    /// `BLOOM_NO_SPLASH`: no splash at the start, for tests and screenshots.
+    pub no_splash: bool,
     /// `BLOOM_APPEARANCE=light|dark|system`.
     pub appearance: Option<String>,
     /// `BLOOM_GLASS=liquid|frosted`: wins over the setting of the user.
@@ -87,6 +89,7 @@ impl Options {
             allow_subtitle_write: text("BLOOM_ALLOW_SUBTITLE_WRITE").as_deref() == Some("1"),
             chromecast_mock: set("BLOOM_CHROMECAST_MOCK"),
             hero_play_inactive: set("BLOOM_HERO_PLAY_INACTIVE"),
+            no_splash: set("BLOOM_NO_SPLASH"),
             appearance: text("BLOOM_APPEARANCE"),
             glass: text("BLOOM_GLASS"),
             no_glass: set("BLOOM_NO_GLASS"),

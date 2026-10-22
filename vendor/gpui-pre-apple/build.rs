@@ -2,6 +2,8 @@
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
 fn main() {
+    // Bloom (vendor/README.md): the build script runs on macOS for a
+    // macOS or an iOS target; the SDK of the shaders follows the target.
     #[cfg(target_os = "macos")]
     macos_build::run();
 }
@@ -139,16 +141,17 @@ mod macos_build {
         let staged_shader_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders.metal");
         std::fs::copy(shader_path, &staged_shader_path).unwrap();
 
+        // The SDK and the minimum version of the target, not of the host.
+        let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        let target_abi = env::var("CARGO_CFG_TARGET_ABI").unwrap_or_default();
+        let (sdk, min_version) = match (target_os.as_str(), target_abi.as_str()) {
+            ("ios", "sim") => ("iphonesimulator", "-miphonesimulator-version-min=16.0"),
+            ("ios", _) => ("iphoneos", "-mios-version-min=16.0"),
+            _ => ("macosx", "-mmacosx-version-min=10.15.7"),
+        };
+        println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
         let output = Command::new("xcrun")
-            .args([
-                "-sdk",
-                "macosx",
-                "metal",
-                "-gline-tables-only",
-                "-mmacosx-version-min=10.15.7",
-                "-MO",
-                "-c",
-            ])
+            .args(["-sdk", sdk, "metal", "-gline-tables-only", min_version, "-MO", "-c"])
             .arg(&staged_shader_path)
             .args(["-include", header_path.to_str().unwrap(), "-o"])
             .arg(&air_output_path)
@@ -164,7 +167,7 @@ mod macos_build {
         }
 
         let output = Command::new("xcrun")
-            .args(["-sdk", "macosx", "metallib"])
+            .args(["-sdk", sdk, "metallib"])
             .arg(&air_output_path)
             .arg("-o")
             .arg(metallib_output_path)

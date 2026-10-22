@@ -1,6 +1,138 @@
+diff -ruN a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -46,27 +46,27 @@
+ default-features = false
+ package = "gpui-pre"
+ 
+-[target.'cfg(target_os = "macos")'.dependencies.anyhow]
++[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.anyhow]
+ version = "1.0.86"
+ 
+-[target.'cfg(target_os = "macos")'.dependencies.block]
++[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.block]
+ version = "0.1"
+ 
+ [target.'cfg(target_os = "macos")'.dependencies.cocoa]
+ version = "=0.26.0"
+ 
+-[target.'cfg(target_os = "macos")'.dependencies.collections]
++[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.collections]
+ version = "=0.3.4"
+ package = "gpui-pre-collections"
+ 
+-[target.'cfg(target_os = "macos")'.dependencies.core-foundation]
++[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.core-foundation]
+ version = "0.10"
+ 
+ [target.'cfg(target_os = "macos")'.dependencies.core-video]
+ version = "0.5.2"
+ features = ["metal"]
+ 
+-[target.'cfg(target_os = "macos")'.dependencies.derive_more]
++[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.derive_more]
+ version = "2.1.1"
+ features = [
+     "add",
+@@ -81,13 +81,13 @@
+     "not",
+ ]
+ 
+-[target.'cfg(target_os = "macos")'.dependencies.etagere]
++[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.etagere]
+ version = "0.2"
+ 
+-[target.'cfg(target_os = "macos")'.dependencies.foreign-types]
++[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.foreign-types]
+ version = "0.5"
+ 
+-[target.'cfg(target_os = "macos")'.dependencies.image]
++[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.image]
+ version = "0.25.1"
+ features = [
+     "bmp",
+@@ -108,20 +108,20 @@
+ ]
+ default-features = false
+ 
+-[target.'cfg(target_os = "macos")'.dependencies.log]
++[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.log]
+ version = "0.4.16"
+ features = [
+     "kv_unstable_serde",
+     "serde",
+ ]
+ 
+-[target.'cfg(target_os = "macos")'.dependencies.metal]
++[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.metal]
+ version = "0.33"
+ 
+-[target.'cfg(target_os = "macos")'.dependencies.objc]
++[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.objc]
+ version = "0.2"
+ 
+-[target.'cfg(target_os = "macos")'.dependencies.parking_lot]
++[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.parking_lot]
+ version = "0.12.1"
+ 
+ [target.'cfg(target_os = "macos")'.build-dependencies.cbindgen]
+diff -ruN a/build.rs b/build.rs
+--- a/build.rs
++++ b/build.rs
+@@ -2,6 +2,8 @@
+ #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
+ 
+ fn main() {
++    // Bloom (vendor/README.md): the build script runs on macOS for a
++    // macOS or an iOS target; the SDK of the shaders follows the target.
+     #[cfg(target_os = "macos")]
+     macos_build::run();
+ }
+@@ -139,16 +141,17 @@
+         let staged_shader_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders.metal");
+         std::fs::copy(shader_path, &staged_shader_path).unwrap();
+ 
++        // The SDK and the minimum version of the target, not of the host.
++        let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
++        let target_abi = env::var("CARGO_CFG_TARGET_ABI").unwrap_or_default();
++        let (sdk, min_version) = match (target_os.as_str(), target_abi.as_str()) {
++            ("ios", "sim") => ("iphonesimulator", "-miphonesimulator-version-min=16.0"),
++            ("ios", _) => ("iphoneos", "-mios-version-min=16.0"),
++            _ => ("macosx", "-mmacosx-version-min=10.15.7"),
++        };
++        println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
+         let output = Command::new("xcrun")
+-            .args([
+-                "-sdk",
+-                "macosx",
+-                "metal",
+-                "-gline-tables-only",
+-                "-mmacosx-version-min=10.15.7",
+-                "-MO",
+-                "-c",
+-            ])
++            .args(["-sdk", sdk, "metal", "-gline-tables-only", min_version, "-MO", "-c"])
+             .arg(&staged_shader_path)
+             .args(["-include", header_path.to_str().unwrap(), "-o"])
+             .arg(&air_output_path)
+@@ -164,7 +167,7 @@
+         }
+ 
+         let output = Command::new("xcrun")
+-            .args(["-sdk", "macosx", "metallib"])
++            .args(["-sdk", sdk, "metallib"])
+             .arg(&air_output_path)
+             .arg("-o")
+             .arg(metallib_output_path)
 diff -ruN a/src/gpui_apple.rs b/src/gpui_apple.rs
 --- a/src/gpui_apple.rs
 +++ b/src/gpui_apple.rs
+@@ -1,4 +1,4 @@
+-#![cfg(target_os = "macos")]
++#![cfg(any(target_os = "macos", target_os = "ios"))]
+ //! Shared Apple platform support for GPUI.
+ //!
+ //! This crate contains the Metal renderer and GPU resource management shared
 @@ -6,3 +6,5 @@
  
  mod metal_atlas;
@@ -10,16 +142,68 @@ diff -ruN a/src/gpui_apple.rs b/src/gpui_apple.rs
 diff -ruN a/src/metal_renderer.rs b/src/metal_renderer.rs
 --- a/src/metal_renderer.rs
 +++ b/src/metal_renderer.rs
-@@ -16,7 +16,7 @@
+@@ -1,11 +1,10 @@
+ use crate::metal_atlas::MetalAtlas;
+ use anyhow::{Context as _, Result};
+ use block::ConcreteBlock;
+-use cocoa::{
+-    base::{NO, YES},
+-    foundation::{NSSize, NSUInteger},
+-    quartzcore::AutoresizingMask,
+-};
++// Bloom (vendor/README.md): the renderer builds for iOS as well, where
++// the `cocoa` crate (AppKit) does not. The few names it took from there
++// are defined here.
++use objc::runtime::{NO, YES};
+ use gpui::{
+     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
+     PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+@@ -13,10 +12,13 @@
+ #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+ use image::RgbaImage;
+ 
++#[cfg(target_os = "macos")]
  use core_foundation::base::TCFType;
++#[cfg(target_os = "macos")]
  use core_video::{
-     metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
+-    metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
 -    pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
++    metal_texture::CVMetalTextureGetTexture,
++    metal_texture_cache::CVMetalTextureCache,
 +    pixel_buffer::{kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange},
  };
  use foreign_types::{ForeignType, ForeignTypeRef};
  use metal::{
-@@ -122,10 +122,16 @@
+@@ -30,6 +32,28 @@
+ // Exported to metal
+ pub(crate) type PointF = gpui::Point<f32>;
+ 
++/// `NSUInteger` of Foundation, on a 64-bit platform.
++type NSUInteger = u64;
++
++/// `NSSize` (`CGSize`) of Foundation, for `setDrawableSize:`.
++#[repr(C)]
++#[derive(Clone, Copy)]
++struct NSSize {
++    width: f64,
++    height: f64,
++}
++
++unsafe impl objc::Encode for NSSize {
++    fn encode() -> objc::Encoding {
++        unsafe { objc::Encoding::from_str("{CGSize=dd}") }
++    }
++}
++
++/// `kCALayerWidthSizable | kCALayerHeightSizable` (macOS only: a layer of
++/// iOS has no autoresizing mask; the view sets its frame).
++#[cfg(target_os = "macos")]
++const LAYER_SIZABLE: u32 = (1 << 1) | (1 << 4);
++
+ #[cfg(not(feature = "runtime_shaders"))]
+ const SHADERS_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.metallib"));
+ #[cfg(feature = "runtime_shaders")]
+@@ -122,18 +146,41 @@
      path_sprites_pipeline_state: metal::RenderPipelineState,
      shadows_pipeline_state: metal::RenderPipelineState,
      quads_pipeline_state: metal::RenderPipelineState,
@@ -30,13 +214,17 @@ diff -ruN a/src/metal_renderer.rs b/src/metal_renderer.rs
      underlines_pipeline_state: metal::RenderPipelineState,
      monochrome_sprites_pipeline_state: metal::RenderPipelineState,
      polychrome_sprites_pipeline_state: metal::RenderPipelineState,
++    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
      surfaces_pipeline_state: metal::RenderPipelineState,
 +    /// Surfaces in BGRA need no colour conversion.
++    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 +    surfaces_bgra_pipeline_state: metal::RenderPipelineState,
      unit_vertices: metal::Buffer,
      #[allow(clippy::arc_with_non_send_sync)]
      instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
-@@ -134,6 +140,20 @@
+     sprite_atlas: Arc<MetalAtlas>,
++    #[cfg(target_os = "macos")]
+     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
      path_intermediate_texture: Option<metal::Texture>,
      path_intermediate_msaa_texture: Option<metal::Texture>,
      path_sample_count: u32,
@@ -57,7 +245,76 @@ diff -ruN a/src/metal_renderer.rs b/src/metal_renderer.rs
      /// Offscreen render target reused across `render_scene` calls when
      /// rendering headlessly without reading pixels back.
      #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
-@@ -291,6 +311,14 @@
+@@ -166,11 +213,8 @@
+         unsafe {
+             let _: () = msg_send![&*layer, setAllowsNextDrawableTimeout: NO];
+             let _: () = msg_send![&*layer, setNeedsDisplayOnBoundsChange: YES];
+-            let _: () = msg_send![
+-                &*layer,
+-                setAutoresizingMask: AutoresizingMask::WIDTH_SIZABLE
+-                    | AutoresizingMask::HEIGHT_SIZABLE
+-            ];
++            #[cfg(target_os = "macos")]
++            let _: () = msg_send![&*layer, setAutoresizingMask: LAYER_SIZABLE];
+         }
+ 
+         Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)
+@@ -189,23 +233,26 @@
+     fn create_device() -> metal::Device {
+         // Prefer low‐power integrated GPUs on Intel Mac. On Apple
+         // Silicon, there is only ever one GPU, so this is equivalent to
+-        // `metal::Device::system_default()`.
+-        if let Some(d) = metal::Device::all()
+-            .into_iter()
+-            .min_by_key(|d| (d.is_removable(), !d.is_low_power()))
++        // `metal::Device::system_default()`. iOS has the one GPU and no
++        // `MTLCopyAllDevices`.
++        #[cfg(target_os = "macos")]
+         {
+-            d
+-        } else {
++            if let Some(d) = metal::Device::all()
++                .into_iter()
++                .min_by_key(|d| (d.is_removable(), !d.is_low_power()))
++            {
++                return d;
++            }
+             // For some reason `all()` can return an empty list, see https://github.com/zed-industries/zed/issues/37689
+             // In that case, we fall back to the system default device.
+             log::error!(
+                 "Unable to enumerate Metal devices; attempting to use system default device"
+             );
+-            metal::Device::system_default().unwrap_or_else(|| {
+-                log::error!("unable to access a compatible graphics device");
+-                std::process::exit(1);
+-            })
+         }
++        metal::Device::system_default().unwrap_or_else(|| {
++            log::error!("unable to access a compatible graphics device");
++            std::process::exit(1);
++        })
+     }
+ 
+     fn new_internal(
+@@ -232,12 +279,15 @@
+ 
+         // Shared memory can be used only if CPU and GPU share the same memory space.
+         // https://developer.apple.com/documentation/metal/setting-resource-storage-modes
+-        let is_unified_memory = device.has_unified_memory();
++        // Bloom (vendor/README.md): iOS has no managed storage mode, and
++        // the simulator's device says it has no unified memory.
++        let is_unified_memory = cfg!(not(target_os = "macos")) || device.has_unified_memory();
+         // Apple GPU families support memoryless textures, which can significantly reduce
+         // memory usage by keeping render targets in on-chip tile memory instead of
+         // allocating backing store in system memory.
+         // https://developer.apple.com/documentation/metal/mtlgpufamily
+-        let is_apple_gpu = device.supports_family(MTLGPUFamily::Apple1);
++        let is_apple_gpu =
++            cfg!(not(target_os = "macos")) || device.supports_family(MTLGPUFamily::Apple1);
+ 
+         let unit_vertices = [
+             to_float2_bits(point(0., 0.)),
+@@ -291,6 +341,14 @@
              "quad_fragment",
              MTLPixelFormat::BGRA8Unorm,
          );
@@ -72,7 +329,7 @@ diff -ruN a/src/metal_renderer.rs b/src/metal_renderer.rs
          let underlines_pipeline_state = build_pipeline_state(
              &device,
              &library,
-@@ -323,12 +351,23 @@
+@@ -323,12 +381,24 @@
              "surface_fragment",
              MTLPixelFormat::BGRA8Unorm,
          );
@@ -87,6 +344,7 @@ diff -ruN a/src/metal_renderer.rs b/src/metal_renderer.rs
  
          let command_queue = device.new_command_queue();
          let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
++        #[cfg(target_os = "macos")]
          let core_video_texture_cache =
              CVMetalTextureCache::new(None, device.clone(), None).unwrap();
  
@@ -96,7 +354,7 @@ diff -ruN a/src/metal_renderer.rs b/src/metal_renderer.rs
          Self {
              device,
              layer,
-@@ -341,10 +380,12 @@
+@@ -341,17 +411,25 @@
              path_sprites_pipeline_state,
              shadows_pipeline_state,
              quads_pipeline_state,
@@ -109,7 +367,8 @@ diff -ruN a/src/metal_renderer.rs b/src/metal_renderer.rs
              unit_vertices,
              instance_buffer_pool,
              sprite_atlas,
-@@ -352,6 +393,11 @@
++            #[cfg(target_os = "macos")]
+             core_video_texture_cache,
              path_intermediate_texture: None,
              path_intermediate_msaa_texture: None,
              path_sample_count: PATH_SAMPLE_COUNT,
@@ -121,7 +380,7 @@ diff -ruN a/src/metal_renderer.rs b/src/metal_renderer.rs
              #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
              headless_render_target: None,
          }
-@@ -395,6 +441,27 @@
+@@ -395,6 +473,27 @@
          self.update_path_intermediate_textures(size);
      }
  
@@ -149,7 +408,7 @@ diff -ruN a/src/metal_renderer.rs b/src/metal_renderer.rs
      fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
          // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
          // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
-@@ -402,9 +469,24 @@
+@@ -402,9 +501,24 @@
          if size.width.0 <= 0 || size.height.0 <= 0 {
              self.path_intermediate_texture = None;
              self.path_intermediate_msaa_texture = None;
@@ -174,7 +433,7 @@ diff -ruN a/src/metal_renderer.rs b/src/metal_renderer.rs
          let texture_descriptor = metal::TextureDescriptor::new();
          texture_descriptor.set_width(size.width.0 as u64);
          texture_descriptor.set_height(size.height.0 as u64);
-@@ -459,6 +541,10 @@
+@@ -459,6 +573,10 @@
              (viewport_size.width.ceil() as i32).into(),
              (viewport_size.height.ceil() as i32).into(),
          );
@@ -185,7 +444,7 @@ diff -ruN a/src/metal_renderer.rs b/src/metal_renderer.rs
          let drawable = if let Some(drawable) = layer.next_drawable() {
              drawable
          } else {
-@@ -466,17 +552,46 @@
+@@ -466,17 +584,46 @@
                  "failed to retrieve next drawable, drawable size: {:?}",
                  viewport_size
              );
@@ -232,7 +491,7 @@ diff -ruN a/src/metal_renderer.rs b/src/metal_renderer.rs
          if self.presents_with_transaction {
              command_buffer.commit();
              command_buffer.wait_until_scheduled();
-@@ -667,13 +782,120 @@
+@@ -667,13 +814,120 @@
              Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
          );
  
@@ -354,7 +613,7 @@ diff -ruN a/src/metal_renderer.rs b/src/metal_renderer.rs
                  }
                  PrimitiveBatch::Paths(range) => {
                      let paths = &scene.paths[range];
-@@ -858,12 +1080,21 @@
+@@ -858,12 +1112,21 @@
          instance_bindings: &InstanceBindings,
          viewport_size: Size<DevicePixels>,
          command_encoder: &metal::RenderCommandEncoderRef,
@@ -377,7 +636,7 @@ diff -ruN a/src/metal_renderer.rs b/src/metal_renderer.rs
          command_encoder.set_vertex_buffer(
              QuadInputIndex::Vertices as u64,
              Some(&self.unit_vertices),
-@@ -879,6 +1110,7 @@
+@@ -879,6 +1142,7 @@
              Some(&instance_bindings.quads.buffer),
              instance_bindings.quads.offset as u64,
          );
@@ -385,7 +644,30 @@ diff -ruN a/src/metal_renderer.rs b/src/metal_renderer.rs
          command_encoder.set_vertex_bytes(
              QuadInputIndex::ViewportSize as u64,
              mem::size_of_val(&viewport_size) as u64,
-@@ -1150,6 +1382,41 @@
+@@ -1115,8 +1379,22 @@
+         );
+     }
+ 
++    /// Bloom (vendor/README.md): a surface carries a `CVPixelBuffer` on
++    /// macOS only (`PaintSurface::image_buffer`); iOS draws none yet.
++    #[cfg(not(target_os = "macos"))]
+     fn draw_surfaces(
+         &mut self,
++        _surfaces: &[PaintSurface],
++        _first_surface: usize,
++        _instance_bindings: &InstanceBindings,
++        _viewport_size: Size<DevicePixels>,
++        _command_encoder: &metal::RenderCommandEncoderRef,
++    ) {
++    }
++
++    #[cfg(target_os = "macos")]
++    fn draw_surfaces(
++        &mut self,
+         surfaces: &[PaintSurface],
+         first_surface: usize,
+         instance_bindings: &InstanceBindings,
+@@ -1150,6 +1428,41 @@
                  DevicePixels::from(surface.image_buffer.get_height() as i32),
              );
  
@@ -427,7 +709,7 @@ diff -ruN a/src/metal_renderer.rs b/src/metal_renderer.rs
              assert_eq!(
                  surface.image_buffer.get_pixel_format(),
                  kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-@@ -1178,11 +1445,6 @@
+@@ -1178,11 +1491,6 @@
                  )
                  .unwrap();
  
@@ -439,12 +721,10 @@ diff -ruN a/src/metal_renderer.rs b/src/metal_renderer.rs
              // let y_texture = y_texture.get_texture().unwrap().
              command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
                  let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
-@@ -1202,6 +1464,67 @@
-             );
-         }
+@@ -1204,6 +1512,67 @@
      }
-+}
-+
+ }
+ 
 +/// Standard deviation of the backdrop blur, in device pixels.
 +const BACKDROP_BLUR_SIGMA: f32 = 30.;
 +/// The blur runs on a copy of the frame this many times smaller per side.
@@ -504,9 +784,27 @@ diff -ruN a/src/metal_renderer.rs b/src/metal_renderer.rs
 +/// serves them all. Its sharp sample is the quarter-size copy.
 +fn shares_backdrop(quad: &gpui::Quad) -> bool {
 +    is_liquid_glass_quad(quad) && quad.border_color.l >= 0.25 && quad.border_color.l < 0.75
++}
++
+ fn new_command_encoder_for_texture<'a>(
+     command_buffer: &'a metal::CommandBufferRef,
+     texture: &'a metal::TextureRef,
+@@ -1385,6 +1754,7 @@
+     underlines: InstanceBinding,
+     monochrome_sprites: InstanceBinding,
+     polychrome_sprites: InstanceBinding,
++    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+     surfaces: InstanceBinding,
  }
  
- fn new_command_encoder_for_texture<'a>(
+@@ -1564,6 +1934,7 @@
+ }
+ 
+ #[repr(C)]
++#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+ enum SurfaceInputIndex {
+     Vertices = 0,
+     Surfaces = 1,
 diff -ruN a/src/present_trace.rs b/src/present_trace.rs
 --- a/src/present_trace.rs
 +++ b/src/present_trace.rs

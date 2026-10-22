@@ -1,11 +1,10 @@
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block::ConcreteBlock;
-use cocoa::{
-    base::{NO, YES},
-    foundation::{NSSize, NSUInteger},
-    quartzcore::AutoresizingMask,
-};
+// Bloom (vendor/README.md): the renderer builds for iOS as well, where
+// the `cocoa` crate (AppKit) does not. The few names it took from there
+// are defined here.
+use objc::runtime::{NO, YES};
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
     PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
@@ -13,9 +12,12 @@ use gpui::{
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
 
+#[cfg(target_os = "macos")]
 use core_foundation::base::TCFType;
+#[cfg(target_os = "macos")]
 use core_video::{
-    metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
+    metal_texture::CVMetalTextureGetTexture,
+    metal_texture_cache::CVMetalTextureCache,
     pixel_buffer::{kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange},
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
@@ -29,6 +31,28 @@ use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
+
+/// `NSUInteger` of Foundation, on a 64-bit platform.
+type NSUInteger = u64;
+
+/// `NSSize` (`CGSize`) of Foundation, for `setDrawableSize:`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NSSize {
+    width: f64,
+    height: f64,
+}
+
+unsafe impl objc::Encode for NSSize {
+    fn encode() -> objc::Encoding {
+        unsafe { objc::Encoding::from_str("{CGSize=dd}") }
+    }
+}
+
+/// `kCALayerWidthSizable | kCALayerHeightSizable` (macOS only: a layer of
+/// iOS has no autoresizing mask; the view sets its frame).
+#[cfg(target_os = "macos")]
+const LAYER_SIZABLE: u32 = (1 << 1) | (1 << 4);
 
 #[cfg(not(feature = "runtime_shaders"))]
 const SHADERS_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.metallib"));
@@ -129,13 +153,16 @@ pub struct MetalRenderer {
     underlines_pipeline_state: metal::RenderPipelineState,
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     surfaces_pipeline_state: metal::RenderPipelineState,
     /// Surfaces in BGRA need no colour conversion.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     surfaces_bgra_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
+    #[cfg(target_os = "macos")]
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
@@ -186,11 +213,8 @@ impl MetalRenderer {
         unsafe {
             let _: () = msg_send![&*layer, setAllowsNextDrawableTimeout: NO];
             let _: () = msg_send![&*layer, setNeedsDisplayOnBoundsChange: YES];
-            let _: () = msg_send![
-                &*layer,
-                setAutoresizingMask: AutoresizingMask::WIDTH_SIZABLE
-                    | AutoresizingMask::HEIGHT_SIZABLE
-            ];
+            #[cfg(target_os = "macos")]
+            let _: () = msg_send![&*layer, setAutoresizingMask: LAYER_SIZABLE];
         }
 
         Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)
@@ -209,23 +233,26 @@ impl MetalRenderer {
     fn create_device() -> metal::Device {
         // Prefer low‐power integrated GPUs on Intel Mac. On Apple
         // Silicon, there is only ever one GPU, so this is equivalent to
-        // `metal::Device::system_default()`.
-        if let Some(d) = metal::Device::all()
-            .into_iter()
-            .min_by_key(|d| (d.is_removable(), !d.is_low_power()))
+        // `metal::Device::system_default()`. iOS has the one GPU and no
+        // `MTLCopyAllDevices`.
+        #[cfg(target_os = "macos")]
         {
-            d
-        } else {
+            if let Some(d) = metal::Device::all()
+                .into_iter()
+                .min_by_key(|d| (d.is_removable(), !d.is_low_power()))
+            {
+                return d;
+            }
             // For some reason `all()` can return an empty list, see https://github.com/zed-industries/zed/issues/37689
             // In that case, we fall back to the system default device.
             log::error!(
                 "Unable to enumerate Metal devices; attempting to use system default device"
             );
-            metal::Device::system_default().unwrap_or_else(|| {
-                log::error!("unable to access a compatible graphics device");
-                std::process::exit(1);
-            })
         }
+        metal::Device::system_default().unwrap_or_else(|| {
+            log::error!("unable to access a compatible graphics device");
+            std::process::exit(1);
+        })
     }
 
     fn new_internal(
@@ -252,12 +279,15 @@ impl MetalRenderer {
 
         // Shared memory can be used only if CPU and GPU share the same memory space.
         // https://developer.apple.com/documentation/metal/setting-resource-storage-modes
-        let is_unified_memory = device.has_unified_memory();
+        // Bloom (vendor/README.md): iOS has no managed storage mode, and
+        // the simulator's device says it has no unified memory.
+        let is_unified_memory = cfg!(not(target_os = "macos")) || device.has_unified_memory();
         // Apple GPU families support memoryless textures, which can significantly reduce
         // memory usage by keeping render targets in on-chip tile memory instead of
         // allocating backing store in system memory.
         // https://developer.apple.com/documentation/metal/mtlgpufamily
-        let is_apple_gpu = device.supports_family(MTLGPUFamily::Apple1);
+        let is_apple_gpu =
+            cfg!(not(target_os = "macos")) || device.supports_family(MTLGPUFamily::Apple1);
 
         let unit_vertices = [
             to_float2_bits(point(0., 0.)),
@@ -362,6 +392,7 @@ impl MetalRenderer {
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
+        #[cfg(target_os = "macos")]
         let core_video_texture_cache =
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
 
@@ -389,6 +420,7 @@ impl MetalRenderer {
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
+            #[cfg(target_os = "macos")]
             core_video_texture_cache,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
@@ -1347,6 +1379,20 @@ impl MetalRenderer {
         );
     }
 
+    /// Bloom (vendor/README.md): a surface carries a `CVPixelBuffer` on
+    /// macOS only (`PaintSurface::image_buffer`); iOS draws none yet.
+    #[cfg(not(target_os = "macos"))]
+    fn draw_surfaces(
+        &mut self,
+        _surfaces: &[PaintSurface],
+        _first_surface: usize,
+        _instance_bindings: &InstanceBindings,
+        _viewport_size: Size<DevicePixels>,
+        _command_encoder: &metal::RenderCommandEncoderRef,
+    ) {
+    }
+
+    #[cfg(target_os = "macos")]
     fn draw_surfaces(
         &mut self,
         surfaces: &[PaintSurface],
@@ -1708,6 +1754,7 @@ struct InstanceBindings {
     underlines: InstanceBinding,
     monochrome_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     surfaces: InstanceBinding,
 }
 
@@ -1887,6 +1934,7 @@ enum SpriteInputIndex {
 }
 
 #[repr(C)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 enum SurfaceInputIndex {
     Vertices = 0,
     Surfaces = 1,

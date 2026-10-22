@@ -43,6 +43,23 @@ path does not draw (see below, and `encode` in `src/ui/glass.rs`). A field
 of their own would be in `Quad`, which is in `gpui-pre` itself: that crate
 is not vendored, and it is not worth a third copy.
 
+## The iOS build (since 2026-10-21)
+
+`gpui-pre-ios` is not a published crate: it is the iOS platform of GPUI,
+after `longbridge/gpui-mobile` (commit 73ebf86, the last on gpui-pre
+0.3.4; Apache-2.0 OR GPL-3.0-or-later OR AGPL-3.0-or-later), with the
+Apple Metal renderer of `gpui-pre-apple` in place of wgpu: a UIKit view
+whose touches go to GPUI's gesture recognizer, the renderer's
+`CAMetalLayer` as a sublayer of it, the CoreText text system, Grand
+Central Dispatch, and a C bridge for the host (`ffi.rs`). The frames
+come from a `CADisplayLink` the window makes from its window scene once
+the view is in a window; when the link gives no tick in a second (a
+simulator with no DeviceHub window on it never ticks one), a 60 Hz timer
+drives them. `gpui-pre-platform` (vendored, one patch) picks it for
+`target_os = "ios"`, so `gpui_kit::platform::application()` and the app
+are the same code on both. `ios/` is the static library and the Xcode
+host; `dev/ios` builds and runs it.
+
 ## gpui-pre-apple 0.3.4
 
 - `src/metal_renderer.rs`, `src/shaders.metal`: a backdrop blur pass for
@@ -73,6 +90,15 @@ is not vendored, and it is not worth a third copy.
   marked `Bloom` in the source, and neither are those of the blur pass
   above (`new_backdrop_blur_filters`, `is_backdrop_blur_quad`,
   `BACKDROP_BLUR_*`): look for the names.
+- The crate builds for iOS (`gpui_apple.rs`, `Cargo.toml`, `build.rs`,
+  `metal_renderer.rs`): the shaders are compiled for the SDK of the
+  target; the names the renderer took from the `cocoa` crate (AppKit)
+  are defined in the file; the one GPU of iOS is the system default; the
+  storage mode is shared there (iOS has no managed mode, and the
+  simulator's device says it has no unified memory); the surface path
+  (`PaintSurface::image_buffer`, CoreVideo) is the Mac's, and `core-video`
+  a Mac dependency, since its io-surface names CGL. On iOS surfaces are
+  not drawn yet.
 - `src/metal_renderer.rs` (`draw`), `src/present_trace.rs`,
   `src/gpui_apple.rs`: the time the display showed each draw, from the
   drawable's presented handler, with the GPU start and end times of its
@@ -82,6 +108,11 @@ is not vendored, and it is not worth a third copy.
   while a video plays). A record is handed out once both handlers ran, or
   at a timeout marked incomplete; a record handed out is never made again.
   With neither consumer on, `draw` records nothing and allocates nothing.
+
+## gpui-pre-platform 0.3.4
+
+- `Cargo.toml`, `src/gpui_platform.rs`: for `target_os = "ios"` the
+  platform is `gpui_ios::current_platform` (vendor/gpui-pre-ios).
 
 ## gpui-pre-macos 0.3.4
 

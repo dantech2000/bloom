@@ -36,6 +36,91 @@ pub const TOPBAR_H: f32 = 64.;
 /// Room kept free for the traffic lights.
 const TRAFFIC_LIGHTS_W: f32 = 84.;
 
+/// The room above the top bar: the status bar of an iPhone (the top of
+/// the safe area); nothing on the Mac, where the bar holds the title bar.
+pub fn top_inset() -> f32 {
+    #[cfg(target_os = "macos")]
+    {
+        0.
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        crate::macos::safe_area_insets().0
+    }
+}
+
+/// The room under the page: the home indicator of an iPhone (the bottom
+/// of the safe area); nothing on the Mac.
+pub fn bottom_inset() -> f32 {
+    #[cfg(target_os = "macos")]
+    {
+        0.
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        crate::macos::safe_area_insets().1
+    }
+}
+
+/// The height of the software keyboard over the window, in points: the
+/// page keeps that room free at the bottom, so a field stays in sight.
+/// 0 on the Mac, and while the keyboard is down.
+pub fn keyboard_inset() -> f32 {
+    #[cfg(target_os = "ios")]
+    {
+        gpui_ios::keyboard_height()
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        0.
+    }
+}
+
+/// A window the width of a phone: the tabs go to a bar at the bottom,
+/// the top bar keeps the title and two buttons, menus open as sheets.
+/// The Mac window is at least 900 wide, so it never is.
+pub fn compact(window: &Window) -> bool {
+    f32::from(window.viewport_size().width) < COMPACT_W
+}
+
+/// Below this width the window is compact.
+pub const COMPACT_W: f32 = 700.;
+
+impl Bloom {
+    /// `compact`, from the viewport the app keeps (`viewport_w`).
+    pub fn compact_w(&self) -> bool {
+        self.viewport_w < COMPACT_W
+    }
+
+    /// A phone, in either orientation: the short side of the window is
+    /// under 500 px (an iPad's is 744 or more, a Mac window's 600). The
+    /// player uses it: in landscape the window is wide but not tall.
+    pub fn phone(&self) -> bool {
+        self.viewport_w.min(self.viewport_h) < PHONE_SHORT_SIDE
+    }
+}
+
+/// A window with a shorter side than this is a phone's.
+pub const PHONE_SHORT_SIDE: f32 = 500.;
+
+/// The safe area on every side: top, left, bottom, right. The notch is at
+/// a side in landscape. Zeros on the Mac.
+pub fn safe_insets() -> (f32, f32, f32, f32) {
+    #[cfg(target_os = "macos")]
+    {
+        (0., 0., 0., 0.)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        crate::macos::safe_area()
+    }
+}
+
+/// Height of the tab bar of a compact window, and the room the page
+/// keeps under it: the bar floats 10 px over the bottom inset.
+pub const TABBAR_H: f32 = 62.;
+const TABBAR_MARGIN: f32 = 10.;
+
 impl Bloom {
     pub fn render_shell(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The player covers the window, so the page behind it is not built.
@@ -63,6 +148,8 @@ impl Bloom {
         // pages start below it.
         let overlay = matches!(self.page, Page::Home(_) | Page::Detail(_));
         let scrolled = f32::from(self.page_scroll.offset().y) < -8.;
+        let compact = compact(window);
+        let keyboard = keyboard_inset();
         use gpui_kit::{MouseButton, NavigationDirection};
         div()
             .id("shell")
@@ -108,7 +195,13 @@ impl Bloom {
                     .child(
                         div()
                             .size_full()
-                            .when(!overlay, |el| el.pt(px(TOPBAR_H)))
+                            .when(!overlay, |el| el.pt(px(TOPBAR_H + top_inset())))
+                            // The page ends above the tab bar, or above the
+                            // keyboard while it is up (the bar is away then).
+                            .when(compact && keyboard == 0., |el| {
+                                el.pb(px(TABBAR_H + TABBAR_MARGIN + bottom_inset()))
+                            })
+                            .when(keyboard > 0., |el| el.pb(px(keyboard)))
                             .child(page),
                     )
                     .child(
@@ -132,10 +225,121 @@ impl Bloom {
                                     linear_color_stop(gpui_kit::black().alpha(0.0), 1.0),
                                 ))
                             })
-                            .child(self.render_topbar(scrolled, cx)),
-                    ),
+                            .child(self.render_topbar(scrolled, compact, cx)),
+                    )
+                    .when(compact && keyboard == 0., |el| el.child(self.render_tabbar(cx))),
             )
             .into_any_element()
+    }
+
+    /// The title of the page for the top bar of a compact window.
+    fn page_title(&self) -> String {
+        match &self.page {
+            Page::Home(_) => self
+                .session
+                .as_ref()
+                .map(|s| s.server_name.clone())
+                .unwrap_or_default(),
+            Page::Library(data) => data.view.name.clone(),
+            Page::Detail(data) => data.item.name.clone(),
+            Page::Search(_) => "Search".into(),
+            Page::Admin(_) => "Dashboard".into(),
+            Page::Settings(_) => "Settings".into(),
+            Page::Playlist(_) => "Playlist".into(),
+            Page::Downloads => "Downloads".into(),
+        }
+    }
+
+    /// The tab bar of a compact window: a glass pill at the bottom with
+    /// home, the libraries and search, as the tab bar of an iPhone app.
+    /// With two libraries or fewer, favourites has a place too.
+    fn render_tabbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = UiTheme::read(cx).clone();
+        let fg = t.colors.foreground;
+        let active = self.active_tab();
+        let is_home = matches!(self.page, Page::Home(_)) && self.history.is_empty();
+        let is_search = matches!(self.page, Page::Search(_));
+        let item = |id: SharedString, label: String, glyph: LucideIcon, selected: bool| {
+            let color = if selected { fg } else { fg.opacity(0.6) };
+            div()
+                .id(id)
+                .role(gpui_kit::Role::Tab)
+                .aria_label(label.clone())
+                .flex_1()
+                .h(px(TABBAR_H - 8.))
+                .rounded(px(18.))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(3.))
+                .cursor_pointer()
+                .text_size(px(10.))
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                .text_color(color)
+                .when(selected, |el| el.bg(fg.opacity(0.12)))
+                .child(icon(glyph, 22., color))
+                .child(label)
+        };
+        let mut bar = div()
+            .absolute()
+            .left(px(12.))
+            .right(px(12.))
+            .bottom(px(TABBAR_MARGIN + bottom_inset()))
+            .h(px(TABBAR_H))
+            .p(px(4.))
+            .rounded(px(24.))
+            .border_1()
+            .border_color(gpui_kit::rgba(0xf5f5f733))
+            .child(glass(px(24.), crate::ui::glass::POPUP_TINT))
+            .flex()
+            .items_center()
+            .child(
+                item("tab.home".into(), "Home".into(), LucideIcon::House, is_home)
+                    .on_click(cx.listener(|this, _, _, cx| this.open_home(cx))),
+            );
+        let libraries: Vec<_> = self.views.iter().take(3).collect();
+        for view in &libraries {
+            let glyph = match view.collection_type.as_deref() {
+                Some("movies") => LucideIcon::Clapperboard,
+                Some("tvshows") => LucideIcon::Tv,
+                Some("music") => LucideIcon::Music,
+                Some("homevideos") | Some("photos") => LucideIcon::Image,
+                Some("boxsets") => LucideIcon::GalleryVerticalEnd,
+                _ => LucideIcon::Folder,
+            };
+            let target = (*view).clone();
+            bar = bar.child(
+                item(
+                    SharedString::from(format!("tab.lib.{}", view.id)),
+                    view.name.clone(),
+                    glyph,
+                    active.as_deref() == Some(view.id.as_str()),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.open_library(target.clone(), cx))),
+            );
+        }
+        if libraries.len() <= 2 {
+            bar = bar.child(
+                item(
+                    "tab.favorites".into(),
+                    "Favorites".into(),
+                    LucideIcon::Heart,
+                    active.as_deref() == Some(crate::app::FAVORITES_ID),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.open_favorites(cx))),
+            );
+        }
+        bar.child(
+            item("tab.search".into(), "Search".into(), LucideIcon::Search, is_search).on_click(
+                cx.listener(|this, _, window, cx| {
+                    let query = this.search_input.read(cx).value().to_string();
+                    this.open_search(query, cx);
+                    let focus = this.search_input.read(cx).focus_handle(cx);
+                    window.focus(&focus, cx);
+                }),
+            ),
+        )
     }
 
     /// A scroll over the page: a two-finger swipe between pages goes back
@@ -422,7 +626,7 @@ impl Bloom {
             .update(cx, |menu, cx| menu.set_items(items, cx));
     }
 
-    fn render_topbar(&self, scrolled: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_topbar(&self, scrolled: bool, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let t = UiTheme::read(cx).clone();
         let fg = t.colors.foreground;
         let active = self.active_tab();
@@ -547,9 +751,52 @@ impl Bloom {
                 |a, image| a.image(image),
             );
 
+        if compact {
+            let avatar = avatar;
+            return div()
+                .relative()
+                .h(px(TOPBAR_H + top_inset()))
+                .pt(px(top_inset()))
+                .flex_shrink_0()
+                .px(px(12.))
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .when(!is_home, |el| {
+                    el.child(round("top.back", "Back", LucideIcon::ArrowLeft).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            if this.history.is_empty() {
+                                this.open_home(cx)
+                            } else {
+                                this.back(cx)
+                            }
+                        }),
+                    ))
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .px(px(8.))
+                        .text_size(px(17.))
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .text_color(fg)
+                        .truncate()
+                        .child(self.page_title()),
+                )
+                .children(self.render_offline_chip(cx))
+                .children(self.render_downloads_chip(cx))
+                .child(
+                    Menu::new(&self.profile_menu, "Account")
+                        .trigger_style_with(|button| button)
+                        .trigger(div().id("top.account").child(avatar)),
+                )
+                .into_any_element();
+        }
         div()
             .relative()
-            .h(px(TOPBAR_H))
+            .h(px(TOPBAR_H + top_inset()))
+            .pt(px(top_inset()))
             .flex_shrink_0()
             .px(px(20.))
             .flex()
@@ -558,7 +805,7 @@ impl Bloom {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .pl(px(TRAFFIC_LIGHTS_W))
+                    .pl(px(if cfg!(target_os = "macos") { TRAFFIC_LIGHTS_W } else { 0. }))
                     .flex()
                     .items_center()
                     .when(!is_home, |el| {
@@ -659,6 +906,7 @@ impl Bloom {
                     .justify_center()
                     .child(tabs),
             )
+            .into_any_element()
     }
 
     /// The name of the server for the offline texts.

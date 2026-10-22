@@ -2,6 +2,8 @@
 //! Home hero: a slideshow of random unwatched titles, after the Media Bar
 //! Enhanced plugin of the web client as styled by the Abyss theme.
 
+#[cfg(target_os = "macos")]
+use gpui_kit::surface;
 use std::time::{Duration, Instant};
 
 use gpui_icons::LucideIcon;
@@ -9,7 +11,6 @@ use gpui_kit::{
     Animation, AnimationExt as _, ClickEvent, Context, Div, InteractiveElement as _, ObjectFit, ParentElement as _,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled, Subscription, Task, Window, div,
     linear_color_stop, linear_gradient, prelude::FluentBuilder as _, px, relative, rgb, rgba,
-    surface,
 };
 
 use crate::{
@@ -544,6 +545,8 @@ impl Bloom {
         let glass_button = |id: &'static str, radius: f32| {
             div()
                 .id(id)
+                .role(gpui_kit::Role::Button)
+                .aria_label(id.rsplit('.').next().unwrap_or(id))
                 .size(px(50.))
                 .flex()
                 .items_center()
@@ -572,6 +575,8 @@ impl Bloom {
             .child(
                 div()
                     .id("hero.play")
+                    .role(gpui_kit::Role::Button)
+                    .aria_label("play")
                     .h(px(50.))
                     .px(px(16.))
                     .rounded(px(12.))
@@ -686,13 +691,21 @@ impl Bloom {
                 .child(div().absolute().inset_0().bg(rgba(0x00000033)))
                 // The trailer covers the image; the web does not dim it.
                 .when_some(frame, |el, frame| {
-                    el.child(
-                        div().absolute().inset_0().child(
-                            surface(frame)
-                                .size_full()
-                                .object_fit(ObjectFit::Cover),
-                        ),
-                    )
+                    #[cfg(target_os = "macos")]
+                    {
+                        el.child(
+                            div().absolute().inset_0().child(
+                                surface(frame)
+                                    .size_full()
+                                    .object_fit(ObjectFit::Cover),
+                            ),
+                        )
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let _ = frame;
+                        el
+                    }
                 })
                 .child(div().absolute().inset_0().bg(linear_gradient(
                     130.,
@@ -718,7 +731,7 @@ impl Bloom {
                         .absolute()
                         .left(px(left))
                         .top(px(vh * 0.15))
-                        .w(relative(0.4))
+                        .w(relative(if self.compact_w() { 0.85 } else { 0.4 }))
                         .h(px(vh * 0.315))
                         .child(title),
                 )
@@ -737,6 +750,8 @@ impl Bloom {
                         .text_size(px(18.))
                         .font_weight(gpui_kit::FontWeight::MEDIUM)
                         .text_color(rgba(0xffffff80))
+                        // A phone: one line, cut where the room ends.
+                        .when(self.compact_w(), |el| el.max_w(px(vw - left * 2.)).truncate())
                         .child(genres),
                 )
                 .child(
@@ -744,12 +759,12 @@ impl Bloom {
                         .absolute()
                         .left(px(left))
                         .top(px(vh * 0.53))
-                        .max_w(px((vw * 0.6).min(840.)))
+                        .max_w(px(if self.compact_w() { vw - left * 2. } else { (vw * 0.6).min(840.) }))
                         .text_size(px(16.))
                         .line_height(relative(1.4))
                         .font_weight(gpui_kit::FontWeight::MEDIUM)
                         .text_color(white)
-                        .line_clamp(2)
+                        .line_clamp(if self.compact_w() { 3 } else { 2 })
                         .child(item.overview.clone().unwrap_or_default()),
                 )
                 .child(
@@ -777,7 +792,7 @@ impl Bloom {
                                 "Mute the trailer (M)"
                             }))
                             .absolute()
-                            .top(px(crate::views::shell::TOPBAR_H))
+                            .top(px(crate::views::shell::TOPBAR_H + crate::views::shell::top_inset()))
                             .right(px(vw * 0.028 + 60.))
                             .size(px(32.))
                             .flex()
@@ -809,7 +824,7 @@ impl Bloom {
                             "Pause the slideshow (Space)"
                         }))
                         .absolute()
-                        .top(px(crate::views::shell::TOPBAR_H))
+                        .top(px(crate::views::shell::TOPBAR_H + crate::views::shell::top_inset()))
                         .right(px(vw * 0.028 + 18.))
                         .size(px(32.))
                         .flex()

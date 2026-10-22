@@ -1,0 +1,60 @@
+#!/bin/sh
+# Gives the iOS app in the simulator a config that is signed in, so it
+# opens on the home page. Run after dev/ios installed the app.
+#
+#   dev/ios-account            signs the test account in on the live server:
+#                              a device of its own ("bloom-ios-sim")
+#   dev/ios-account --own      copies the servers of the user's own config:
+#                              the same session as his app, as dev/run-test
+#                              does for a live test (dev/ios starts the app
+#                              with the socket and the reports off)
+#   BLOOM_IOS_SIM=<udid>       another simulator than the booted one
+#
+# A token goes to the file in the container only; nothing prints it.
+set -e
+account="$HOME/Library/Application Support/bloom/test-account.txt"
+own="$HOME/Library/Application Support/bloom/config.json"
+[ -f "$account" ] || { echo "dev/ios-account: no $account" >&2; exit 1; }
+sim=${BLOOM_IOS_SIM:-booted}
+container=$(xcrun simctl get_app_container "$sim" dev.bloom.ios data)
+python3 -I - "$account" "$own" "$container/Library/Application Support/bloom/config.json" "${1:-}" <<'PY'
+import json, os, sys, urllib.request
+account, own, out, mode = sys.argv[1:5]
+if mode == "--own":
+    source = json.load(open(own))
+    config = {key: source[key] for key in ("device_id", "servers", "active") if key in source}
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w") as f:
+        json.dump(config, f, indent=2)
+    os.chmod(out, 0o600)
+    print(f"copied the own config ({len(config['servers'])} server) to {out}")
+    sys.exit(0)
+creds = dict(line.split(":", 1) for line in open(account) if ":" in line)
+user, password = creds["user"].strip(), creds["password"].strip()
+server = json.load(open(own))["servers"][0]
+req = urllib.request.Request(
+    server["url"] + "/Users/AuthenticateByName",
+    data=json.dumps({"Username": user, "Pw": password}).encode(),
+    headers={
+        "Content-Type": "application/json",
+        # The proxy in front of the server refuses Python's own user agent.
+        "User-Agent": "Bloom/0.1.10",
+        "Authorization": 'MediaBrowser Client="Bloom", Device="iOS simulator", '
+                         'DeviceId="bloom-ios-sim", Version="0.1.10"',
+    },
+)
+with urllib.request.urlopen(req, timeout=30) as r:
+    auth = json.load(r)
+config = {
+    "device_id": "bloom-ios-sim",
+    "servers": [{"id": server["id"], "name": server["name"], "url": server["url"],
+                 "profiles": [{"user_id": auth["User"]["Id"], "name": auth["User"]["Name"],
+                               "token": auth["AccessToken"]}]}],
+    "active": [server["id"], auth["User"]["Id"]],
+}
+os.makedirs(os.path.dirname(out), exist_ok=True)
+with open(out, "w") as f:
+    json.dump(config, f, indent=2)
+os.chmod(out, 0o600)
+print(f"signed in as {auth['User']['Name']} on {server['url']}; config at {out}")
+PY

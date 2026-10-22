@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The macOS menu bar and its standard shortcuts.
 
+// The menu bar is the Mac's; the iOS build keeps the module unused.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use gpui_kit::{
     App, KeyBinding, Menu, MenuItem, OsAction, actions,
     base::input::{Copy, Cut, Paste, Redo, SelectAll, Undo},

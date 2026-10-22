@@ -3,6 +3,10 @@
 //! main player, renders into GPU surfaces. It reports nothing to Jellyfin and
 //! resolves YouTube links through mpv's ytdl hook, which needs yt-dlp.
 
+// The iOS build has no mpv: the worker and the renderer stay out, and
+// what only they used is unused there.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
+
 use std::{
     ffi::c_void,
     path::PathBuf,
@@ -17,14 +21,25 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
+#[cfg(target_os = "macos")]
 use libmpv2::{
     Format, Mpv,
     events::{Event, PropertyData},
     mpv_end_file_reason,
 };
+#[cfg(target_os = "macos")]
 use libmpv2_sys as sys;
 
-use crate::video_surface::{self, GlRenderer, VideoFrame};
+use crate::video_surface::VideoFrame;
+#[cfg(target_os = "macos")]
+use crate::video_surface::{self, GlRenderer};
+
+/// No mpv on this platform yet (iOS): trailers are not available, since
+/// `find_ytdl` finds nothing, and a worker could not run.
+#[cfg(not(target_os = "macos"))]
+fn run(_shared: Arc<Shared>, _rx: mpsc::Receiver<Cmd>, _ytdl: PathBuf) -> Result<()> {
+    Err(anyhow!("no trailer player on this platform yet"))
+}
 
 /// Volume of a trailer once the user turns the sound on.
 const VOLUME: i64 = 40;
@@ -229,6 +244,9 @@ impl TrailerPlayer {
 
 /// yt-dlp on `PATH`, which mpv's ytdl hook runs to resolve a YouTube link.
 fn find_ytdl() -> Option<PathBuf> {
+    if cfg!(not(target_os = "macos")) {
+        return None;
+    }
     let path = std::env::var_os("PATH").unwrap_or_default();
     // An app started from Finder gets a short PATH, so the usual install
     // places of Homebrew and Nix are searched too.
@@ -247,11 +265,13 @@ fn find_ytdl() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+#[cfg(target_os = "macos")]
 struct Renderer {
     ctx: *mut sys::mpv_render_context,
     gl: GlRenderer,
 }
 
+#[cfg(target_os = "macos")]
 impl Drop for Renderer {
     fn drop(&mut self) {
         // mpv frees its GL objects here, so the context in `gl` must outlive it.
@@ -267,6 +287,7 @@ unsafe extern "C" fn on_render_update(ctx: *mut c_void) {
     ask.shared.wake();
 }
 
+#[cfg(target_os = "macos")]
 fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Cmd>, ytdl: PathBuf) -> Result<()> {
     let mut mpv = Mpv::with_initializer(|init| {
         init.set_option("vo", "libmpv")?;
@@ -493,6 +514,7 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Cmd>, ytdl: PathBuf) -> Result<()
     }
 }
 
+#[cfg(target_os = "macos")]
 fn create_renderer(mpv: &Mpv, needs_render: &'static RenderAsk) -> Result<Renderer> {
     // The GL context becomes current on this thread; mpv renders with it.
     let gl = GlRenderer::new()?;
@@ -601,6 +623,7 @@ impl Crop {
 
     /// Looks at the frame just rendered at `w` x `h`. Sets the crop in mpv
     /// when the bars are known, and sends the trailer back to its start.
+    #[cfg(target_os = "macos")]
     fn measure(&mut self, mpv: &Mpv, renderer: &mut Renderer, (w, h): (u32, u32), src: (u32, u32)) {
         self.frames += 1;
         let first_frame = *self.first_frame.get_or_insert_with(std::time::Instant::now);
@@ -674,6 +697,7 @@ impl Crop {
 /// than the source, then publishes its GPU surface. False when the size of
 /// the picture (`dims`, from the events) is not known yet: the frame is
 /// drawn once it is.
+#[cfg(target_os = "macos")]
 fn render_frame(
     mpv: &Mpv,
     renderer: &mut Renderer,

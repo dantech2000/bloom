@@ -12,6 +12,8 @@
 //! function [`wanted`]; the app feeds it the facts of the player at every
 //! change of the status (see `start_player_poll` in `src/app.rs`).
 
+#![cfg_attr(not(target_os = "macos"), allow(unused_imports))]
+
 use std::time::{Duration, Instant};
 
 use core_foundation::{base::TCFType, string::CFString};
@@ -19,6 +21,7 @@ use gpui_kit::{Context, Task};
 
 use crate::{app::Bloom, cast::target::Kind, player::PlayState};
 
+#[cfg(target_os = "macos")]
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
     fn IOPMAssertionCreateWithName(
@@ -58,7 +61,19 @@ fn end_activity(token: usize) {
 }
 
 /// `kIOPMAssertionLevelOn`.
+#[cfg(target_os = "macos")]
 const LEVEL_ON: u32 = 255;
+
+/// `UIApplication.idleTimerDisabled`: on, the screen does not dim or lock
+/// while the app is in front.
+#[cfg(not(target_os = "macos"))]
+fn set_idle_timer_disabled(disabled: bool) {
+    use crate::macos::{Id, class, send};
+    let app = send!(Id, class(c"UIApplication"), c"sharedApplication");
+    if !app.is_null() {
+        send!((), app, c"setIdleTimerDisabled:", disabled => bool);
+    }
+}
 
 /// How long a pause keeps the display awake. A pause for a drink or a
 /// message must not let the display sleep and come back; a longer pause
@@ -161,16 +176,26 @@ impl Awake {
         if self.id.is_some() {
             return;
         }
-        let kind = CFString::from_static_string("PreventUserIdleDisplaySleep");
-        let name = CFString::new(&format!("{} plays a video", crate::brand::NAME));
-        let mut id = 0;
-        let result = unsafe {
-            IOPMAssertionCreateWithName(
-                kind.as_concrete_TypeRef(),
-                LEVEL_ON,
-                name.as_concrete_TypeRef(),
-                &mut id,
-            )
+        #[cfg(target_os = "macos")]
+        let (result, id) = {
+            let kind = CFString::from_static_string("PreventUserIdleDisplaySleep");
+            let name = CFString::new(&format!("{} plays a video", crate::brand::NAME));
+            let mut id = 0;
+            let result = unsafe {
+                IOPMAssertionCreateWithName(
+                    kind.as_concrete_TypeRef(),
+                    LEVEL_ON,
+                    name.as_concrete_TypeRef(),
+                    &mut id,
+                )
+            };
+            (result, id)
+        };
+        // iOS: the idle timer of the app, which dims and locks the screen.
+        #[cfg(not(target_os = "macos"))]
+        let (result, id) = {
+            set_idle_timer_disabled(true);
+            (0, 1)
         };
         if result == 0 {
             self.id = Some(id);
@@ -190,7 +215,15 @@ impl Awake {
             end_activity(activity);
         }
         if let Some(id) = self.id.take() {
-            unsafe { IOPMAssertionRelease(id) };
+            #[cfg(target_os = "macos")]
+            unsafe {
+                IOPMAssertionRelease(id)
+            };
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = id;
+                set_idle_timer_disabled(false);
+            }
             log::info!("awake: display may sleep again");
         }
     }

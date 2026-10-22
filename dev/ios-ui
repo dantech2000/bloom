@@ -1,0 +1,66 @@
+#!/bin/sh
+# Drives the iOS app in the simulator by touch, through idb (Facebook's
+# iOS Development Bridge: `brew install idb-companion`, the client in
+# target/ios/idb-venv, made by `dev/ios-ui setup`). Coordinates are in
+# points of the device (an iPhone 17 Pro is 402 x 874 in portrait, 874 x
+# 402 in landscape; a screenshot is 3x that). GPUI has no accessibility
+# tree on iOS yet, so a tap goes to a place, and `dev/jctl state` says
+# what the app did.
+#
+#   dev/ios-ui setup                   installs the client
+#   dev/ios-ui tap <x> <y>             a tap
+#   dev/ios-ui swipe <x1> <y1> <x2> <y2> [ms]   a drag, 300 ms by default
+#   dev/ios-ui text "<text>"           types on the keyboard that is up
+#   dev/ios-ui key <hid code>          one key (40 is return, 42 delete)
+#   dev/ios-ui shot <png>              a screenshot
+#   dev/ios-ui find <label>            the nodes of the app's accessibility
+#                                      tree with that label (role, bounds)
+#   dev/ios-ui tap-label <label>       a tap at the middle of the first one
+#   dev/ios-ui describe                the tree UIKit sees (bare today)
+#   BLOOM_IOS_SIM=<udid>               another simulator than iPhone 17 Pro
+set -e
+dir=$(cd "$(dirname "$0")/.." && pwd)
+idb=$dir/target/ios/idb-venv/bin/idb
+sim=${BLOOM_IOS_SIM:-$(xcrun simctl list devices available | grep 'iPhone 17 Pro (' | head -1 | sed -E 's/.*\(([A-F0-9-]+)\).*/\1/')}
+cmd=${1:-}; [ $# -gt 0 ] && shift
+case $cmd in
+  setup)
+    command -v idb_companion >/dev/null || { brew trust facebook/fb >/dev/null; brew install idb-companion; }
+    [ -x "$idb" ] || { python3 -m venv "$dir/target/ios/idb-venv"; "$dir/target/ios/idb-venv/bin/pip" install -q fb-idb; }
+    "$idb" list-targets | grep -i "$sim" ;;
+  tap) "$idb" ui tap --udid "$sim" "$1" "$2" ;;
+  swipe) "$idb" ui swipe --udid "$sim" --duration "$(echo "${5:-300} / 1000" | bc -l)" "$1" "$2" "$3" "$4" ;;
+  text) "$idb" ui text --udid "$sim" "$1" ;;
+  key) "$idb" ui key --udid "$sim" "$1" ;;
+  shot) "$idb" screenshot --udid "$sim" "$1" >/dev/null ;;
+  describe) "$idb" ui describe-all --udid "$sim" ;;
+  find|tap-label)
+    # The app's own tree, over its debug channel (dev/ios starts it with
+    # BLOOM_A11Y_TREE=1 and the socket); bounds are in points. A label
+    # matches whole, or as a prefix when nothing matches whole.
+    export BLOOM_DEBUG_SOCK=${BLOOM_DEBUG_SOCK:-/tmp/bloom-ios.sock}
+    tree=$dir/target/ios/a11y.json
+    "$dir/dev/jctl" a11y > "$tree"
+    at=$(python3 -I -c '
+import json, sys
+mode, wanted, path = sys.argv[1], sys.argv[2].lower(), sys.argv[3]
+nodes = [n for n in json.load(open(path)).get("nodes", []) if n.get("bounds")]
+hits = [n for n in nodes if (n.get("label") or "").lower() == wanted]
+if not hits:
+    hits = [n for n in nodes if (n.get("label") or "").lower().startswith(wanted)]
+if not hits:
+    sys.exit(f"no element labelled {sys.argv[2]!r}")
+hits.sort(key=lambda n: (n["bounds"]["y"], n["bounds"]["x"]))
+for n in hits:
+    b = n["bounds"]
+    print(f"{n[chr(114)+chr(111)+chr(108)+chr(101)]:12} {n[chr(108)+chr(97)+chr(98)+chr(101)+chr(108)]!r:34} x={b[chr(120)]:.0f} y={b[chr(121)]:.0f} w={b[chr(119)]:.0f} h={b[chr(104)]:.0f}", file=sys.stderr)
+b = hits[0]["bounds"]
+print(f"{b[chr(120)] + b[chr(119)] / 2:.0f} {b[chr(121)] + b[chr(104)] / 2:.0f}")
+' "$cmd" "$1" "$tree") || exit 1
+    if [ "$cmd" = tap-label ]; then
+      # shellcheck disable=SC2086
+      "$idb" ui tap --udid "$sim" $at
+      echo "tapped $1 at $at"
+    fi ;;
+  *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

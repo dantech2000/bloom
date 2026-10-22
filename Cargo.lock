@@ -771,6 +771,7 @@ dependencies = [
  "gpui-icons",
  "gpui-kit",
  "gpui-pre-apple",
+ "gpui-pre-ios",
  "gpui-pre-macos",
  "gpui-pre-platform",
  "image",
@@ -810,6 +811,17 @@ dependencies = [
  "ureq",
  "uuid",
  "webpki-roots 1.0.9",
+]
+
+[[package]]
+name = "bloom-ios"
+version = "0.1.10"
+dependencies = [
+ "bloom",
+ "gpui-pre",
+ "gpui-pre-ios",
+ "log",
+ "objc2 0.6.4",
 ]
 
 [[package]]
@@ -2733,6 +2745,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui-pre-ios"
+version = "0.3.4"
+dependencies = [
+ "anyhow",
+ "block2 0.6.2",
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
+ "core-graphics 0.24.0",
+ "core-text",
+ "futures",
+ "gpui-pre",
+ "gpui-pre-apple",
+ "log",
+ "metal",
+ "objc2 0.6.4",
+ "parking_lot",
+ "pathfinder_geometry",
+ "raw-window-handle",
+ "serde_json",
+ "smallvec",
+ "uuid",
+ "zed-font-kit",
+]
+
+[[package]]
 name = "gpui-pre-linux"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2866,11 +2903,10 @@ dependencies = [
 [[package]]
 name = "gpui-pre-platform"
 version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e85fc9ec7ea5ff87ffb69edd0e23254e5627bc95758de232fb876d578ebd9e6d"
 dependencies = [
  "console_error_panic_hook",
  "gpui-pre",
+ "gpui-pre-ios",
  "gpui-pre-linux",
  "gpui-pre-macos",
  "gpui-pre-web",

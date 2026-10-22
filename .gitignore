@@ -10,3 +10,6 @@
 CLAUDE.md
 # The Sparkle update framework and tools, fetched by dev/vendor-sparkle
 /vendor/sparkle
+
+# Made by xcodegen from ios/host/project.yml (dev/ios).
+ios/host/Bloom.xcodeproj/

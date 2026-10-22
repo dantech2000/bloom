@@ -17,6 +17,10 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/heads");
     println!("cargo:rerun-if-env-changed=MPV_LIB_DIR");
+    // The iOS build has no libmpv yet (the player is stubbed there).
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return;
+    }
     if let Ok(dir) = std::env::var("MPV_LIB_DIR").map(|d| d.trim().to_string())
         && !dir.is_empty()
     {

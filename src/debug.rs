@@ -229,7 +229,13 @@ impl Bloom {
         match command {
             "home" => self.open_home(cx),
             "back" => self.back(cx),
-            "search" => self.open_search(rest.to_string(), cx),
+            // As the search button of the bar: the page, and the field
+            // focused (on a phone that raises the keyboard).
+            "search" => {
+                self.open_search(rest.to_string(), cx);
+                let focus = gpui_kit::Focusable::focus_handle(self.search_input.read(cx), cx);
+                window.focus(&focus, cx);
+            }
             "library" => {
                 let view = self
                     .views
@@ -605,6 +611,22 @@ impl Bloom {
             // What a keystroke in the search field does: the title index
             // answers, with no request.
             "type" => self.search_titles(rest.to_string(), cx),
+            // The accessibility tree of the last frame as JSON: the roles,
+            // labels and bounds of the elements, for a test that taps by
+            // label (`dev/ios-ui tap-label`). It needs the tree built: on
+            // iOS `BLOOM_A11Y_TREE=1` turns that on (dev/ios does).
+            "a11y" => {
+                #[cfg(target_os = "ios")]
+                {
+                    return gpui_ios::a11y_json();
+                }
+                #[cfg(not(target_os = "ios"))]
+                {
+                    return window
+                        .debug_a11y_tree_json()
+                        .unwrap_or_else(|| "error: the accessibility tree is not built".into());
+                }
+            }
             // Opens a menu of the player, as a click on its button does.
             "menu" => {
                 if rest == "close" {

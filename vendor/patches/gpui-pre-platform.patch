@@ -1,0 +1,30 @@
+diff -ruN a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -74,6 +74,10 @@
+ version = "=0.3.4"
+ package = "gpui-pre-web"
+ 
++[target.'cfg(target_os = "ios")'.dependencies.gpui_ios]
++path = "../gpui-pre-ios"
++package = "gpui-pre-ios"
++
+ [target.'cfg(target_os = "macos")'.dependencies.gpui_macos]
+ version = "=0.3.4"
+ default-features = false
+diff -ruN a/src/gpui_platform.rs b/src/gpui_platform.rs
+--- a/src/gpui_platform.rs
++++ b/src/gpui_platform.rs
+@@ -60,6 +60,12 @@
+         Rc::new(gpui_macos::MacPlatform::new(headless))
+     }
+ 
++    // Bloom (vendor/README.md): iOS, from vendor/gpui-pre-ios.
++    #[cfg(target_os = "ios")]
++    {
++        gpui_ios::current_platform(headless)
++    }
++
+     #[cfg(target_os = "windows")]
+     {
+         Rc::new(

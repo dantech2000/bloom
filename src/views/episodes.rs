@@ -148,6 +148,11 @@ impl Bloom {
         let playing = self.playing.as_ref()?;
         let t = UiTheme::read(cx).clone();
         let soft = rgba(0xf5f5f7b3);
+        // A phone in landscape has little height: the picker is a sheet at
+        // the right side from top to bottom, with smaller stills.
+        let phone = self.phone();
+        let (top_in, _, _, right_in) = crate::views::shell::safe_insets();
+        let (still_size, row_h) = if phone { ((120., 68.), 84.) } else { (STILL, ROW_H) };
 
         fn swallow(
             this: &mut Bloom,
@@ -192,7 +197,12 @@ impl Bloom {
         }
 
         // The rows take the width of the list, so long text wraps inside it.
-        let row_w = PICKER_W.min(self.viewport_w - 48.) - 30.;
+        let picker_w = if phone {
+            PICKER_W.min(self.viewport_w * 0.62)
+        } else {
+            PICKER_W.min(self.viewport_w - 48.)
+        };
+        let row_w = picker_w - 30.;
         let mut rows = div().w(px(row_w)).flex().flex_col();
         for episode in &picker.episodes {
             let current = episode.id == playing.id;
@@ -217,8 +227,10 @@ impl Bloom {
             rows = rows.child(
                 div()
                     .id(SharedString::from(format!("picker.episode.{}", episode.id)))
+                    .role(gpui_kit::Role::Button)
+                    .aria_label(name.clone())
                     .w(px(row_w))
-                    .h(px(ROW_H))
+                    .h(px(row_h))
                     .flex_shrink_0()
                     .px(px(8.))
                     .rounded(px(14.))
@@ -232,7 +244,7 @@ impl Bloom {
                         this.pick_episode(pick.clone(), cx)
                     }))
                     .child(
-                        artwork(still, STILL.0, STILL.1, px(10.), LucideIcon::Tv, cx)
+                        artwork(still, still_size.0, still_size.1, px(10.), LucideIcon::Tv, cx)
                             .flex_shrink_0()
                             .when_some(episode.progress(), |el, value| {
                                 el.child(
@@ -302,10 +314,17 @@ impl Bloom {
             );
         }
 
-        let list_h = (self.viewport_h - bottom - 190.).clamp(ROW_H * 2., ROW_H * 5.);
+        let list_h = if phone {
+            // The sheet from top to bottom: the rows get what the title and
+            // the seasons leave.
+            let seasons_h = if picker.seasons.len() > 1 { 40. } else { 0. };
+            (self.viewport_h - 8. - top_in - bottom - 28. - 34. - seasons_h - 20.).max(row_h)
+        } else {
+            (self.viewport_h - bottom - 190.).clamp(row_h * 2., row_h * 5.)
+        };
         let body = if picker.loading {
             div()
-                .h(px(ROW_H))
+                .h(px(row_h))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -314,7 +333,7 @@ impl Bloom {
                 .child("Loading…")
         } else if picker.episodes.is_empty() {
             div()
-                .h(px(ROW_H))
+                .h(px(row_h))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -323,7 +342,7 @@ impl Bloom {
                 .child("This season has no episodes.")
         } else {
             div()
-                .h(px(list_h.min(picker.episodes.len() as f32 * ROW_H)))
+                .h(px(list_h.min(picker.episodes.len() as f32 * row_h)))
                 .child(
                     ScrollArea::new("picker.scroll")
                         .track(&picker.scroll)
@@ -335,9 +354,11 @@ impl Bloom {
         Some(
             div()
                 .absolute()
-                .right(px(24.))
+                .right(px(if phone { 12. + right_in } else { 24. }))
+                // Over the video, not over the control bar.
                 .bottom(px(bottom))
-                .w(px(PICKER_W.min(self.viewport_w - 48.)))
+                .when(phone, |el| el.top(px(8. + top_in)))
+                .w(px(picker_w))
                 .rounded(px(24.))
                 .border_1()
                 .border_color(rgba(0xf5f5f733))

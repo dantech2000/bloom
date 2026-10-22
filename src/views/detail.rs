@@ -42,6 +42,16 @@ struct Layout {
 impl Bloom {
     fn detail_layout(&self) -> Layout {
         let (vw, vh) = (self.viewport_w, self.viewport_h);
+        // A phone: one column the width of the page, and no poster beside
+        // it (the band shows the art).
+        if self.compact_w() {
+            return Layout {
+                content_left: 16.,
+                side: 16.,
+                poster_w: 0.,
+                band_h: (TOPBAR_H + vh * 0.38).round(),
+            };
+        }
         // The web narrows the poster column on very wide windows.
         let (content, poster) = if vw / vh >= 1.98 {
             (0.2845, 0.21)
@@ -115,9 +125,9 @@ impl Bloom {
                 el.child(
                     crate::images::remote_logo(url)
                         .absolute()
-                        .left(px(vw * 0.325))
+                        .left(px(if self.compact_w() { l.side } else { vw * 0.325 }))
                         .top(px(TOPBAR_H + vh * 0.20))
-                        .w(px(vw * 0.25))
+                        .w(px(if self.compact_w() { vw * 0.6 } else { vw * 0.25 }))
                         .h(px(vh * 0.16)),
                 )
             });
@@ -130,12 +140,15 @@ impl Bloom {
             .pr(px(l.side))
             .bg(rgba(0x00000033))
             .flex()
+            // A phone: the actions on a row of their own under the name.
+            .when(self.compact_w(), |el| el.flex_wrap().gap(px(12.)))
             .items_center()
-            .gap(px(24.))
+            .when(!self.compact_w(), |el| el.gap(px(24.)))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
+                    .when(self.compact_w(), |el| el.w_full().flex_shrink_0())
                     .flex()
                     .flex_col()
                     .gap(px(8.))
@@ -269,8 +282,9 @@ impl Bloom {
 
         rows.extend(self.enhanced_detail_rows(item, l.content_left, l.side, cx));
 
-        // The poster keeps its place while the page scrolls under it.
-        let poster = div()
+        // The poster keeps its place while the page scrolls under it. A
+        // phone has no room beside the text for it.
+        let poster = (!self.compact_w()).then(|| div()
             .absolute()
             .left(px(l.side))
             .top(px(vh * 0.15))
@@ -283,7 +297,7 @@ impl Bloom {
                 px(24.),
                 LucideIcon::Clapperboard,
                 cx,
-            ));
+            )));
 
         div()
             .relative()
@@ -304,7 +318,7 @@ impl Bloom {
                             .child(div().mt(px(24.)).flex().flex_col().gap(px(22.)).children(rows)),
                     ),
             )
-            .child(poster)
+            .children(poster)
     }
 
     /// Title lines: the series is a link on season and episode pages.
@@ -396,6 +410,8 @@ impl Bloom {
         let round = |id: &'static str, glyph: gpui_kit::Svg| {
             div()
                 .id(id)
+                .role(gpui_kit::Role::Button)
+                .aria_label(id.rsplit('.').next().unwrap_or(id))
                 .size(px(46.))
                 .rounded(px(CARD_RADIUS))
                 .flex()
@@ -412,6 +428,8 @@ impl Bloom {
             row = row.child(
                 div()
                     .id("detail.play")
+                    .role(gpui_kit::Role::Button)
+                    .aria_label("play")
                     .h(px(44.))
                     .pl(px(18.))
                     .pr(px(24.))

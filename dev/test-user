@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""Makes the test account of ~/Library/Application Support/bloom/test-account.txt
+exist on the server, with the password of the file and access to every
+library, and checks that it signs in. Uses the admin token of the own config
+and the LAN address of the server. Prints no token.
+
+    dev/test-user                 http://snorelax:8096
+    dev/test-user <base url>      another address of the server
+"""
+import json, os, sys, urllib.request
+
+base = sys.argv[1] if len(sys.argv) > 1 else "http://snorelax:8096"
+support = os.path.expanduser("~/Library/Application Support/bloom")
+config = json.load(open(os.path.join(support, "config.json")))
+server, profile = config["servers"][0], config["servers"][0]["profiles"][0]
+creds = dict(line.split(":", 1) for line in open(os.path.join(support, "test-account.txt")) if ":" in line)
+user, password = creds["user"].strip(), creds["password"].strip()
+
+
+def call(method, path, body=None, token=profile["token"]):
+    data = json.dumps(body).encode() if body is not None else None
+    auth = f'MediaBrowser Client="Bloom", Device="dev", DeviceId="{config["device_id"]}", Version="0.1.10"'
+    if token:
+        auth += f', Token="{token}"'
+    req = urllib.request.Request(base + path, data=data, method=method, headers={
+        "User-Agent": "Bloom/0.1.10", "Content-Type": "application/json", "Authorization": auth})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        raw = r.read()
+        return json.loads(raw) if raw.strip() else None
+
+
+users = {u["Name"]: u for u in call("GET", "/Users")}
+if user in users:
+    account = users[user]
+    print(f"{user} exists")
+else:
+    account = call("POST", "/Users/New", {"Name": user, "Password": password})
+    print(f"created {user}")
+policy = call("GET", f"/Users/{account['Id']}")["Policy"]
+policy.update(EnableAllFolders=True, EnableRemoteAccess=True, IsDisabled=False)
+call("POST", f"/Users/{account['Id']}/Policy", policy)
+print("policy: every library, remote access")
+auth = call("POST", "/Users/AuthenticateByName", {"Username": user, "Pw": password}, token=None)
+print(f"signs in as {auth['User']['Name']}")

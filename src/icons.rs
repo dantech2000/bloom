@@ -132,6 +132,10 @@ pub fn filled(icon: Filled, size: f32, color: Rgba) -> Svg {
 }
 
 const LOGO_PATH: &str = "icons/jellyfin.svg";
+/// The icon of the app, as the asset source serves it.
+const APP_ICON_PATH: &str = "icons/bloom.png";
+/// The icon of the app: the jellyfish on its dark rounded square.
+const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icon/bloom.png");
 /// The Jellyfin mark with no background, from the Jellyfin branding files
 /// (CC BY-SA 4.0).
 const LOGO_SVG: &[u8] = include_bytes!("../assets/icon/jellyfin-transparent.svg");
@@ -141,6 +145,11 @@ pub fn logo(size: f32, color: Rgba) -> Svg {
     svg().path(LOGO_PATH).size(px(size)).text_color(color)
 }
 
+/// The icon of the app (the jellyfish), `size` on a side.
+pub fn app_icon(size: f32) -> gpui_kit::Img {
+    gpui_kit::img(APP_ICON_PATH).size(px(size))
+}
+
 /// Serves the filled icons and passes every other path on to Lucide.
 pub struct Assets;
 
@@ -148,6 +157,9 @@ impl AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
         if path == LOGO_PATH {
             return Ok(Some(Cow::Borrowed(LOGO_SVG)));
+        }
+        if path == APP_ICON_PATH {
+            return Ok(Some(Cow::Borrowed(APP_ICON_PNG)));
         }
         let Some(name) = path
             .strip_prefix(PREFIX)

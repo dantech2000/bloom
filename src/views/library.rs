@@ -139,12 +139,17 @@ impl Bloom {
                 )
         };
 
+        // On a phone the toolbar takes two rows: the title with the range
+        // and the pages, then the actions.
+        let compact = self.compact_w();
+        let toolbar_h = if compact { 96. } else { 54. };
         let toolbar = div()
             .px(px(m.side))
-            .h(px(54.))
+            .h(px(toolbar_h))
             .flex()
+            .when(compact, |el| el.flex_wrap())
             .items_center()
-            .gap(px(18.))
+            .gap(px(if compact { 10. } else { 18. }))
             .child({
                 let title = div()
                     .flex()
@@ -175,7 +180,14 @@ impl Bloom {
                     }),
             )
             .child(div().flex_1())
+            .when(compact, |el| {
+                el.child(page_arrow("library.previous", LucideIcon::ChevronLeft, has_previous, false))
+                    .child(page_arrow("library.next", LucideIcon::ChevronRight, has_next, true))
+                    // The second row starts here.
+                    .child(div().w_full().h_0())
+            })
             .when(playable, |el| el.child(play_all))
+            .when(compact, |el| el.child(div().flex_1()))
             .child(
                 div()
                     .flex()
@@ -212,18 +224,20 @@ impl Bloom {
                         LucideIcon::ArrowDownAZ,
                         data.sort != "SortName" || data.descending,
                     ))
-                    .child(page_arrow(
-                        "library.previous",
-                        LucideIcon::ChevronLeft,
-                        has_previous,
-                        false,
-                    ))
-                    .child(page_arrow(
-                        "library.next",
-                        LucideIcon::ChevronRight,
-                        has_next,
-                        true,
-                    )),
+                    .when(!compact, |el| {
+                        el.child(page_arrow(
+                            "library.previous",
+                            LucideIcon::ChevronLeft,
+                            has_previous,
+                            false,
+                        ))
+                        .child(page_arrow(
+                            "library.next",
+                            LucideIcon::ChevronRight,
+                            has_next,
+                            true,
+                        ))
+                    }),
             );
 
         let body = if data.loading && data.items.is_empty() {
@@ -243,12 +257,12 @@ impl Bloom {
             )
         } else {
             // The grid starts under the toolbar and its gap.
-            grid(self, &data.items, &client, 54. + 12., cx)
+            grid(self, &data.items, &client, toolbar_h + 12., cx)
         };
 
         // Letter picker at the right edge, as on the web. It needs a tall
         // window and a sort by name.
-        let picker = (data.sort == "SortName" && self.viewport_h >= 610.).then(|| {
+        let picker = (data.sort == "SortName" && self.viewport_h >= 610. && !compact).then(|| {
             let letters = std::iter::once('#').chain('A'..='Z');
             div()
                 .absolute()

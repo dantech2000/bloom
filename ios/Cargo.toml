@@ -1,0 +1,21 @@
+# The static library of the iOS app: the Rust side that the Xcode project
+# in `host/` links. `dev/ios` builds both and runs the app in a simulator.
+[package]
+name = "bloom-ios"
+version.workspace = true
+edition = "2024"
+rust-version = "1.97.1"
+license = "AGPL-3.0-or-later"
+description = "Bloom for iOS: the Rust library the app links"
+publish = false
+
+[lib]
+name = "bloom_ios"
+crate-type = ["staticlib"]
+
+[dependencies]
+bloom = { path = ".." }
+gpui = { package = "gpui-pre", version = "=0.3.4", default-features = false }
+gpui-ios = { package = "gpui-pre-ios", path = "../vendor/gpui-pre-ios" }
+log = "0.4"
+objc2 = "0.6"
