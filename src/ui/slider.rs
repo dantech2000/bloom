@@ -3,9 +3,10 @@ use super::theme::{UiTheme, apply_style};
 pub use gpui_kit::base::slider::{SliderEvent, SliderState};
 use gpui_kit::base::{SliderIndicator, SliderThumb, SliderTrack};
 use gpui_kit::{
-    AccessibleAction, App, ElementId, Entity, InteractiveElement as _, IntoElement, MouseButton,
-    ParentElement as _, RenderOnce, Role, SharedString, StatefulInteractiveElement as _,
-    StyleRefinement, Styled, Window, div, prelude::FluentBuilder as _, relative,
+    AccessibleAction, App, Axis, Bounds, DispatchPhase, ElementId, Entity, InteractiveElement as _,
+    IntoElement, MouseButton, ParentElement as _, Pixels, RenderOnce, Role, SharedString,
+    StatefulInteractiveElement as _, StyleRefinement, Styled, TouchDragEvent, TouchPhase, Window,
+    canvas, div, prelude::FluentBuilder as _, relative,
 };
 
 #[derive(IntoElement)]
@@ -84,6 +85,48 @@ impl RenderOnce for Slider {
         let set_value = self.state.clone();
         let release = self.state.clone();
         let release_out = self.state.clone();
+        // A finger on a touch screen: the drag is claimed at its start, or
+        // GPUI takes it for a scroll and the thumb stays. The flag lives
+        // across frames, since the listener is registered at each paint.
+        let claimed = window.use_keyed_state(
+            ElementId::from(("slider-touch", self.state.entity_id())),
+            cx,
+            |_, _| false,
+        );
+        let touch_state = self.state.clone();
+        let touch = canvas(
+            |_, _, _| {},
+            move |bounds: Bounds<Pixels>, _, window, _| {
+                window.on_mouse_event(move |event: &TouchDragEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble {
+                        return;
+                    }
+                    match event.phase {
+                        TouchPhase::Started => {
+                            if !bounds.contains(&event.start_position) {
+                                return;
+                            }
+                            claimed.update(cx, |on, _| *on = true);
+                            window.prevent_default();
+                            set_from_x(&touch_state, bounds, event.position.x, false, window, cx);
+                        }
+                        TouchPhase::Moved => {
+                            if *claimed.read(cx) {
+                                set_from_x(&touch_state, bounds, event.position.x, false, window, cx);
+                            }
+                        }
+                        TouchPhase::Ended | TouchPhase::Cancelled => {
+                            if *claimed.read(cx) {
+                                claimed.update(cx, |on, _| *on = false);
+                                set_from_x(&touch_state, bounds, event.position.x, true, window, cx);
+                            }
+                        }
+                    }
+                });
+            },
+        )
+        .absolute()
+        .inset_0();
         let thumb = SliderThumb::new(&self.state)
             .disabled(self.disabled)
             .absolute()
@@ -188,9 +231,30 @@ impl RenderOnce for Slider {
                             ),
                     )
                     .child(thumb),
-            );
+            )
+            .when(!self.disabled, |root| root.child(touch));
         apply_style(root, &self.style)
     }
+}
+
+/// Sets the value from a position along the track, as the track does for
+/// the mouse (`update_value_by_position` marks the drag, so the release
+/// emits its event and the player seeks). `bounds` is the track's own.
+fn set_from_x(
+    state: &Entity<SliderState>,
+    _bounds: Bounds<Pixels>,
+    x: Pixels,
+    release: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    state.update(cx, |state, cx| {
+        let y = state.bounds().center().y;
+        state.update_value_by_position(Axis::Horizontal, gpui_kit::point(x, y), false, window, cx);
+        if release {
+            state.handle_release(cx);
+        }
+    });
 }
 fn update_value(state: &Entity<SliderState>, value: f32, window: &mut Window, cx: &mut App) {
     if !value.is_finite() {

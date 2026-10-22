@@ -56,6 +56,12 @@ tap play; expect "Play starts playback" 'player=Playing'
 expect "the phone turned to landscape" 'window=874x402'
 sleep 2; shot player
 $ui tap 437 201 >/dev/null; sleep 0.5; shot player-controls
+# A drag along the timeline (y of the Seek slider in landscape) seeks.
+$ui swipe 250 314 600 314 800 >/dev/null 2>&1
+expect "a drag on the timeline seeks" 'player=Playing pos=[1-9][0-9]{2,}'
+# The controls hide a few seconds after the last touch: wait for that,
+# then a tap on the video brings them back fresh for the close.
+sleep 4; $ui tap 437 201 >/dev/null 2>&1; sleep 0.7
 tap close; expect "Back ends playback" 'player=Idle'
 expect "the phone turned back to portrait" 'window=402x874'
 shot after-player

@@ -11,6 +11,7 @@
 
 use gpui_icons::LucideIcon;
 use gpui_kit::{
+    IntoElement as _,
     ClickEvent, Context, Div, InteractiveElement as _, MouseButton, MouseDownEvent,
     ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _, Styled, Window, canvas,
     div, prelude::FluentBuilder as _, px, rgba,
@@ -539,7 +540,24 @@ impl Bloom {
                             .child(title),
                     ),
             )
-            .child(body);
+            // A phone in landscape is shorter than the panel: the body
+            // scrolls inside the height the screen has over the controls.
+            .child(if self.phone() {
+                let (top_in, _, _, _) = crate::views::shell::safe_insets();
+                let room = self.viewport_h - self.panel_corner().1 - top_in - 70.;
+                div()
+                    .id("cast.panel.scroll")
+                    .max_h(px(room.max(120.)))
+                    // A scroll box is a flex item that shrinks to nothing
+                    // without this; it keeps its content's height up to the
+                    // most height.
+                    .flex_shrink_0()
+                    .overflow_y_scroll()
+                    .child(body)
+                    .into_any_element()
+            } else {
+                body.into_any_element()
+            });
         Some(match top {
             Some(top) => panel.top(px(top)),
             None => panel.bottom(px(self.panel_corner().1)),
