@@ -311,6 +311,9 @@ pub extern "C" fn gpui_ios_request_frame(window_ptr: *mut c_void) {
 
 /// One frame: GPUI draws if something is dirty, or if text arrived.
 pub(crate) fn request_frame(window: &super::window::IosWindow) {
+    // The composition view mirrors the focused field, outside GPUI's draw
+    // (the input handler updates the window, which the draw holds).
+    window.sync_input_view();
     // Check if text input arrived since last frame — if so, force a render
     // so drain_pending_text() runs and the UI updates.
     let text_dirty = crate::TEXT_INPUT_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel);

@@ -528,9 +528,13 @@ impl Bloom {
                 .and_then(|s| s.display_title.clone())
                 .unwrap_or_else(|| format!("Track {}", n + 1))
         };
+        // A phone: a box wider than the room left beside the label goes
+        // under it, the whole width (it ran off the page, 2026-10-23).
+        let compact = self.compact_w();
         let row = |name: &'static str| {
             div()
                 .flex()
+                .when(compact, |el| el.flex_wrap().gap_y(px(6.)))
                 .items_center()
                 .text_size(px(15.))
                 .child(div().w(px(93.)).flex_shrink_0().text_color(label).child(name))
@@ -545,8 +549,9 @@ impl Bloom {
                 .trigger_style_with(|button| button)
                 .trigger(
                     div()
-                        .w(px(width))
-                        .h(px(34.))
+                        .when(!compact, |el| el.w(px(width)))
+                        .when(compact, |el| el.w_full())
+                        .h(px(if compact { 44. } else { 34. }))
                         .pl(px(9.))
                         .pr(px(6.))
                         .relative()
@@ -834,7 +839,12 @@ fn credits(item: &Item, cx: &Context<Bloom>) -> Option<Div> {
                                 .child(name),
                         )
                         .child(
+                            // The room left beside the label, up to 560: a
+                            // long studio list wraps instead of running off
+                            // a phone's page.
                             div()
+                                .flex_1()
+                                .min_w_0()
                                 .max_w(px(560.))
                                 .font_weight(gpui_kit::FontWeight::MEDIUM)
                                 .text_color(t.colors.foreground)

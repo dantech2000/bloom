@@ -359,6 +359,18 @@ impl Bloom {
                 Ok(secs) => self.request_seek_to(secs, cx),
                 Err(_) => return "error: usage: seek <seconds>".into(),
             },
+            // `admin user <name>` opens the page of that user on the Users
+            // section (the list must have loaded).
+            "admin" if rest.starts_with("user ") => {
+                let name = rest.trim_start_matches("user ").trim();
+                self.open_admin(crate::admin::Section::Users, cx);
+                if let Page::Admin(data) = &mut self.page {
+                    data.list = false;
+                }
+                if !crate::admin::users::open_user_named(self, name, cx) {
+                    return "error: no such user on the Users page (loaded?)".into();
+                }
+            }
             "admin" => match crate::admin::Section::from_name(if rest.is_empty() {
                 "dashboard"
             } else {

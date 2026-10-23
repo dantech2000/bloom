@@ -1,0 +1,401 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-23T06:30:00Z",
+  "title": "Design System: Bloom",
+  "extensions": {
+    "colorMeta": {
+      "theatre-black": {
+        "role": "neutral",
+        "displayName": "Theatre Black",
+        "canonical": "#101010",
+        "tonalRamp": [
+          "#101010",
+          "#1a1a1a",
+          "#262626",
+          "#343434",
+          "#4a4a4a",
+          "#6b6b6b",
+          "#9a9a9a",
+          "#d4d4d4"
+        ]
+      },
+      "screen-white": {
+        "role": "primary",
+        "displayName": "Screen White",
+        "canonical": "#f5f5f7",
+        "tonalRamp": [
+          "#2a2a2c",
+          "#3e3e41",
+          "#5a5a5e",
+          "#7a7a7f",
+          "#9c9ca1",
+          "#bebec3",
+          "#dcdce0",
+          "#f5f5f7"
+        ]
+      },
+      "screen-white-quiet": {
+        "role": "neutral",
+        "displayName": "Screen White, quiet",
+        "canonical": "rgba(245, 245, 247, 0.6)",
+        "tonalRamp": [
+          "rgba(245,245,247,0.15)",
+          "rgba(245,245,247,0.25)",
+          "rgba(245,245,247,0.35)",
+          "rgba(245,245,247,0.45)",
+          "rgba(245,245,247,0.6)",
+          "rgba(245,245,247,0.7)",
+          "rgba(245,245,247,0.85)",
+          "rgba(245,245,247,1)"
+        ]
+      },
+      "smoked-glass": {
+        "role": "neutral",
+        "displayName": "Smoked Glass",
+        "canonical": "rgba(42, 42, 42, 0.72)",
+        "tonalRamp": [
+          "#141414",
+          "#1e1e1e",
+          "#2a2a2a",
+          "#383838",
+          "#4a4a4a",
+          "#666666",
+          "#8c8c8c",
+          "#b8b8b8"
+        ]
+      },
+      "liquid-tint": {
+        "role": "neutral",
+        "displayName": "Liquid Tint",
+        "canonical": "rgba(28, 28, 31, 0.35)",
+        "tonalRamp": [
+          "#0e0e10",
+          "#1c1c1f",
+          "#2a2a2e",
+          "#3a3a3f",
+          "#4e4e54",
+          "#6a6a70",
+          "#8e8e94",
+          "#b8b8bd"
+        ]
+      },
+      "glass-edge": {
+        "role": "neutral",
+        "displayName": "Glass Edge",
+        "canonical": "rgba(245, 245, 247, 0.2)",
+        "tonalRamp": [
+          "rgba(245,245,247,0.05)",
+          "rgba(245,245,247,0.1)",
+          "rgba(245,245,247,0.15)",
+          "rgba(245,245,247,0.2)",
+          "rgba(245,245,247,0.3)",
+          "rgba(245,245,247,0.45)",
+          "rgba(245,245,247,0.7)",
+          "rgba(245,245,247,1)"
+        ]
+      },
+      "disc": {
+        "role": "neutral",
+        "displayName": "Disc",
+        "canonical": "rgba(204, 204, 207, 0.25)",
+        "tonalRamp": [
+          "rgba(204,204,207,0.08)",
+          "rgba(204,204,207,0.12)",
+          "rgba(204,204,207,0.18)",
+          "rgba(204,204,207,0.25)",
+          "rgba(204,204,207,0.35)",
+          "rgba(204,204,207,0.5)",
+          "rgba(204,204,207,0.7)",
+          "rgba(204,204,207,1)"
+        ]
+      },
+      "live-green": {
+        "role": "tertiary",
+        "displayName": "Live Green",
+        "canonical": "#7ee787",
+        "tonalRamp": [
+          "#0f2a14",
+          "#174020",
+          "#1f5a2c",
+          "#2b7a3c",
+          "#3c9e50",
+          "#58c468",
+          "#7ee787",
+          "#b6f3bb"
+        ]
+      },
+      "attention-amber": {
+        "role": "tertiary",
+        "displayName": "Attention Amber",
+        "canonical": "#e3b341",
+        "tonalRamp": [
+          "#2e2308",
+          "#4a380c",
+          "#6b5112",
+          "#8f6c17",
+          "#b4891f",
+          "#d19f2f",
+          "#e3b341",
+          "#f0d58c"
+        ]
+      },
+      "failed-red": {
+        "role": "tertiary",
+        "displayName": "Failed Red",
+        "canonical": "#ff7b72",
+        "tonalRamp": [
+          "#3a1210",
+          "#5a1c18",
+          "#7e2722",
+          "#a4332c",
+          "#c94238",
+          "#e85c51",
+          "#ff7b72",
+          "#ffb3ad"
+        ]
+      },
+      "danger-fill": {
+        "role": "tertiary",
+        "displayName": "Danger Fill",
+        "canonical": "#c62828",
+        "tonalRamp": [
+          "#2a0909",
+          "#450f0f",
+          "#661717",
+          "#8a1e1e",
+          "#a82323",
+          "#c62828",
+          "#dc5252",
+          "#ee9a9a"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "The hero's title when the film has no title art; the title of a detail page on the phone."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "The title of a detail page on the Mac; the heading of the connect card."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "A row's name on the phone, a section heading, the label of a 50-point button."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Menu entries, descriptions, setting values, the label of a 44-point button."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Detail lines, chips, group headings, the tab bar's words."
+      },
+      "mono": {
+        "displayName": "Mono",
+        "purpose": "Logs, paths, the Quick Connect code."
+      }
+    },
+    "shadows": [],
+    "motion": [
+      {
+        "name": "fast",
+        "value": "150ms",
+        "purpose": "Hover and highlight changes."
+      },
+      {
+        "name": "normal",
+        "value": "200ms",
+        "purpose": "A sheet or a panel opening; reduced motion crossfades instead."
+      },
+      {
+        "name": "keyboard-slide",
+        "value": "UIKit's announced duration, eased out",
+        "purpose": "The page moves with the software keyboard on the phone."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "compact (a phone)",
+        "value": "under 700px"
+      },
+      {
+        "name": "glyph tabs (an iPad)",
+        "value": "under 900px"
+      },
+      {
+        "name": "six posters",
+        "value": "1200px"
+      },
+      {
+        "name": "seven posters",
+        "value": "1400px"
+      },
+      {
+        "name": "eight posters",
+        "value": "1600px"
+      },
+      {
+        "name": "nine posters",
+        "value": "1920px"
+      }
+    ],
+    "glass": {
+      "dark": {
+        "bezel": 16,
+        "thickness": 20,
+        "rim": 0.4,
+        "rimWidth": 0.75,
+        "frost": 0.5,
+        "blur": 0,
+        "tintAlpha": 0.35
+      },
+      "phonePopup": {
+        "frost": 1,
+        "blur": 1
+      },
+      "edge": "1px rgba(245, 245, 247, 0.2)"
+    }
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The one main action of a page: Play, Sign In, Connect. Screen White on black.",
+      "html": "<button class=\"ds-btn-primary\"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M8 5v14l11-7z\"/></svg>Play</button>",
+      "css": ".ds-btn-primary { display: inline-flex; align-items: center; gap: 10px; height: 44px; padding: 0 20px; background: #f5f5f7; color: #121212; font-family: 'Google Sans', Geist, -apple-system, sans-serif; font-size: 15px; font-weight: 500; border: none; border-radius: 14px; cursor: pointer; transition: opacity 150ms; } .ds-btn-primary:hover { opacity: 0.88; } .ds-btn-primary:focus-visible { outline: 1px solid rgba(245,245,247,0.6); outline-offset: 2px; } .ds-btn-primary:active { opacity: 0.8; }"
+    },
+    {
+      "name": "Quiet Button",
+      "kind": "button",
+      "refersTo": "button-quiet",
+      "description": "The second action beside a primary, on quiet glass.",
+      "html": "<button class=\"ds-btn-quiet\">Use Quick Connect</button>",
+      "css": ".ds-btn-quiet { display: inline-flex; align-items: center; height: 44px; padding: 0 20px; background: rgba(255,255,255,0.12); color: #f5f5f7; font-family: 'Google Sans', Geist, -apple-system, sans-serif; font-size: 15px; font-weight: 500; border: 1px solid rgba(245,245,247,0.2); border-radius: 14px; cursor: pointer; transition: background 150ms; } .ds-btn-quiet:hover { background: rgba(255,255,255,0.18); } .ds-btn-quiet:focus-visible { outline: 1px solid rgba(245,245,247,0.6); outline-offset: 2px; }"
+    },
+    {
+      "name": "Danger Button",
+      "kind": "button",
+      "refersTo": "button-danger",
+      "description": "An action that stops or deletes something, in the dashboard.",
+      "html": "<button class=\"ds-btn-danger\">Delete user</button>",
+      "css": ".ds-btn-danger { display: inline-flex; align-items: center; height: 38px; padding: 0 16px; background: #c62828; color: #ffffff; font-family: 'Google Sans', Geist, -apple-system, sans-serif; font-size: 14px; font-weight: 500; border: none; border-radius: 12px; cursor: pointer; transition: opacity 150ms; } .ds-btn-danger:hover { opacity: 0.88; } .ds-btn-danger:focus-visible { outline: 1px solid rgba(245,245,247,0.6); outline-offset: 2px; }"
+    },
+    {
+      "name": "Text Field",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "A dark translucent field with the glass edge; the edge brightens on focus, turns red on an error.",
+      "html": "<input class=\"ds-input\" placeholder=\"https://jellyfin.example.com\">",
+      "css": ".ds-input { width: 100%; height: 44px; padding: 0 12px; background: rgba(68,68,68,0.3); color: #f5f5f7; font-family: 'Google Sans', Geist, -apple-system, sans-serif; font-size: 15px; border: 1px solid rgba(245,245,247,0.2); border-radius: 14px; outline: none; transition: border-color 150ms; } .ds-input::placeholder { color: rgba(245,245,247,0.5); } .ds-input:focus-visible { border-color: rgba(245,245,247,0.55); } .ds-input[aria-invalid=\"true\"] { border-color: #ff7b72; } .ds-input:disabled { opacity: 0.5; }"
+    },
+    {
+      "name": "Chip",
+      "kind": "chip",
+      "refersTo": "chip",
+      "description": "A quiet pill for a fact: rating, year, age rating, end time. Never coloured.",
+      "html": "<span class=\"ds-chip\"><svg width=\"11\" height=\"11\" viewBox=\"0 0 24 24\" fill=\"#e3b341\"><path d=\"M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z\"/></svg>7.1</span> <span class=\"ds-chip\">1998</span> <span class=\"ds-chip\">R</span>",
+      "css": ".ds-chip { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 12px; background: rgba(255,255,255,0.12); color: #f5f5f7; font-family: 'Google Sans', Geist, -apple-system, sans-serif; font-size: 12px; font-weight: 500; border: 1px solid rgba(245,245,247,0.2); border-radius: 18px; }"
+    },
+    {
+      "name": "Menu Sheet",
+      "kind": "nav",
+      "refersTo": "menu-sheet",
+      "description": "The glass card every menu and panel shares: rows with an icon, a title and a detail line, the selected row on the highlight.",
+      "html": "<div class=\"ds-menu\"><div class=\"ds-menu-head\">jellyfin.drod.dev</div><div class=\"ds-menu-row ds-menu-row-selected\"><svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><circle cx=\"12\" cy=\"8\" r=\"4\"/><path d=\"M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1\"/></svg><div><div class=\"ds-menu-title\">drodriguez</div></div></div><div class=\"ds-menu-rule\"></div><div class=\"ds-menu-row\"><svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1\"/><rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1\"/></svg><div><div class=\"ds-menu-title\">Dashboard</div><div class=\"ds-menu-detail\">Users, libraries, tasks and logs of the server</div></div></div><div class=\"ds-menu-row\"><svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><circle cx=\"12\" cy=\"12\" r=\"3\"/><path d=\"M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z\"/></svg><div><div class=\"ds-menu-title\">Settings</div><div class=\"ds-menu-detail\">Playback, subtitles, home page, profile</div></div></div></div>",
+      "css": ".ds-menu { width: 320px; padding: 12px; background: rgba(42,42,42,0.72); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); border: 1px solid rgba(245,245,247,0.2); border-radius: 20px; color: #f5f5f7; font-family: 'Google Sans', Geist, -apple-system, sans-serif; } .ds-menu-head { padding: 4px 12px 10px; font-size: 12px; font-weight: 500; color: rgba(245,245,247,0.6); } .ds-menu-row { display: flex; align-items: center; gap: 12px; min-height: 38px; padding: 8px 12px; border-radius: 12px; cursor: pointer; transition: background 150ms; } .ds-menu-row:hover, .ds-menu-row-selected { background: rgba(255,255,255,0.12); } .ds-menu-row:focus-visible { outline: 1px solid rgba(245,245,247,0.6); } .ds-menu-title { font-size: 15px; font-weight: 500; line-height: 20px; } .ds-menu-detail { font-size: 12px; line-height: 15px; color: rgba(245,245,247,0.6); } .ds-menu-rule { height: 1px; margin: 6px 12px; background: rgba(245,245,247,0.12); }"
+    },
+    {
+      "name": "Phone Tab Bar",
+      "kind": "nav",
+      "refersTo": "tab-bar",
+      "description": "The glass capsule at the bottom of a phone: five entries of glyph over word, the selected one on a highlight pill.",
+      "html": "<nav class=\"ds-tabbar\"><a class=\"ds-tab ds-tab-selected\"><svg width=\"22\" height=\"22\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><path d=\"M3 11l9-8 9 8v10a1 1 0 0 1-1 1h-5v-7h-6v7H4a1 1 0 0 1-1-1z\"/></svg><span>Home</span></a><a class=\"ds-tab\"><svg width=\"22\" height=\"22\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><rect x=\"3\" y=\"5\" width=\"18\" height=\"14\" rx=\"2\"/><path d=\"M3 10h18\"/></svg><span>Movies</span></a><a class=\"ds-tab\"><svg width=\"22\" height=\"22\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><rect x=\"2\" y=\"7\" width=\"20\" height=\"14\" rx=\"2\"/><path d=\"M8 7l4-4 4 4\"/></svg><span>Shows</span></a><a class=\"ds-tab\"><svg width=\"22\" height=\"22\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><circle cx=\"11\" cy=\"11\" r=\"7\"/><path d=\"M21 21l-4.3-4.3\"/></svg><span>Search</span></a></nav>",
+      "css": ".ds-tabbar { display: flex; justify-content: space-around; align-items: center; width: 370px; height: 62px; padding: 6px; background: rgba(42,42,42,0.72); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); border: 1px solid rgba(245,245,247,0.2); border-radius: 24px; font-family: 'Google Sans', Geist, -apple-system, sans-serif; } .ds-tab { display: flex; flex-direction: column; align-items: center; gap: 3px; min-width: 64px; padding: 6px 10px; border-radius: 20px; color: rgba(245,245,247,0.6); font-size: 12px; font-weight: 500; text-decoration: none; cursor: pointer; transition: background 150ms, color 150ms; } .ds-tab-selected, .ds-tab:hover { background: rgba(255,255,255,0.12); color: #f5f5f7; } .ds-tab:focus-visible { outline: 1px solid rgba(245,245,247,0.6); }"
+    },
+    {
+      "name": "Poster Card",
+      "kind": "card",
+      "refersTo": "poster",
+      "description": "Artwork clipped at 12 points, the title and a detail line under it; the artwork is the only colour.",
+      "html": "<div class=\"ds-poster\"><div class=\"ds-poster-art\"></div><div class=\"ds-poster-title\">The Negotiator</div><div class=\"ds-poster-detail\">1998</div></div>",
+      "css": ".ds-poster { width: 140px; font-family: 'Google Sans', Geist, -apple-system, sans-serif; color: #f5f5f7; } .ds-poster-art { width: 140px; height: 210px; border-radius: 12px; background: linear-gradient(160deg, #5a1a1a, #1a0a0a); border: 1px solid rgba(245,245,247,0.08); transition: transform 150ms; } .ds-poster:hover .ds-poster-art { transform: translateY(-2px); } .ds-poster-title { margin-top: 8px; font-size: 14px; font-weight: 500; line-height: 18px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } .ds-poster-detail { font-size: 12px; line-height: 16px; color: rgba(245,245,247,0.6); }"
+    },
+    {
+      "name": "Glass Card",
+      "kind": "card",
+      "refersTo": "card-surface",
+      "description": "A card or dialog: smoked glass with the light edge, 24-point corners, 32 points of padding on the Mac.",
+      "html": "<div class=\"ds-card\"><div class=\"ds-card-label\">Server address</div><input class=\"ds-card-input\" placeholder=\"https://jellyfin.example.com\"><button class=\"ds-card-btn\">Connect</button></div>",
+      "css": ".ds-card { width: 320px; padding: 32px; background: rgba(42,42,42,0.69); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); border: 1px solid rgba(245,245,247,0.2); border-radius: 24px; color: #f5f5f7; font-family: 'Google Sans', Geist, -apple-system, sans-serif; display: flex; flex-direction: column; gap: 12px; } .ds-card-label { font-size: 12px; font-weight: 600; color: rgba(245,245,247,0.5); } .ds-card-input { height: 44px; padding: 0 12px; background: rgba(68,68,68,0.3); color: #f5f5f7; font-size: 15px; border: 1px solid rgba(245,245,247,0.2); border-radius: 14px; outline: none; } .ds-card-input:focus-visible { border-color: rgba(245,245,247,0.55); } .ds-card-btn { height: 44px; background: #f5f5f7; color: #121212; font-size: 15px; font-weight: 500; border: none; border-radius: 14px; cursor: pointer; } .ds-card-btn:hover { opacity: 0.88; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Glass Over the Poster",
+    "overview": "Bloom is a dark room with the film art as its only light. The page is Theatre Black, the text is one ink, Screen White, and every surface the interface needs is a pane of smoked glass laid over the artwork: the account sheet, the player's panels, the tab bar on the phone, the card on the connect screen. Colour belongs to the posters and the backdrops; the interface never competes with them. The mood is cinematic, quiet and precise: the home page opens on a full-bleed backdrop with the title treatment and a single white Play button, and everything else sits one step back.\n\nThe system is the same on the Mac and the phone and native on each. The Mac has the top bar with the server name and the libraries, the floating poster on a detail page and the pointer's hover states. The phone has a glass tab bar at the bottom, menus as sheets that rise from the bottom, three posters across, and fields and buttons at the sizes a finger expects. Shared code is an implementation detail; what the user sees is their platform's app.\n\nDensity is generous. Rows are 38 points or taller, cards have 27 points between them, text stays at 15 points for reading and 12 for detail, and nothing is packed to fit. Two things were tried and rejected: a dark scrim over the glass, which read as a foreign blob, and a white wash with a uniform ring, which read as a flat grey outlined button. Glass controls draw no ring.",
+    "keyCharacteristics": [
+      "One ink, Screen White, at three opacities; colour means a state, never a kind of thing",
+      "Smoked glass surfaces with a light edge; depth from translucency, never from shadows",
+      "Film art full-bleed behind the interface, with a shade only where text must stay readable",
+      "Native structure per platform: top bar and hover on the Mac, tab bar and sheets on the phone",
+      "Google Sans for everything the user reads, Geist Mono for logs and paths",
+      "Motion marks arrival only: pages push from the right on a phone and lift into place on the Mac, sheets rise, popups settle, changes in place fade; 150 or 200 ms on one ease-out curve, off under Reduce Motion"
+    ],
+    "rules": [
+      {
+        "name": "The One Ink Rule",
+        "body": "Text and icons are Screen White, quieter text is the same ink at lower opacity, icons sit on the disc. A different colour for each kind of thing, tinted tiles, coloured badges and gradients on cards were rejected as slop on 2026-10-03.",
+        "section": "colors"
+      },
+      {
+        "name": "The Colour Is State Rule",
+        "body": "Green, amber and red mean live, needs a look, and failed. A badge is a quiet pill; a state shows as a dot. No other colour is the interface's own; the rest comes from the artwork.",
+        "section": "colors"
+      },
+      {
+        "name": "The Phone Reads at 17 Rule",
+        "body": "On a phone, a field or a button is 50 points tall with 17-point text, the body size of Dynamic Type; a tap target is never under 44 points. The Mac keeps 44-point fields and 15-point text.",
+        "section": "typography"
+      },
+      {
+        "name": "The No Shadow Rule",
+        "body": "Nothing casts a shadow. If a surface needs to read as above another, it is glass with a light edge, and the blur does the lifting.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Glass Shows Through Rule",
+        "body": "A glass surface never hides what it covers; a dark scrim over glass and a white wash under a ring were both rejected. On a phone the frost rises to keep text readable, and that is the only exception.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Arrival Rule",
+        "body": "Motion marks where something came from: pushed pages from the right, sheets from the bottom, popups from just above their place, a replaced page from just below it. Nothing else moves.",
+        "section": "motion"
+      },
+      {
+        "name": "The Quiet Return Rule",
+        "body": "Going back fades; only going forward slides.",
+        "section": "motion"
+      }
+    ],
+    "dos": [
+      "Do use Screen White (#f5f5f7) for all text and icons, and lower its opacity to 70%, 60% or 50% for secondary, detail and quiet text.",
+      "Do draw every popup, sheet, panel and bar as smoked glass with the one-pixel light edge, rows of 38 points or more with 12-point corners and 12-point padding, 15-point body text and 12-point detail text.",
+      "Do let the artwork carry the colour; keep the interface black, white and grey.",
+      "Do keep one white primary button per page and make every other action quiet glass.",
+      "Do build the phone's structure from the platform's own patterns: a tab bar, sheets from the bottom, 50-point fields with 17-point text, 44-point tap targets, the safe area respected.",
+      "Do keep a menu, the episode list and a panel exclusive: open one, close the rest.",
+      "Do give what arrives its entrance from ui::motion (push, rise, settle or fade) and nothing more; honour Reduce Motion."
+    ],
+    "donts": [
+      "Don't give a kind of thing a colour: no rainbow avatars, tinted icon tiles, coloured category badges or gradients on cards.",
+      "Don't cast shadows. Depth is translucency and the light edge.",
+      "Don't put a dark scrim over glass, or a white wash with a uniform ring around a glass control; both were rejected.",
+      "Don't add a second accent colour. Green, amber and red are states, not accents.",
+      "Don't reinvent a native control on the phone for flavour; the glass is the brand, the structure is the platform's.",
+      "Don't shrink text below 12 points, or a tap target below 44.",
+      "Don't animate for show: no bounce, no spring, no movement on hover, and no entrance longer than 200 ms."
+    ]
+  }
+}

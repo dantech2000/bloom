@@ -656,6 +656,8 @@ impl Bloom {
         let arrow = |id: &'static str, glyph: LucideIcon, forward: bool| {
             div()
                 .id(id)
+                .role(gpui_kit::Role::Button)
+                .aria_label(if forward { "Next slide" } else { "Previous slide" })
                 .absolute()
                 .top(px(height * 0.35))
                 .size(px(40.))
@@ -676,6 +678,9 @@ impl Bloom {
         };
 
         let paused = self.hero.paused.is_some();
+        // The small controls at the top right: a 32-point glyph on a
+        // 44-point target on a phone.
+        let small_control = if self.compact_w() { 44. } else { 32. };
         Some(
             div()
                 .id(SharedString::from("hero"))
@@ -765,6 +770,8 @@ impl Bloom {
                         .font_weight(gpui_kit::FontWeight::MEDIUM)
                         .text_color(white)
                         .line_clamp(if self.compact_w() { 3 } else { 2 })
+                        // The cut ends in an ellipsis, not mid-word.
+                        .text_ellipsis()
                         .child(item.overview.clone().unwrap_or_default()),
                 )
                 .child(
@@ -791,10 +798,12 @@ impl Bloom {
                             } else {
                                 "Mute the trailer (M)"
                             }))
+                            .role(gpui_kit::Role::Button)
+                            .aria_label(if video.muted { "Unmute the trailer" } else { "Mute the trailer" })
                             .absolute()
                             .top(px(crate::views::shell::TOPBAR_H + crate::views::shell::top_inset()))
                             .right(px(vw * 0.028 + 60.))
-                            .size(px(32.))
+                            .size(px(small_control))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -823,10 +832,12 @@ impl Bloom {
                         } else {
                             "Pause the slideshow (Space)"
                         }))
+                        .role(gpui_kit::Role::Button)
+                        .aria_label(if paused { "Resume the slideshow" } else { "Pause the slideshow" })
                         .absolute()
                         .top(px(crate::views::shell::TOPBAR_H + crate::views::shell::top_inset()))
                         .right(px(vw * 0.028 + 18.))
-                        .size(px(32.))
+                        .size(px(small_control))
                         .flex()
                         .items_center()
                         .justify_center()

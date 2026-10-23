@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Plugins: a card for each installed plugin with its image, version and
-//! status. A plugin can be enabled, disabled or uninstalled.
+//! status. A card has one button, its settings, and a "…" menu with the
+//! rest: enable or disable, the web settings, uninstall (2026-10-23; four
+//! buttons on every card before).
 
 use std::{collections::HashSet, rc::Rc};
 
@@ -12,11 +14,13 @@ use gpui_kit::{
 };
 use serde::Deserialize;
 
+use gpui_icons::LucideIcon;
+
 use crate::{
     admin::{ButtonKind, Confirm, badge, button},
     app::Bloom,
     jellyfin::Client,
-    ui::theme::UiTheme,
+    ui::{menu::MenuItem, theme::UiTheme},
 };
 
 /// Smallest width of a plugin card; the grid fits as many as the page holds.
@@ -78,6 +82,113 @@ pub fn load(client: &Client) -> Result<Data> {
 }
 
 /// Text and colour of the badge for a plugin status.
+/// What the "…" menu of a plugin needs to know.
+#[derive(Clone)]
+struct MenuPlugin {
+    id: String,
+    version: String,
+    name: String,
+    status: String,
+    can_uninstall: bool,
+    web_url: String,
+}
+
+impl MenuPlugin {
+    fn toggle(&self) -> Option<&'static str> {
+        match self.status.as_str() {
+            "Active" | "Restart" => Some("Disable"),
+            "Disabled" => Some("Enable"),
+            _ => None,
+        }
+    }
+
+    fn has_entries(&self) -> bool {
+        self.toggle().is_some() || self.status == "Active" || (self.can_uninstall && self.status != "Deleted")
+    }
+
+    /// The entries of the menu: enable or disable, the settings page of
+    /// the plugin in the web, and uninstall last, after a line.
+    fn items(&self, cx: &Context<Bloom>) -> Vec<MenuItem> {
+        let handle = cx.weak_entity();
+        let mut items = Vec::new();
+        if let Some(verb) = self.toggle() {
+            let (handle, plugin) = (handle.clone(), self.clone());
+            items.push(
+                MenuItem::new("admin.plugins.menu.toggle", verb)
+                    .icon(if verb == "Enable" { LucideIcon::Power } else { LucideIcon::PowerOff })
+                    .detail("Applies after the next server restart")
+                    .on_click(move |_, _, cx| {
+                        handle.update(cx, |this, cx| plugin.ask_toggle(this, verb, cx)).ok();
+                    }),
+            );
+        }
+        if self.status == "Active" {
+            let url = self.web_url.clone();
+            items.push(
+                MenuItem::new("admin.plugins.menu.web", "Open settings in the web")
+                    .icon(LucideIcon::ExternalLink)
+                    .on_click(move |_, _, cx| cx.open_url(&url)),
+            );
+        }
+        if self.can_uninstall && self.status != "Deleted" {
+            if !items.is_empty() {
+                items.push(MenuItem::separator());
+            }
+            let (handle, plugin) = (handle.clone(), self.clone());
+            items.push(
+                MenuItem::new("admin.plugins.menu.uninstall", "Uninstall…")
+                    .icon(LucideIcon::Trash)
+                    .on_click(move |_, _, cx| {
+                        handle.update(cx, |this, cx| plugin.ask_uninstall(this, cx)).ok();
+                    }),
+            );
+        }
+        items
+    }
+
+    fn ask_toggle(&self, app: &mut Bloom, verb: &'static str, cx: &mut Context<Bloom>) {
+        let (id, version) = (self.id.clone(), self.version.clone());
+        app.ask_confirm(
+            Confirm {
+                title: format!("{verb} {}?", self.name),
+                message: "The change applies after the next server restart.".to_string(),
+                action: verb.to_string(),
+                danger: false,
+                run: Rc::new(move |this, cx| {
+                    let (id, version) = (id.clone(), version.clone());
+                    let done = if verb == "Enable" { "Plugin enabled" } else { "Plugin disabled" };
+                    this.admin_action(done, cx, move |client| {
+                        client.call("POST", &format!("/Plugins/{id}/{version}/{verb}"), &[])
+                    })
+                }),
+            },
+            cx,
+        );
+    }
+
+    fn ask_uninstall(&self, app: &mut Bloom, cx: &mut Context<Bloom>) {
+        let (id, version) = (self.id.clone(), self.version.clone());
+        app.ask_confirm(
+            Confirm {
+                title: format!("Uninstall {}?", self.name),
+                message: format!(
+                    "Version {version} and its settings are removed from the server. The change \
+                     applies after the next server restart."
+                ),
+                action: "Uninstall".to_string(),
+                danger: true,
+                run: Rc::new(move |this, cx| {
+                    let (id, version) = (id.clone(), version.clone());
+                    this.admin_action("Plugin uninstalled", cx, move |client| {
+                        client.call("DELETE", &format!("/Plugins/{id}/{version}"), &[])
+                    })
+                }),
+            },
+            cx,
+        );
+    }
+}
+
 fn status_badge(status: &str) -> (&'static str, Rgba) {
     match status {
         "Active" => ("Active", rgb(0x2e7d32)),
@@ -127,62 +238,17 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
             .map(|c| c.to_uppercase().collect())
             .unwrap_or_default();
 
-        let mut actions = div().flex().flex_wrap().gap(px(8.));
-        // A plugin that is on can be turned off, and the other way round.
-        let toggle = match plugin.status.as_str() {
-            "Active" | "Restart" => Some("Disable"),
-            "Disabled" => Some("Enable"),
-            _ => None,
-        };
-        if let Some(verb) = toggle {
-            let (id, version, name) = (
-                plugin.id.clone(),
-                plugin.version.clone(),
-                plugin.name.clone(),
-            );
-            actions = actions.child(
-                button(
-                    SharedString::from(format!("admin.plugins.toggle.{}", plugin.id)),
-                    verb,
-                    ButtonKind::Plain,
-                    cx,
-                )
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    let (id, version) = (id.clone(), version.clone());
-                    this.ask_confirm(
-                        Confirm {
-                            title: format!("{verb} {name}?"),
-                            message: "The change applies after the next server restart."
-                                .to_string(),
-                            action: verb.to_string(),
-                            danger: false,
-                            run: Rc::new(move |this, cx| {
-                                let (id, version) = (id.clone(), version.clone());
-                                let done = if verb == "Enable" {
-                                    "Plugin enabled"
-                                } else {
-                                    "Plugin disabled"
-                                };
-                                this.admin_action(done, cx, move |client| {
-                                    client.call(
-                                        "POST",
-                                        &format!("/Plugins/{id}/{version}/{verb}"),
-                                        &[],
-                                    )
-                                })
-                            }),
-                        },
-                        cx,
-                    )
-                })),
-            );
-        }
-        // The editor of the stored settings, when the plugin has any.
+        // One action on the card, the settings when the plugin has any in
+        // the app; the rest in the "…" menu (enable or disable, the web
+        // settings, uninstall last).
+        let mut actions = div().flex().items_center().gap(px(8.));
         if data.settings.contains(&plugin.id) {
             let (id, name, version) = (plugin.id.clone(), plugin.name.clone(), plugin.version.clone());
             actions = actions.child(
                 button(
-                    SharedString::from(format!("admin.plugins.settings.{}", plugin.id)),
+                    // With the version: a plugin can be installed twice (one
+                    // superseded), and two elements of one id abort a debug build.
+                    SharedString::from(format!("admin.plugins.settings.{}.{}", plugin.id, plugin.version)),
                     "Settings",
                     ButtonKind::Plain,
                     cx,
@@ -192,58 +258,25 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                 })),
             );
         }
-        // The settings page of a plugin is a web page of the plugin itself.
-        if plugin.status == "Active" {
-            let url = client.web_plugin_url(&plugin.id);
-            actions = actions.child(
-                button(
-                    SharedString::from(format!("admin.plugins.web.{}", plugin.id)),
-                    "Open settings in the web",
-                    ButtonKind::Plain,
+        let menu_plugin = MenuPlugin {
+            id: plugin.id.clone(),
+            version: plugin.version.clone(),
+            name: plugin.name.clone(),
+            status: plugin.status.clone(),
+            can_uninstall: plugin.can_uninstall,
+            web_url: client.web_plugin_url(&plugin.id),
+        };
+        if menu_plugin.has_entries() {
+            actions = actions.child(div().flex_1()).child(
+                super::more_button(
+                    SharedString::from(format!("admin.plugins.more.{}.{}", plugin.id, plugin.version)),
                     cx,
                 )
-                .on_click(move |_: &ClickEvent, _, cx| cx.open_url(&url)),
-            );
-        }
-        if plugin.can_uninstall && plugin.status != "Deleted" {
-            let (id, version, name) = (
-                plugin.id.clone(),
-                plugin.version.clone(),
-                plugin.name.clone(),
-            );
-            actions = actions.child(
-                button(
-                    SharedString::from(format!("admin.plugins.uninstall.{}", plugin.id)),
-                    "Uninstall",
-                    ButtonKind::Plain,
-                    cx,
-                )
-                .text_color(rgb(0xef5350))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    let (id, version) = (id.clone(), version.clone());
-                    this.ask_confirm(
-                        Confirm {
-                            title: format!("Uninstall {name}?"),
-                            message: format!(
-                                "Version {version} and its settings are removed from the \
-                                 server. The change applies after the next server restart."
-                            ),
-                            action: "Uninstall".to_string(),
-                            danger: true,
-                            run: Rc::new(move |this, cx| {
-                                let (id, version) = (id.clone(), version.clone());
-                                this.admin_action("Plugin uninstalled", cx, move |client| {
-                                    client.call(
-                                        "DELETE",
-                                        &format!("/Plugins/{id}/{version}"),
-                                        &[],
-                                    )
-                                })
-                            }),
-                        },
-                        cx,
-                    )
-                })),
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        let items = menu_plugin.items(cx);
+                        this.open_admin_menu(items, event.position(), window, cx);
+                    })),
             );
         }
 
@@ -257,7 +290,10 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                 .overflow_hidden()
                 .flex()
                 .flex_col()
-                .when(plugin.status == "Disabled", |el| el.opacity(0.7))
+                .when(
+                    matches!(plugin.status.as_str(), "Disabled" | "Superseded" | "Deleted"),
+                    |el| el.opacity(0.62),
+                )
                 // The image, over a coloured tile with the first letter. The
                 // tile stays when the plugin has no image or it cannot load.
                 .child(

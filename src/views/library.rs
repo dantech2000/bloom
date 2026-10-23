@@ -12,7 +12,13 @@ use crate::{
     app::{Bloom, LibraryShow, PAGE_SIZE, Page},
     icons::{Filled, filled},
     jellyfin::ItemKind,
-    ui::{glass::glass, menu::Menu, scroll_area::ScrollArea, theme::UiTheme},
+    ui::{
+        glass::glass,
+        menu::Menu,
+        motion::{Enter, enter},
+        scroll_area::ScrollArea,
+        theme::UiTheme,
+    },
     views::cards::{empty_state, grid, icon, skeleton_row},
 };
 use crate::ui::tip::tip;
@@ -41,10 +47,17 @@ impl Bloom {
             format!("{}-{} of {}", data.start + 1, last.min(data.total), data.total)
         };
 
-        let tool = |id: &'static str, glyph: gpui_kit::Svg| {
+        // On a phone the toolbar takes two rows: the view with the range
+        // and the pages, then the actions. Its tools are 44 points there,
+        // the size a thumb needs; 38 on the Mac.
+        let compact = self.compact_w();
+        let tool_size = if compact { 44. } else { 38. };
+        let tool = |id: &'static str, label: &'static str, glyph: gpui_kit::Svg| {
             div()
                 .id(id)
-                .size(px(38.))
+                .role(gpui_kit::Role::Button)
+                .aria_label(label)
+                .size(px(tool_size))
                 .rounded(px(12.))
                 .flex()
                 .items_center()
@@ -56,7 +69,7 @@ impl Bloom {
         let has_previous = data.start > 0;
         let has_next = data.start + PAGE_SIZE < data.total;
         let page_arrow = |id: &'static str, glyph: LucideIcon, enabled: bool, forward: bool| {
-            tool(id, icon(glyph, 22., fg))
+            tool(id, if forward { "Next page" } else { "Previous page" }, icon(glyph, 22., fg))
                 .tooltip(tip(if forward { "Next page" } else { "Previous page" }))
                 .when(!enabled, |el| el.opacity(0.3))
                 .when(enabled, |el| {
@@ -85,7 +98,9 @@ impl Bloom {
             .child(
                 div()
                     .id("library.play-all")
-                    .h(px(38.))
+                    .role(gpui_kit::Role::Button)
+                    .aria_label("Play all")
+                    .h(px(tool_size))
                     .pl(px(14.))
                     .pr(px(16.))
                     .rounded_l_full()
@@ -103,8 +118,11 @@ impl Bloom {
             )
             .child(
                 div()
-                    .id("library.shuffle").tooltip(tip("Shuffle"))
-                    .h(px(38.))
+                    .id("library.shuffle")
+                    .role(gpui_kit::Role::Button)
+                    .aria_label("Shuffle")
+                    .tooltip(tip("Shuffle"))
+                    .h(px(tool_size))
                     .px(px(14.))
                     .rounded_r_full()
                     .flex()
@@ -127,8 +145,10 @@ impl Bloom {
                 .trigger(
                     div()
                         .id(label)
+                        .role(gpui_kit::Role::Button)
+                        .aria_label(label)
                         .tooltip(tip(label))
-                        .size(px(38.))
+                        .size(px(tool_size))
                         .rounded(px(12.))
                         .flex()
                         .items_center()
@@ -139,10 +159,8 @@ impl Bloom {
                 )
         };
 
-        // On a phone the toolbar takes two rows: the title with the range
-        // and the pages, then the actions.
-        let compact = self.compact_w();
-        let toolbar_h = if compact { 96. } else { 54. };
+        let toolbar_h = if compact { 98. } else { 54. };
+        let views = !LibraryShow::of(data.view.collection_type.as_deref()).is_empty();
         let toolbar = div()
             .px(px(m.side))
             .h(px(toolbar_h))
@@ -151,21 +169,53 @@ impl Bloom {
             .items_center()
             .gap(px(if compact { 10. } else { 18. }))
             .child({
-                let title = div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.))
-                    .text_size(px(22.))
-                    .text_color(soft)
-                    .child(data.show.label(&data.title));
-                // The title opens the views of the library, when it has some.
-                if LibraryShow::of(data.view.collection_type.as_deref()).is_empty() {
-                    title.into_any_element()
+                // The Mac: the title, which opens the views of the library
+                // when it has some. A phone has the title in the top bar,
+                // so the row holds the view as a small pill instead (the
+                // title stood twice, 2026-10-23), or nothing without views.
+                if compact {
+                    if views {
+                        Menu::new(&self.show_menu, "View")
+                            .trigger_style_with(|button| button)
+                            .trigger(
+                                div()
+                                    .id("library.view")
+                                    .role(gpui_kit::Role::Button)
+                                    .aria_label("View")
+                                    .h(px(36.))
+                                    .pl(px(14.))
+                                    .pr(px(8.))
+                                    .rounded_full()
+                                    .bg(rgba(0xffffff1f))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(2.))
+                                    .text_size(px(15.))
+                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                    .text_color(fg)
+                                    .child(data.show.label(&data.title))
+                                    .child(filled(Filled::DropDown, 22., soft)),
+                            )
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    }
                 } else {
-                    Menu::new(&self.show_menu, "View")
-                        .trigger_style_with(|button| button)
-                        .trigger(title.child(filled(Filled::DropDown, 24., soft)))
-                        .into_any_element()
+                    let title = div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .text_size(px(22.))
+                        .text_color(soft)
+                        .child(data.show.label(&data.title));
+                    if views {
+                        Menu::new(&self.show_menu, "View")
+                            .trigger_style_with(|button| button)
+                            .trigger(title.child(filled(Filled::DropDown, 24., soft)))
+                            .into_any_element()
+                    } else {
+                        title.into_any_element()
+                    }
                 }
             })
             .child(
@@ -176,7 +226,7 @@ impl Bloom {
                     .child(if data.loading && data.items.is_empty() {
                         "∙".to_string()
                     } else {
-                        range
+                        range.clone()
                     }),
             )
             .child(div().flex_1())
@@ -201,8 +251,10 @@ impl Bloom {
                                 .trigger(
                                     div()
                                         .id("library.more")
+                                        .role(gpui_kit::Role::Button)
+                                        .aria_label("More")
                                         .tooltip(tip("More"))
-                                        .size(px(38.))
+                                        .size(px(tool_size))
                                         .rounded(px(12.))
                                         .flex()
                                         .items_center()
@@ -240,6 +292,27 @@ impl Bloom {
                     }),
             );
 
+        // The pages again under the grid: a page of a hundred is ten screens
+        // on a phone, and the arrows at the top were the only way on.
+        let footer = (data.total > PAGE_SIZE && !(data.loading && data.items.is_empty())).then(|| {
+            div()
+                .px(px(m.side))
+                .pt(px(8.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(14.))
+                .child(page_arrow("library.previous.end", LucideIcon::ChevronLeft, has_previous, false))
+                .child(
+                    div()
+                        .text_size(px(15.))
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .text_color(soft)
+                        .child(range.clone()),
+                )
+                .child(page_arrow("library.next.end", LucideIcon::ChevronRight, has_next, true))
+        });
+
         let body = if data.loading && data.items.is_empty() {
             skeleton_row(
                 self,
@@ -256,8 +329,12 @@ impl Bloom {
                 cx,
             )
         } else {
-            // The grid starts under the toolbar and its gap.
-            grid(self, &data.items, &client, toolbar_h + 12., cx)
+            // The grid starts under the toolbar and its gap. A new page of
+            // it lifts into place (`ui::motion`); the key names the page,
+            // so a redraw of the same page runs nothing.
+            let key = SharedString::from(format!("library.grid.{}.{:?}.{}", data.view.id, data.show, data.start));
+            div()
+                .child(enter(grid(self, &data.items, &client, toolbar_h + 12., cx), key, Enter::Lift, cx))
         };
 
         // Letter picker at the right edge, as on the web. It needs a tall
@@ -329,7 +406,8 @@ impl Bloom {
                             .gap(px(12.))
                             .pb(px(72.))
                             .child(toolbar)
-                            .child(body),
+                            .child(body)
+                            .children(footer),
                     ),
             )
             .children(picker)

@@ -28,8 +28,11 @@ impl gpui_kit::Global for HoveredCard {}
 
 /// Corner radius of card images.
 pub const CARD_RADIUS: f32 = 12.;
-/// Space between two card images in a row or grid.
+/// Space between two card images in a row or grid on the Mac; a phone has
+/// `Metrics::gap`.
 pub const CARD_GAP: f32 = 27.;
+/// The gap on a phone: three posters across at 121 points, not 109.
+const PHONE_GAP: f32 = 14.;
 /// Height of the two text lines under a card image.
 pub const CARD_TEXT_H: f32 = 52.;
 
@@ -46,6 +49,8 @@ pub struct Metrics {
     pub grid_columns: usize,
     /// Image width of a portrait card in a wrapping grid.
     pub grid_w: f32,
+    /// Space between two cards in a row or a grid.
+    pub gap: f32,
 }
 
 impl Metrics {
@@ -59,19 +64,18 @@ impl Metrics {
             w if w < crate::views::shell::COMPACT_W => (34., 64., 3),
             _ => (18.4, 30., 5),
         };
-        let side = if viewport < crate::views::shell::COMPACT_W {
-            16.
-        } else {
-            (viewport * 0.033).round() + 9.
-        };
+        let compact = viewport < crate::views::shell::COMPACT_W;
+        let side = if compact { 16. } else { (viewport * 0.033).round() + 9. };
+        let gap = if compact { PHONE_GAP } else { CARD_GAP };
         let inner = viewport - side * 2.;
         let columns = grid_columns as f32;
         Self {
             side,
-            portrait_w: (viewport * portrait_vw / 100. - CARD_GAP).floor(),
-            backdrop_w: (viewport * backdrop_vw / 100. - CARD_GAP).floor(),
+            portrait_w: (viewport * portrait_vw / 100. - gap).floor(),
+            backdrop_w: (viewport * backdrop_vw / 100. - gap).floor(),
             grid_columns,
-            grid_w: ((inner - CARD_GAP * (columns - 1.)) / columns).floor(),
+            grid_w: ((inner - gap * (columns - 1.)) / columns).floor(),
+            gap,
         }
     }
 
@@ -607,7 +611,8 @@ fn episode_line(item: &Item) -> String {
 }
 
 /// Moves a row by nearly one view width, the way the web arrows do. The row
-/// glides there in about a quarter of a second.
+/// glides there in about a quarter of a second, or jumps under Reduce
+/// Motion.
 fn page_row(handle: &ScrollHandle, direction: f32, window: &mut Window, cx: &mut App) {
     const STEP: Duration = Duration::from_millis(8);
     const STEPS: u32 = 34;
@@ -616,6 +621,13 @@ fn page_row(handle: &ScrollHandle, direction: f32, window: &mut Window, cx: &mut
     let from = handle.offset().x;
     let to = (from - view * 0.9 * direction).clamp(-max.max(px(0.)), px(0.));
     if to == from {
+        return;
+    }
+    if UiTheme::read(cx).motion.reduced || cx.reduce_motion() {
+        let mut offset = handle.offset();
+        offset.x = to;
+        handle.set_offset(offset);
+        window.refresh();
         return;
     }
     let handle = handle.clone();
@@ -707,7 +719,8 @@ pub fn section_padded(
 
     // Build the cards in view and one more at each side; empty space of the
     // same width stands in for the rest, so the row scrolls as before.
-    let stride = cards.width + CARD_GAP;
+    let gap = this.metrics().gap;
+    let stride = cards.width + gap;
     let scrolled = -f32::from(handle.offset().x);
     // A row that starts inside the page (the rows of the detail page, at
     // the right of the poster) is cut off at its start: a card that scrolls
@@ -720,7 +733,7 @@ pub fn section_padded(
         .min(cards.count);
     let first = first.min(last);
     let built: Vec<Stateful<Div>> = (first..last)
-        .map(|index| (cards.build)(index, cx).mr(px(CARD_GAP)))
+        .map(|index| (cards.build)(index, cx).mr(px(gap)))
         .collect();
 
     let heading = div()
@@ -744,6 +757,8 @@ pub fn section_padded(
         let handle = handle.clone();
         div()
             .id(SharedString::from(format!("{id}.{name}")))
+            .role(gpui_kit::Role::Button)
+            .aria_label(if direction < 0. { "Previous" } else { "Next" })
             .size(px(36.))
             .rounded(px(CARD_RADIUS))
             .flex()
@@ -756,6 +771,9 @@ pub fn section_padded(
             .on_click(move |_, window, cx| page_row(&handle, direction, window, cx))
     };
 
+    // A phone pans the row with a finger: no arrows there, and the heading
+    // has the whole width (they cut "Recently Added in Movies" short).
+    let compact = this.compact_w();
     div()
         .flex()
         .flex_col()
@@ -769,13 +787,15 @@ pub fn section_padded(
                 .items_center()
                 .justify_between()
                 .child(heading)
-                .child(
-                    div()
-                        .flex()
-                        .gap(px(8.))
-                        .child(arrow("prev", LucideIcon::ChevronLeft, -1.))
-                        .child(arrow("next", LucideIcon::ChevronRight, 1.)),
-                ),
+                .when(!compact, |el| {
+                    el.child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(arrow("prev", LucideIcon::ChevronLeft, -1.))
+                            .child(arrow("next", LucideIcon::ChevronRight, 1.)),
+                    )
+                }),
         )
         .child(
             div()
@@ -825,6 +845,7 @@ pub fn grid(
     let m = this.metrics();
     let columns = m.grid_columns.max(1);
     let stride = (m.grid_w * 1.5).round() + CARD_TEXT_H + ROW_GAP;
+    let gap = m.gap;
     let rows = items.len().div_ceil(columns);
     let scrolled = -f32::from(this.page_scroll.offset().y) - top;
     let first = ((scrolled / stride).floor() - 1.).max(0.) as usize;
@@ -835,7 +856,7 @@ pub fn grid(
         .px(px(m.side))
         .flex()
         .flex_wrap()
-        .gap_x(px(CARD_GAP))
+        .gap_x(px(gap))
         .child(div().w_full().h(px(first as f32 * stride)))
         .children(
             visible
@@ -854,10 +875,11 @@ pub fn skeleton_row(
     cx: &Context<Bloom>,
 ) -> Div {
     let t = UiTheme::read(cx);
+    let m = this.metrics();
     div()
         .flex()
-        .gap(px(CARD_GAP))
-        .px(px(this.metrics().side))
+        .gap(px(m.gap))
+        .px(px(m.side))
         .overflow_hidden()
         .children((0..count).map(|i| {
             div()

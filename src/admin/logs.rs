@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Logs: the log files of the server, newest first, and the last lines of
-//! the newest server log.
+//! Logs: the log files of the server in three groups (the server's own
+//! log first, then the plugins', then the media conversions'), and the
+//! last lines of the one that is open. The Mac shows the list beside the
+//! viewer; a phone shows the list, and a file opens as a page of its own.
 
 use anyhow::Result;
 use gpui_icons::LucideIcon;
@@ -12,7 +14,7 @@ use gpui_kit::{
 use serde::Deserialize;
 
 use crate::{
-    admin::{ago, badge, panel, rows::rows},
+    admin::{ago, badge, panel, rows::rows, users::icon_disc},
     app::{Bloom, Page},
     jellyfin::Client,
     ui::theme::UiTheme,
@@ -25,9 +27,11 @@ const TAIL_LINES: usize = 300;
 const LINE_CHARS: usize = 400;
 /// Height of a line of the viewer.
 const LINE_H: f32 = 20.;
-/// Smallest width of a file tile; the grid fits as many as the page holds.
-const FILE_MIN_W: f32 = 320.;
-const FILE_GAP: f32 = 10.;
+/// Width of the list of files beside the viewer on the Mac.
+const LIST_W: f32 = 340.;
+/// The list and the viewer sit side by side from this content width; a
+/// narrower window stacks them.
+const TWO_COLUMNS_W: f32 = 820.;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -62,6 +66,9 @@ pub struct Data {
     pub lines: Vec<Line>,
     /// Lines in the whole file.
     pub total_lines: usize,
+    /// Whether any line has a time and a level: the viewer keeps a column
+    /// for them then. An FFmpeg log has none.
+    pub timed: bool,
 }
 
 /// `wanted` is the file the user chose; without one, the page opens the
@@ -83,11 +90,13 @@ pub fn load(client: &Client, wanted: Option<&str>) -> Result<Data> {
         }
         None => (Vec::new(), 0),
     };
+    let timed = lines.iter().any(|line| !line.time.is_empty());
     Ok(Data {
         files,
         open,
         lines,
         total_lines,
+        timed,
     })
 }
 
@@ -100,8 +109,9 @@ fn tail(text: &str) -> (Vec<Line>, usize) {
         .iter()
         .map(|raw| {
             // "[2026-10-03 03:43:28.781 -07:00] [INF] [105] Source: message"
+            // (the server), "[2026-10-23 00:21:52] [INFO] message" (a plugin).
             let (time, rest) = match raw.strip_prefix('[').and_then(|r| r.split_once("] ")) {
-                Some((stamp, rest)) if stamp.len() > 19 && stamp.is_char_boundary(19) => {
+                Some((stamp, rest)) if stamp.len() >= 19 && stamp.is_char_boundary(19) => {
                     (stamp[11..19].to_string(), rest)
                 }
                 _ => (String::new(), *raw),
@@ -113,6 +123,13 @@ fn tail(text: &str) -> (Vec<Line>, usize) {
                 ("[INF] ", Level::Info),
                 ("[DBG] ", Level::Debug),
                 ("[VRB] ", Level::Debug),
+                ("[ERROR] ", Level::Error),
+                ("[FATAL] ", Level::Error),
+                ("[WARN] ", Level::Warning),
+                ("[WARNING] ", Level::Warning),
+                ("[INFO] ", Level::Info),
+                ("[DEBUG] ", Level::Debug),
+                ("[TRACE] ", Level::Debug),
             ]
             .iter()
             .find_map(|(tag, level)| Some((*level, rest.strip_prefix(tag)?)))
@@ -138,8 +155,9 @@ fn file_size(bytes: u64) -> String {
     }
 }
 
-/// One line of the log viewer.
-fn log_line(line: &Line) -> Div {
+/// One line of the log viewer. `timed` keeps the column of the time and
+/// the level, which a line that continues an entry leaves empty.
+fn log_line(line: &Line, timed: bool) -> Div {
     let (tag, tag_color, text_color) = level_style(line.level);
     div()
         .h(px(LINE_H))
@@ -149,16 +167,15 @@ fn log_line(line: &Line) -> Div {
         .gap(px(10.))
         .when(line.level == Level::Error, |el| el.bg(rgba(0xef535024)))
         .when(line.level == Level::Warning, |el| el.bg(rgba(0xffb30014)))
-        .child(
-            div()
-                .w(px(96.))
-                .flex_shrink_0()
-                .text_color(tag_color)
-                // A line that continues an entry has no time and tag.
-                .when(!line.time.is_empty(), |el| {
-                    el.child(format!("{} {tag}", line.time))
-                }),
-        )
+        .when(timed, |el| {
+            el.child(
+                div()
+                    .w(px(96.))
+                    .flex_shrink_0()
+                    .text_color(tag_color)
+                    .when(!line.time.is_empty(), |el| el.child(format!("{} {tag}", line.time))),
+            )
+        })
         .child(
             div()
                 .flex_1()
@@ -179,80 +196,238 @@ fn level_style(level: Level) -> (&'static str, Rgba, Rgba) {
     }
 }
 
-pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
-    let t = UiTheme::read(cx).clone();
-    let content_w = (app.admin_content_w() - 38.).max(FILE_MIN_W);
-    let columns = (((content_w + FILE_GAP) / (FILE_MIN_W + FILE_GAP)).floor() as usize).max(1);
-    let file_w = ((content_w - FILE_GAP * (columns - 1) as f32) / columns as f32).floor();
+/// The group of a log file, from its name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Server,
+    Plugin,
+    Ffmpeg,
+}
 
-    let mut files = div().flex().flex_wrap().gap(px(FILE_GAP));
-    for file in &data.files {
-        let open = data.open.as_deref() == Some(file.name.as_str());
-        // The server log, a media conversion, or the log of a plugin.
-        let glyph = if file.name.starts_with("log_") {
-            LucideIcon::Server
-        } else if file.name.starts_with("FFmpeg") {
-            LucideIcon::Clapperboard
+impl Kind {
+    fn of(name: &str) -> Self {
+        if name.starts_with("log_") {
+            Self::Server
+        } else if name.starts_with("FFmpeg") {
+            Self::Ffmpeg
         } else {
-            LucideIcon::Boxes
-        };
-        let name = file.name.clone();
-        files = files.child(
-            div()
-                .id(SharedString::from(format!("admin.log.{}", file.name)))
-                .cursor_pointer()
-                .hover(|s| s.bg(rgba(0xffffff1f)))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    if let Page::Admin(data) = &mut this.page {
-                        data.log_open = Some(name.clone());
-                    }
-                    this.load_page(cx);
-                }))
-                .w(px(file_w))
-                .h(px(52.))
-                .px(px(12.))
-                .rounded(px(12.))
-                .border_1()
-                .border_color(if open { rgba(0xf5f5f766) } else { rgba(0xf5f5f714) })
-                .bg(if open { rgba(0xffffff1f) } else { rgba(0xffffff08) })
-                .flex()
-                .items_center()
-                .gap(px(12.))
-                .child(icon(glyph, 18., t.colors.muted_foreground))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .text_ellipsis_middle()
-                                .whitespace_nowrap()
-                                .overflow_hidden()
-                                .text_size(px(14.))
-                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                .text_color(t.colors.foreground)
-                                .child(file.name.clone()),
-                        )
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(px(12.))
-                                .text_color(t.colors.muted_foreground)
-                                .child(format!(
-                                    "{} · {}",
-                                    file_size(file.size),
-                                    ago(&file.date_modified)
-                                )),
-                        ),
-                ),
-        );
+            Self::Plugin
+        }
     }
 
+    fn label(self) -> &'static str {
+        match self {
+            Self::Server => "Server",
+            Self::Plugin => "Plugins",
+            Self::Ffmpeg => "Media conversion",
+        }
+    }
+
+    fn glyph(self) -> LucideIcon {
+        match self {
+            Self::Server => LucideIcon::Server,
+            Self::Plugin => LucideIcon::Boxes,
+            Self::Ffmpeg => LucideIcon::Clapperboard,
+        }
+    }
+}
+
+pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
+    let compact = app.compact_w();
+    // The file the user chose, as opposed to the one the page opened by
+    // itself; on a phone it is a page of its own.
+    let chosen = app.admin_data().and_then(|d| d.log_open.clone());
+    if compact {
+        return if chosen.is_some() && chosen == data.open {
+            viewer(data, true, cx)
+        } else {
+            file_list(app, data, true, cx)
+        };
+    }
+
+    let two_columns = app.admin_content_w() >= TWO_COLUMNS_W;
+    let list = file_list(app, data, false, cx);
+    let viewer = data
+        .open
+        .clone()
+        .map(|name| panel(name, cx).child(viewer(data, false, cx)));
+    if two_columns {
+        div()
+            .flex()
+            .items_start()
+            .gap(px(20.))
+            .child(list.w(px(LIST_W)).flex_shrink_0())
+            .child(div().flex_1().min_w_0().children(viewer))
+    } else {
+        div().flex().flex_col().gap(px(20.)).children(viewer).child(list)
+    }
+}
+
+/// The files in their groups; each group is a card of rows. A field finds
+/// one by its name once there are enough to look for one.
+fn file_list(app: &Bloom, data: &Data, compact: bool, cx: &mut Context<Bloom>) -> Div {
+    let t = UiTheme::read(cx).clone();
+    let mut groups = div().flex().flex_col().gap(px(if compact { 14. } else { 20. }));
+    if data.files.is_empty() {
+        return groups.child(
+            super::card(cx)
+                .text_size(px(15.))
+                .text_color(t.colors.foreground.opacity(0.6))
+                .child("The server has no log files."),
+        );
+    }
+    let query = app.admin_logs_filter.read(cx).value().trim().to_lowercase();
+    if data.files.len() >= super::FIND_FROM {
+        groups = groups.child(super::find_field(&app.admin_logs_filter, "Find a log file", compact));
+    }
+    let mut any = false;
+    for kind in [Kind::Server, Kind::Plugin, Kind::Ffmpeg] {
+        let files: Vec<&LogFile> = data
+            .files
+            .iter()
+            .filter(|f| Kind::of(&f.name) == kind)
+            .filter(|f| query.is_empty() || f.name.to_lowercase().contains(&query))
+            .collect();
+        if files.is_empty() {
+            continue;
+        }
+        any = true;
+        let mut rows = div().flex().flex_col().child(
+            div()
+                .px(px(16.))
+                .pt(px(14.))
+                .pb(px(6.))
+                .text_size(px(12.))
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                .text_color(t.colors.foreground.opacity(0.6))
+                .child(format!("{} ({})", kind.label(), files.len())),
+        );
+        for file in files {
+            let open = !compact && data.open.as_deref() == Some(file.name.as_str());
+            rows = rows.child(file_row(file, kind, open, compact, &t, cx));
+        }
+        groups = groups.child(super::surface(div()).overflow_hidden().child(rows));
+    }
+    if !any {
+        groups = groups.child(super::surface(div()).child(super::nothing_found("log file", &query, cx)));
+    }
+    groups
+}
+
+/// The title of a media conversion's log, from its name: the kind of
+/// stream and the time ("Direct stream \u{b7} 21 Oct 2026 21:05" for
+/// "FFmpeg.DirectStream-2026-10-21_21-05-05_<hash>.log"). None for a
+/// name of another shape.
+fn ffmpeg_title(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("FFmpeg.")?;
+    let (kind, rest) = rest.split_once('-')?;
+    let kind = match kind {
+        "DirectStream" => "Direct stream",
+        "Transcode" => "Transcode",
+        "Remux" => "Remux",
+        other => other,
+    };
+    // "2026-10-21_21-05-05"
+    let stamp = rest.get(..19)?;
+    let (date, time) = stamp.split_once('_')?;
+    let mut date = date.split('-');
+    let (year, month, day) = (date.next()?, date.next()?, date.next()?);
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .get(month.parse::<usize>().ok()?.checked_sub(1)?)?;
+    let time = time.get(..5)?.replace('-', ":");
+    Some(format!(
+        "{kind} \u{b7} {} {month} {year} {time}",
+        day.trim_start_matches('0')
+    ))
+}
+
+/// A row of the list: the glyph of the group on a disc, the name, the
+/// size and the age. A media conversion's row has the kind and the time
+/// as its title and the whole name in the detail, which wraps; the other
+/// names are the title (a long one wraps). On the Mac the open file is
+/// lit; on a phone a chevron says the row opens a page.
+fn file_row(
+    file: &LogFile,
+    kind: Kind,
+    open: bool,
+    compact: bool,
+    t: &UiTheme,
+    cx: &mut Context<Bloom>,
+) -> gpui_kit::Stateful<Div> {
+    let name = file.name.clone();
+    let title = match kind {
+        Kind::Ffmpeg => ffmpeg_title(&file.name),
+        _ => None,
+    };
+    let mut detail = Vec::new();
+    if title.is_some() {
+        detail.push(file.name.clone());
+    }
+    detail.push(file_size(file.size));
+    detail.push(ago(&file.date_modified));
+    let detail = detail.join(" \u{b7} ");
+    div()
+        .id(SharedString::from(format!("admin.log.{}", file.name)))
+        .role(gpui_kit::Role::Button)
+        .aria_label(file.name.clone())
+        .min_h(px(if compact { 56. } else { 50. }))
+        .px(px(16.))
+        .py(px(8.))
+        .flex()
+        .items_center()
+        .gap(px(14.))
+        .cursor_pointer()
+        .when(open, |el| el.bg(rgba(0xffffff14)))
+        .hover(|s| s.bg(rgba(0xf5f5f714)))
+        .child(icon_disc(kind.glyph(), t.colors.foreground, if compact { 36. } else { 32. }))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(
+                    div()
+                        // 15 px on the phone too: a name is an identifier,
+                        // and at 17 px "JellyfinEnhanced_2026-10-23.log"
+                        // wrapped its last letter.
+                        .text_size(px(15.))
+                        .line_height(px(20.))
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .text_color(t.colors.foreground)
+                        .child(title.unwrap_or_else(|| file.name.clone())),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .line_height(px(18.))
+                        .text_color(t.colors.foreground.opacity(0.6))
+                        .child(detail),
+                ),
+        )
+        .when(compact, |el| {
+            el.child(icon(LucideIcon::ChevronRight, 16., t.colors.foreground.opacity(0.35)))
+        })
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            if let Page::Admin(data) = &mut this.page {
+                data.log_open = Some(name.clone());
+            }
+            this.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+            this.load_page(cx);
+        }))
+}
+
+/// The last lines of the open file under a line with the count and the
+/// warnings and errors among them. On a phone the lines take the page's
+/// width, with no card around them.
+fn viewer(data: &Data, compact: bool, cx: &mut Context<Bloom>) -> Div {
+    let t = UiTheme::read(cx).clone();
     let warnings = data.lines.iter().filter(|l| l.level == Level::Warning).count();
     let errors = data.lines.iter().filter(|l| l.level == Level::Error).count();
-    let mut viewer = div()
+    let mut lines = div()
         .rounded(px(12.))
         .bg(rgba(0x00000066))
         .py(px(10.))
@@ -267,11 +442,11 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
             };
             data.lines[range]
                 .iter()
-                .map(|line| log_line(line).into_any_element())
+                .map(|line| log_line(line, data.timed).into_any_element())
                 .collect()
         }));
     if data.lines.is_empty() {
-        viewer = viewer.child(
+        lines = lines.child(
             div()
                 .px(px(14.))
                 .text_color(t.colors.muted_foreground)
@@ -280,17 +455,13 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
     }
 
     let mut heading = div()
-        .mb(px(12.))
         .flex()
+        .flex_wrap()
         .items_center()
         .gap(px(10.))
         .text_size(px(14.))
         .text_color(t.colors.muted_foreground)
-        .child(format!(
-            "Last {} of {} lines",
-            data.lines.len(),
-            data.total_lines
-        ));
+        .child(format!("Last {} of {} lines", data.lines.len(), data.total_lines));
     if warnings > 0 {
         heading = heading.child(badge(
             format!("{warnings} {}", if warnings == 1 { "warning" } else { "warnings" }),
@@ -307,9 +478,8 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
     div()
         .flex()
         .flex_col()
-        .gap(px(20.))
-        .child(panel(format!("Log Files ({})", data.files.len()), cx).child(files))
-        .when_some(data.open.clone(), |el, name| {
-            el.child(panel(name, cx).child(heading).child(viewer))
-        })
+        .gap(px(12.))
+        .when(compact, |el| el.pt(px(4.)))
+        .child(heading)
+        .child(lines)
 }

@@ -9,14 +9,20 @@
 use std::rc::Rc;
 
 use gpui_kit::{
-    ClickEvent, ClipboardItem, Context, Div, Focusable as _, InteractiveElement as _,
-    ParentElement as _, Stateful, StatefulInteractiveElement as _, Styled, Window, div, px, rgba,
+    AnyElement, ClickEvent, ClipboardItem, Context, Div, Focusable as _, InteractiveElement as _,
+    ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _, Styled, Window, div,
+    px, rgba,
 };
 
 use super::{ButtonKind, button};
 use crate::{
     app::{Bloom, Page},
-    ui::{glass::glass, input::Input, theme::UiTheme},
+    ui::{
+        glass::glass,
+        input::Input,
+        motion::{Enter, enter},
+        theme::UiTheme,
+    },
 };
 
 /// The dialogs that wait for the user. One shows at a time.
@@ -213,7 +219,7 @@ impl Bloom {
     }
 
     /// The form dialog over the page.
-    pub(crate) fn render_prompt(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(crate) fn render_prompt(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let prompt = self.dialogs.prompt.clone()?;
         let t = UiTheme::read(cx).clone();
         let mut fields = div().flex().flex_col().gap(px(12.));
@@ -270,7 +276,7 @@ impl Bloom {
     }
 
     /// The dialog that shows a value once.
-    pub(super) fn render_secret(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(super) fn render_secret(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let secret = self.dialogs.secret.clone()?;
         let t = UiTheme::read(cx).clone();
         let value = secret.value.clone();
@@ -317,9 +323,10 @@ impl Bloom {
 }
 
 /// Dark layer over the page with a dialog in its middle. A click beside the
-/// dialog closes it.
-fn backdrop(id: &'static str, card: Stateful<Div>, cx: &mut Context<Bloom>) -> Stateful<Div> {
-    div()
+/// dialog closes it. The layer fades in and the dialog settles into place.
+fn backdrop(id: &'static str, card: Stateful<Div>, cx: &mut Context<Bloom>) -> AnyElement {
+    let card = enter(card, SharedString::from(format!("{id}.card.in")), Enter::Settle, cx);
+    let layer = div()
         .id(id)
         .absolute()
         .inset_0()
@@ -337,7 +344,8 @@ fn backdrop(id: &'static str, card: Stateful<Div>, cx: &mut Context<Bloom>) -> S
         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
             this.close_admin_dialog(window, cx)
         }))
-        .child(card)
+        .child(card);
+    enter(layer, SharedString::from(format!("{id}.in")), Enter::Fade, cx)
 }
 
 /// The glass card of a dialog with its title and message.

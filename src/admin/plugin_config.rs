@@ -890,7 +890,9 @@ pub fn render(app: &Bloom, editor: &Editor, cx: &mut Context<Bloom>) -> Div {
     }
     page = page.child(note);
     if editor.fields.len() > FILTER_MIN {
-        page = page.child(Input::new(&editor.filter_input).aria_label("Filter the settings").w(px(360.)));
+        page = page.child(Input::new(&editor.filter_input)
+            .keyboard(crate::ui::input::Keyboard::plain())
+            .aria_label("Filter the settings").w(px(360.)));
     }
     if groups.is_empty() {
         page = page.child(

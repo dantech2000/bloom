@@ -622,7 +622,9 @@ impl Bloom {
                         .items_center()
                         .gap(px(8.))
                         .children(input.map(|input| {
-                            Input::new(&input).aria_label("Bookmark label").flex_1().h(px(38.))
+                            Input::new(&input)
+                                .keyboard(crate::ui::input::Keyboard::name())
+                                .aria_label("Bookmark label").flex_1().h(px(38.))
                         }))
                         .child(
                             div()

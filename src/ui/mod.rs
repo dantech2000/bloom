@@ -3,6 +3,7 @@ pub mod button;
 pub mod glass;
 pub mod input;
 pub mod menu;
+pub mod motion;
 pub mod scroll_area;
 pub mod slider;
 pub mod theme;

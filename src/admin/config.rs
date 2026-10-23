@@ -957,7 +957,10 @@ fn list_is_numbers(app: &Bloom, field: &Field) -> bool {
 
 // ----- the page -----------------------------------------------------------------
 
-/// A field that shows its value and opens a form on a click.
+/// A field that shows its value and opens a form on a click. It has the
+/// fill and the edge of a text field at rest (`ui::input`), so it reads
+/// as a field before the pointer reaches it (it read as text with a
+/// pencil beside it, 2026-10-23).
 pub(super) fn value_button(id: SharedString, value: String, cx: &Context<Bloom>) -> Stateful<Div> {
     let t = UiTheme::read(cx);
     let empty = value.is_empty();
@@ -968,10 +971,10 @@ pub(super) fn value_button(id: SharedString, value: String, cx: &Context<Bloom>)
         .h(px(38.))
         .pl(px(12.))
         .pr(px(10.))
-        .rounded(px(8.))
+        .rounded(t.radius.lg)
         .border_1()
-        .border_color(rgba(0x282828cc))
-        .bg(rgba(0x00000059))
+        .border_color(t.colors.input)
+        .bg(t.colors.input.opacity(0.3))
         .flex()
         .items_center()
         .justify_between()

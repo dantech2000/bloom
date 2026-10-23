@@ -35,7 +35,7 @@ use anyhow::Result;
 pub use dialogs::{Field, Prompt, Secret};
 use gpui_icons::LucideIcon;
 use gpui_kit::{
-    ClickEvent, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
+    AnyElement, ClickEvent, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled, div,
     prelude::FluentBuilder as _, px, rgb, rgba,
 };
@@ -43,7 +43,12 @@ use gpui_kit::{
 use crate::{
     app::{Bloom, Page},
     jellyfin::Client,
-    ui::{glass::glass, scroll_area::ScrollArea, theme::UiTheme},
+    ui::{
+        glass::glass,
+        motion::{Enter, enter},
+        scroll_area::ScrollArea,
+        theme::UiTheme,
+    },
     views::cards::icon,
 };
 
@@ -232,6 +237,8 @@ pub struct AdminData {
     /// while the user did not close it. An answer for another open is
     /// dropped.
     pub plugin_open: Option<crate::app::Revision>,
+    /// The user whose page is open on the Users section (the id).
+    pub user_open: Option<String>,
     /// When the live reload last asked for a redraw.
     redrawn: Instant,
 }
@@ -259,8 +266,35 @@ impl AdminData {
             text_editor: None,
             plugin_editor: None,
             plugin_open: None,
+            user_open: None,
             redrawn: Instant::now(),
         }
+    }
+
+    /// The name of the user whose page is open, for the top bar of a phone.
+    pub fn open_user_name(&self) -> Option<String> {
+        let id = self.user_open.as_ref()?;
+        self.users
+            .as_ref()?
+            .users
+            .iter()
+            .find(|user| &user.id == id)
+            .map(|user| user.name.clone())
+    }
+
+    /// The title of the page inside a section on a phone: the name of the
+    /// open user, or of the log file the user chose.
+    pub fn subpage_title(&self) -> Option<String> {
+        if let Some(name) = self.open_user_name() {
+            return Some(name);
+        }
+        if self.section == Section::Logs {
+            let open = self.log_open.as_ref()?;
+            if self.logs.as_ref()?.open.as_ref() == Some(open) {
+                return Some(open.clone());
+            }
+        }
+        None
     }
 
     /// Whether a live reload needs a redraw: when the data changed, and once
@@ -318,6 +352,7 @@ impl Bloom {
                 // A click in the list of sections shows the list of the
                 // section; an editor with edits that are not saved stays.
                 data.triggers = None;
+                data.user_open = None;
                 if data.access.as_ref().is_some_and(|editor| !editor.dirty()) {
                     data.access = None;
                 }
@@ -347,10 +382,64 @@ impl Bloom {
         if data.list {
             return false;
         }
+        // The pages inside a section close first: the access editor (when
+        // it has nothing to save), then the page of a user.
+        if data.access.as_ref().is_some_and(|editor| !editor.dirty()) {
+            data.access = None;
+            self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+            cx.notify();
+            return true;
+        }
+        if data.user_open.is_some() {
+            data.user_open = None;
+            self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+            cx.notify();
+            return true;
+        }
+        if data.section == Section::Logs && data.log_open.is_some() {
+            data.log_open = None;
+            self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+            cx.notify();
+            return true;
+        }
         data.list = true;
         self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
         cx.notify();
         true
+    }
+
+    /// Opens the "…" menu of a row or a card of the dashboard with these
+    /// entries, at the point of the click. One menu serves every row: the
+    /// entries are built by the row that was clicked.
+    pub fn open_admin_menu(
+        &mut self,
+        items: Vec<crate::ui::menu::MenuItem>,
+        position: gpui_kit::Point<gpui_kit::Pixels>,
+        window: &mut gpui_kit::Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.admin_menu.update(cx, |menu, cx| {
+            menu.set_items(items, cx);
+            menu.open_at(Some(position), window, cx);
+        });
+    }
+
+    /// Opens the page of a user on the Users section.
+    pub fn admin_open_user(&mut self, id: String, cx: &mut Context<Self>) {
+        if let Page::Admin(data) = &mut self.page {
+            data.user_open = Some(id);
+            self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+            cx.notify();
+        }
+    }
+
+    /// Back from the page of a user to the list.
+    pub fn admin_close_user(&mut self, cx: &mut Context<Self>) {
+        if let Page::Admin(data) = &mut self.page {
+            data.user_open = None;
+            self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+            cx.notify();
+        }
     }
 
     /// Width of the content of a section: the window less the sidebar and
@@ -424,7 +513,7 @@ impl Bloom {
                                 }
                             }
                         }
-                        Err(err) => data.error = Some(format!("{err:#}")),
+                        Err(err) => data.error = Some(explain_load(&err)),
                     }
                 }
                 cx.notify();
@@ -687,6 +776,20 @@ impl Bloom {
         // A phone shows one of the two: the list, or the section with the
         // top bar's title (the back arrow returns to the list).
         let (show_list, show_page) = if compact { (data.list, !data.list) } else { (true, true) };
+        // How the page comes in: pushed from the right on a phone (the
+        // section from the list, a user or a log from the section), a fade
+        // on the Mac where the sidebar stays. The key names the page, so a
+        // change of section or of subpage runs it again.
+        let page_key = SharedString::from(format!(
+            "admin.page.{:?}.{}.{}.{}{}{}",
+            data.section,
+            data.user_open.as_deref().unwrap_or(""),
+            data.log_open.as_deref().unwrap_or(""),
+            data.access.is_some() as u8,
+            data.plugin_editor.is_some() as u8,
+            data.triggers.is_some() as u8,
+        ));
+        let page = enter(page, page_key, if compact { Enter::Push } else { Enter::Fade }, cx);
         div()
             .relative()
             .size_full()
@@ -703,7 +806,9 @@ impl Bloom {
                             ScrollArea::new("admin.nav.scroll")
                                 .size_full()
                                 .child(sidebar.when(compact, |el| el.px(px(4.)).pb(px(72.)))),
-                        ),
+                        )
+                        // Back from a section on a phone: the list fades in.
+                        .map(|el| if compact { enter(el, "admin.list", Enter::Fade, cx) } else { el.into_any_element() }),
                 )
             })
             .when(show_page, |el| {
@@ -744,29 +849,11 @@ impl Bloom {
     }
 
     /// The question dialog over the page.
-    pub(crate) fn render_confirm(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(crate) fn render_confirm(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let confirm = self.dialogs.confirm.clone()?;
         let t = UiTheme::read(cx).clone();
         let run = confirm.run.clone();
-        Some(
-            div()
-                .id("admin.confirm")
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(rgba(0x00000099))
-                // The page behind takes no click meanwhile (see `backdrop`
-                // in `dialogs.rs`).
-                .occlude()
-                // A click beside the dialog closes it.
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.dialogs.confirm = None;
-                    cx.notify();
-                }))
-                .child(
-                    div()
+        let card = div()
                         .id("admin.confirm.card")
                         .relative()
                         .w(px(440.))
@@ -824,9 +911,25 @@ impl Bloom {
                                         },
                                     )),
                                 ),
-                        ),
-                ),
-        )
+                        );
+        let backdrop = div()
+                .id("admin.confirm")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000099))
+                // The page behind takes no click meanwhile (see `backdrop`
+                // in `dialogs.rs`).
+                .occlude()
+                // A click beside the dialog closes it.
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.dialogs.confirm = None;
+                    cx.notify();
+                }))
+                .child(enter(card, "admin.confirm.card.in", Enter::Settle, cx));
+        Some(enter(backdrop, "admin.confirm.in", Enter::Fade, cx))
     }
 }
 
@@ -838,18 +941,99 @@ fn section_page<D>(
     render: impl FnOnce(&D, &mut Context<Bloom>) -> Div,
 ) -> Div {
     let t = UiTheme::read(cx).clone();
-    let note = |text: String| {
-        div()
-            .py(px(40.))
-            .text_size(px(15.))
-            .text_color(t.colors.muted_foreground)
-            .child(text)
-    };
     match (loaded, &data.error) {
         (Some(loaded), _) => render(loaded, cx),
-        (None, Some(error)) => note(format!("Could not load this page: {error}")),
-        (None, None) => note("Loading…".to_string()),
+        // The failure in plain words, and a way to try again without
+        // leaving the page (the raw error and no button, before 2026-10-23).
+        (None, Some(error)) => card(cx)
+            .max_w(px(560.))
+            .gap(px(14.))
+            .child(
+                div()
+                    .text_size(px(17.))
+                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                    .text_color(t.colors.foreground)
+                    .child(format!("{} could not load", data.section.label())),
+            )
+            .child(
+                div()
+                    .text_size(px(15.))
+                    .line_height(px(22.))
+                    .text_color(t.colors.foreground.opacity(0.7))
+                    .child(error.clone()),
+            )
+            .child(
+                div().flex().child(
+                    button("admin.retry", "Try again", ButtonKind::Primary, cx)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            if let Page::Admin(data) = &mut this.page {
+                                data.error = None;
+                            }
+                            this.load_page(cx);
+                            cx.notify();
+                        })),
+                ),
+            ),
+        (None, None) => skeleton(data.section),
     }
+}
+
+/// What a failed load says, in plain words, by what the error was: the
+/// server away, the session gone, the page missing on this version, the
+/// server in trouble, or an answer the app did not understand.
+fn explain_load(err: &anyhow::Error) -> String {
+    use crate::connection::{Verdict, Why, classify, plain_words};
+    let text = format!("{err:#}");
+    match classify(err) {
+        Verdict::Unreachable(Why::Gateway(code)) => format!(
+            "The server is offline behind its proxy ({code}): the proxy answers, but the server \
+             behind it does not."
+        ),
+        Verdict::Unreachable(why) => {
+            format!("The server does not answer. {} Check your network connection.", plain_words(why))
+        }
+        Verdict::Unauthorized => {
+            "The server refused the request (401): the session is no longer valid. Sign in again."
+                .to_string()
+        }
+        Verdict::Answered if text.contains("HTTP 403") => {
+            "The server refused the request (403): the account may not be an administrator.".to_string()
+        }
+        Verdict::Answered if text.contains("HTTP 404") => {
+            "This page is not available on this version of the server.".to_string()
+        }
+        Verdict::Answered if text.contains("HTTP 5") => {
+            "The server has a problem at the moment. Try again in a little while.".to_string()
+        }
+        Verdict::Answered if text.contains("decode") => {
+            "The server answered, but not in a way Bloom understands.".to_string()
+        }
+        Verdict::Answered => text,
+    }
+}
+
+/// The shape of a section while it loads: a line of counts and two
+/// cards, as most sections are, so the page does not jump when the data
+/// comes. Quiet glass, no text.
+fn skeleton(section: Section) -> Div {
+    let block = |w: f32, h: f32| surface(div()).w(px(w)).h(px(h)).opacity(0.45);
+    let compact = crate::views::shell::compact_now();
+    let wide = !compact && !matches!(section, Section::Logs);
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(18.))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(12.))
+                .child(block(128., 56.))
+                .child(block(160., 56.))
+                .when(wide, |el| el.child(block(140., 56.)).child(block(176., 56.))),
+        )
+        .child(surface(div()).w_full().h(px(if compact { 220. } else { 180. })).opacity(0.45))
+        .child(surface(div()).w_full().h(px(if compact { 320. } else { 300. })).opacity(0.3))
 }
 
 // ----- shared widgets ---------------------------------------------------------
@@ -878,6 +1062,59 @@ pub fn surface<E: Styled + gpui_kit::ParentElement + gpui_kit::prelude::FluentBu
         .border_color(rgba(0xf5f5f733))
         .when(!liquid, |el| el.bg(rgba(0x2a2a2ab0)))
         .when(liquid, |el| el.relative().child(crate::ui::glass::card_glass(px(24.), crate::ui::glass::POPUP_TINT)))
+}
+
+/// The field that finds an entry of a long list (users, tasks, log files):
+/// the whole width, a plain keyboard, the sizes of the platform.
+pub fn find_field(
+    state: &gpui_kit::Entity<crate::ui::input::InputState>,
+    label: &'static str,
+    compact: bool,
+) -> crate::ui::input::Input {
+    crate::ui::input::Input::new(state)
+        .keyboard(crate::ui::input::Keyboard::plain())
+        .aria_label(label)
+        .w_full()
+        .h(px(if compact { 50. } else { 44. }))
+        .when(compact, |el| el.text_size(px(17.)).line_height(px(22.)))
+}
+
+/// Entries this many or more get a field to find one.
+pub const FIND_FROM: usize = 10;
+
+/// A line that says a list has nothing for the query.
+pub fn nothing_found(what: &str, query: &str, cx: &Context<Bloom>) -> Div {
+    let t = UiTheme::read(cx);
+    div()
+        .h(px(60.))
+        .px(px(16.))
+        .flex()
+        .items_center()
+        .text_size(px(15.))
+        .text_color(t.colors.foreground.opacity(0.6))
+        .child(format!("No {what} named \u{201c}{query}\u{201d}."))
+}
+
+/// The "…" button of a row or a card: the actions that are not the main
+/// one go into its menu (`Bloom::open_admin_menu`). Add `.on_click(...)`
+/// that builds the entries and opens the menu at `event.position()`.
+pub fn more_button(id: impl Into<SharedString>, cx: &Context<Bloom>) -> Stateful<Div> {
+    let t = UiTheme::read(cx);
+    div()
+        .id(id.into())
+        .role(gpui_kit::Role::Button)
+        .aria_label("More")
+        .size(px(38.))
+        .flex_shrink_0()
+        .rounded(px(12.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .bg(rgba(0x282828cc))
+        .hover(|s| s.bg(rgba(0xffffff2e)))
+        .tooltip(crate::ui::tip::tip("More"))
+        .child(crate::views::cards::icon(LucideIcon::Ellipsis, 16., t.colors.foreground))
 }
 
 /// A plain card surface: the glass group of the theme, as the Settings

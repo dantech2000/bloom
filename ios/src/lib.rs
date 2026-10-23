@@ -17,7 +17,12 @@ impl log::Log for NsLogLogger {
     }
 
     fn log(&self, record: &log::Record) {
-        nslog(&format!("[{}] {}: {}", record.level(), record.target(), record.args()));
+        let line = format!("[{}] {}: {}", record.level(), record.target(), record.args());
+        nslog(&line);
+        // On a phone, `devicectl device process launch --console` bridges
+        // stdout alone to the Mac; NSLog goes to the unified log, which
+        // `log collect` reads only as root (2026-10-22).
+        println!("{line}");
     }
 
     fn flush(&self) {}

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Users of the server as a grid of cards: who is an administrator, who is
-//! disabled, and when each user was last here. Also holds the small widgets
-//! that the devices, activity and API key pages share.
+//! Users of the server as a list of rows, each opening the page of one
+//! user with its facts and actions (2026-10-23; a grid of cards with four
+//! buttons each before). Also holds the small widgets that the devices,
+//! activity and API key pages share.
 
 use std::rc::Rc;
 
@@ -15,17 +16,16 @@ use gpui_kit::{
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{Confirm, Field, Prompt, ago, badge, card, parse_date};
+use super::{Confirm, Field, Prompt, ago, badge, parse_date};
 use crate::{
     app::Bloom,
     jellyfin::Client,
-    ui::{theme::UiTheme, tip::tip},
+    ui::{
+        input::{Input, Keyboard},
+        theme::UiTheme,
+    },
     views::cards::icon,
 };
-
-/// Narrowest user card; the grid takes as many columns as fit.
-const CARD_MIN_W: f32 = 300.;
-const GRID_GAP: f32 = 16.;
 
 pub const GREEN: u32 = 0x2e9e5bff;
 pub const AMBER: u32 = 0xc98a1bff;
@@ -88,199 +88,61 @@ pub fn load(client: &Client) -> Result<Data> {
 }
 
 pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
-    // The access editor of one user takes the place of the grid.
+    // The access editor of one user takes the place of the page.
     if let Some(editor) = app.admin_data().and_then(|d| d.access.as_ref()) {
         return super::access::render(editor, cx);
     }
-    let t = UiTheme::read(cx).clone();
     let Some(session) = app.session.as_ref() else {
         return div();
     };
-    let client = &session.client;
+    // One user open: their page, with the facts and the actions.
+    let open = app
+        .admin_data()
+        .and_then(|d| d.user_open.as_ref())
+        .and_then(|id| data.users.iter().find(|user| &user.id == id));
+    match open {
+        Some(user) => render_user(app, user, session, cx),
+        None => render_list(app, data, session, cx),
+    }
+}
 
-    let width = content_width(app);
-    let columns = (((width + GRID_GAP) / (CARD_MIN_W + GRID_GAP)).floor() as usize).max(1);
-    let card_w = ((width - GRID_GAP * (columns - 1) as f32) / columns as f32).floor();
+/// The users as a list of rows: a row is a name with what matters at a
+/// glance, and opens the user's page. The grid of cards before had four
+/// buttons on each of ten cards, and on a phone one card was a screen.
+fn render_list(app: &Bloom, data: &Data, session: &crate::app::Session, cx: &mut Context<Bloom>) -> Div {
+    let t = UiTheme::read(cx).clone();
+    let compact = app.compact_w();
+    let client = &session.client;
 
     let admins = data.users.iter().filter(|u| u.is_admin()).count();
     let disabled = data.users.iter().filter(|u| u.is_disabled()).count();
     let open = data.users.iter().filter(|u| !u.has_password).count();
 
-    let mut grid = div().flex().flex_wrap().gap(px(GRID_GAP));
-    for user in &data.users {
-        let me = user.id == session.user_id;
-        let mut badges = div().flex().flex_wrap().gap(px(6.));
-        if me {
-            badges = badges.child(badge("You", rgba(BLUE)));
-        }
-        if user.is_admin() {
-            badges = badges.child(badge("Admin", rgba(GREY)));
-        }
-        if user.is_disabled() {
-            badges = badges.child(badge("Disabled", rgba(RED)));
-        }
-        if user.is_hidden() {
-            badges = badges.child(badge("Hidden", rgba(GREY)));
-        }
-        if !user.is_admin() && !user.is_disabled() && !user.is_hidden() && !me {
-            badges = badges.child(badge("User", rgba(GREY)));
-        }
+    let query = app.admin_users_filter.read(cx).value().trim().to_lowercase();
+    let shown: Vec<&User> = data
+        .users
+        .iter()
+        .filter(|user| query.is_empty() || user.name.to_lowercase().contains(&query))
+        .collect();
 
-        let seen = |date: &Option<String>| match date.as_deref().filter(|d| is_real_date(d)) {
-            Some(date) => ago(date),
-            None => "Never".to_string(),
-        };
-        let line = |glyph: LucideIcon, label: &'static str, value: String, warn: bool| {
-            let color = if warn {
-                rgba(0xf0b34aff)
-            } else {
-                t.colors.foreground.opacity(0.78)
-            };
+    let mut page = div().flex().flex_col().gap(px(if compact { 14. } else { 18. }));
+    if compact {
+        // A phone: the counts as one quiet line, not four pills over the list.
+        page = page.child(
             div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
+                .px(px(4.))
                 .text_size(px(13.))
-                .child(icon(glyph, 14., t.colors.foreground.opacity(0.45)))
-                .child(
-                    div()
-                        .w(px(84.))
-                        .flex_shrink_0()
-                        .text_color(t.colors.foreground.opacity(0.5))
-                        .child(label),
-                )
-                .child(div().min_w_0().truncate().text_color(color).child(value))
-        };
-
-        let mut actions = div().flex().flex_wrap().gap(px(8.)).child({
-            let target = user.clone();
-            action(format!("users.access.{}", user.id), LucideIcon::ShieldCheck, "Access", false, cx)
-                .tooltip(tip("Libraries and rights of this user"))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.access_open(&target, cx)))
-        });
-        // A user cannot disable or delete the account that is signed in here.
-        if !me {
-            let (label, glyph) = if user.is_disabled() {
-                ("Enable", LucideIcon::UserCheck)
-            } else {
-                ("Disable", LucideIcon::Ban)
-            };
-            let target = user.clone();
-            actions = actions
-                .child(
-                    action(format!("users.toggle.{}", user.id), glyph, label, false, cx).on_click(
-                        cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            ask_set_disabled(this, &target, !target.is_disabled(), cx)
-                        }),
-                    ),
-                )
-                .child({
-                    let target = user.clone();
-                    action(
-                        format!("users.password.{}", user.id),
-                        LucideIcon::KeyRound,
-                        "Password",
-                        false,
-                        cx,
-                    )
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        ask_password(this, &target, cx)
-                    }))
-                })
-                .child({
-                    let target = user.clone();
-                    action(
-                        format!("users.delete.{}", user.id),
-                        LucideIcon::Trash,
-                        "Delete",
-                        true,
-                        cx,
-                    )
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        ask_delete(this, &target, cx)
-                    }))
-                });
-        } else {
-            actions = actions.child(
-                div()
-                    .h(px(30.))
-                    .flex()
-                    .items_center()
-                    .text_size(px(12.))
-                    .text_color(t.colors.foreground.opacity(0.45))
-                    .child("Signed in on this device"),
-            );
-        }
-
-        grid = grid.child(
-            card(cx)
-                .w(px(card_w))
-                // A set least and most width spares a layout pass (`Bloom::render_settings`).
-                .min_w(px(card_w))
-                .max_w(px(card_w))
-                .gap(px(14.))
-                .when(user.is_disabled(), |el| el.opacity(0.62))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(14.))
-                        .child(avatar(&user.name, user.image_url(client), 56.))
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .gap(px(6.))
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_size(px(18.))
-                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                        .text_color(t.colors.foreground)
-                                        .child(user.name.clone()),
-                                )
-                                .child(badges),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(6.))
-                        .child(line(
-                            LucideIcon::Activity,
-                            "Last active",
-                            seen(&user.last_activity_date),
-                            false,
-                        ))
-                        .child(line(
-                            LucideIcon::LogIn,
-                            "Last login",
-                            seen(&user.last_login_date),
-                            false,
-                        ))
-                        .child(if user.has_password {
-                            line(LucideIcon::Lock, "Password", "Set".to_string(), false)
-                        } else {
-                            line(
-                                LucideIcon::LockOpen,
-                                "Password",
-                                "No password".to_string(),
-                                true,
-                            )
-                        }),
-                )
-                .child(div().h(px(1.)).bg(rgba(0xf5f5f714)))
-                .child(actions),
+                .text_color(t.colors.foreground.opacity(0.6))
+                .child(format!(
+                    "{} users · {} administrators · {} disabled · {} without password",
+                    data.users.len(),
+                    admins,
+                    disabled,
+                    open
+                )),
         );
-    }
-
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(18.))
-        .child(
+    } else {
+        page = page.child(
             div()
                 .flex()
                 .flex_wrap()
@@ -297,8 +159,348 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                         ),
                     ),
                 ),
+        );
+    }
+    // A field to find a user, once there are enough to look for one.
+    if data.users.len() > 6 {
+        page = page.child(
+            Input::new(&app.admin_users_filter)
+                .keyboard(Keyboard::plain())
+                .aria_label("Find a user")
+                .w_full()
+                .h(px(if compact { 50. } else { 44. }))
+                .when(compact, |el| el.text_size(px(17.)).line_height(px(22.))),
+        );
+    }
+
+    let mut rows = div().relative().flex().flex_col();
+    for (index, user) in shown.iter().enumerate() {
+        if index > 0 {
+            rows = rows.child(hairline());
+        }
+        rows = rows.child(user_row(user, user.id == session.user_id, client, compact, &t, cx));
+    }
+    if shown.is_empty() {
+        rows = rows.child(
+            div()
+                .h(px(60.))
+                .px(px(16.))
+                .flex()
+                .items_center()
+                .text_size(px(15.))
+                .text_color(t.colors.foreground.opacity(0.6))
+                .child(format!("No user named \u{201c}{}\u{201d}.", query)),
+        );
+    }
+    if compact {
+        // On a phone the new user is the last row of the list, where iOS
+        // keeps "Add" in a list of accounts.
+        if !shown.is_empty() {
+            rows = rows.child(hairline());
+        }
+        rows = rows.child(
+            div()
+                .id("users.new")
+                .role(gpui_kit::Role::Button)
+                .aria_label("New user")
+                .h(px(60.))
+                .px(px(16.))
+                .flex()
+                .items_center()
+                .gap(px(14.))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgba(0xf5f5f714)))
+                .child(icon_disc(LucideIcon::UserPlus, t.colors.foreground, 40.))
+                .child(
+                    div()
+                        .text_size(px(17.))
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .text_color(t.colors.foreground)
+                        .child("New user\u{2026}"),
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| ask_new(this, cx))),
+        );
+    }
+    page.child(super::surface(div()).overflow_hidden().child(rows))
+}
+
+/// A row of the list: the picture, the name, a line with what matters
+/// (signed in here, administrator, disabled, hidden, when last active)
+/// and a chevron. A tap opens the user's page.
+fn user_row(
+    user: &User,
+    me: bool,
+    client: &Client,
+    compact: bool,
+    t: &UiTheme,
+    cx: &mut Context<Bloom>,
+) -> Stateful<Div> {
+    let mut detail: Vec<String> = Vec::new();
+    if me {
+        detail.push("You".to_string());
+    }
+    if user.is_admin() {
+        detail.push("Administrator".to_string());
+    }
+    if user.is_disabled() {
+        detail.push("Disabled".to_string());
+    }
+    if user.is_hidden() {
+        detail.push("Hidden".to_string());
+    }
+    detail.push(match user.last_activity_date.as_deref().filter(|d| is_real_date(d)) {
+        Some(date) => format!("Active {}", ago(date)),
+        None => "Never active".to_string(),
+    });
+    let id = user.id.clone();
+    div()
+        .id(SharedString::from(format!("users.row.{}", user.id)))
+        .role(gpui_kit::Role::Button)
+        .aria_label(user.name.clone())
+        .h(px(if compact { 60. } else { 54. }))
+        .px(px(16.))
+        .flex()
+        .items_center()
+        .gap(px(14.))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgba(0xf5f5f714)))
+        .when(user.is_disabled(), |el| el.opacity(0.62))
+        .child(avatar(&user.name, user.image_url(client), if compact { 40. } else { 36. }))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(if compact { 17. } else { 15. }))
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .text_color(t.colors.foreground)
+                        .child(user.name.clone()),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(13.))
+                        .text_color(t.colors.foreground.opacity(0.6))
+                        .child(detail.join(" \u{b7} ")),
+                ),
         )
-        .child(grid)
+        .child(icon(LucideIcon::ChevronRight, 16., t.colors.foreground.opacity(0.35)))
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.admin_open_user(id.clone(), cx)))
+}
+
+/// The page of one user: the picture and the name, the facts, and the
+/// actions as rows, the dangerous one last.
+fn render_user(app: &Bloom, user: &User, session: &crate::app::Session, cx: &mut Context<Bloom>) -> Div {
+    let t = UiTheme::read(cx).clone();
+    let compact = app.compact_w();
+    let me = user.id == session.user_id;
+    let client = &session.client;
+
+    let mut badges = div().flex().flex_wrap().gap(px(6.));
+    if me {
+        badges = badges.child(badge("You", rgba(BLUE)));
+    }
+    if user.is_admin() {
+        badges = badges.child(badge("Admin", rgba(GREY)));
+    }
+    if user.is_disabled() {
+        badges = badges.child(badge("Disabled", rgba(RED)));
+    }
+    if user.is_hidden() {
+        badges = badges.child(badge("Hidden", rgba(GREY)));
+    }
+
+    let seen = |date: &Option<String>| match date.as_deref().filter(|d| is_real_date(d)) {
+        Some(date) => ago(date),
+        None => "Never".to_string(),
+    };
+    let fact = |label: &'static str, value: String, warn: bool| {
+        div()
+            .h(px(if compact { 50. } else { 44. }))
+            .px(px(16.))
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .text_size(px(if compact { 17. } else { 15. }))
+            .child(
+                div()
+                    .w(px(120.))
+                    .flex_shrink_0()
+                    .text_color(t.colors.foreground.opacity(0.6))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(if warn { rgba(0xf0b34aff) } else { t.colors.foreground })
+                    .child(value),
+            )
+    };
+
+    let facts = super::surface(div())
+        .overflow_hidden()
+        .child(
+            div()
+                .relative()
+                .flex()
+                .flex_col()
+                .child(fact("Last active", seen(&user.last_activity_date), false))
+                .child(hairline())
+                .child(fact("Last login", seen(&user.last_login_date), false))
+                .child(hairline())
+                .child(if user.has_password {
+                    fact("Password", "Set".to_string(), false)
+                } else {
+                    fact("Password", "No password".to_string(), true)
+                }),
+        );
+
+    let mut actions = div().relative().flex().flex_col().child({
+        let target = user.clone();
+        action_row("users.access", LucideIcon::ShieldCheck, "Access", "Libraries and rights", false, true, compact, &t)
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.access_open(&target, cx)))
+    });
+    if me {
+        actions = actions.child(hairline()).child(
+            div()
+                .px(px(16.))
+                .py(px(14.))
+                .text_size(px(13.))
+                .text_color(t.colors.foreground.opacity(0.6))
+                .child("This is the account signed in here. It cannot be disabled or deleted from this device."),
+        );
+    } else {
+        let (label, glyph) = if user.is_disabled() {
+            ("Enable", LucideIcon::UserCheck)
+        } else {
+            ("Disable", LucideIcon::Ban)
+        };
+        let toggle = user.clone();
+        let password = user.clone();
+        let delete = user.clone();
+        actions = actions
+            .child(hairline())
+            .child(
+                action_row("users.password", LucideIcon::KeyRound, "Change password", "", false, false, compact, &t)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| ask_password(this, &password, cx))),
+            )
+            .child(hairline())
+            .child(
+                action_row("users.toggle", glyph, label, "", false, false, compact, &t).on_click(cx.listener(
+                    move |this, _: &ClickEvent, _, cx| ask_set_disabled(this, &toggle, !toggle.is_disabled(), cx),
+                )),
+            )
+            .child(hairline())
+            .child(
+                action_row("users.delete", LucideIcon::Trash, "Delete user", "", true, false, compact, &t)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| ask_delete(this, &delete, cx))),
+            );
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(18.))
+        .max_w(px(640.))
+        // The Mac has no back arrow in its bar: a link back to the list.
+        .when(!compact, |el| {
+            el.child(
+                div().flex().child(
+                    action("users.back", LucideIcon::ArrowLeft, "Users", false, cx)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.admin_close_user(cx))),
+                ),
+            )
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(16.))
+                .px(px(4.))
+                .child(avatar(&user.name, user.image_url(client), if compact { 64. } else { 72. }))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(22.))
+                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                .text_color(t.colors.foreground)
+                                .child(user.name.clone()),
+                        )
+                        .child(badges),
+                ),
+        )
+        .child(facts)
+        .child(super::surface(div()).overflow_hidden().child(actions))
+}
+
+/// A row that runs an action: an icon, a label, a detail line when there
+/// is one, and a chevron when the row opens a page. Red for the dangerous one.
+#[allow(clippy::too_many_arguments)]
+fn action_row(
+    id: &'static str,
+    glyph: LucideIcon,
+    label: &'static str,
+    detail: &'static str,
+    danger: bool,
+    opens: bool,
+    compact: bool,
+    t: &UiTheme,
+) -> Stateful<Div> {
+    let color = if danger { rgba(0xff8a80ff) } else { t.colors.foreground };
+    div()
+        .id(id)
+        .role(gpui_kit::Role::Button)
+        .aria_label(label)
+        .min_h(px(if compact { 50. } else { 46. }))
+        .px(px(16.))
+        .py(px(8.))
+        .flex()
+        .items_center()
+        .gap(px(14.))
+        .cursor_pointer()
+        .hover(move |s| s.bg(if danger { rgba(0xc6282833) } else { rgba(0xf5f5f714) }))
+        .child(icon(glyph, 18., color))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .child(
+                    div()
+                        .text_size(px(if compact { 17. } else { 15. }))
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .text_color(color)
+                        .child(label),
+                )
+                .when(!detail.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(t.colors.foreground.opacity(0.6))
+                            .child(detail),
+                    )
+                }),
+        )
+        .when(opens, |el| el.child(icon(LucideIcon::ChevronRight, 16., t.colors.foreground.opacity(0.35))))
+}
+
+/// The line between two rows of a list.
+fn hairline() -> Div {
+    div().h(px(1.)).mx(px(16.)).bg(rgba(0xf5f5f714))
 }
 
 fn ask_set_disabled(app: &mut Bloom, user: &User, disable: bool, cx: &mut Context<Bloom>) {
@@ -340,6 +542,24 @@ fn ask_set_disabled(app: &mut Bloom, user: &User, disable: bool, cx: &mut Contex
         }),
     };
     app.ask_confirm(confirm, cx);
+}
+
+/// Opens the page of the user with this name. For the debug channel.
+pub(crate) fn open_user_named(app: &mut Bloom, name: &str, cx: &mut Context<Bloom>) -> bool {
+    let crate::app::Page::Admin(data) = &app.page else {
+        return false;
+    };
+    let id = data
+        .users
+        .as_ref()
+        .and_then(|users| users.users.iter().find(|user| user.name == name).map(|user| user.id.clone()));
+    match id {
+        Some(id) => {
+            app.admin_open_user(id, cx);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Opens the password form for the user with this name. For the debug channel.

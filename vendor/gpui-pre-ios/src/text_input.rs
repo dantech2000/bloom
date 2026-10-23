@@ -6,29 +6,86 @@
 
 use gpui::{KeyDownEvent, Keystroke, Modifiers, PlatformInput};
 
-/// Configure the public UITextInputTraits properties on the native text view.
+/// Configure the public UITextInputTraits properties on the native text view
+/// from the traits of the focused field (`crate::TextTraits`).
 ///
 /// UIKit can implement these selectors through Objective-C forwarding rather
 /// than entries in UITextView's method table. objc2's debug msg_send! verifier
-/// rejects those valid messages before the runtime can forward them. Restrict
-/// direct dispatch to these three known setters with their exact ABI:
-/// void (id, SEL, NSInteger).
+/// rejects those valid messages before the runtime can forward them. So the
+/// setters go through `objc_msgSend` with their exact ABI: void (id, SEL,
+/// NSInteger), void (id, SEL, BOOL) and void (id, SEL, id).
 ///
 /// # Safety
 /// `view` must be a live UITextView, accessed on the UIKit main thread.
 pub(super) unsafe fn configure_keyboard_traits(
     view: *mut objc2::runtime::AnyObject,
-    keyboard_type: isize,
+    traits: &crate::TextTraits,
 ) {
-    let send: unsafe extern "C-unwind" fn(
-        *mut objc2::runtime::AnyObject,
-        objc2::runtime::Sel,
-        isize,
-    ) = unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as unsafe extern "C-unwind" fn()) };
+    use crate::{Capitalize, KeyboardType, ReturnKey, TextContent};
+    type Obj = *mut objc2::runtime::AnyObject;
+    type Sel = objc2::runtime::Sel;
+    let send_int: unsafe extern "C-unwind" fn(Obj, Sel, isize) =
+        unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as unsafe extern "C-unwind" fn()) };
+    let send_bool: unsafe extern "C-unwind" fn(Obj, Sel, objc2::runtime::Bool) =
+        unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as unsafe extern "C-unwind" fn()) };
+    let send_obj: unsafe extern "C-unwind" fn(Obj, Sel, Obj) =
+        unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as unsafe extern "C-unwind" fn()) };
+    // UIKeyboardType
+    let keyboard: isize = match traits.keyboard {
+        KeyboardType::Default => 0,
+        KeyboardType::URL => 3,
+        KeyboardType::NumberPad => 4,
+        KeyboardType::Phone => 5,
+        KeyboardType::EmailAddress => 7,
+        KeyboardType::Decimal => 8,
+    };
+    // UIReturnKeyType
+    let return_key: isize = match traits.return_key {
+        ReturnKey::Default => 0,
+        ReturnKey::Go => 1,
+        ReturnKey::Next => 4,
+        ReturnKey::Search => 6,
+        ReturnKey::Send => 7,
+        ReturnKey::Done => 9,
+    };
+    // UITextAutocapitalizationType
+    let capitalize: isize = match traits.capitalize {
+        Capitalize::None => 0,
+        Capitalize::Words => 1,
+        Capitalize::Sentences => 2,
+    };
+    // UITextAutocorrectionType, UITextSpellCheckingType and the smart
+    // types share the values Default 0, No 1, Yes 2.
+    let correct: isize = if traits.autocorrect { 0 } else { 1 };
+    // UITextContentType: a string the system matches against what it keeps;
+    // nil, the documented default, for a field of no kind.
+    let content = match traits.content {
+        TextContent::None => None,
+        TextContent::Username => Some("username"),
+        TextContent::Password => Some("password"),
+        TextContent::NewPassword => Some("newPassword"),
+        TextContent::Url => Some("URL"),
+        TextContent::Email => Some("emailAddress"),
+        TextContent::OneTimeCode => Some("oneTimeCode"),
+        TextContent::Name => Some("name"),
+    };
     unsafe {
-        send(view, objc2::sel!(setKeyboardType:), keyboard_type);
-        send(view, objc2::sel!(setAutocorrectionType:), 1);
-        send(view, objc2::sel!(setAutocapitalizationType:), 0);
+        send_int(view, objc2::sel!(setKeyboardType:), keyboard);
+        send_int(view, objc2::sel!(setReturnKeyType:), return_key);
+        send_int(view, objc2::sel!(setAutocorrectionType:), correct);
+        send_int(view, objc2::sel!(setSpellCheckingType:), correct);
+        send_int(view, objc2::sel!(setSmartQuotesType:), correct);
+        send_int(view, objc2::sel!(setSmartDashesType:), correct);
+        send_int(view, objc2::sel!(setSmartInsertDeleteType:), correct);
+        send_int(view, objc2::sel!(setAutocapitalizationType:), capitalize);
+        // UIKeyboardAppearanceDark: the app is dark.
+        send_int(view, objc2::sel!(setKeyboardAppearance:), 1);
+        send_bool(view, objc2::sel!(setSecureTextEntry:), objc2::runtime::Bool::new(traits.secure));
+        let content: Obj = match content {
+            Some(name) => crate::util::nsstring(name),
+            None => std::ptr::null_mut(),
+        };
+        send_obj(view, objc2::sel!(setTextContentType:), content);
     }
 }
 

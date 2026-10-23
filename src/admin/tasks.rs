@@ -7,7 +7,8 @@ use anyhow::Result;
 use gpui_icons::LucideIcon;
 use gpui_kit::{
     ClickEvent, Context, Div, InteractiveElement as _, IntoElement as _, ParentElement as _, Rgba,
-    SharedString, StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _, px, rgb, rgba,
+    SharedString, StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _, px, rgb,
+    rgba,
 };
 use serde::Deserialize;
 
@@ -15,7 +16,7 @@ use crate::{
     admin::{ButtonKind, ago, badge, button, panel, parse_date, rows::rows},
     app::Bloom,
     jellyfin::Client,
-    ui::{theme::UiTheme, tip::tip},
+    ui::{menu::MenuItem, theme::UiTheme},
     views::cards::icon,
 };
 
@@ -23,6 +24,11 @@ use crate::{
 const SCHEDULE_MIN_W: f32 = 900.;
 /// Height of a task row: the line above it, the padding and two lines of text.
 const ROW_H: f32 = 67.;
+/// Space above and below the texts of a row, and the line heights of the
+/// name and the description (`row_height`).
+const ROW_PAD: f32 = 12.;
+const NAME_LINE_H: f32 = 20.;
+const DESCRIPTION_LINE_H: f32 = 18.;
 
 #[derive(Deserialize, PartialEq)]
 #[serde(rename_all = "PascalCase")]
@@ -148,29 +154,110 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
     }
 
     let mut page = div().flex().flex_col().gap(px(18.)).child(summary);
+    let content_w = app.admin_content_w();
+    let compact = app.compact_w();
+    let show_schedule = content_w >= SCHEDULE_MIN_W;
+
+    // A field to find a task by its name or its description, once there
+    // are enough to look for one; a category with no match is left out.
+    let query = app.admin_tasks_filter.read(cx).value().trim().to_lowercase();
+    if tasks().count() >= super::FIND_FROM {
+        page = page.child(super::find_field(&app.admin_tasks_filter, "Find a task", compact));
+    }
+    let matches = |task: &Task| {
+        query.is_empty()
+            || task.name.to_lowercase().contains(&query)
+            || task.description.to_lowercase().contains(&query)
+    };
+    let mut any = false;
     for (group, (category, list)) in data.groups.iter().enumerate() {
-        // Only the rows in view are built; see `rows`.
-        // A phone's row has the state on a third line (`row`).
-        let row_h = if crate::views::shell::compact_now() { ROW_H + 24. } else { ROW_H };
-        let list = rows(cx, list.len(), row_h, move |this, range, cx| {
+        let shown: Vec<usize> =
+            list.iter().enumerate().filter(|(_, task)| matches(task)).map(|(i, _)| i).collect();
+        if shown.is_empty() {
+            continue;
+        }
+        any = true;
+        // Only the rows in view are built; see `rows`. The rows of a
+        // category share one height: the tallest a name and a description
+        // of the category need (a plain column, where each row grows on its
+        // own, cost 12 ms of layout per frame on 2026-10-23).
+        let row_h = shown
+            .iter()
+            .map(|&i| row_height(&list[i], compact, show_schedule, content_w))
+            .fold(0., f32::max);
+        let list = rows(cx, shown.len(), row_h, move |this, range, cx| {
             let Some(data) = this.admin_data().and_then(|d| d.tasks.as_ref()) else {
                 return Vec::new();
             };
-            let show_schedule = this.admin_content_w() >= SCHEDULE_MIN_W;
-            data.groups[group].1[range.clone()]
+            let content_w = this.admin_content_w();
+            let compact = this.compact_w();
+            let show_schedule = content_w >= SCHEDULE_MIN_W;
+            shown[range.clone()]
                 .iter()
                 .zip(range)
-                .map(|(task, index)| row(task, index, show_schedule, cx).into_any_element())
+                .map(|(&i, index)| {
+                    let task = &data.groups[group].1[i];
+                    let lines = text_lines(task, compact, show_schedule, content_w);
+                    row(task, index, show_schedule, row_h, lines, cx).into_any_element()
+                })
                 .collect()
         });
         let title = if category.is_empty() { "Other" } else { category };
         page = page.child(panel(title.to_string(), cx).pb(px(6.)).child(list));
     }
+    if !any {
+        page = page.child(super::surface(div()).child(super::nothing_found("task", &query, cx)));
+    }
     page
 }
 
+/// Lines of the name and of the description of a task at the width the
+/// text column has, estimated from the average width of a glyph. The row
+/// clamps each text to its estimate, so a text that runs longer ends in an
+/// ellipsis rather than outside the row.
+fn text_lines(task: &Task, compact: bool, show_schedule: bool, content_w: f32) -> (usize, usize) {
+    // The panel's padding, the status and schedule columns, the buttons,
+    // and the gaps between them (`row`).
+    let fixed = if compact {
+        40. + 118. + 10.
+    } else {
+        40. + 210. + if show_schedule { 200. + 20. } else { 0. } + 118. + 40.
+    };
+    let width = (content_w - fixed).max(120.);
+    let lines = |text: &str, glyph_w: f32, max: usize| {
+        let per_line = (width / glyph_w).max(8.) as usize;
+        text.chars().count().div_ceil(per_line).clamp(1, max)
+    };
+    // Two lines of the description on the Mac, the rest under the pointer;
+    // three on a phone, which has no pointer. A name wraps on a phone only.
+    (
+        lines(&task.name, 8.2, if compact { 2 } else { 1 }),
+        lines(&one_line(&task.description), 6.6, if compact { 3 } else { 2 }),
+    )
+}
+
+/// Height of a row that holds the texts of this task.
+fn row_height(task: &Task, compact: bool, show_schedule: bool, content_w: f32) -> f32 {
+    let (name_lines, description_lines) = text_lines(task, compact, show_schedule, content_w);
+    let mut text_h = name_lines as f32 * NAME_LINE_H + 2. + description_lines as f32 * DESCRIPTION_LINE_H;
+    if compact {
+        // The state under the texts: one line, two with the run time or the
+        // progress bar.
+        let busy = task.state != "Idle";
+        text_h += 4. + if busy || task.last_execution_result.is_some() { 38. } else { 20. };
+    }
+    (text_h + 2. * ROW_PAD).max(ROW_H)
+}
+
 /// One task of a category.
-fn row(task: &Task, index: usize, show_schedule: bool, cx: &mut Context<Bloom>) -> Div {
+fn row(
+    task: &Task,
+    index: usize,
+    show_schedule: bool,
+    row_h: f32,
+    (name_lines, description_lines): (usize, usize),
+    cx: &mut Context<Bloom>,
+) -> Div {
     let t = UiTheme::read(cx).clone();
     let busy = task.state != "Idle";
     let progress = (task.current_progress_percentage.unwrap_or(0.) as f32 / 100.)
@@ -295,7 +382,8 @@ fn row(task: &Task, index: usize, show_schedule: bool, cx: &mut Context<Bloom>) 
     let compact = crate::views::shell::compact_now();
     let mut status = Some(status);
     div()
-            .h(px(if compact { ROW_H + 24. } else { ROW_H }))
+            .h(px(row_h))
+            .py(px(ROW_PAD))
             .flex()
             .items_center()
             .gap(px(if compact { 10. } else { 20. }))
@@ -311,19 +399,29 @@ fn row(task: &Task, index: usize, show_schedule: bool, cx: &mut Context<Bloom>) 
                     .gap(px(2.))
                     .child(
                         div()
-                            .truncate()
+                            .line_clamp(name_lines)
+                            .text_ellipsis()
                             .text_size(px(15.))
+                            .line_height(px(NAME_LINE_H))
                             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                             .text_color(t.colors.foreground)
                             .child(task.name.clone()),
                     )
-                    .child(
+                    .child({
+                        // The rest of a long description is under the pointer.
+                        let description = one_line(&task.description);
                         div()
-                            .truncate()
+                            .id(SharedString::from(format!("admin.tasks.description.{}", task.id)))
+                            .line_clamp(description_lines)
+                            .text_ellipsis()
                             .text_size(px(13.))
+                            .line_height(px(DESCRIPTION_LINE_H))
                             .text_color(t.colors.muted_foreground)
-                            .child(one_line(&task.description)),
-                    )
+                            .when(!compact && description.len() > 110, |el| {
+                                el.tooltip(crate::ui::tip::tip(description.clone()))
+                            })
+                            .child(description)
+                    })
                     .when(compact, |el| el.child(div().pt(px(4.)).children(status.take()))),
             )
             .when(!compact, |el| el.child(div().w(px(210.)).flex_shrink_0().children(status.take())))
@@ -342,7 +440,8 @@ fn row(task: &Task, index: usize, show_schedule: bool, cx: &mut Context<Bloom>) 
                 )
             })
             .child({
-                // The triggers of the task, then Run or Stop.
+                // Run or Stop, and a "…" menu with the schedule of the task
+                // (an unlabelled clock button before, 2026-10-23).
                 let (id, name, description) = (task.id.clone(), task.name.clone(), task.description.clone());
                 div()
                     .flex_shrink_0()
@@ -351,21 +450,23 @@ fn row(task: &Task, index: usize, show_schedule: bool, cx: &mut Context<Bloom>) 
                     .justify_end()
                     .gap(px(8.))
                     .child(
-                        div()
-                            .id(SharedString::from(format!("admin.tasks.triggers.{}", task.id)))
-                            .size(px(38.))
-                            .flex_shrink_0()
-                            .rounded(px(12.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .bg(rgba(0x282828cc))
-                            .hover(|s| s.bg(rgba(0xffffff2e)))
-                            .tooltip(tip("When this task runs"))
-                            .child(icon(LucideIcon::Clock, 16., t.colors.foreground))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.triggers_open(&id, &name, &description, cx)
+                        super::more_button(SharedString::from(format!("admin.tasks.more.{}", task.id)), cx)
+                            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                let handle = cx.weak_entity();
+                                let (id, name, description) = (id.clone(), name.clone(), description.clone());
+                                let items = vec![
+                                    MenuItem::new("admin.tasks.menu.schedule", "Edit schedule…")
+                                        .icon(LucideIcon::Clock)
+                                        .detail("When this task runs")
+                                        .on_click(move |_, _, cx| {
+                                            let (id, name, description) = (id.clone(), name.clone(), description.clone());
+                                            handle
+                                                .update(cx, |this, cx| this.triggers_open(&id, &name, &description, cx))
+                                                .ok();
+                                        }),
+                                ];
+                                this.open_admin_menu(items, event.position(), window, cx);
                             })),
                     )
                     .child(div().when(!compact, |el| el.w(px(92.))).flex_shrink_0().flex().justify_end().child(action))

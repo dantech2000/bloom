@@ -4,9 +4,9 @@
 
 use gpui_icons::LucideIcon;
 use gpui_kit::{
-    ClickEvent, Context, Div, InteractiveElement as _, IntoElement, KeyDownEvent, ObjectFit,
-    ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _, Styled, div,
-    prelude::FluentBuilder as _, px, rgba,
+    AnyElement, ClickEvent, Context, Div, InteractiveElement as _, IntoElement, KeyDownEvent,
+    ObjectFit, ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _, Styled,
+    div, prelude::FluentBuilder as _, px, rgba,
 };
 
 use crate::{
@@ -16,7 +16,12 @@ use crate::{
     jellyfin::{ItemKind, format_runtime},
     lists::{Dialog, ListKind},
     ui::{
-        glass::glass, input::Input, scroll_area::ScrollArea, theme::UiTheme, tip::tip,
+        glass::glass,
+        input::Input,
+        motion::{Enter, enter},
+        scroll_area::ScrollArea,
+        theme::UiTheme,
+        tip::tip,
     },
     views::cards::{empty_state, icon},
 };
@@ -328,7 +333,7 @@ impl Bloom {
     }
 
     /// The dialog of the lists over the page.
-    pub fn render_lists_dialog(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub fn render_lists_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let dialog = self.lists.dialog.clone()?;
         let t = UiTheme::read(cx).clone();
         let soft = rgba(0xf5f5f7b3);
@@ -382,7 +387,10 @@ impl Bloom {
                         .text_color(t.colors.foreground.opacity(0.7))
                         .child(label),
                 )
-                .child(Input::new(&self.lists.input).aria_label(label).w_full())
+                .child(Input::new(&self.lists.input)
+                        .keyboard(crate::ui::input::Keyboard::name())
+                        .aria_label(label)
+                        .w_full())
         };
         let buttons = |action: &'static str, kind: ButtonKind, cx: &mut Context<Self>| {
             div()
@@ -537,7 +545,8 @@ impl Bloom {
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     this.close_lists_dialog(window, cx)
                 }))
-                .child(card),
+                .child(enter(card, "lists.card.in", Enter::Settle, cx)),
         )
+        .map(|layer| enter(layer, "lists.overlay.in", Enter::Fade, cx))
     }
 }

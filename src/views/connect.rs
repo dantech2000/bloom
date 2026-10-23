@@ -21,7 +21,8 @@ use crate::{
     jellyfin::{Branding, Client, User},
     ui::{
         glass::glass,
-        input::{Input, InputEvent, InputState},
+        input::{Input, InputEvent, InputState, Keyboard},
+        motion::{Enter, enter},
         scroll_area::ScrollArea,
     },
     views::cards::icon,
@@ -68,6 +69,10 @@ pub struct ConnectState {
     /// Empties the password field at the next frame.
     pub clear_password: bool,
     pub error: Option<String>,
+    /// The scroll of the page, so the card can follow the keyboard.
+    pub scroll: gpui_kit::ScrollHandle,
+    /// The keyboard height the scroll was last set for.
+    pub scrolled_for: std::cell::Cell<f32>,
 }
 
 impl ConnectState {
@@ -95,6 +100,8 @@ impl ConnectState {
             confirm: None,
             clear_password: false,
             error: None,
+            scroll: gpui_kit::ScrollHandle::new(),
+            scrolled_for: std::cell::Cell::new(0.),
         }
     }
 
@@ -640,6 +647,19 @@ impl Bloom {
             .filter(|_| self.connect.branding.splashscreen_enabled)
             .map(|s| Client::new(&s.url, &self.config.device_id).splashscreen_url());
 
+        // The keyboard slides: the page scrolls to its end at each frame of
+        // the slide (the scroll's reach is the last frame's, a step behind
+        // the padding that grows with the keyboard). Once the keyboard
+        // stands, the user scrolls as they like.
+        let keyboard = crate::views::shell::keyboard_inset();
+        if keyboard > 0. && self.connect.scrolled_for.get() != keyboard {
+            self.connect.scrolled_for.set(keyboard);
+            let reach = self.connect.scroll.max_offset().y;
+            self.connect.scroll.set_offset(gpui_kit::point(px(0.), -reach));
+        } else if keyboard == 0. {
+            self.connect.scrolled_for.set(0.);
+        }
+
         let content = match &server {
             Some(server) if self.connect.quick.is_some() => self.render_quick(server, cx),
             Some(server) => self.render_sign_in(server, cx),
@@ -652,7 +672,7 @@ impl Bloom {
             .border_1()
             .border_color(rgba(0xf5f5f726))
             .child(glass(px(CARD_RADIUS), rgba(0x1a1a1acc)))
-            .child(content.relative().p(px(32.)).flex().flex_col().gap(px(22.)));
+            .child(content.relative().p(px(metrics().pad)).flex().flex_col().gap(px(22.)));
 
         div()
             .relative()
@@ -668,11 +688,27 @@ impl Bloom {
             })
             .child(div().absolute().inset_0().bg(rgba(0x0000008c)))
             .child(
-                ScrollArea::new("connect.scroll").size_full().child(
+                ScrollArea::new("connect.scroll").track(&self.connect.scroll).size_full().child(
                     div()
                         .w_full()
                         .min_h(px(self.viewport_h))
-                        .py(px(64.))
+                        // On iOS with a session the back pill sits under the
+                        // status bar: a card taller than the room starts
+                        // under the pill, not behind it.
+                        .pt(px(if cfg!(target_os = "macos") || self.session.is_none() {
+                            64.
+                        } else {
+                            crate::views::shell::top_inset() + 60.
+                        }))
+                        // A phone: the first field takes the focus, and the
+                        // keyboard rises over the lower half of the card.
+                        // The page keeps the keyboard's height free at the
+                        // bottom and the card centres in the room above it,
+                        // moving with the keyboard as it slides; a card
+                        // taller than the room scrolls to its end, so the
+                        // fields and buttons sit over the keyboard, not
+                        // under it (2026-10-22).
+                        .pb(px(if keyboard > 0. { 24. + keyboard } else { 64. }))
                         .flex()
                         .flex_col()
                         .items_center()
@@ -891,10 +927,14 @@ impl Bloom {
                     .child(label("Server address"))
                     .child(
                         Input::new(&self.connect.url)
+                            .keyboard(Keyboard::url())
                             .aria_label("Server address")
                             .disabled(probing)
                             .w_full()
-                            .h(px(FIELD_H)),
+                            .h(px(metrics().field_h))
+                            .when(crate::views::shell::compact_now(), |el| {
+                                el.text_size(px(17.)).line_height(px(22.))
+                            }),
                     )
                     .children(self.error_note())
                     .child(
@@ -1034,17 +1074,25 @@ impl Bloom {
             })
             .child(
                 Input::new(&self.connect.username)
+                    .keyboard(Keyboard::username())
                     .aria_label("Username")
                     .disabled(busy)
                     .w_full()
-                    .h(px(FIELD_H)),
+                    .h(px(metrics().field_h))
+                    .when(crate::views::shell::compact_now(), |el| {
+                        el.text_size(px(17.)).line_height(px(22.))
+                    }),
             )
             .child(
                 Input::new(&self.connect.password)
+                    .keyboard(Keyboard::password())
                     .aria_label("Password")
                     .disabled(busy)
                     .w_full()
-                    .h(px(FIELD_H)),
+                    .h(px(metrics().field_h))
+                    .when(crate::views::shell::compact_now(), |el| {
+                        el.text_size(px(17.)).line_height(px(22.))
+                    }),
             )
             .children(self.error_note())
             .child(
@@ -1221,7 +1269,7 @@ impl Bloom {
     }
 
     /// The dialog that signs in another device with the code it shows.
-    pub fn render_authorize(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub fn render_authorize(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
         let dialog = self.connect.authorize.as_ref()?;
         let name = self
             .session
@@ -1248,7 +1296,7 @@ impl Bloom {
                 }))
                 // A click beside the dialog closes it.
                 .on_click(cx.listener(|this, _, window, cx| this.close_authorize(window, cx)))
-                .child(
+                .child(enter(
                     div()
                         .id("quick.authorize.card")
                         .relative()
@@ -1283,11 +1331,15 @@ impl Bloom {
                                 )
                                 .child(
                                     Input::new(&self.connect.code)
+                                        .keyboard(Keyboard::code())
                                         .aria_label("Quick Connect code")
                                         .disabled(busy)
                                         .invalid(dialog.error.is_some())
                                         .w_full()
-                                        .h(px(FIELD_H)),
+                                        .h(px(metrics().field_h))
+                                        .when(crate::views::shell::compact_now(), |el| {
+                                            el.text_size(px(17.)).line_height(px(22.))
+                                        }),
                                 )
                                 .when_some(dialog.error.clone(), |el, error| {
                                     el.child(
@@ -1321,8 +1373,12 @@ impl Bloom {
                                         ),
                                 ),
                         ),
-                ),
+                    "quick.authorize.card.in",
+                    Enter::Settle,
+                    cx,
+                )),
         )
+        .map(|layer| enter(layer, "quick.authorize.in", Enter::Fade, cx))
     }
 }
 
@@ -1331,6 +1387,29 @@ const CARD_W: f32 = 440.;
 const CARD_RADIUS: f32 = 28.;
 /// Height of the text fields and the main buttons.
 const FIELD_H: f32 = 44.;
+
+/// The sizes of the card's controls. On a phone they follow iOS (2026-10-22,
+/// Daniel found the fields small on his phone): a field or a button is
+/// 50 pt tall, the height of a large control, with 17 pt text, the body
+/// size of Dynamic Type; a group label is 13 pt (footnote), a quiet link
+/// 15 pt (subheadline) on a tap target 44 pt tall, the smallest the
+/// guidelines allow; the card's padding is 24 pt, so the fields keep their
+/// width on a 402 pt screen. The Mac keeps its sizes.
+struct Metrics {
+    field_h: f32,
+    button_text: f32,
+    label_text: f32,
+    link_text: f32,
+    pad: f32,
+}
+
+fn metrics() -> Metrics {
+    if crate::views::shell::compact_now() {
+        Metrics { field_h: 50., button_text: 17., label_text: 13., link_text: 15., pad: 24. }
+    } else {
+        Metrics { field_h: FIELD_H, button_text: 15., label_text: 12., link_text: 13., pad: 32. }
+    }
+}
 /// Time between two questions about a Quick Connect code.
 const QUICK_POLL: Duration = Duration::from_secs(3);
 /// The app stops the wait for an approval after this time.
@@ -1355,7 +1434,7 @@ fn host(url: &str) -> &str {
 /// Small heading over a group of the card.
 fn label(text: &'static str) -> Div {
     div()
-        .text_size(px(12.))
+        .text_size(px(metrics().label_text))
         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
         .text_color(rgba(0xf5f5f780))
         .child(text)
@@ -1375,13 +1454,14 @@ fn action(
         (rgba(0xffffff1f), rgb(0xf5f5f7))
     };
     let text = text.into();
+    let m = metrics();
     div()
         .id(id)
         .role(gpui_kit::Role::Button)
         .aria_label(text.clone())
         .flex_1()
-        .min_h(px(FIELD_H))
-        .h(px(FIELD_H))
+        .min_h(px(m.field_h))
+        .h(px(m.field_h))
         .px(px(16.))
         .rounded(px(14.))
         .flex()
@@ -1389,7 +1469,7 @@ fn action(
         .justify_center()
         .bg(bg)
         .text_color(fg)
-        .text_size(px(15.))
+        .text_size(px(m.button_text))
         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
         .when(busy, |el| el.opacity(0.6).occlude())
         .when(!busy, |el| el.cursor_pointer().hover(|s| s.opacity(0.88)))
@@ -1403,7 +1483,8 @@ fn link(id: &'static str, text: &'static str) -> Stateful<Div> {
         .role(gpui_kit::Role::Button)
         .aria_label(text)
         .cursor_pointer()
-        .text_size(px(13.))
+        .text_size(px(metrics().link_text))
+        .when(crate::views::shell::compact_now(), |el| el.h(px(44.)).flex().items_center())
         .text_color(rgba(0xf5f5f799))
         .hover(|s| s.text_color(rgb(0xf5f5f7)))
         .child(text)

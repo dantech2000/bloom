@@ -309,8 +309,9 @@ impl Platform for IosPlatform {
         unsafe {
             let pasteboard: *mut AnyObject = msg_send![class!(UIPasteboard), generalPasteboard];
             if let Some(text) = item.text() {
-                let ns_string: *mut AnyObject =
-                    msg_send![class!(NSString), stringWithUTF8String: text.as_ptr()];
+                // With its length: a `&str` has no NUL at its end, and
+                // `stringWithUTF8String:` read past it (2026-10-22).
+                let ns_string = crate::util::nsstring(&text);
                 let _: () = msg_send![pasteboard, setString: ns_string];
             }
         }

@@ -10,6 +10,7 @@ use gpui_kit::{
     prelude::FluentBuilder as _, px,
 };
 
+use crate::ui::motion::{Enter, enter};
 use crate::{
     app::{Bloom, Page, Panel},
     jellyfin::ItemKind,
@@ -64,15 +65,30 @@ pub fn bottom_inset() -> f32 {
 
 /// The height of the software keyboard over the window, in points: the
 /// page keeps that room free at the bottom, so a field stays in sight.
-/// 0 on the Mac, and while the keyboard is down.
+/// While the keyboard slides, the height it covers at this instant, so
+/// the page moves with it (`Bloom::render` asks for a frame per tick
+/// meanwhile, `keyboard_sliding`). 0 on the Mac, and while the keyboard
+/// is down.
 pub fn keyboard_inset() -> f32 {
     #[cfg(target_os = "ios")]
     {
-        gpui_ios::keyboard_height()
+        gpui_ios::keyboard_height_now().0
     }
     #[cfg(not(target_os = "ios"))]
     {
         0.
+    }
+}
+
+/// True while the software keyboard slides up or down.
+pub fn keyboard_sliding() -> bool {
+    #[cfg(target_os = "ios")]
+    {
+        gpui_ios::keyboard_height_now().1
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        false
     }
 }
 
@@ -169,6 +185,33 @@ impl Bloom {
             Page::Playlist(_) => self.render_playlist(cx).into_any_element(),
             Page::Downloads => self.render_downloads(cx).into_any_element(),
         };
+        // The page comes in (`ui::motion`): on a phone it slides in from
+        // the right, or fades when Back brought it; on the Mac it lifts
+        // into place. The key names the page, so the next page runs it
+        // again and a redraw of the same page does not.
+        let page_key = SharedString::from(match &self.page {
+            _ if self.offline_page_shows() => "page.offline".to_string(),
+            Page::Home(_) => "page.home".to_string(),
+            Page::Library(d) => format!("page.library.{}.{:?}", d.view.id, d.show),
+            Page::Detail(d) => format!("page.detail.{}", d.item.id),
+            Page::Search(_) => "page.search".to_string(),
+            Page::Admin(_) => "page.admin".to_string(),
+            Page::Settings(_) => "page.settings".to_string(),
+            Page::Playlist(d) => format!("page.playlist.{}", d.list.id),
+            Page::Downloads => "page.downloads".to_string(),
+        });
+        let page = enter(
+            div().size_full().child(page),
+            page_key,
+            if !compact(window) {
+                Enter::Lift
+            } else if self.nav_back {
+                Enter::Fade
+            } else {
+                Enter::Push
+            },
+            cx,
+        );
         // On home and detail pages the bar lies over the artwork; other
         // pages start below it.
         let overlay = matches!(self.page, Page::Home(_) | Page::Detail(_));
@@ -206,22 +249,6 @@ impl Bloom {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    // The server dashboard has the colours of the Jellyfin
-                    // dashboard behind it: blue at the left, purple at the
-                    // right, fading into the page at the bottom. The cards
-                    // are glass, so the colour comes through them.
-                    .when(matches!(self.page, Page::Admin(_)), |el| {
-                        el.child(div().absolute().inset_0().bg(linear_gradient(
-                            100.,
-                            linear_color_stop(gpui_kit::rgba(0x0b2f8a61), 0.0),
-                            linear_color_stop(gpui_kit::rgba(0x5b1f8f6b), 1.0),
-                        )))
-                        .child(div().absolute().inset_0().bg(linear_gradient(
-                            180.,
-                            linear_color_stop(gpui_kit::rgba(0x10101000), 0.25),
-                            linear_color_stop(gpui_kit::rgba(0x101010f2), 1.0),
-                        )))
-                    })
                     .child(
                         div()
                             .size_full()
@@ -280,7 +307,9 @@ impl Bloom {
             Page::Search(_) => "Search".into(),
             // On a phone the list of sections is "Dashboard", the section
             // open has its own name.
-            Page::Admin(d) if !d.list && self.compact_w() => d.section.label().into(),
+            Page::Admin(d) if !d.list && self.compact_w() => {
+                d.subpage_title().unwrap_or_else(|| d.section.label().to_string())
+            }
             Page::Admin(_) => "Dashboard".into(),
             Page::Settings(open) if !self.settings_list && self.compact_w() => open.label().into(),
             Page::Settings(_) => "Settings".into(),
@@ -316,9 +345,14 @@ impl Bloom {
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .gap(px(3.))
+                .gap(px(4.))
                 .cursor_pointer()
                 .text_size(px(10.))
+                // The line box as tall as the text: with the shell's 20-point
+                // line the label carried 5 points of empty box under it and
+                // the pair sat 3 points above the middle of the bar
+                // (Daniel, 2026-10-23).
+                .line_height(px(12.))
                 .font_weight(gpui_kit::FontWeight::MEDIUM)
                 .text_color(color)
                 .when(selected, |el| el.bg(fg.opacity(0.12)))

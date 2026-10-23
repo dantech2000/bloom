@@ -341,6 +341,9 @@ pub struct Bloom {
     pub views: Vec<Item>,
     pub page: Page,
     pub history: Vec<Page>,
+    /// True when the page came from Back: it fades in on a phone instead
+    /// of sliding in from the right (`ui::motion`, The Quiet Return Rule).
+    pub nav_back: bool,
     /// Scroll position of each page in `history`.
     history_scroll: Vec<gpui_kit::Point<gpui_kit::Pixels>>,
     /// The pages Back left, nearest last, for Forward; a new page empties it.
@@ -357,6 +360,11 @@ pub struct Bloom {
     /// The panel a click outside of it closed, and when (`toggle_panel`).
     panel_dismissed: Option<(Panel, std::time::Instant)>,
     pub search_input: Entity<InputState>,
+    /// The field that narrows the Users section of the dashboard by name.
+    pub admin_users_filter: Entity<InputState>,
+    /// The fields that find a task and a log file on their sections.
+    pub admin_tasks_filter: Entity<InputState>,
+    pub admin_logs_filter: Entity<InputState>,
     /// Scroll position of the current page.
     pub page_scroll: ScrollHandle,
     /// A phone shows the Settings page as a list of its sections first;
@@ -432,6 +440,8 @@ pub struct Bloom {
     pub more_menu: Entity<MenuState>,
     /// Context menu of the card under the pointer.
     pub card_menu: Entity<MenuState>,
+    /// The "…" menu of a row or a card of the dashboard (`open_admin_menu`).
+    pub admin_menu: Entity<MenuState>,
     /// Quality tag settings of the user in Jellyfin Enhanced: on, resolution
     /// tag, dynamic range tag.
     pub je_quality_tags: (bool, bool, bool),
@@ -514,6 +524,14 @@ impl Bloom {
         let profile_menu = cx.new(|cx| MenuState::new([], cx));
         let search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search movies, shows, episodes…"));
+        let admin_users_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Find a user"));
+        let admin_tasks_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Find a task"));
+        let admin_logs_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Find a log file"));
+        // The lists follow their fields as they are typed.
+        for field in [&admin_users_filter, &admin_tasks_filter, &admin_logs_filter] {
+            cx.subscribe_in(field, window, |_, _, _: &crate::ui::input::InputEvent, _, cx| cx.notify())
+                .detach();
+        }
         let connect = ConnectState::new(window, cx);
         let seek_slider = cx.new(|_| SliderState::new().min(0.).max(1.).step(0.1));
         let audio_menu = cx.new(|cx| MenuState::new([], cx));
@@ -527,6 +545,7 @@ impl Bloom {
         let detail_subtitle_menu = cx.new(|cx| MenuState::new([], cx));
         let more_menu = cx.new(|cx| MenuState::new([], cx));
         let card_menu = cx.new(|cx| MenuState::new([], cx));
+        let admin_menu = cx.new(|cx| MenuState::new([], cx));
         let subtitle_menu = cx.new(|cx| MenuState::new([], cx));
 
         let mut subscriptions = Vec::new();
@@ -737,6 +756,7 @@ impl Bloom {
             views: Vec::new(),
             page: Page::Home(HomeData::default()),
             history: Vec::new(),
+            nav_back: false,
             history_scroll: Vec::new(),
             forward: Vec::new(),
             forward_scroll: Vec::new(),
@@ -746,6 +766,9 @@ impl Bloom {
             panel: None,
             panel_dismissed: None,
             search_input,
+            admin_users_filter,
+            admin_tasks_filter,
+            admin_logs_filter,
             page_scroll: ScrollHandle::new(),
             settings_list: false,
             backdrop_seen: 0,
@@ -789,6 +812,7 @@ impl Bloom {
             detail_subtitle_menu,
             more_menu,
             card_menu,
+            admin_menu,
             je_quality_tags: (false, true, true),
             dialogs: crate::admin::dialogs::Dialogs::new(admin_inputs),
             admin_live: crate::admin::Live::default(),
@@ -1304,6 +1328,7 @@ impl Bloom {
         self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
         let previous = std::mem::replace(&mut self.page, page);
         self.history.push(previous);
+        self.nav_back = false;
         if self.history.len() > 40 {
             self.history.remove(0);
             self.history_scroll.remove(0);
@@ -1318,6 +1343,7 @@ impl Bloom {
     pub fn back(&mut self, cx: &mut Context<Self>) {
         if let Some(page) = self.history.pop() {
             let offset = self.history_scroll.pop().unwrap_or_default();
+            self.nav_back = true;
             let (page, offset) = self.swap_page(page, offset, cx);
             self.forward.push(page);
             self.forward_scroll.push(offset);
@@ -1328,6 +1354,7 @@ impl Bloom {
     pub fn forward(&mut self, cx: &mut Context<Self>) {
         if let Some(page) = self.forward.pop() {
             let offset = self.forward_scroll.pop().unwrap_or_default();
+            self.nav_back = false;
             let (page, offset) = self.swap_page(page, offset, cx);
             self.history.push(page);
             self.history_scroll.push(offset);
@@ -1915,8 +1942,9 @@ impl Bloom {
 
     /// Every menu of the app. A new menu goes into this list, and nowhere
     /// else: the observers of `Bloom::new` and `close_popups` read it.
-    fn menus(&self) -> [&Entity<MenuState>; 11] {
+    fn menus(&self) -> [&Entity<MenuState>; 12] {
         [
+            &self.admin_menu,
             &self.profile_menu,
             &self.audio_menu,
             &self.settings_menu,
@@ -2526,7 +2554,7 @@ impl Bloom {
                                     .position(|ep| ep.id == data.item.id)
                                     .unwrap_or(0);
                                 let step = (this.viewport_w * 0.173).round()
-                                    + crate::views::cards::CARD_GAP;
+                                    + this.metrics().gap;
                                 let offset = at as f32 * step;
                                 this.row_scroll(&"detail.season-episodes".into())
                                     .set_offset(gpui_kit::point(px(-offset), px(0.)));
@@ -3370,10 +3398,18 @@ impl Render for Bloom {
         self.sync_frame(window);
         crate::ui::glass::set_over_video(self.player_open);
         // iOS: the video is under GPUI's layer, so a glass over it needs a
-        // copy of the frame while a popup is open over the player.
+        // copy of the frame while a popup is open over the player, or while
+        // the controls show (Daniel, 2026-10-23: the bar is glass over the
+        // picture on the phone, not a dark slab; they hide after a few
+        // seconds, so the copies stop then).
         if cfg!(target_os = "ios") {
             let popup = self.panel_open() || self.menus().iter().any(|menu| menu.read(cx).is_open());
-            self.player.set_backdrop(self.player_open && popup);
+            self.player.set_backdrop(self.player_open && (popup || self.controls_visible));
+        }
+        // The page moves with the software keyboard: a frame per tick
+        // while it slides.
+        if crate::views::shell::keyboard_sliding() {
+            window.request_animation_frame();
         }
         self.viewport_w = f32::from(window.viewport_size().width);
         self.viewport_h = f32::from(window.viewport_size().height);
@@ -3527,6 +3563,7 @@ impl Render for Bloom {
             .line_height(px(20.))
             .child(content)
             .child(self.card_menu.clone())
+            .child(self.admin_menu.clone())
             .children(self.render_metadata(window, cx))
             .children(self.render_lists_dialog(cx))
             .children(self.render_authorize(cx))

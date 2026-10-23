@@ -47,6 +47,14 @@ impl Bloom {
         // area (in landscape the notch is at a side).
         let phone = self.phone();
         let (top_in, left_in, bottom_in, right_in) = crate::views::shell::safe_insets();
+        // A popup from the bar on a phone opens above the bar, where the
+        // episode picker sits (`ui::menu`, `touch_bottom`).
+        let menu_bottom = phone.then(|| self.viewport_h - self.panel_corner().1);
+        for menu in [&self.subtitle_menu, &self.settings_menu] {
+            if menu.read(cx).touch_bottom != menu_bottom {
+                menu.update(cx, |menu, _| menu.touch_bottom = menu_bottom);
+            }
+        }
         let (panel_left, panel_right, panel_bottom) = if phone {
             (12. + left_in, 12. + right_in, 8. + bottom_in)
         } else {
@@ -144,13 +152,16 @@ impl Bloom {
             cx.stop_propagation();
         }
 
+        // A control of the bar: 44 points on a phone, the size a thumb
+        // needs; 40 under a pointer.
+        let control = if phone { 44. } else { 40. };
         let button = |id: &'static str, glyph: Svg| {
             div()
                 .id(id)
                 // For assistive tech and the tests that tap by label.
                 .role(gpui_kit::Role::Button)
                 .aria_label(id.rsplit('.').next().unwrap_or(id))
-                .size(px(40.))
+                .size(px(control))
                 .rounded(px(12.))
                 .flex()
                 .items_center()
@@ -168,8 +179,10 @@ impl Bloom {
                 .trigger(
                     div()
                         .id(label)
+                        .role(gpui_kit::Role::Button)
+                        .aria_label(label)
                         .tooltip(tip(label))
-                        .size(px(40.))
+                        .size(px(control))
                         .rounded(px(12.))
                         .flex()
                         .items_center()
@@ -448,7 +461,15 @@ impl Bloom {
                 .rounded(px(24.))
                 .opacity(visibility)
                 .on_mouse_down(MouseButton::Left, cx.listener(swallow))
-                .child(glass(px(24.), rgba(0x1c1c1cb8)))
+                // A phone: the glass of the tab bar, tint and light edge
+                // (Daniel, 2026-10-23: the darker tint read as a slab, not
+                // as the glass of the menus and the tab bar).
+                .when(phone, |el| el.border_1().border_color(rgba(0xf5f5f733)))
+                .child(if phone {
+                    crate::ui::glass::bar_glass(px(24.), crate::ui::glass::POPUP_TINT)
+                } else {
+                    glass(px(24.), rgba(0x1c1c1cb8))
+                })
                 .px(px(if phone { 14. } else { 20. }))
                 .pt(px(10.))
                 .pb(px(8.))
@@ -520,7 +541,8 @@ impl Bloom {
                                 .truncate()
                                 .child(s.title.clone()),
                         )
-                        .children(self.enhanced_player_rating())
+                        // A phone's header has room for the title alone.
+                        .children(self.enhanced_player_rating().filter(|_| !phone))
                         .children(self.sync_player_chip(cx)),
                 );
             (header, panel)

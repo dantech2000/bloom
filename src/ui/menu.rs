@@ -1,6 +1,7 @@
 //! Nova menus composed from Kit buttons and popup positioning.
 use super::{
     button::{ButtonSize, ButtonVariant, style_button},
+    motion::{Enter, enter},
     theme::{UiTheme, apply_style},
 };
 use gpui_icons::{LucideIcon, lucide};
@@ -140,6 +141,10 @@ pub struct MenuState {
     return_focus: Option<FocusHandle>,
     anchor: Bounds<Pixels>,
     pointer: bool,
+    /// On a touch window that is no sheet (a phone in landscape), the
+    /// window y the popup's bottom edge stays above: the top of the bar
+    /// its trigger sits in, so the popup clears the bar.
+    pub touch_bottom: Option<f32>,
     path: Vec<usize>,
     highlighted: Vec<Option<usize>>,
     row_bounds: Vec<Vec<Bounds<Pixels>>>,
@@ -164,6 +169,7 @@ impl MenuState {
             return_focus: None,
             anchor: Default::default(),
             pointer: false,
+            touch_bottom: None,
             path: Vec::new(),
             highlighted: Vec::new(),
             row_bounds: Vec::new(),
@@ -684,7 +690,15 @@ impl Render for MenuState {
                     });
                 list = list.child(row);
             }
-            let popup = popup.child(list);
+            // The sheet of a phone rises from the bottom; a popup settles
+            // into place. The element leaves the tree with the menu, so
+            // the entrance runs at each open.
+            let popup = enter(
+                popup.child(list),
+                SharedString::from(format!("menu.enter.{depth}")),
+                if compact { Enter::Rise } else { Enter::Settle },
+                cx,
+            );
             let anchor = if compact {
                 // A line along the bottom of the window: the sheet sits on it.
                 Bounds::new(
@@ -700,14 +714,27 @@ impl Render for MenuState {
                 gpui_kit::deferred(
                     Positioner::side(anchor)
                         .align(Align::Start)
-                        .placement(if compact {
+                        // A sheet opens up from the bottom; so does a popup
+                        // from a button of the player's bar on a phone in
+                        // landscape (it lay over the bar, 2026-10-23).
+                        .placement(if compact || (touch && depth == 0 && !self.pointer) {
                             Placement::Top
                         } else if depth > 0 || self.pointer {
                             Placement::Right
                         } else {
                             Placement::Bottom
                         })
-                        .offset(gpui_kit::px(if compact { 0. } else { 8. }))
+                        .offset(gpui_kit::px(if compact {
+                            0.
+                        } else if touch && depth == 0 && !self.pointer {
+                            // Above the bar the trigger sits in, not the
+                            // trigger alone.
+                            self.touch_bottom
+                                .map(|y| (f32::from(self.anchor.top()) - y).max(8.))
+                                .unwrap_or(8.)
+                        } else {
+                            8.
+                        }))
                         .occlude()
                         .child(popup),
                 )

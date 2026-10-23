@@ -31,11 +31,16 @@ done
 cd "$dir"
 # A real device (`--device <id>`, an id of `xcrun devicectl list devices`)
 # needs the signing team in BLOOM_IOS_TEAM (the ten characters of the
-# Apple Developer account); Xcode makes the profile. Not run on a device
-# yet (2026-10-22): the simulator is the tested path.
+# Apple Developer account); Xcode makes the profile and registers the
+# phone. First run on 2026-10-22 (an iPhone Air): the account had to
+# accept the new license agreement, the phone Developer Mode and the
+# trust of the Mac, each a stop of its own.
 if [ -n "$device" ]; then
   [ -n "${BLOOM_IOS_TEAM:-}" ] || { echo "dev/ios: --device needs BLOOM_IOS_TEAM=<team id>" >&2; exit 2; }
-  target=aarch64-apple-ios; sdk_name=iphoneos; platform_version=ios; destination='generic/platform=iOS'
+  # The destination is the phone itself, so Xcode registers it with the
+  # team (a generic destination names no device, and a fresh team has none:
+  # "Your team has no devices", 2026-10-22).
+  target=aarch64-apple-ios; sdk_name=iphoneos; platform_version=ios; destination="id=$device"
 else
   target=aarch64-apple-ios-sim; sdk_name=iphonesimulator; platform_version=ios-simulator; destination='generic/platform=iOS Simulator'
 fi
@@ -70,7 +75,7 @@ derived=$dir/target/ios/DerivedData
 mkdir -p "$dir/target/ios"
 if [ -n "$device" ]; then
   xcodebuild -project ios/host/Bloom.xcodeproj -scheme Bloom -configuration "$config" \
-    -sdk iphoneos -destination "$destination" -allowProvisioningUpdates \
+    -sdk iphoneos -destination "$destination" -allowProvisioningUpdates -allowProvisioningDeviceRegistration \
     -derivedDataPath "$derived" DEVELOPMENT_TEAM="$BLOOM_IOS_TEAM" build -quiet
   app=$derived/Build/Products/$config-iphoneos/Bloom.app
   echo "built $app"
@@ -96,6 +101,12 @@ xcrun simctl bootstatus "$sim" -b >/dev/null
 open -a "$(xcode-select -p)/Applications/Simulator.app" 2>/dev/null || true
 xcrun simctl terminate "$sim" dev.bloom.ios 2>/dev/null || true
 xcrun simctl install "$sim" "$app"
+# The keys idb types (dev/ios-ui text, key) count as a hardware keyboard,
+# and iOS then minimises the software keyboard until a reboot: a field
+# got the focus and UIKit answered "will hide" with no show (2026-10-22).
+# With the minimisation off the keyboard shows regardless. DeviceHub's
+# "Connect Hardware Keyboard" (I/O > Keyboard) does the same when on.
+xcrun simctl spawn "$sim" defaults write com.apple.keyboard.preferences AutomaticMinimizationEnabled -bool false 2>/dev/null || true
 log=$dir/target/ios/run.log
 : > "$log"
 # --console-pty hands the app's stdout and stderr (NSLog) to this shell;

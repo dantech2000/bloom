@@ -25,7 +25,7 @@ use objc2::encode::{Encode, Encoding, RefEncode};
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Sel};
 use objc2::{class, msg_send, sel};
 
-use super::cg_types::ObjcCGRect;
+use super::cg_types::{ObjcCGPoint, ObjcCGRect};
 use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, UiKitDisplayHandle, UiKitWindowHandle};
 use std::{
@@ -426,40 +426,29 @@ fn register_text_input_view_class() -> &'static AnyClass {
             let is_marked = !marked.is_null();
             *(*this).get_mut_ivar::<Bool>("gpui_marked_text") = Bool::new(is_marked);
             let window = &*(window_ptr as *const IosWindow);
+            // Only the view of the focused field writes to it: UIKit calls
+            // `unmarkText` on a view as it resigns, and that view's empty
+            // text wiped the field that had just taken the focus
+            // (the username, on the way back from the password; 2026-10-22).
+            if this != window.active_input_view() {
+                return;
+            }
 
+            // The view mirrors the field (`sync_input_view`): its document is
+            // the field's text, so UIKit's own edits (a tapped prediction,
+            // an autocorrection, a replaced word) land on real text. After
+            // each edit the field takes the view's whole text and selection.
+            let selected: super::text_input::ObjcNSRange = msg_send![this, selectedRange];
+            let selected = selected.location..selected.location + selected.length;
             if is_marked {
-                let selected: super::text_input::ObjcNSRange = msg_send![this, selectedRange];
+                // A composition in progress (an IME): the field shows the
+                // whole text as marked until it is committed.
+                let Some((_, len)) = window.gpui_document() else { return };
                 if let Some(handler) = window.input_handler.borrow_mut().as_mut() {
-                    handler.replace_and_mark_text_in_range(
-                        None,
-                        &text_string,
-                        Some(selected.location..selected.location + selected.length),
-                    );
+                    handler.replace_and_mark_text_in_range(Some(0..len), &text_string, Some(selected));
                 }
-                // Legacy string callbacks receive only committed text. Sending
-                // each pinyin update would otherwise append duplicate syllables.
-            } else if was_marked || !text_string.is_empty() {
-                // Clear before forwarding: GPUI callbacks can change focus.
-                begin_edit(this);
-                let empty: *mut AnyObject = msg_send![class!(NSString), new];
-                let _: () = msg_send![this, setText: empty];
-                let _: () = msg_send![empty, release];
-                *(*this).get_mut_ivar::<usize>("gpui_edit_depth") -= 1;
-
-                if was_marked {
-                    if let Some(handler) = window.input_handler.borrow_mut().as_mut() {
-                        handler.replace_text_in_range(None, &text_string);
-                        handler.unmark_text();
-                        return;
-                    }
-                }
-                // Keep NSString alive across clearing the native document.
-                let bytes = text_string.as_bytes();
-                let committed: *mut AnyObject = msg_send![class!(NSString), alloc];
-                let committed: *mut AnyObject = msg_send![committed,
-                    initWithBytes: bytes.as_ptr().cast::<c_void>(), length: bytes.len(), encoding: 4_usize];
-                window.handle_text_input(committed);
-                let _: () = msg_send![committed, release];
+            } else {
+                window.take_input_view(this, &text_string, selected, was_marked);
             }
         }
 
@@ -504,6 +493,15 @@ fn register_text_input_view_class() -> &'static AnyClass {
             let _: () = msg_send![super(this, class!(UITextView)),
                 setAttributedMarkedText: text, selectedRange: selected];
             end_edit(this);
+        }
+
+        /// `apply_text_traits`, deferred to the run loop.
+        #[allow(deprecated)]
+        unsafe extern "C" fn apply_traits(this: *mut AnyObject, _sel: Sel) {
+            let window_ptr: *mut c_void = unsafe { *(*this).get_ivar(GPUI_WINDOW_IVAR) };
+            if !window_ptr.is_null() {
+                unsafe { (&*(window_ptr as *const IosWindow)).apply_text_traits_now() };
+            }
         }
 
         #[allow(deprecated)]
@@ -587,6 +585,10 @@ fn register_text_input_view_class() -> &'static AnyClass {
                 reset_composition as unsafe extern "C" fn(*mut AnyObject, Sel),
             );
             decl.add_method(
+                sel!(gpuiApplyTraits),
+                apply_traits as unsafe extern "C" fn(*mut AnyObject, Sel),
+            );
+            decl.add_method(
                 sel!(replaceRange:withText:),
                 replace_range
                     as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject, *mut AnyObject),
@@ -637,6 +639,12 @@ pub(crate) struct IosWindow {
     view: *mut AnyObject,
     /// The hidden text input view for keyboard input
     text_input_view: *mut AnyObject,
+    /// A second one for a username or a password (`TextContent`): iOS
+    /// keeps its AutoFill session (the Passwords bar) on a view once it
+    /// held a credential, whatever its traits say after, so the other
+    /// fields keep a view of their own (2026-10-22). `input_view_for`
+    /// picks one by the traits.
+    credential_input_view: *mut AnyObject,
     /// Current bounds in pixels
     bounds: Cell<Bounds<Pixels>>,
     /// Scale factor
@@ -681,6 +689,12 @@ pub(crate) struct IosWindow {
     /// The software keyboard is up: GPUI has an input handler (a text
     /// field has the focus). Checked at each draw.
     keyboard_shown: Cell<bool>,
+    /// The edit menu of a text field: the `UIEditMenuInteraction` on the
+    /// view and its delegate, made at the first menu; what the menu offers
+    /// and does is in `edit_menu`.
+    edit_menu_interaction: Cell<*mut AnyObject>,
+    edit_menu_delegate: Cell<*mut AnyObject>,
+    edit_menu: RefCell<EditMenuState>,
     /// The accessibility tree GPUI sent last (`a11y_tree_update`), by node,
     /// with its root: the roles, labels and bounds of the elements, for
     /// `a11y_json`. Kept only with `BLOOM_A11Y_TREE`.
@@ -773,6 +787,13 @@ impl IosWindow {
             let _: () = msg_send![text_input_view, setUserInteractionEnabled: true];
             let _: () = msg_send![text_input_view, setScrollEnabled: false];
             let _: () = msg_send![view, addSubview: text_input_view];
+            let credential_input_view: *mut AnyObject = msg_send![text_input_class, alloc];
+            let credential_input_view: *mut AnyObject =
+                msg_send![credential_input_view, initWithFrame: text_input_frame];
+            let _: () = msg_send![credential_input_view, setAlpha: 0.01_f64];
+            let _: () = msg_send![credential_input_view, setUserInteractionEnabled: true];
+            let _: () = msg_send![credential_input_view, setScrollEnabled: false];
+            let _: () = msg_send![view, addSubview: credential_input_view];
 
             // --- The Metal renderer and its layer ---------------------------
             let pixel_w = (screen_bounds_cg.width * scale) as i32;
@@ -814,6 +835,7 @@ impl IosWindow {
                 view_controller,
                 view,
                 text_input_view,
+                credential_input_view,
                 bounds: Cell::new(screen_bounds),
                 scale_factor: Cell::new(scale_factor),
                 input_handler: RefCell::new(None),
@@ -834,6 +856,9 @@ impl IosWindow {
                 renderer: Mutex::new(renderer),
                 display_link: Cell::new(ptr::null_mut()),
                 keyboard_shown: Cell::new(false),
+                edit_menu_interaction: Cell::new(ptr::null_mut()),
+                edit_menu_delegate: Cell::new(ptr::null_mut()),
+                edit_menu: RefCell::new(EditMenuState::default()),
                 a11y_nodes: RefCell::new(HashMap::new()),
                 a11y_root: Cell::new(None),
                 a11y_callbacks: RefCell::new(None),
@@ -869,6 +894,8 @@ impl IosWindow {
             #[allow(deprecated)]
             {
                 *(*self.text_input_view).get_mut_ivar::<*mut c_void>(GPUI_WINDOW_IVAR) = window_ptr;
+                *(*self.credential_input_view).get_mut_ivar::<*mut c_void>(GPUI_WINDOW_IVAR) =
+                    window_ptr;
             }
             log::info!(
                 "GPUI iOS: Set window pointer {:p} on view {:p} and text input {:p}",
@@ -984,13 +1011,17 @@ impl IosWindow {
                 }
                 let frame: ObjcCGRect = msg_send![frame_value, CGRectValue];
                 let height = frame.height as f32;
-                log::info!("GPUI iOS: Keyboard will show, height={}", height);
-                crate::set_keyboard_height(height);
+                let duration = keyboard_slide_seconds(user_info);
+                log::info!("GPUI iOS: Keyboard will show, height={} over {}s", height, duration);
+                crate::set_keyboard_height(height, duration);
             });
 
-            let hide_block = block2::RcBlock::new(move |_notification: *mut AnyObject| {
-                log::info!("GPUI iOS: Keyboard will hide");
-                crate::set_keyboard_height(0.0);
+            let hide_block = block2::RcBlock::new(move |notification: *mut AnyObject| {
+                let user_info: *mut AnyObject =
+                    if notification.is_null() { std::ptr::null_mut() } else { msg_send![notification, userInfo] };
+                let duration = keyboard_slide_seconds(user_info);
+                log::info!("GPUI iOS: Keyboard will hide over {}s", duration);
+                crate::set_keyboard_height(0.0, duration);
             });
 
             let _: *mut AnyObject = msg_send![notification_center,
@@ -1029,7 +1060,7 @@ impl IosWindow {
             // Finish the old input's composition before this contact can move
             // GPUI focus (including taps between two text fields).
             unsafe {
-                let _: () = msg_send![self.text_input_view, unmarkText];
+                let _: () = msg_send![self.active_input_view(), unmarkText];
             }
             // UIKit may reuse UITouch addresses, so assign a fresh ID per contact.
             let id = gpui::TouchId(self.next_touch_id.get());
@@ -1114,34 +1145,365 @@ impl IosWindow {
     pub fn show_keyboard_with_type(&self, keyboard_type: crate::KeyboardType) {
         log::info!("GPUI iOS: Showing keyboard (type={:?})", keyboard_type);
         unsafe {
-            use crate::KeyboardType;
-            let kb_type: isize = match keyboard_type {
-                KeyboardType::Default => 0,      // UIKeyboardTypeDefault
-                KeyboardType::EmailAddress => 7, // UIKeyboardTypeEmailAddress
-                KeyboardType::Phone => 5,        // UIKeyboardTypePhonePad
-                KeyboardType::NumberPad => 4,    // UIKeyboardTypeNumberPad
-                KeyboardType::URL => 3,          // UIKeyboardTypeURL
-                KeyboardType::Decimal => 8,      // UIKeyboardTypeDecimalPad
-            };
-            log::info!(
-                "GPUI iOS: text_input_view={:p}, setKeyboardType: {}",
-                self.text_input_view,
-                kb_type
-            );
             if self.text_input_view.is_null() {
                 log::error!("GPUI iOS: text_input_view is NULL!");
                 return;
             }
-            super::text_input::configure_keyboard_traits(self.text_input_view, kb_type);
+            // The traits of the focused field (`set_text_traits`); the
+            // keyboard asked for here wins over their default one.
+            let mut traits = crate::text_traits();
+            if traits.keyboard == crate::KeyboardType::Default {
+                traits.keyboard = keyboard_type;
+            }
+            log::info!("GPUI iOS: keyboard traits {:?}", traits);
+            let input = self.input_view_for(&traits);
+            super::text_input::configure_keyboard_traits(input, &traits);
+            self.rest_other_input_view(input);
+            self.attach_input_view(input);
             log::info!("GPUI iOS: scheduling becomeFirstResponder");
 
             // Defer becomeFirstResponder to the next run-loop iteration.
-            let _: () = msg_send![self.text_input_view,
+            let _: () = msg_send![input,
                 performSelector: sel!(becomeFirstResponder),
                 withObject: ptr::null::<AnyObject>(),
                 afterDelay: 0.0_f64
             ];
             log::info!("GPUI iOS: show_keyboard_with_type done");
+        }
+    }
+
+    /// The text of the focused field and its length in UTF-16 units, from
+    /// GPUI's input handler; None without a handler.
+    pub(crate) fn gpui_document(&self) -> Option<(String, usize)> {
+        let mut handler = self.input_handler.borrow_mut();
+        let handler = handler.as_mut()?;
+        let mut adjusted = None;
+        let text = handler.text_for_range(0..usize::MAX, &mut adjusted)?;
+        let len = adjusted.map(|range| range.end).unwrap_or_else(|| text.encode_utf16().count());
+        Some((text, len))
+    }
+
+    /// The composition view takes the field's text and selection, so UIKit
+    /// edits a real document (the predictive bar replaces the word under
+    /// the caret, autocorrection the last one). Called before each frame
+    /// while the keyboard is up, outside GPUI's draw; it does nothing
+    /// during a native edit or a composition, or when nothing differs.
+    pub(crate) fn sync_input_view(&self) {
+        if !self.keyboard_shown.get() {
+            return;
+        }
+        let input = self.active_input_view();
+        if input.is_null() {
+            return;
+        }
+        unsafe {
+            #[allow(deprecated)]
+            let depth = *(*input).get_ivar::<usize>("gpui_edit_depth");
+            #[allow(deprecated)]
+            let marked_flag = (*input).get_ivar::<Bool>("gpui_marked_text").as_bool();
+            let marked: *mut AnyObject = msg_send![input, markedTextRange];
+            if depth != 0 || marked_flag || !marked.is_null() {
+                return;
+            }
+            let Some((text, len)) = self.gpui_document() else { return };
+            let selection = {
+                let mut handler = self.input_handler.borrow_mut();
+                handler
+                    .as_mut()
+                    .and_then(|handler| handler.selected_text_range(false))
+                    .map(|selection| selection.range)
+                    .unwrap_or(len..len)
+            };
+            let current: *mut AnyObject = msg_send![input, text];
+            let current = nsstring_to_string(current);
+            let current_selection: super::text_input::ObjcNSRange = msg_send![input, selectedRange];
+            #[allow(deprecated)]
+            if current != text {
+                *(*input).get_mut_ivar::<usize>("gpui_edit_depth") += 1;
+                let _: () = msg_send![input, setText: crate::util::nsstring(&text)];
+                *(*input).get_mut_ivar::<usize>("gpui_edit_depth") -= 1;
+            }
+            let wanted = super::text_input::ObjcNSRange {
+                location: selection.start.min(len),
+                length: selection.end.min(len).saturating_sub(selection.start.min(len)),
+            };
+            #[allow(deprecated)]
+            if current != text
+                || current_selection.location != wanted.location
+                || current_selection.length != wanted.length
+            {
+                *(*input).get_mut_ivar::<usize>("gpui_edit_depth") += 1;
+                let _: () = msg_send![input, setSelectedRange: wanted];
+                *(*input).get_mut_ivar::<usize>("gpui_edit_depth") -= 1;
+            }
+        }
+    }
+
+    /// A native edit ended: the field takes the view's whole text and its
+    /// selection. The return key arrives as a newline in the text: it is
+    /// taken out of the view and sent as the Enter key (a search, a
+    /// sign-in).
+    pub(crate) fn take_input_view(
+        &self,
+        input: *mut AnyObject,
+        text: &str,
+        selection: std::ops::Range<usize>,
+        was_marked: bool,
+    ) {
+        let mut text = std::borrow::Cow::Borrowed(text);
+        let mut selection = selection;
+        let mut enter = false;
+        if text.contains('\n') {
+            enter = true;
+            let before = text.encode_utf16().count();
+            let stripped: String = text.chars().filter(|c| *c != '\n').collect();
+            let after = stripped.encode_utf16().count();
+            let removed = before - after;
+            selection = selection.start.saturating_sub(removed)..selection.end.saturating_sub(removed);
+            text = std::borrow::Cow::Owned(stripped);
+            unsafe {
+                #[allow(deprecated)]
+                {
+                    *(*input).get_mut_ivar::<usize>("gpui_edit_depth") += 1;
+                    let _: () = msg_send![input, setText: crate::util::nsstring(&text)];
+                    let range = super::text_input::ObjcNSRange { location: selection.start, length: selection.end - selection.start };
+                    let _: () = msg_send![input, setSelectedRange: range];
+                    *(*input).get_mut_ivar::<usize>("gpui_edit_depth") -= 1;
+                }
+            }
+        }
+        if let Some((current, len)) = self.gpui_document() {
+            if was_marked || current != text.as_ref() {
+                if let Some(handler) = self.input_handler.borrow_mut().as_mut() {
+                    // The whole text, with the selection where the view has
+                    // it; marked for a moment, since that is the one call
+                    // that places the selection, then unmarked.
+                    handler.replace_and_mark_text_in_range(Some(0..len), &text, Some(selection.clone()));
+                    handler.unmark_text();
+                }
+            }
+        }
+        if enter {
+            let event = PlatformInput::KeyDown(gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke {
+                    modifiers: Modifiers::default(),
+                    key: "enter".to_string(),
+                    key_char: None,
+                },
+                is_held: false,
+                prefer_character_input: false,
+            });
+            if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
+                callback(event);
+            }
+        }
+    }
+
+    /// The traits of the focused field changed (`set_text_traits`): the
+    /// composition view takes them, and the keyboard, if it is up, reloads
+    /// to show them (another return key, a password keyboard).
+    pub fn apply_text_traits(&self) {
+        if self.text_input_view.is_null() {
+            return;
+        }
+        // On the next turn of the run loop (`gpuiApplyTraits`), as the
+        // first show is: this is called from the render of the field, and
+        // UIKit's keyboard work (a reload, a change of first responder,
+        // the passwords bar) calls back into GPUI at once. On the phone
+        // that aborted the app at the tap on the password field
+        // (2026-10-22).
+        unsafe {
+            let _: () = msg_send![self.text_input_view,
+                performSelector: sel!(gpuiApplyTraits),
+                withObject: ptr::null::<AnyObject>(),
+                afterDelay: 0.0_f64
+            ];
+        }
+    }
+
+    /// `apply_text_traits`, from the run loop.
+    pub(crate) fn apply_text_traits_now(&self) {
+        let traits = crate::text_traits();
+        let input = self.input_view_for(&traits);
+        let other = self.rest_other_input_view(input);
+        self.attach_input_view(input);
+        unsafe {
+            super::text_input::configure_keyboard_traits(input, &traits);
+            if self.keyboard_shown.get() {
+                let other_has_it: Bool = msg_send![other, isFirstResponder];
+                if other_has_it.as_bool() {
+                    // The focus went from a credential to another kind of
+                    // field (or back) with the keyboard up: the other view
+                    // takes over.
+                    let _: () = msg_send![other, gpuiResetComposition];
+                    let _: Bool = msg_send![other, resignFirstResponder];
+                    // Out of the hierarchy before the other view takes
+                    // the keyboard, or the keyboard keeps the Passwords
+                    // bar for the username field (it is set up at
+                    // `becomeFirstResponder`).
+                    if other == self.credential_input_view {
+                        let _: () = msg_send![other, removeFromSuperview];
+                    }
+                    let _: Bool = msg_send![input, becomeFirstResponder];
+                } else {
+                    let _: () = msg_send![input, reloadInputViews];
+                }
+            }
+            // Now that it holds no focus, the credential view at rest
+            // leaves the hierarchy (`rest_other_input_view` skips a view
+            // that still has it: a removal resigns it, and the keyboard
+            // went down on the switch to the username field).
+            if other == self.credential_input_view {
+                let _: () = msg_send![other, removeFromSuperview];
+            }
+        }
+    }
+
+    /// The composition view that is not `input` goes back to the default
+    /// traits, and is returned. iOS offers the saved passwords on every
+    /// field of a window that holds a view typed as a username or a
+    /// password, in use or not: the Passwords bar stayed on the search
+    /// field after a sign-in field (2026-10-22). A view at rest is typed
+    /// as nothing.
+    fn rest_other_input_view(&self, input: *mut AnyObject) -> *mut AnyObject {
+        let other = if input == self.text_input_view {
+            self.credential_input_view
+        } else {
+            self.text_input_view
+        };
+        unsafe {
+            super::text_input::configure_keyboard_traits(other, &crate::TextTraits::DEFAULT);
+            // Typing the view as nothing was not enough after a password
+            // field: the Passwords bar stayed on the search field
+            // (2026-10-23). iOS looks through the window's views for a
+            // field that was secure, so the credential view leaves the
+            // hierarchy while at rest (`attach_input_view` puts it back).
+            let has_focus: Bool = msg_send![other, isFirstResponder];
+            if other == self.credential_input_view && !has_focus.as_bool() {
+                let _: () = msg_send![other, removeFromSuperview];
+            }
+        }
+        other
+    }
+
+    /// Puts a composition view back under the window's view when it left
+    /// it at rest (`rest_other_input_view`), before it takes the focus.
+    fn attach_input_view(&self, input: *mut AnyObject) {
+        unsafe {
+            let superview: *mut AnyObject = msg_send![input, superview];
+            if superview.is_null() {
+                let _: () = msg_send![self.view, addSubview: input];
+            }
+        }
+    }
+
+    /// The composition view for a field with these traits: the credential
+    /// one for a username or a password, the other for the rest.
+    fn input_view_for(&self, traits: &crate::TextTraits) -> *mut AnyObject {
+        use crate::TextContent;
+        let credential = traits.secure
+            || matches!(
+                traits.content,
+                TextContent::Username | TextContent::Password | TextContent::NewPassword
+            );
+        if credential { self.credential_input_view } else { self.text_input_view }
+    }
+
+    /// The composition view of the field that has the focus.
+    fn active_input_view(&self) -> *mut AnyObject {
+        self.input_view_for(&crate::text_traits())
+    }
+
+    /// Shows the system's edit menu over a text field (`UIEditMenuInteraction`,
+    /// iOS 16): Cut, Copy, Paste and Select All, as the menu offers them.
+    /// The chosen entry goes to `on_action`, once.
+    pub fn present_edit_menu(&self, menu: crate::EditMenu, on_action: Box<dyn FnMut(crate::EditAction)>) {
+        if self.view.is_null() {
+            return;
+        }
+        {
+            let mut state = self.edit_menu.borrow_mut();
+            state.menu = menu;
+            state.on_action = Some(on_action);
+            state.blocks.clear();
+        }
+        unsafe {
+            if self.edit_menu_interaction.get().is_null() {
+                let Some(class) = AnyClass::get(c"UIEditMenuInteraction") else {
+                    log::warn!("GPUI iOS: no UIEditMenuInteraction (iOS 16 and later); no edit menu");
+                    return;
+                };
+                let delegate_class = register_edit_menu_delegate_class();
+                let delegate: *mut AnyObject = msg_send![delegate_class, alloc];
+                let delegate: *mut AnyObject = msg_send![delegate, init];
+                #[allow(deprecated)]
+                {
+                    *(*delegate).get_mut_ivar::<*mut c_void>(GPUI_WINDOW_IVAR) =
+                        self as *const IosWindow as *mut c_void;
+                }
+                let interaction: *mut AnyObject = msg_send![class, alloc];
+                let interaction: *mut AnyObject = msg_send![interaction, initWithDelegate: delegate];
+                let _: () = msg_send![self.view, addInteraction: interaction];
+                self.edit_menu_delegate.set(delegate);
+                self.edit_menu_interaction.set(interaction);
+            }
+            // The menu points at the top middle of the field; the delegate
+            // gives the whole rect of the field as the target.
+            let source = ObjcCGPoint { x: (menu.x + menu.w / 2.) as f64, y: menu.y as f64 };
+            let config: *mut AnyObject = msg_send![class!(UIEditMenuConfiguration),
+                configurationWithIdentifier: ptr::null::<AnyObject>(), sourcePoint: source];
+            let _: () = msg_send![self.edit_menu_interaction.get(), presentEditMenuWithConfiguration: config];
+        }
+    }
+
+    /// The user chose an entry of the edit menu.
+    fn edit_menu_fire(&self, action: crate::EditAction) {
+        // Out of the cell before the call: the app may show another menu
+        // or move the focus from inside the callback.
+        let on_action = self.edit_menu.borrow_mut().on_action.take();
+        if let Some(mut on_action) = on_action {
+            on_action(action);
+        }
+    }
+
+    /// The rect of the field the edit menu is for, for the delegate.
+    fn edit_menu_rect(&self) -> ObjcCGRect {
+        let menu = self.edit_menu.borrow().menu;
+        ObjcCGRect::new(menu.x as f64, menu.y as f64, menu.w as f64, menu.h as f64)
+    }
+
+    /// The `UIMenu` of the edit menu: an action for each entry the field
+    /// offers, each with a block that fires `edit_menu_fire`.
+    unsafe fn edit_menu_build(&self) -> *mut AnyObject {
+        use crate::EditAction;
+        let menu = self.edit_menu.borrow().menu;
+        let entries: [(bool, &str, EditAction); 4] = [
+            (menu.cut, "Cut", EditAction::Cut),
+            (menu.copy, "Copy", EditAction::Copy),
+            (menu.paste, "Paste", EditAction::Paste),
+            (menu.select_all, "Select All", EditAction::SelectAll),
+        ];
+        let window_ptr = self as *const IosWindow as usize;
+        unsafe {
+            let children: *mut AnyObject = msg_send![class!(NSMutableArray), array];
+            for (offered, title, action) in entries {
+                if !offered {
+                    continue;
+                }
+                let block = block2::RcBlock::new(move |_action: *mut AnyObject| {
+                    let window = &*(window_ptr as *const IosWindow);
+                    window.edit_menu_fire(action);
+                });
+                let ui_action: *mut AnyObject = msg_send![class!(UIAction),
+                    actionWithTitle: crate::util::nsstring(title),
+                    image: ptr::null::<AnyObject>(),
+                    identifier: ptr::null::<AnyObject>(),
+                    handler: &*block];
+                let _: () = msg_send![children, addObject: ui_action];
+                // UIKit copies the block; keeping ours is cheap insurance.
+                self.edit_menu.borrow_mut().blocks.push(block);
+            }
+            msg_send![class!(UIMenu), menuWithChildren: children]
         }
     }
 
@@ -1152,12 +1514,19 @@ impl IosWindow {
     pub fn hide_keyboard(&self) {
         log::info!("GPUI iOS: Hiding keyboard");
         unsafe {
-            let _: () = msg_send![self.text_input_view, gpuiResetComposition];
-            let _: () = msg_send![self.text_input_view,
-                performSelector: sel!(resignFirstResponder),
-                withObject: ptr::null::<AnyObject>(),
-                afterDelay: 0.0_f64
-            ];
+            for input in [self.text_input_view, self.credential_input_view] {
+                // Typed as nothing while down (`rest_other_input_view`).
+                super::text_input::configure_keyboard_traits(input, &crate::TextTraits::DEFAULT);
+                let _: () = msg_send![input, gpuiResetComposition];
+                let _: () = msg_send![input,
+                    performSelector: sel!(resignFirstResponder),
+                    withObject: ptr::null::<AnyObject>(),
+                    afterDelay: 0.0_f64
+                ];
+            }
+            // The credential view leaves the hierarchy while down, or the
+            // next field's keyboard offers the Passwords bar.
+            let _: () = msg_send![self.credential_input_view, removeFromSuperview];
         }
     }
 
@@ -2045,5 +2414,114 @@ impl IosWindow {
             "nodes": list,
         })
         .to_string()
+    }
+}
+
+/// The seconds a keyboard slide takes, from the user info of a
+/// `UIKeyboardWillShow` or `WillHide` notification; UIKit's usual quarter
+/// second when the notification does not say.
+fn keyboard_slide_seconds(user_info: *mut AnyObject) -> f64 {
+    if user_info.is_null() {
+        return 0.25;
+    }
+    unsafe {
+        let key = crate::util::nsstring("UIKeyboardAnimationDurationUserInfoKey");
+        let value: *mut AnyObject = msg_send![user_info, objectForKey: key];
+        if value.is_null() {
+            return 0.25;
+        }
+        let seconds: f64 = msg_send![value, doubleValue];
+        if seconds > 0. { seconds } else { 0.25 }
+    }
+}
+
+/// What the edit menu of a text field offers and does (`present_edit_menu`).
+#[derive(Default)]
+struct EditMenuState {
+    menu: crate::EditMenu,
+    on_action: Option<Box<dyn FnMut(crate::EditAction)>>,
+    /// The handler blocks of the menu's actions, alive while the menu is.
+    blocks: Vec<block2::RcBlock<dyn Fn(*mut AnyObject)>>,
+}
+
+static EDIT_MENU_DELEGATE_CLASS_REGISTERED: std::sync::Once = std::sync::Once::new();
+
+/// The delegate of the edit menu interaction: it answers with the menu the
+/// window builds (`edit_menu_build`) and the rect of the field.
+fn register_edit_menu_delegate_class() -> &'static AnyClass {
+    EDIT_MENU_DELEGATE_CLASS_REGISTERED.call_once(|| {
+        let mut decl = ClassBuilder::new(c"GPUIEditMenuDelegate", class!(NSObject)).unwrap();
+        decl.add_ivar::<*mut c_void>(c"gpui_window_ptr");
+
+        unsafe fn window_of(this: *mut AnyObject) -> Option<&'static IosWindow> {
+            #[allow(deprecated)]
+            let window_ptr: *mut c_void = unsafe { *(*this).get_ivar(GPUI_WINDOW_IVAR) };
+            if window_ptr.is_null() {
+                None
+            } else {
+                Some(unsafe { &*(window_ptr as *const IosWindow) })
+            }
+        }
+
+        unsafe extern "C" fn menu_for_configuration(
+            this: *mut AnyObject,
+            _sel: Sel,
+            _interaction: *mut AnyObject,
+            _configuration: *mut AnyObject,
+            _suggested: *mut AnyObject,
+        ) -> *mut AnyObject {
+            match unsafe { window_of(this) } {
+                Some(window) => unsafe { window.edit_menu_build() },
+                None => ptr::null_mut(),
+            }
+        }
+
+        unsafe extern "C" fn target_rect_for_configuration(
+            this: *mut AnyObject,
+            _sel: Sel,
+            _interaction: *mut AnyObject,
+            _configuration: *mut AnyObject,
+        ) -> ObjcCGRect {
+            match unsafe { window_of(this) } {
+                Some(window) => window.edit_menu_rect(),
+                None => ObjcCGRect::new(0., 0., 0., 0.),
+            }
+        }
+
+        unsafe {
+            decl.add_method(
+                sel!(editMenuInteraction:menuForConfiguration:suggestedActions:),
+                menu_for_configuration
+                    as unsafe extern "C" fn(
+                        *mut AnyObject,
+                        Sel,
+                        *mut AnyObject,
+                        *mut AnyObject,
+                        *mut AnyObject,
+                    ) -> *mut AnyObject,
+            );
+            decl.add_method(
+                sel!(editMenuInteraction:targetRectForConfiguration:),
+                target_rect_for_configuration
+                    as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject, *mut AnyObject) -> ObjcCGRect,
+            );
+        }
+        decl.register();
+    });
+    class!(GPUIEditMenuDelegate)
+}
+
+/// The text of an `NSString`, empty for nil.
+fn nsstring_to_string(string: *mut AnyObject) -> String {
+    if string.is_null() {
+        return String::new();
+    }
+    unsafe {
+        let utf8: *const i8 = msg_send![string, UTF8String];
+        if utf8.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+        }
     }
 }

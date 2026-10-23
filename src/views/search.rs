@@ -12,7 +12,12 @@ use crate::{
     app::{CardRow, Bloom, Page},
     icons::{Filled, filled},
     jellyfin::{Item, ItemKind, SeerrItem},
-    ui::{input::Input, scroll_area::ScrollArea, theme::UiTheme},
+    ui::{
+        input::Input,
+        motion::{Enter, enter},
+        scroll_area::ScrollArea,
+        theme::UiTheme,
+    },
     views::cards::{
         CARD_RADIUS, CARD_TEXT_H, Cards, artwork, empty_state, icon, poster_card, section, skeleton_row,
         wide_card,
@@ -122,12 +127,26 @@ impl Bloom {
                         .child(
                             div().px(px(m.side)).flex().justify_center().child(
                                 Input::new(&self.search_input)
+                                    .keyboard(crate::ui::input::Keyboard::search())
                                     .aria_label("Search")
                                     .w(px(640.))
                                     .h(px(46.)),
                             ),
                         )
-                        .children(rows),
+                        // The results lift into place when they arrive
+                        // (`ui::motion`): the key is the query and whether
+                        // there are results, so the skeleton stays still
+                        // and the rows come in once.
+                        .child(enter(
+                            div().flex().flex_col().gap(px(22.)).children(rows),
+                            SharedString::from(format!(
+                                "search.rows.{}.{}",
+                                data.query,
+                                !data.results.is_empty() || !data.seerr.is_empty()
+                            )),
+                            Enter::Lift,
+                            cx,
+                        )),
                 ),
         )
     }

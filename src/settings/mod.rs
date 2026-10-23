@@ -21,7 +21,12 @@ use serde_json::Value;
 use crate::{
     app::{Bloom, Page, SessionEpoch},
     jellyfin::Client,
-    ui::{menu::MenuItem, scroll_area::ScrollArea, theme::UiTheme},
+    ui::{
+        menu::MenuItem,
+        motion::{Enter, enter},
+        scroll_area::ScrollArea,
+        theme::UiTheme,
+    },
     views::cards::icon,
 };
 
@@ -797,7 +802,14 @@ impl Bloom {
                                     .child(open.label()),
                             )
                         })
-                        .child(page),
+                        // The section comes in: pushed from the right on
+                        // a phone, a fade on the Mac (`ui::motion`).
+                        .child(enter(
+                            page,
+                            SharedString::from(format!("settings.page.{open:?}")),
+                            if compact { Enter::Push } else { Enter::Fade },
+                            cx,
+                        )),
                 ),
         );
 
@@ -808,7 +820,13 @@ impl Bloom {
             .when(narrow, |el| el.flex_col())
             .when(show_list, |el| {
                 el.child(if compact {
-                    ScrollArea::new("settings.nav.scroll").size_full().child(nav).into_any_element()
+                    // Back from a section: the list fades in.
+                    enter(
+                        ScrollArea::new("settings.nav.scroll").size_full().child(nav),
+                        "settings.list",
+                        Enter::Fade,
+                        cx,
+                    )
                 } else {
                     nav.into_any_element()
                 })
