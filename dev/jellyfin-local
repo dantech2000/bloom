@@ -8,21 +8,26 @@
 #   dev/jellyfin-local reset   remove the container and its data
 #
 # `dev/test-server` calls `up` for BLOOM_TEST_SERVER=container. The data is
-# in target/jellyfin-local (config, cache, media). The media are clips that
-# ffmpeg makes, 20 seconds each, under the names of films with an open
-# licence, so the server finds posters and backdrops for them when the
-# container reaches the network. The account is `bloom-test`; its token is
-# for this server alone.
+# in target/jellyfin-local-<tag> (config, cache, media), one folder per
+# image tag, since a server does not open the database of a newer one.
+# The media are clips that ffmpeg makes, 20 seconds each, under the names
+# of films with an open licence, so the server finds posters and backdrops
+# for them when the container reaches the network, and the clip of
+# dev/make-sub-clip with every kind of subtitle. The account is
+# `bloom-test`; its token is for this server alone.
 #
 # Needs a container engine that answers `docker` (Docker Desktop, Rancher
-# Desktop, colima), ffmpeg, curl and python3. BLOOM_JELLYFIN_IMAGE names the image and
-# BLOOM_JELLYFIN_PORT the port on this Mac (default 8097).
+# Desktop, colima), ffmpeg, curl and python3. BLOOM_JELLYFIN_IMAGE names the
+# image (`jellyfin/jellyfin:12.1.0` for the version of a server) and
+# BLOOM_JELLYFIN_PORT the port on this Mac (default 8097). One version runs
+# at a time: `up` stops the container of another tag first.
 dir=$(cd "$(dirname "$0")/.." && pwd)
-data=$dir/target/jellyfin-local
 image=${BLOOM_JELLYFIN_IMAGE:-jellyfin/jellyfin:latest}
+tag=${image##*:}
+data=$dir/target/jellyfin-local-$tag
 port=${BLOOM_JELLYFIN_PORT:-8097}
 url=http://127.0.0.1:$port
-container=bloom-jellyfin-local
+container=bloom-jellyfin-local-$tag
 user=bloom-test
 auth='MediaBrowser Client="bloom-dev", Device="dev", DeviceId="bloom-jellyfin-local", Version="1"'
 
@@ -55,6 +60,8 @@ media() {
   for episode in 01 02 03; do
     clip "$data/media/shows/Pioneer One (2010)/Season 01/Pioneer One S01E$episode.mkv"
   done
+  python3 -I "$dir/dev/make-sub-clip" "$data/media/movies/Subtitle Clip (2026)" </dev/null ||
+    die "dev/make-sub-clip could not make the subtitle clip"
 }
 
 # The server answers from a small "starting" server first and drops that
@@ -90,6 +97,10 @@ up() {
   media
   mkdir -p "$data/config" "$data/cache"
   if [ -z "$(docker ps -q -f "name=^$container\$")" ]; then
+    # Another version on the port: stop it, its data stays.
+    for other in $(docker ps -q -f name=^bloom-jellyfin-local-); do
+      docker stop "$other" >/dev/null
+    done
     docker rm "$container" >/dev/null 2>&1
     docker run -d --name "$container" -p "127.0.0.1:$port:8096" \
       -v "$data/config:/config" -v "$data/cache:/cache" -v "$data/media:/media:ro" \
@@ -114,7 +125,7 @@ case ${1:-} in
   up) up ;;
   down)
     engine
-    docker stop "$container" >/dev/null 2>&1
+    docker stop $(docker ps -q -f name=^bloom-jellyfin-local-) >/dev/null 2>&1
     say "stopped"
     ;;
   reset)

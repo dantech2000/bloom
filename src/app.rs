@@ -3071,6 +3071,28 @@ impl Bloom {
                     }),
                 );
             }
+            // The subtitle files the server offers that mpv does not have
+            // yet: an image track comes when it is chosen.
+            if kind == "sub" && let Some(resolved) = crate::stream::current() {
+                for sub in &resolved.external_subs {
+                    if resolved.sid_of_external(sub.index, status).is_some() {
+                        continue;
+                    }
+                    let (index, handle) = (sub.index, this.clone());
+                    let detail = if status.pending_subs.contains(&index) { "Loading…" } else { "" };
+                    items.push(
+                        MenuItem::new(
+                            gpui_kit::SharedString::from(format!("track.sub.file.{index}")),
+                            sub.title.clone(),
+                        )
+                        .detail(detail)
+                        .radio(false)
+                        .on_click(move |_, _, cx| {
+                            handle.update(cx, |t, _| t.stream_subtitle(index)).ok();
+                        }),
+                    );
+                }
+            }
             if items.is_empty() {
                 items.push(
                     MenuItem::new(
@@ -3179,6 +3201,9 @@ impl Bloom {
                             || status.tracks_version != this.player_status.tracks_version;
                         this.player_status = status;
                         this.subs_status_changed(cx);
+                        for index in this.player.take_failed_subtitles() {
+                            this.subtitle_file_failed(index);
+                        }
                         if this.player_status.tracks_version != this.tracks_version {
                             this.tracks_version = this.player_status.tracks_version;
                             this.rebuild_track_menus(cx);

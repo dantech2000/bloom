@@ -283,6 +283,37 @@ impl Bloom {
                     self.player.set_muted(false);
                 }
             }
+            // A track by its server index, as the menus pick one: `track sub
+            // <index|off>`, `track audio <index>`. `tracks` prints them.
+            "track" => {
+                let usage = "error: usage: track sub <index|off> | track audio <index>";
+                let (kind, which) = rest.split_once(' ').unwrap_or((rest, ""));
+                let index = match which {
+                    "off" => -1,
+                    n => match n.parse::<i64>() {
+                        Ok(n) => n,
+                        Err(_) => return usage.into(),
+                    },
+                };
+                let resolved = crate::stream::current();
+                let transcode = resolved
+                    .as_ref()
+                    .is_some_and(|r| r.play_method == crate::stream::PlayMethod::Transcode);
+                match kind {
+                    "sub" => self.stream_subtitle(index),
+                    "audio" if transcode => self.stream_reload(Some(index), None),
+                    // Direct play: mpv's own tracks, in the file's order.
+                    "audio" => {
+                        let aid = resolved.as_ref().and_then(|r| {
+                            r.embedded("Audio").iter().position(|s| s.index == index).map(|p| p as i64 + 1)
+                        });
+                        self.player.set_audio(aid);
+                    }
+                    _ => return usage.into(),
+                }
+                return self.debug_tracks();
+            }
+            "tracks" => return self.debug_tracks(),
             // Mutes this instance, for a test member that only follows a group.
             "mute" => {
                 self.muted = true;
@@ -1055,6 +1086,46 @@ impl Bloom {
             self.connect.branding.splashscreen_enabled,
             self.connect.public_users.len(),
             self.connect.error,
+        )
+    }
+
+    /// The tracks as mpv lists them, each with its server index, and what
+    /// the server decided for the subtitles.
+    fn debug_tracks(&self) -> String {
+        let resolved = crate::stream::current();
+        let rows: Vec<String> = self
+            .player_status
+            .tracks
+            .iter()
+            .map(|t| {
+                let index = match (t.kind.as_str(), resolved.as_ref()) {
+                    ("sub", Some(r)) => r.subtitle_of(t.id, &self.player_status),
+                    ("audio", Some(r)) => r.audio_of(t.id),
+                    _ => None,
+                };
+                format!(
+                    "{}{}:{} index={} codec={} title={:?} lang={:?}{}",
+                    if t.selected { "*" } else { " " },
+                    t.kind,
+                    t.id,
+                    index.map_or("-".to_string(), |i| i.to_string()),
+                    t.codec.as_deref().unwrap_or("-"),
+                    t.title,
+                    t.lang,
+                    if t.external { " external" } else { "" },
+                )
+            })
+            .collect();
+        format!(
+            "tracks method={} burned={:?} burn_in={} external_subs={:?} selected_external={:?} sids={:?} pending={:?}\n{}",
+            resolved.as_ref().map_or("none", |r| r.play_method.as_str()),
+            resolved.as_ref().and_then(|r| r.burned_subtitle),
+            resolved.as_ref().is_some_and(|r| r.burn_in),
+            resolved.as_ref().map(|r| r.external_subs.iter().map(|s| s.index).collect::<Vec<_>>()).unwrap_or_default(),
+            resolved.as_ref().and_then(|r| r.selected_external),
+            self.player_status.external_sids,
+            self.player_status.pending_subs,
+            rows.join("\n")
         )
     }
 

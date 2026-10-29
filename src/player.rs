@@ -123,16 +123,31 @@ pub struct PlayerStatus {
     /// The subtitle and audio delay in seconds, as mpv reports them.
     pub sub_delay: f64,
     pub audio_delay: f64,
+    /// The id mpv gave each subtitle file added to the item, by server
+    /// index. mpv numbers a file as it is added, so the menus map a file
+    /// by this and not by its place in a list: a file that did not come
+    /// does not shift the ids of the ones after it.
+    pub external_sids: Vec<(i64, i64)>,
+    /// The server indexes of the subtitle files on their way.
+    pub pending_subs: Vec<i64>,
+    /// Files that were to start shown and did not come: the app burns
+    /// the track in instead (`Player::take_failed_subtitles`).
+    pub failed_subs: Vec<i64>,
 }
 
 /// A subtitle in a file of its own, added to the item once it is loaded.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SubtitleFile {
+    /// The server index of the stream.
+    pub index: i64,
     pub url: String,
     pub title: String,
     pub lang: String,
     /// Starts shown.
     pub select: bool,
+    /// An image track (PGS, VobSub): tens of MB, so it is fetched when it
+    /// is chosen and not at the start, unless it starts shown.
+    pub graphical: bool,
 }
 
 pub struct PlayRequest {
@@ -241,7 +256,10 @@ enum Cmd {
     /// Stops the item, with the load count at the stop (see [`Player::stop`]).
     Stop(u64),
     /// A subtitle file of the load `generation` came (see `fetch_subtitles`).
-    AddSubtitle { generation: u64, path: PathBuf, select: bool, title: String, lang: String },
+    AddSubtitle { generation: u64, index: i64, path: PathBuf, select: bool, title: String, lang: String },
+    /// Fetches one subtitle file of the item that plays and shows it when
+    /// it comes (an image track the user chose).
+    FetchSubtitle(SubtitleFile),
     /// Reads an mpv property on the worker (`dev/jctl mpv <name>`, tests).
     Probe(String, mpsc::Sender<String>),
 }
@@ -701,6 +719,17 @@ impl Player {
     pub fn set_subtitle(&self, id: Option<i64>) {
         self.send(Cmd::SetSubtitle(id));
     }
+    /// Fetches a subtitle file of the item that plays, on the side, and
+    /// shows it when it comes: an image track the user chose, which was
+    /// not fetched at the start.
+    pub fn fetch_subtitle_file(&self, file: SubtitleFile) {
+        self.send(Cmd::FetchSubtitle(file));
+    }
+    /// The server indexes of the chosen subtitle files that did not come
+    /// since the last call.
+    pub fn take_failed_subtitles(&self) -> Vec<i64> {
+        std::mem::take(&mut self.shared.status.lock().unwrap().failed_subs)
+    }
     /// Volume from 0 to 100.
     pub fn set_volume(&self, volume: f64) {
         self.send(Cmd::SetVolume(volume));
@@ -1070,8 +1099,9 @@ pub(crate) fn spawn_reporter() -> mpsc::Sender<Report> {
 /// subtitle of a transcode at the first request for it, out of the whole
 /// file: about 80 s for a 9 GB episode (measured 2026-10-17).
 const SUBTITLE_WAIT: Duration = Duration::from_secs(180);
-/// A subtitle file larger than this is not one.
-const SUBTITLE_LIMIT: u64 = 32 * 1024 * 1024;
+/// A subtitle file larger than this is not one. A PGS track of a film is
+/// 20 to 60 MB, one of a 4K film about 100 MB.
+const SUBTITLE_LIMIT: u64 = 256 * 1024 * 1024;
 
 /// Fetches the subtitle files of a load on a thread of its own and hands
 /// each to the worker as `Cmd::AddSubtitle`, in their order. mpv's own
@@ -1080,7 +1110,9 @@ const SUBTITLE_LIMIT: u64 = 32 * 1024 * 1024;
 /// command for the time of a slow server, the stop of the user among them
 /// (2026-10-17, a transcode of an episode whose subtitles the server
 /// first had to make). A load that was replaced or stopped meanwhile gets
-/// no files.
+/// no files. An image track that does not start shown is left for the
+/// moment the user chooses it (`Cmd::FetchSubtitle`): a film's ten PGS
+/// tracks are 300 MB, which would go with the video over the link.
 fn fetch_subtitles(
     shared: Arc<Shared>,
     tx: mpsc::Sender<Cmd>,
@@ -1088,33 +1120,35 @@ fn fetch_subtitles(
     generation: u64,
     subtitles: Vec<SubtitleFile>,
 ) {
+    let subtitles: Vec<SubtitleFile> = subtitles.into_iter().filter(|sub| sub.select || !sub.graphical).collect();
+    for sub in &subtitles {
+        set_pending(&shared, sub.index, true);
+    }
     let _ = thread::Builder::new().name("subtitles".into()).spawn(move || {
         let dir = std::env::temp_dir().join("bloom-subtitles");
-        for (n, sub) in subtitles.into_iter().enumerate() {
+        for sub in subtitles {
             if shared.load_gen.load(Ordering::Acquire) != generation {
                 return;
             }
-            let bytes = match fetch_subtitle(&client, &sub.url) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    log::warn!("subtitle {:?} not fetched: {err:#}", sub.title);
-                    continue;
-                }
-            };
             // The extension tells mpv the format ahead of the content.
-            let extension = sub
-                .url
-                .split('?')
-                .next()
-                .and_then(|path| path.rsplit('.').next().filter(|ext| ext.len() <= 4))
-                .unwrap_or("srt");
-            let path = dir.join(format!("{}-{generation}-{n}.{extension}", std::process::id()));
-            if let Err(err) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &bytes)) {
-                log::warn!("subtitle file not written: {err}");
+            let path = dir.join(format!("{}-{generation}-{}.{}", std::process::id(), sub.index, subtitle_extension(&sub.url)));
+            let fetched = std::fs::create_dir_all(&dir)
+                .map_err(anyhow::Error::from)
+                .and_then(|()| fetch_subtitle(&client, &sub.url, &path));
+            if let Err(err) = fetched {
+                log::warn!("subtitle {:?} not fetched: {err:#}", sub.title);
+                let _ = std::fs::remove_file(&path);
+                set_pending(&shared, sub.index, false);
+                if sub.select && shared.load_gen.load(Ordering::Acquire) == generation {
+                    let mut status = shared.status.lock().unwrap();
+                    status.failed_subs.push(sub.index);
+                    status.tracks_version += 1;
+                }
                 continue;
             }
             let sent = tx.send(Cmd::AddSubtitle {
                 generation,
+                index: sub.index,
                 path,
                 select: sub.select,
                 title: sub.title,
@@ -1129,8 +1163,23 @@ fn fetch_subtitles(
     });
 }
 
-/// One subtitle file, with the token in the header as every request.
-fn fetch_subtitle(client: &Client, url: &str) -> Result<Vec<u8>> {
+/// Marks a subtitle file as on its way, or as come: the menu says
+/// "Loading…" meanwhile.
+fn set_pending(shared: &Shared, index: i64, pending: bool) {
+    let mut status = shared.status.lock().unwrap();
+    let was = status.pending_subs.contains(&index);
+    match (pending, was) {
+        (true, false) => status.pending_subs.push(index),
+        (false, true) => status.pending_subs.retain(|i| *i != index),
+        _ => return,
+    }
+    status.tracks_version += 1;
+}
+
+/// One subtitle file into `path`, with the token in the header as every
+/// request. The body goes to the file as it comes: an image track is tens
+/// of MB, and the memory of the app need not hold it.
+fn fetch_subtitle(client: &Client, url: &str, path: &std::path::Path) -> Result<()> {
     let mut response = client
         .agent()
         .get(url)
@@ -1139,7 +1188,29 @@ fn fetch_subtitle(client: &Client, url: &str) -> Result<Vec<u8>> {
         .build()
         .header("Authorization", client.auth_header())
         .call()?;
-    Ok(response.body_mut().with_config().limit(SUBTITLE_LIMIT).read_to_vec()?)
+    let mut reader = response.body_mut().with_config().limit(SUBTITLE_LIMIT).reader();
+    let mut file = std::fs::File::create(path)?;
+    std::io::copy(&mut reader, &mut file)?;
+    Ok(())
+}
+
+/// The extension of the file written for a subtitle address: the format
+/// the server names, as mpv knows it. The server's names for the two
+/// image formats are not file extensions (ffmpeg refuses `.pgssub`), and
+/// a VobSub comes in an `.mks`. A text format keeps its name; anything
+/// else is taken for SubRip, the format the server converts to.
+fn subtitle_extension(url: &str) -> String {
+    let name = url.split(['?', '#']).next().unwrap_or(url);
+    let extension = match name.rsplit_once('.') {
+        Some((_, extension)) if !extension.contains('/') => extension.to_ascii_lowercase(),
+        _ => String::new(),
+    };
+    match extension.as_str() {
+        "pgssub" | "pgs" | "sup" => "sup".into(),
+        "vobsub" | "dvdsub" | "mks" => "mks".into(),
+        "srt" | "ass" | "ssa" | "vtt" => extension,
+        _ => "srt".into(),
+    }
 }
 
 /// How long the player may be out of data before it counts as a stall.
@@ -1760,7 +1831,8 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
                         rest(&shared);
                     }
                 }
-                Cmd::AddSubtitle { generation, path, select, title, lang } => {
+                Cmd::AddSubtitle { generation, index, path, select, title, lang } => {
+                    set_pending(&shared, index, false);
                     // Of an item that is over, or of a load a later one replaced.
                     if generation != worker.generation || session.is_none() {
                         let _ = std::fs::remove_file(&path);
@@ -1768,10 +1840,36 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
                     }
                     let flag = if select { "select" } else { "auto" };
                     let file = path.to_string_lossy().into_owned();
-                    if let Err(err) = mpv.command("sub-add", &[file.as_str(), flag, &title, &lang]) {
-                        log::warn!("sub-add failed: {err}");
+                    match mpv.command("sub-add", &[file.as_str(), flag, &title, &lang]) {
+                        Err(err) => log::warn!("sub-add failed: {err}"),
+                        Ok(()) => {
+                            // mpv appends the track, so its id is the highest
+                            // subtitle id now; the menus find the file by it.
+                            let sid = mpv
+                                .get_property::<String>("track-list")
+                                .ok()
+                                .and_then(|json| serde_json::from_str::<Vec<Track>>(&json).ok())
+                                .and_then(|tracks| tracks.iter().filter(|t| t.kind == "sub").map(|t| t.id).max());
+                            if let Some(sid) = sid {
+                                let mut status = shared.status.lock().unwrap();
+                                status.external_sids.retain(|(i, _)| *i != index);
+                                status.external_sids.push((index, sid));
+                                status.tracks_version += 1;
+                            }
+                        }
                     }
                     worker.sub_files.push(path);
+                }
+                Cmd::FetchSubtitle(file) => {
+                    if let Some(active) = session.as_ref() {
+                        fetch_subtitles(
+                            shared.clone(),
+                            worker.tx.clone(),
+                            active.client.clone(),
+                            worker.generation,
+                            vec![SubtitleFile { select: true, ..file }],
+                        );
+                    }
                 }
                 Cmd::Quit => {
                     worker.forget_subtitles();
@@ -2964,6 +3062,140 @@ mod tests {
     /// A 30 s clip with no sound: two silent audio tracks and two subtitle
     /// tracks (so a choice of the second one can be told from what mpv
     /// selects by itself, the first), for a test that must never be heard.
+    #[test]
+    fn a_subtitle_file_gets_the_extension_mpv_knows() {
+        let at = |end: &str| subtitle_extension(&format!("https://media.example.com/Videos/i/s/Subtitles/3/0/Stream.{end}"));
+        assert_eq!(at("pgssub?ApiKey=x"), "sup");
+        assert_eq!(at("sup"), "sup");
+        assert_eq!(at("vobsub"), "mks");
+        assert_eq!(at("mks"), "mks");
+        assert_eq!(at("srt"), "srt");
+        assert_eq!(at("ASS"), "ass");
+        assert_eq!(at("vtt#frag"), "vtt");
+        // What the server converts to SubRip, and an address without an extension.
+        assert_eq!(at("mov_text"), "srt");
+        assert_eq!(subtitle_extension("https://media.example.com/no-extension"), "srt");
+        assert_eq!(subtitle_extension("https://a.b/x"), "srt");
+    }
+
+    /// The files of `dev/make-sub-clip` (a PGS and a VobSub, real ones
+    /// every decoder takes), made once per run; none without ffmpeg.
+    fn sub_clip() -> Option<std::path::PathBuf> {
+        let folder = std::env::temp_dir().join("bloom-test-sub-clip");
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("dev/make-sub-clip");
+        let made = std::process::Command::new("python3").arg("-I").arg(script).arg(&folder).status();
+        match made {
+            Ok(status) if status.success() => Some(folder),
+            Ok(status) => panic!("dev/make-sub-clip failed: {status}"),
+            Err(_) => {
+                eprintln!("python3 not available; skipping");
+                None
+            }
+        }
+    }
+
+    /// A server of files by the end of the path; any other path is a 404.
+    fn file_server(files: Vec<(&'static str, std::path::PathBuf)>) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut request = [0u8; 4096];
+                let n = std::io::Read::read(&mut stream, &mut request).unwrap_or(0);
+                let head = String::from_utf8_lossy(&request[..n]).to_string();
+                let path = head.split_whitespace().nth(1).unwrap_or_default().to_string();
+                let body = files.iter().find(|(end, _)| path.ends_with(end)).and_then(|(_, file)| std::fs::read(file).ok());
+                let answer = match body {
+                    Some(body) => {
+                        let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                        [head.into_bytes(), body].concat()
+                    }
+                    None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+                };
+                let _ = std::io::Write::write_all(&mut stream, &answer);
+            }
+        });
+        port
+    }
+
+    /// An image track comes as a file the server names `Stream.pgssub` or
+    /// `Stream.vobsub`: written with the extension mpv knows, it is a
+    /// subtitle track of the right codec. A file that starts shown is
+    /// fetched at the start, an image track that does not waits for the
+    /// choice (`fetch_subtitle_file`), and a file that fails to come is
+    /// reported and shifts no id of the others: the ids map by the file.
+    #[test]
+    fn image_subtitle_files_are_tracks_of_their_codec_and_map_by_file() {
+        let Some(_one) = real_player_turn() else { return };
+        let Some(clip) = silent_clip("bloom-test-image-subs.mp4") else { return };
+        let Some(subs) = sub_clip() else { return };
+        let port = file_server(vec![
+            ("/Subtitles/1/0/Stream.pgssub", subs.join("Subtitle Clip (2026).eng.sup")),
+            ("/Subtitles/2/0/Stream.vobsub", subs.join("Subtitle Clip (2026).eng.mks")),
+        ]);
+        let file = |index: i64, format: &str, select: bool, graphical: bool| SubtitleFile {
+            index,
+            url: format!("http://127.0.0.1:{port}/Videos/i/s/Subtitles/{index}/0/Stream.{format}"),
+            title: format!("file {index}"),
+            lang: "eng".into(),
+            select,
+            graphical,
+        };
+        let player = Player::default();
+        let _closer = Closer(player.clone());
+        let mut request = request(&clip.to_string_lossy(), "image subtitles", 1);
+        // The PGS starts shown; the text file 3 is not on the server; the
+        // VobSub is an image track not chosen, so it waits.
+        request.subtitles = vec![file(1, "pgssub", true, true), file(3, "srt", false, false), file(2, "vobsub", false, true)];
+        player.play(request);
+        let wait = |what: &str, done: &dyn Fn(&PlayerStatus) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let status = player.status();
+                assert!(status.error.is_none(), "{status:?}");
+                if done(&status) {
+                    return status;
+                }
+                assert!(Instant::now() < deadline, "{what} did not happen: {status:?}");
+                thread::sleep(Duration::from_millis(50));
+            }
+        };
+        let codec = |status: &PlayerStatus, sid: i64| {
+            status.tracks.iter().find(|t| t.kind == "sub" && t.id == sid).and_then(|t| t.codec.clone()).unwrap_or_default()
+        };
+        let status = wait("the PGS file", &|s| s.external_sids.iter().any(|(index, _)| *index == 1) && s.pending_subs.is_empty());
+        let pgs = status.external_sids.iter().find(|(index, _)| *index == 1).map(|(_, sid)| *sid).unwrap();
+        let status = wait("the PGS track", &|s| !codec(s, pgs).is_empty());
+        assert_eq!(codec(&status, pgs), "hdmv_pgs_subtitle", "{status:?}");
+        assert!(status.tracks.iter().any(|t| t.id == pgs && t.selected), "the PGS starts shown: {status:?}");
+        // The lost text file was not to start shown, so it is no failure
+        // to report; the VobSub was not asked for.
+        assert_eq!(player.take_failed_subtitles(), Vec::<i64>::new());
+        assert!(status.external_sids.iter().all(|(index, _)| *index == 1), "{status:?}");
+        // The VobSub comes when it is chosen, and gets the next id.
+        player.fetch_subtitle_file(file(2, "vobsub", true, true));
+        let status = wait("the VobSub file", &|s| s.external_sids.iter().any(|(index, _)| *index == 2));
+        let vobsub = status.external_sids.iter().find(|(index, _)| *index == 2).map(|(_, sid)| *sid).unwrap();
+        assert_eq!(vobsub, pgs + 1, "{status:?}");
+        let status = wait("the VobSub track", &|s| !codec(s, vobsub).is_empty());
+        assert_eq!(codec(&status, vobsub), "dvd_subtitle", "{status:?}");
+        assert_eq!(status.external_sids, vec![(1, pgs), (2, vobsub)]);
+        // A chosen file that does not come is reported, and the map stands.
+        player.fetch_subtitle_file(file(3, "srt", true, false));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let failed = loop {
+            let failed = player.take_failed_subtitles();
+            if !failed.is_empty() {
+                break failed;
+            }
+            assert!(Instant::now() < deadline, "the lost file was not reported: {:?}", player.status());
+            thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(failed, vec![3]);
+        assert_eq!(player.status().external_sids, vec![(1, pgs), (2, vobsub)]);
+        player.stop();
+    }
+
     fn silent_clip(name: &str) -> Option<std::path::PathBuf> {
         let media = std::env::temp_dir().join(name);
         let subs = std::env::temp_dir().join(format!("{name}.srt"));
@@ -3052,10 +3284,12 @@ mod tests {
         let _closer = Closer(player.clone());
         let mut request = request(&clip.to_string_lossy(), "slow subtitle", 1);
         request.subtitles = vec![SubtitleFile {
+            index: 2,
             url: format!("http://127.0.0.1:{port}/Subtitles/2/0/Stream.srt"),
             title: "slow".into(),
             lang: "eng".into(),
             select: true,
+            graphical: false,
         }];
         let started = Instant::now();
         player.play(request);
