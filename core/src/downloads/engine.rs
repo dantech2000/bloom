@@ -1028,7 +1028,7 @@ fn download_run(inner: &Arc<Inner>, job: &Job, again: bool) -> Result<(), Stop> 
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|s| s["Type"].as_str() == Some("Subtitle") && s["IsExternal"].as_bool() == Some(true))
+            .filter(|s| sidecar_format(s).is_some())
             .count();
         let subtitles = fetch_subtitles(&agent, client, item_id, &source, folder, &live);
         meta["SubtitlesMissing"] = Value::Bool(subtitles.len() < wanted);
@@ -1559,6 +1559,26 @@ fn fetch_images(
     }
 }
 
+/// The format asked of the server and the extension of the file kept
+/// for an external subtitle stream; none for a stream the engine leaves
+/// out. A PGS sidecar comes as it is under the server's name for the
+/// format (a server before 12.2 refuses "sup"), and mpv takes the `.sup`
+/// on the side. The server gives no file for the other image sidecars: a
+/// VobSub pair (`.idx/.sub`) goes through its text converter and fails.
+fn sidecar_format(stream: &Value) -> Option<(&'static str, &'static str)> {
+    if stream["Type"].as_str() != Some("Subtitle") || stream["IsExternal"].as_bool() != Some(true) {
+        return None;
+    }
+    match stream["Codec"].as_str().unwrap_or_default().to_lowercase().as_str() {
+        "subrip" | "srt" => Some(("srt", "srt")),
+        "ass" => Some(("ass", "ass")),
+        "ssa" => Some(("ssa", "ssa")),
+        "webvtt" | "vtt" => Some(("vtt", "vtt")),
+        "pgssub" | "pgs" | "hdmv_pgs_subtitle" => Some(("pgssub", "sup")),
+        _ => None,
+    }
+}
+
 /// External subtitle files of the item. Returns what `meta.json` keeps of
 /// them: the stream index, language, title and file name. `live` is asked
 /// before each write.
@@ -1577,19 +1597,11 @@ fn fetch_subtitles(
             continue;
         }
         let Some(index) = stream["Index"].as_i64() else { continue };
-        let codec = stream["Codec"].as_str().unwrap_or_default().to_lowercase();
-        let extension = match codec.as_str() {
-            "subrip" | "srt" => "srt",
-            "ass" => "ass",
-            "ssa" => "ssa",
-            "webvtt" | "vtt" => "vtt",
-            // Image subtitles are not a file mpv takes on the side.
-            _ => continue,
-        };
+        let Some((format, extension)) = sidecar_format(stream) else { continue };
         let path = stream["DeliveryUrl"]
             .as_str()
             .map(str::to_string)
-            .unwrap_or_else(|| format!("/Videos/{item_id}/{source_id}/Subtitles/{index}/0/Stream.{extension}"));
+            .unwrap_or_else(|| format!("/Videos/{item_id}/{source_id}/Subtitles/{index}/0/Stream.{format}"));
         let Some(url) = resolve_url(&client.base, &path) else {
             log::info!("subtitle {index} of {item_id}: the address {path:?} is not one this app fetches");
             continue;
@@ -1600,17 +1612,11 @@ fn fetch_subtitles(
         let name = format!("sub-{index}.{extension}");
         let file = folder.join(&name);
         if !file.exists() {
-            // A route that answered with the web page gave no subtitle.
-            let Ok(bytes) = get_bytes(agent, &url, auth)
-                .and_then(|bytes| match bytes.starts_with(b"<!DOCTYPE") || bytes.starts_with(b"<html") {
-                    true => Err(anyhow!("not a subtitle file")),
-                    false => Ok(bytes),
-                })
-            else {
-                log::info!("subtitle {index} of {item_id} not fetched");
+            if !live() {
                 continue;
-            };
-            if !live() || write_whole(&file, &bytes).is_err() {
+            }
+            if let Err(err) = get_file(agent, &url, auth, &file) {
+                log::info!("subtitle {index} of {item_id} not fetched: {err:#}");
                 continue;
             }
         }
@@ -1650,6 +1656,48 @@ fn resolve_url(base: &str, given: &str) -> Option<String> {
         return None;
     }
     Some(format!("{base}/{given}"))
+}
+
+/// A subtitle file larger than this is not one (a PGS track of a 4K film
+/// is about 100 MB).
+const MOST_SUBTITLE: u64 = 256 * 1024 * 1024;
+
+/// GET of a subtitle file straight to `path` (a `.tmp` beside it first, as
+/// `write_whole`), so the memory of the app need not hold a PGS track.
+/// `auth` sends the session header with it. A route that answers with
+/// the web page gave no subtitle.
+fn get_file(agent: &ureq::Agent, url: &str, auth: Option<&Client>, path: &Path) -> Result<()> {
+    use std::io::{Read as _, Write as _};
+    let mut request = agent.get(url);
+    if let Some(client) = auth {
+        request = request.header("Authorization", client.auth_header());
+    }
+    let mut response = request.call().context("get")?;
+    let mut reader = response.body_mut().as_reader().take(MOST_SUBTITLE + 1);
+    let mut head = Vec::with_capacity(512);
+    (&mut reader).take(512).read_to_end(&mut head).context("read")?;
+    if head.starts_with(b"<!DOCTYPE") || head.starts_with(b"<html") {
+        return Err(anyhow!("not a subtitle file"));
+    }
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".tmp");
+    let partial = PathBuf::from(name);
+    let written = (|| -> Result<u64> {
+        let mut file = fs::File::create(&partial).context("create")?;
+        file.write_all(&head).context("write")?;
+        Ok(head.len() as u64 + std::io::copy(&mut reader, &mut file).context("read")?)
+    })();
+    match written {
+        Ok(size) if size > MOST_SUBTITLE => {
+            let _ = fs::remove_file(&partial);
+            Err(anyhow!("the answer is over {} MB", MOST_SUBTITLE / (1024 * 1024)))
+        }
+        Ok(_) => fs::rename(&partial, path).context("rename"),
+        Err(err) => {
+            let _ = fs::remove_file(&partial);
+            Err(err)
+        }
+    }
 }
 
 /// GET of a small file. `auth` sends the session header with it.
@@ -3081,6 +3129,29 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let out = fetch_subtitles(&agent, &client, "item", &stream("file:///etc/passwd".into()), &dir, &live);
         assert!(out.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// An image sidecar: a PGS is kept as the `.sup` the server serves as
+    /// it is; a VobSub pair gets no file from the server and is left out.
+    #[test]
+    fn a_pgs_sidecar_is_kept_and_a_vobsub_pair_is_not() {
+        let dir = temp_dir("subpgs");
+        let agent = agent(Duration::from_secs(5), Arc::new(AtomicBool::new(false)));
+        let (own, seen) = one_request_server();
+        let client = Client::new(&format!("http://127.0.0.1:{own}"), "d").with_session("t", "u");
+        let source = serde_json::json!({ "Id": "src", "MediaStreams": [
+            { "Type": "Subtitle", "IsExternal": true, "Index": 0, "Codec": "DVDSUB", "DisplayTitle": "English - DVDSUB - External" },
+            { "Type": "Subtitle", "IsExternal": true, "Index": 1, "Codec": "PGSSUB", "DisplayTitle": "English - PGSSUB - External" },
+            { "Type": "Subtitle", "IsExternal": false, "Index": 5, "Codec": "PGSSUB" }
+        ]});
+        let out = fetch_subtitles(&agent, &client, "item", &source, &dir, &|| true);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0]["File"], "sub-1.sup");
+        assert_eq!(out[0]["Index"], 1);
+        assert!(dir.join("sub-1.sup").is_file());
+        let head = seen.lock().unwrap().clone().expect("the server got the request");
+        assert!(head.starts_with("GET /Videos/item/src/Subtitles/1/0/Stream.pgssub "), "{head}");
         let _ = fs::remove_dir_all(dir);
     }
 

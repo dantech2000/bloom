@@ -76,8 +76,14 @@ pub fn local_source(player: &Player, server_id: Option<&str>, item_id: &str) -> 
                 .collect()
         })
         .unwrap_or_default();
-    // A stream must not get the subtitles of the item before.
-    player.set_property("sub-files", &subtitles.join(":"));
+    // A stream must not get the subtitles of the item before. An empty
+    // string is not an empty list to mpv (it tried to open '' at each
+    // load), so the list is cleared as one.
+    if subtitles.is_empty() {
+        player.command("change-list", &["sub-files", "clr", ""]);
+    } else {
+        player.set_property("sub-files", &subtitles.join(":"));
+    }
     path.map(|p| p.display().to_string())
 }
 
