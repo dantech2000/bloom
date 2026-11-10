@@ -102,7 +102,8 @@ fn rank(title: &str, query: &Query) -> Option<u8> {
     if title.starts_with(query.text) {
         return Some(1);
     }
-    if title.split(' ').any(|word| word.starts_with(query.text)) || title.contains(&query.after_space) {
+    // At the start of a later word. (The first word is the case above.)
+    if title.contains(&query.after_space) {
         return Some(2);
     }
     if title.contains(query.text) {
@@ -123,26 +124,15 @@ fn rank(title: &str, query: &Query) -> Option<u8> {
     query.words.iter().all(|(word, letters)| near(word, *letters)).then_some(4)
 }
 
-/// The items whose title fits the text, best first.
-pub fn search(catalog: &[Item], query: &str) -> Vec<Item> {
-    let query = fold(query);
-    if query.is_empty() {
-        return Vec::new();
-    }
-    let query = Query::new(&query);
-    let mut folded = String::new();
-    let mut rank_of = |title: &str| {
-        fold_into(title, &mut folded);
-        rank(&folded, &query)
-    };
-    let mut found: Vec<(u8, &Item)> = catalog
-        .iter()
-        .filter_map(|item| {
-            let name = rank_of(&item.name);
-            let original = item.original_title.as_deref().and_then(&mut rank_of);
-            name.into_iter().chain(original).min().map(|rank| (rank, item))
-        })
-        .collect();
+/// The best rank of an item whose folded title and original title are given.
+fn rank_of(name: &str, original: Option<&str>, query: &Query) -> Option<u8> {
+    let name = rank(name, query);
+    let original = original.and_then(|title| rank(title, query));
+    name.into_iter().chain(original).min()
+}
+
+/// The items of the ranks, best first.
+fn best(mut found: Vec<(u8, &Item)>) -> Vec<Item> {
     // A title with a typing error only counts when no title fits the text
     // as it is; next to real matches it reads as a wrong result.
     if found.iter().any(|(rank, _)| *rank < 4) {
@@ -150,6 +140,73 @@ pub fn search(catalog: &[Item], query: &str) -> Vec<Item> {
     }
     found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
     found.into_iter().take(LIMIT).map(|(_, item)| item.clone()).collect()
+}
+
+/// The items whose title fits the text, best first. Folds every title for
+/// this one search; a caller that searches the same titles at each key
+/// keeps an [`Index`].
+pub fn search(catalog: &[Item], query: &str) -> Vec<Item> {
+    let query = fold(query);
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let query = Query::new(&query);
+    let (mut name, mut original) = (String::new(), String::new());
+    best(catalog
+        .iter()
+        .filter_map(|item| {
+            fold_into(&item.name, &mut name);
+            let other = item.original_title.as_deref().map(|title| {
+                fold_into(title, &mut original);
+                original.as_str()
+            });
+            rank_of(&name, other, &query).map(|rank| (rank, item))
+        })
+        .collect())
+}
+
+/// The titles of a library with their folded text, made once when the
+/// titles load: a search at each key then folds the typed text alone.
+#[derive(Clone, Debug, Default)]
+pub struct Index {
+    items: Vec<Item>,
+    /// The folded title and original title of each item, in step with `items`.
+    folded: Vec<(String, Option<String>)>,
+}
+
+impl Index {
+    pub fn new(items: Vec<Item>) -> Self {
+        let folded = items
+            .iter()
+            .map(|item| (fold(&item.name), item.original_title.as_deref().map(fold)))
+            .collect();
+        Self { items, folded }
+    }
+
+    pub fn items(&self) -> &[Item] {
+        &self.items
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// The items whose title fits the text, best first; what [`search`] gives.
+    pub fn search(&self, query: &str) -> Vec<Item> {
+        let query = fold(query);
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let query = Query::new(&query);
+        best(self
+            .items
+            .iter()
+            .zip(&self.folded)
+            .filter_map(|(item, (name, original))| {
+                rank_of(name, original.as_deref(), &query).map(|rank| (rank, item))
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -172,173 +229,63 @@ mod tests {
             .collect()
     }
 
-    /// The search as it was, for the comparison below.
-    mod before {
-        use super::super::{Item, LIMIT};
-
-        pub fn fold(text: &str) -> String {
-            let mut out = String::with_capacity(text.len());
-            for c in text.chars().flat_map(char::to_lowercase) {
-                let c = match c {
-                    'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => 'a',
-                    'è' | 'é' | 'ê' | 'ë' => 'e',
-                    'ì' | 'í' | 'î' | 'ï' => 'i',
-                    'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' => 'o',
-                    'ù' | 'ú' | 'û' | 'ü' => 'u',
-                    'ñ' => 'n',
-                    'ç' => 'c',
-                    c if c.is_alphanumeric() => c,
-                    _ => ' ',
-                };
-                if c != ' ' || !out.ends_with(' ') {
-                    out.push(c);
-                }
-            }
-            out.trim().to_string()
-        }
-
-        pub fn one_off(a: &str, b: &str) -> bool {
-            let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
-            let (short, long) = if a.len() <= b.len() { (&a, &b) } else { (&b, &a) };
-            if long.len() - short.len() > 1 {
-                return false;
-            }
-            let same = short.iter().zip(long.iter()).take_while(|(x, y)| x == y).count();
-            if long.len() == short.len() {
-                short[same..].iter().skip(1).eq(long[same..].iter().skip(1))
-            } else {
-                short[same..].iter().eq(long[same..].iter().skip(1))
-            }
-        }
-
-        fn rank(title: &str, query: &str) -> Option<u8> {
-            if title == query {
-                return Some(0);
-            }
-            if title.starts_with(query) {
-                return Some(1);
-            }
-            if title.split(' ').any(|word| word.starts_with(query)) || title.contains(&format!(" {query}")) {
-                return Some(2);
-            }
-            if title.contains(query) {
-                return Some(3);
-            }
-            let words: Vec<&str> = query.split(' ').collect();
-            let near = |wanted: &str| {
-                title.split(' ').any(|word| {
-                    word.starts_with(wanted)
-                        || (wanted.chars().count() >= 5
-                            && (one_off(word, wanted)
-                                || word
-                                    .char_indices()
-                                    .nth(wanted.chars().count())
-                                    .is_some_and(|(end, _)| one_off(&word[..end], wanted))))
-                })
-            };
-            words.iter().all(|word| near(word)).then_some(4)
-        }
-
-        pub fn search(catalog: &[Item], query: &str) -> Vec<Item> {
-            let query = fold(query);
-            if query.is_empty() {
-                return Vec::new();
-            }
-            let mut found: Vec<(u8, &Item)> = catalog
-                .iter()
-                .filter_map(|item| {
-                    let name = rank(&fold(&item.name), &query);
-                    let original = item
-                        .original_title
-                        .as_deref()
-                        .and_then(|title| rank(&fold(title), &query));
-                    name.into_iter().chain(original).min().map(|rank| (rank, item))
-                })
-                .collect();
-            if found.iter().any(|(rank, _)| *rank < 4) {
-                found.retain(|(rank, _)| *rank < 4);
-            }
-            found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
-            found.into_iter().take(LIMIT).map(|(_, item)| item.clone()).collect()
-        }
-    }
-
-    /// A catalog of made-up titles, some with accents, signs and an
-    /// original title.
-    fn large_catalog(titles: usize) -> Vec<Item> {
-        const WORDS: [&str; 24] = [
-            "The", "Night", "Étoile", "Star", "Wars", "of", "Return", "Kingdom", "Señor", "Amélie",
-            "Spider-Man:", "Home", "Interstellar", "Inception", "Dark", "Knight", "Lost", "Über",
-            "Garden", "(2019)", "II", "Blade", "Runner", "Çà",
-        ];
-        // The same titles in each run.
-        let mut seed = 0x2545_f491_4f6c_dd1du64;
-        let mut next = move |below: usize| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            (seed % below as u64) as usize
-        };
-        (0..titles)
-            .map(|n| {
-                let mut title = |words: usize| {
-                    (0..words).map(|_| WORDS[next(WORDS.len())]).collect::<Vec<_>>().join(" ")
-                };
-                let name = title(1 + n % 5);
-                let original = (n % 4 == 0).then(|| title(2 + n % 3));
-                serde_json::from_value(serde_json::json!({
-                    "Id": n.to_string(), "Name": name, "Type": "Movie", "OriginalTitle": original
-                }))
-                .expect("item")
-            })
-            .collect()
-    }
-
-    /// The search gives the results it gave, in the order it gave them, and
-    /// takes less time for each key typed.
     #[test]
-    fn the_search_is_the_same_and_cheaper() {
-        const TITLES: usize = 5000;
-        let items = large_catalog(TITLES);
-        let queries = [
-            "s", "the", "star", "star w", "star wars", "night of the", "amelie", "AMÉLIE", "etoile",
-            "spider man", "spider-man: home", "intersteller", "incepton", "kingdon", "kinght",
-            "the kinght", "retrun", "returnn", "retur", "garde", "gardenn", "uber", "ca", "2019",
-            "xyz", "blade runer", " ", "::", "ii", "senor", "señor los",
-        ];
-        let ids = |found: &[Item]| found.iter().map(|i| i.id.clone()).collect::<Vec<_>>();
-        for query in queries {
-            assert_eq!(ids(&search(&items, query)), ids(&before::search(&items, query)), "{query:?}");
+    fn folds_to_lower_case_letters_digits_and_single_spaces() {
+        for (text, folded) in [
+            ("", ""),
+            (" ", ""),
+            ("  A  b ", "a b"),
+            ("Amélie", "amelie"),
+            ("WALL·E", "wall e"),
+            ("Spider-Man: Homecoming", "spider man homecoming"),
+            ("a\u{a0}b", "a b"),
+            ("Señor Çà", "senor ca"),
+            ("!!", ""),
+        ] {
+            assert_eq!(fold(text), folded, "{text:?}");
         }
-        for text in ["", " ", "  A  b ", "Amélie", "İstanbul", "ǅ", "ß", "Σίσυφος", "a\u{a0}b", "WALL·E", "9½ Weeks", "!!"] {
-            assert_eq!(fold(text), before::fold(text), "{text:?}");
-        }
-        for (a, b) in [("", ""), ("a", ""), ("abc", "abd"), ("abc", "ab"), ("ab", "abc"), ("abc", "xbc"),
-            ("abc", "bc"), ("abcd", "ab"), ("abc", "acb"), ("étoile", "etoile"), ("abc", "abc"), ("abcd", "abxd")]
-        {
-            assert_eq!(one_off(a, b), before::one_off(a, b), "{a:?} {b:?}");
-            assert_eq!(one_off(b, a), before::one_off(b, a), "{b:?} {a:?}");
-        }
+    }
 
-        let time = |run: &dyn Fn(&[Item], &str) -> Vec<Item>, query: &str| {
-            // The best of a few rounds: other tests run at the same time.
-            (0..7)
-                .map(|_| {
-                    let started = std::time::Instant::now();
-                    std::hint::black_box(run(std::hint::black_box(&items), query));
-                    started.elapsed()
-                })
-                .min()
-                .unwrap()
-        };
-        let (mut was, mut is) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
-        for query in ["the", "intersteller", "blade runer", "xyz"] {
-            let (before, now) = (time(&before::search, query), time(&search, query));
-            println!("search of {TITLES} titles for {query:?}: {before:?} before, {now:?} now");
-            was += before;
-            is += now;
+    #[test]
+    fn one_letter_changed_missing_or_extra_is_one_off() {
+        for (a, b, near) in [
+            ("abc", "abd", true),
+            ("abc", "ab", true),
+            ("abc", "xbc", true),
+            ("abc", "bc", true),
+            ("abcd", "abxd", true),
+            ("abc", "abc", true),
+            ("a", "", true),
+            ("abcd", "ab", false),
+            ("abc", "acb", false),
+            ("étoile", "etoile", true),
+        ] {
+            assert_eq!(one_off(a, b), near, "{a:?} {b:?}");
+            assert_eq!(one_off(b, a), near, "{b:?} {a:?}");
         }
-        // The times are printed, not asserted: a loaded machine can turn them.
+    }
+
+    /// A word of the title that starts with the text is a match of the
+    /// second rank wherever the word is, with one word typed or more.
+    #[test]
+    fn the_start_of_a_later_word_ranks_before_a_substring() {
+        let items = catalog(&["The Dark Knight", "Darkness", "Undark", "A Knight Of The Dark"]);
+        assert_eq!(names(&search(&items, "dark")), ["Darkness", "A Knight Of The Dark", "The Dark Knight", "Undark"]);
+        assert_eq!(names(&search(&items, "dark kn")), ["The Dark Knight"]);
+    }
+
+    /// The index gives what the search over the same titles gives.
+    #[test]
+    fn the_index_gives_the_results_of_the_search() {
+        let mut items = catalog(&["Amélie", "Star Wars", "A Star Is Born", "Superstar", "Interstellar", "Étoile"]);
+        items[5].original_title = Some("The Star".into());
+        let index = Index::new(items.clone());
+        assert_eq!(index.items().len(), 6);
+        for query in ["star", "AMELIE", "intersteller", "the s", "etoile", "xyz", "", " "] {
+            assert_eq!(names(&index.search(query)), names(&search(&items, query)), "{query:?}");
+        }
+        assert_eq!(names(&index.search("the star")), ["Étoile"]);
+        assert!(Index::default().search("star").is_empty());
     }
 
     #[test]

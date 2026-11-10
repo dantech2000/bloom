@@ -87,10 +87,6 @@ impl ToastState {
             cx.notify();
         }
     }
-    /// Returns whether the notification queue is empty.
-    pub fn is_empty(&self) -> bool {
-        self.manager.is_empty()
-    }
 }
 impl Render for ToastState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -104,6 +100,7 @@ impl Render for ToastState {
             .left(theme.space(4.))
             .bottom(theme.space(4.))
             .w((viewport.width - theme.space(8.)).min(theme.space(96.)));
+        let liquid = super::glass::liquid();
         for (id, notice, phase) in self.manager.visible(3) {
             let dismiss = id.clone();
             let state = cx.entity().downgrade();
@@ -139,8 +136,8 @@ impl Render for ToastState {
                 .border_1()
                 .border_color(colors.border)
                 // Liquid glass prototype: the toast is a glass panel too.
-                .when(!super::glass::liquid(), |el| el.bg(colors.popover))
-                .when(super::glass::liquid(), |el| {
+                .when(!liquid, |el| el.bg(colors.popover))
+                .when(liquid, |el| {
                     el.child(super::glass::glass(theme.radius.two_xl, super::glass::POPUP_TINT))
                 })
                 .text_color(colors.popover_foreground)

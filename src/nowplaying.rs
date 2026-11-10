@@ -16,7 +16,7 @@
 
 use std::{
     ffi::{CStr, c_void},
-    sync::OnceLock,
+    sync::{Mutex, OnceLock},
     time::Instant,
 };
 
@@ -101,20 +101,47 @@ impl Command {
     }
 }
 
-/// The commands on their way to the UI thread.
-fn channel() -> &'static (async_channel::Sender<Command>, async_channel::Receiver<Command>) {
-    static CHANNEL: OnceLock<(async_channel::Sender<Command>, async_channel::Receiver<Command>)> =
-        OnceLock::new();
-    CHANNEL.get_or_init(|| async_channel::bounded(64))
+/// The commands on their way to the UI thread: a queue for each reader
+/// (`install`), and every reader gets every command. With one queue for
+/// all, the task of a window that closed took the command meant for the
+/// window that is open, and dropped it (as the signal of `updates.rs`
+/// did).
+static READERS: Readers = Readers(Mutex::new(Vec::new()));
+
+/// The queues of the readers. A test makes a list of its own: the
+/// app's list holds the readers of the other tests' windows.
+struct Readers(Mutex<Vec<async_channel::Sender<Command>>>);
+
+impl Readers {
+    /// A reader of the commands, from now on.
+    fn reader(&self) -> async_channel::Receiver<Command> {
+        let (tx, rx) = async_channel::bounded(64);
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
+        rx
+    }
+
+    /// The command goes to every reader; a reader that is gone is
+    /// dropped from the list.
+    fn send(&self, command: Command) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).retain(|reader| {
+            if reader.try_send(command).is_err() && !reader.is_closed() {
+                log::warn!("now playing: command {command:?} dropped, the queue is full");
+            }
+            !reader.is_closed()
+        });
+    }
+}
+
+/// A reader of the commands, from now on.
+fn reader() -> async_channel::Receiver<Command> {
+    READERS.reader()
 }
 
 /// What every handler block does with its command, and what the debug
 /// command `nowplaying command` does: the command goes to the UI thread.
 pub fn on_remote(command: Command) {
     log::info!("now playing: command {command:?}");
-    if channel().0.try_send(command).is_err() {
-        log::warn!("now playing: command {command:?} dropped, the queue is full");
-    }
+    READERS.send(command);
 }
 
 fn center() -> Id {
@@ -506,7 +533,7 @@ fn describe_commands() -> String {
 /// tile and the display assertion when the app quits. Called once, from
 /// `Bloom::new`.
 pub fn install(cx: &mut Context<Bloom>) -> Subscription {
-    let receiver = channel().1.clone();
+    let receiver = reader();
     cx.spawn(async move |this, cx| {
         while let Ok(command) = receiver.recv().await {
             if this.update(cx, |this, cx| this.nowplaying_command(command, cx)).is_err() {
@@ -781,6 +808,23 @@ mod tests {
         let mut movie = item("Heat");
         movie.production_year = Some(1995);
         assert_eq!(labels(&movie), ("Heat (1995)".into(), None, None));
+    }
+
+    /// Every reader gets a command: the task of a window that closed
+    /// still reads until it finds its window gone, and with one queue for
+    /// all it took the command of the open window.
+    #[test]
+    fn a_reader_left_behind_does_not_take_the_command_of_another() {
+        let readers = Readers(Mutex::new(Vec::new()));
+        let (stale, live) = (readers.reader(), readers.reader());
+        readers.send(Command::Next);
+        assert_eq!(stale.try_recv(), Ok(Command::Next));
+        assert_eq!(live.try_recv(), Ok(Command::Next), "the stale reader took the command");
+        // A reader that is gone leaves the list at the next command.
+        drop(stale);
+        readers.send(Command::Previous);
+        assert_eq!(live.try_recv(), Ok(Command::Previous));
+        assert_eq!(readers.0.lock().unwrap().len(), 1);
     }
 
     #[test]

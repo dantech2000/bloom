@@ -2,7 +2,10 @@
 //! The tap in the app: looks at the player, the window and the page, and
 //! sends the events of what changed.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use gpui_kit::{Context, Task};
 use serde_json::json;
@@ -64,9 +67,7 @@ impl Bloom {
             }
             // The lights were on when the events went off: their helper
             // has the events again. (A test instance starts none itself.)
-            if hub().on() && self.config.lights == Some(true) && crate::options::options().test_name.is_none() {
-                self.lights_helper(true);
-            }
+            self.lights_resume(cx);
         } else {
             hub().stop();
             self.events = State { lights: self.events.lights.take(), ..State::default() };
@@ -118,14 +119,19 @@ impl Bloom {
         let active = self.player_open && status.state == PlayState::Playing;
         Snapshot {
             active,
-            item: self.playing.as_ref().filter(|_| active).map(|item| ItemInfo {
-                id: item.id.clone(),
-                kind: item.kind.to_string(),
-                name: item.name.clone(),
-                series: item.series_name.clone(),
-                season: item.parent_index_number.map(i64::from),
-                episode: item.index_number.map(i64::from),
-                year: item.production_year.map(i64::from),
+            item: self.playing.as_ref().filter(|_| active).map(|item| match &self.events.last.item {
+                // The item of the last look: its texts are not made again
+                // at each look, some times a second.
+                Some(last) if last.id == item.id => last.clone(),
+                _ => Arc::new(ItemInfo {
+                    id: item.id.clone(),
+                    kind: item.kind.to_string(),
+                    name: item.name.clone(),
+                    series: item.series_name.clone(),
+                    season: item.parent_index_number.map(i64::from),
+                    episode: item.index_number.map(i64::from),
+                    year: item.production_year.map(i64::from),
+                }),
             }),
             paused: status.paused,
             buffering: status.buffering,
@@ -160,6 +166,9 @@ impl Bloom {
         if !events.is_empty() || self.events.state_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)) {
             self.events.state_at = Some(Instant::now());
             hub().set_state(now.state_json(self.events.session, titles));
+            // A helper of the lights that ended is seen while a film
+            // plays, not only at the next change of the page.
+            self.lights_check(cx);
         }
         let started = events.iter().any(|(event, _)| *event == "playback.started");
         for (event, data) in events {

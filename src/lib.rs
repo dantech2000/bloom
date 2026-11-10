@@ -32,17 +32,16 @@ mod perf;
 mod pip;
 mod playback;
 mod player;
-mod quality;
+mod quality_tags;
 mod queue;
 mod seasons;
 mod settings;
+mod socket;
 mod stream;
 mod subtitles;
 mod swipe;
 mod syncplay;
 mod trailer;
-// The parts of the component kit that the app does not use yet.
-#[allow(dead_code)]
 mod ui;
 mod updates;
 #[cfg(target_os = "macos")]

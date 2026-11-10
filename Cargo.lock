@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-ios"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "bloom",
  "gpui-pre",

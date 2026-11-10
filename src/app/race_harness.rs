@@ -243,10 +243,12 @@ pub(crate) fn add_server(this: &mut Bloom, id: &str, url: &str, user: &str) {
         url: url.to_string(),
         profiles: vec![],
     });
-    this.config.upsert_profile(
-        id,
-        crate::config::Profile { user_id: user.into(), name: user.to_uppercase(), token: "t".into(), image_tag: None },
-    );
+    this.config.upsert_profile(id, profile(user));
+}
+
+/// A saved profile of a user, as a sign-in makes one.
+pub(crate) fn profile(user: &str) -> crate::config::Profile {
+    crate::config::Profile { user_id: user.into(), name: user.to_uppercase(), token: "t".into(), image_tag: None }
 }
 
 /// A mock server stops with the test, also when nothing can connect to it

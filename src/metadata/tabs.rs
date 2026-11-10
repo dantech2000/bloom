@@ -6,7 +6,7 @@ use gpui_kit::{
     ClickEvent, Context, Div, InteractiveElement as _, KeyDownEvent,
     MouseButton, ObjectFit, ParentElement as _, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled, Window,
-    base::input::{InputEditorStyle, Textarea},
+    base::input::Textarea,
     div,
     prelude::FluentBuilder as _,
     px, rgb, rgba,
@@ -14,7 +14,7 @@ use gpui_kit::{
 use serde_json::Value;
 
 use super::{
-    Browse, DETAIL_FIELDS, FIELDS, FIND_IMDB, FIND_NAME, FIND_TMDB, FIND_YEAR, IMAGE_TYPES,
+    DETAIL_FIELDS, FIELDS, FIND_IMDB, FIND_NAME, FIND_TMDB, FIND_YEAR, IMAGE_TYPES,
     ImageInfo, LOCKABLE, Manager, RefreshMode, RemoteImage, TAGLINE, Tab,
 };
 use crate::{
@@ -120,7 +120,7 @@ impl Bloom {
                     .hover(|s| s.bg(rgba(0xffffff1f)))
                     .child(icon(LucideIcon::X, 18., t.colors.foreground))
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.close_metadata(window, cx)
+                        this.ask_close_metadata(window, cx)
                     })),
             );
 
@@ -160,29 +160,38 @@ impl Bloom {
             );
         }
 
-        let note = |text: String| {
+        // A load that failed says so, with a way to try again: with no
+        // item it is the page, and over an item of before it is a line
+        // (which showed nothing, and "no images", before).
+        let failed = manager.error.as_ref().map(|error| {
             div()
-                .py(px(48.))
                 .flex()
-                .justify_center()
-                .text_size(px(15.))
-                .text_color(t.colors.muted_foreground)
-                .child(text)
-        };
-        let body = match (&manager.item, &manager.error) {
-            (None, Some(error)) => note(format!("Could not load the item: {error}")),
-            (None, None) => note("Loading…".to_string()),
-            (Some(item), _) => match manager.tab {
+                .flex_wrap()
+                .items_center()
+                .gap(px(12.))
+                .child(muted_note(format!("Could not load the item: {error}"), cx))
+                .child(
+                    button("meta.retry", "Try again", ButtonKind::Plain, cx)
+                        .when(manager.busy, |el| el.opacity(0.5))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.reload_metadata(cx))),
+                )
+        });
+        let body = match &manager.item {
+            None => div().py(px(32.)).flex().justify_center().child(match failed {
+                Some(failed) => failed,
+                None => muted_note("Loading…".to_string(), cx),
+            }),
+            Some(item) => div().flex().flex_col().children(failed).child(match manager.tab {
                 Tab::Details => self.metadata_details(manager, item, content_w, window, cx),
                 Tab::Images => self.metadata_images(manager, &client, content_w, cx),
                 Tab::Identify => self.metadata_identify(manager, content_w, cx),
                 Tab::Refresh => self.metadata_refresh(manager, cx),
-            },
+            }),
         };
 
         let cancel = |label: &'static str, cx: &mut Context<Self>| {
             button("meta.cancel", label, ButtonKind::Plain, cx).on_click(cx.listener(
-                |this, _: &ClickEvent, window, cx| this.close_metadata(window, cx),
+                |this, _: &ClickEvent, window, cx| this.ask_close_metadata(window, cx),
             ))
         };
         let footer_note = match manager.tab {
@@ -283,7 +292,7 @@ impl Bloom {
                                 .and_then(|manager| manager.confirm.take());
                             match waits {
                                 Some(_) => cx.notify(),
-                                None => this.close_metadata(window, cx),
+                                None => this.ask_close_metadata(window, cx),
                             }
                         }
                         "tab" => this.next_metadata_field(keystroke.modifiers.shift, window, cx),
@@ -304,7 +313,7 @@ impl Bloom {
                 }))
                 // A click beside the dialog closes it.
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.close_metadata(window, cx)
+                    this.ask_close_metadata(window, cx)
                 }))
                 .child(card),
         )
@@ -428,15 +437,7 @@ impl Bloom {
         // The overview: a field of several lines in the look of the others.
         let overview = self.metadata.overview.clone();
         overview.update(cx, |state, _| {
-            state.set_editor_style(InputEditorStyle {
-                foreground: colors.foreground.into(),
-                muted_foreground: colors.muted_foreground.into(),
-                background: colors.background.into(),
-                border: colors.input.into(),
-                selection: colors.ring.opacity(0.3).into(),
-                caret: colors.foreground.into(),
-                ..Default::default()
-            });
+            state.set_editor_style(crate::admin::text_editor::editor_style(&t))
         });
         let focused = {
             use gpui_kit::Focusable as _;
@@ -620,12 +621,11 @@ impl Bloom {
         cx: &mut Context<Self>,
     ) -> Div {
         let t = UiTheme::read(cx).clone();
-        let columns = (((content_w + GAP) / (TILE_W + GAP)).floor() as usize).max(2);
-        let tile_w = ((content_w - GAP * (columns - 1) as f32) / columns as f32).floor();
-        let images = manager.images.clone().unwrap_or_default();
+        let (_, tile_w) = crate::admin::rows::grid(content_w, TILE_W, GAP, 2, usize::MAX);
+        let images = manager.images.as_deref().unwrap_or_default();
 
         let mut current = div().flex().flex_wrap().gap(px(GAP));
-        for image in &images {
+        for image in images {
             let target = image.clone();
             let label = match image.image_index {
                 Some(index) if image.image_type == "Backdrop" => {
@@ -638,7 +638,7 @@ impl Bloom {
                 facts.push(format!("{w} × {h}"));
             }
             if let Some(size) = image.size {
-                facts.push(file_size(size));
+                facts.push(crate::downloads::format_bytes(size));
             }
             current = current.child(
                 tile(
@@ -666,13 +666,17 @@ impl Bloom {
             );
         }
         if images.is_empty() {
-            current = current.child(
-                div()
-                    .py(px(20.))
-                    .text_size(px(14.))
-                    .text_color(t.colors.muted_foreground)
-                    .child("This item has no images."),
-            );
+            // No list is not an empty list: the load is on its way, or it
+            // failed (the line above the tab says why).
+            current = current.child(muted_note(
+                match (&manager.images, &manager.error) {
+                    (Some(_), _) => "This item has no images.",
+                    (None, Some(_)) => "The images did not load.",
+                    (None, None) => "Loading…",
+                }
+                .to_string(),
+                cx,
+            ));
         }
 
         let browsing = manager.browse.as_ref().map(|b| b.kind.as_str());
@@ -686,33 +690,21 @@ impl Bloom {
         }
 
         let found = match &manager.browse {
-            None => div()
-                .py(px(16.))
-                .text_size(px(14.))
-                .text_color(t.colors.muted_foreground)
-                .child("Pick an image type to see what the providers offer."),
-            Some(Browse { loading: true, .. }) => div()
-                .py(px(16.))
-                .text_size(px(14.))
-                .text_color(t.colors.muted_foreground)
-                .child("Asking the providers…"),
-            Some(Browse {
-                error: Some(error), ..
-            }) => div()
-                .py(px(16.))
-                .text_size(px(14.))
-                .text_color(t.colors.muted_foreground)
-                .child(format!("Could not load the images: {error}")),
-            Some(browse) if browse.images.is_empty() => div()
-                .py(px(16.))
-                .text_size(px(14.))
-                .text_color(t.colors.muted_foreground)
-                .child(format!("No provider has a {} image.", browse.kind.to_lowercase())),
+            None => muted_note("Pick an image type to see what the providers offer.".to_string(), cx),
+            Some(browse) if browse.images.is_empty() => muted_note(
+                match (&browse.error, browse.loading) {
+                    (Some(error), _) => format!("Could not load the images: {error}"),
+                    (None, true) => "Asking the providers…".to_string(),
+                    (None, false) => format!("No provider has a {} image.", browse.kind.to_lowercase()),
+                },
+                cx,
+            ),
             Some(browse) => {
                 let mut grid = div().flex().flex_wrap().gap(px(GAP));
                 for (n, image) in browse.images.iter().enumerate() {
                     grid = grid.child(self.remote_tile(n, image, tile_w, cx));
                 }
+                let total = browse.total.max(browse.images.len());
                 div()
                     .flex()
                     .flex_col()
@@ -722,13 +714,33 @@ impl Bloom {
                             .text_size(px(13.))
                             .text_color(t.colors.muted_foreground)
                             .child(format!(
-                                "{} of {} {} images",
+                                "{} of {total} {} images",
                                 browse.images.len(),
-                                browse.total.max(browse.images.len()),
                                 browse.kind.to_lowercase()
                             )),
                     )
                     .child(grid)
+                    .children(
+                        browse
+                            .error
+                            .as_ref()
+                            .map(|error| muted_note(format!("Could not load more images: {error}"), cx)),
+                    )
+                    // The next images of the providers, while there are some.
+                    .when(browse.images.len() < total, |el| {
+                        el.child(
+                            div().flex().child(
+                                button(
+                                    "meta.browse.more",
+                                    if browse.loading { "Loading…" } else { "Show more" },
+                                    ButtonKind::Plain,
+                                    cx,
+                                )
+                                .when(browse.loading, |el| el.opacity(0.5))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.browse_more(cx))),
+                            ),
+                        )
+                    })
             }
         };
 
@@ -771,19 +783,12 @@ impl Bloom {
 
     fn metadata_identify(&self, manager: &Manager, content_w: f32, cx: &mut Context<Self>) -> Div {
         let t = UiTheme::read(cx).clone();
-        let muted = |text: String| {
-            div()
-                .py(px(16.))
-                .text_size(px(14.))
-                .text_color(t.colors.muted_foreground)
-                .child(text)
-        };
         if !manager.can_identify() {
-            return muted(format!(
+            return muted_note(format!(
                 "The providers cannot look up an item of the type {}. Identify its series or \
                  edit the fields on the Details tab.",
                 manager.kind
-            ));
+            ), cx);
         }
         let mut form = div().flex().flex_wrap().gap(px(GAP));
         for index in [FIND_NAME, FIND_YEAR, FIND_IMDB, FIND_TMDB] {
@@ -822,16 +827,16 @@ impl Bloom {
                 })),
             );
 
-        let columns = (((content_w + GAP) / (150. + GAP)).floor() as usize).max(2);
-        let tile_w = ((content_w - GAP * (columns - 1) as f32) / columns as f32).floor();
+        let (_, tile_w) = crate::admin::rows::grid(content_w, 150., GAP, 2, usize::MAX);
         let results = match (&manager.search_error, &manager.results) {
-            (Some(error), _) => muted(error.clone()),
-            (None, None) => muted(
+            (Some(error), _) => muted_note(error.clone(), cx),
+            (None, None) => muted_note(
                 "Search by name, or give an id for an exact match. Enter starts the search."
                     .to_string(),
+                cx,
             ),
             (None, Some(results)) if results.is_empty() => {
-                muted("No provider found a match.".to_string())
+                muted_note("No provider found a match.".to_string(), cx)
             }
             (None, Some(results)) => {
                 let mut grid = div().flex().flex_wrap().gap(px(GAP));
@@ -1064,12 +1069,15 @@ fn image_url(client: &Client, id: &str, image: &ImageInfo, width: u32) -> String
     )
 }
 
-/// "1.2 MB" for a number of bytes.
-fn file_size(bytes: u64) -> String {
-    match bytes {
-        0..1_000_000 => format!("{:.0} KB", bytes as f64 / 1e3),
-        _ => format!("{:.1} MB", bytes as f64 / 1e6),
-    }
+/// A quiet line that stands for content: "Loading…", an error, an empty
+/// list.
+fn muted_note(text: String, cx: &Context<Bloom>) -> Div {
+    let t = UiTheme::read(cx);
+    div()
+        .py(px(16.))
+        .text_size(px(14.))
+        .text_color(t.colors.muted_foreground)
+        .child(text)
 }
 
 /// Heading of a group of fields.

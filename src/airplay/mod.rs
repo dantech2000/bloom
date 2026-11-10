@@ -25,7 +25,7 @@ use crate::airplay::stream::AirPlayApi as _;
 use crate::stream::StreamApi as _;
 use std::{
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
@@ -98,8 +98,9 @@ pub struct AirPlayStatus {
     pub duration: f64,
     /// The item plays on a receiver, not on this Mac.
     pub external: bool,
-    /// Name of the receiver. macOS gives no public call for it; the panel
-    /// may fill it from the route the user picked.
+    /// Name of the receiver. macOS gives no public call for it: it is the
+    /// one receiver the browse sees while the item plays on a receiver, and
+    /// none when the browse sees more than one or does not run.
     pub route: Option<String>,
     pub error: Option<String>,
     pub play_session_id: Option<String>,
@@ -156,6 +157,8 @@ enum Cmd {
     SetMuted(bool),
     /// Starts route detection; the status shows its result.
     Detect,
+    /// Ends route detection: it costs power while it is on.
+    Undetect,
     /// Stops and lets the player go.
     Disconnect,
 }
@@ -205,15 +208,30 @@ struct Gates {
     gone: Option<(Generation, Arc<std::sync::Barrier>)>,
 }
 
+/// The readers of the events, each with a queue of its own: every reader
+/// gets every event. With one queue for all, a second reader would take
+/// events from the first.
+#[derive(Default)]
+struct Readers {
+    queues: Vec<async_channel::Sender<AirPlayEvent>>,
+    /// What was told before the first reader came; it gets them.
+    early: std::collections::VecDeque<AirPlayEvent>,
+}
+
+/// The most events kept for a first reader that has not come yet.
+const EARLY_EVENTS: usize = 64;
+
 struct Shared {
     status: Mutex<AirPlayStatus>,
     /// The lifecycle events, every one; `Position` goes through `sample`.
-    events: (async_channel::Sender<AirPlayEvent>, async_channel::Receiver<AirPlayEvent>),
+    readers: Mutex<Readers>,
     /// The latest look at the position, and whether a `Position` event
     /// for it is on the channel and not read yet. Many looks between two
     /// reads make one event; the reader gets the latest look.
     sample: Mutex<(Option<Sample>, bool)>,
     handoff: Mutex<Handoff>,
+    /// Told when an engine put its player in the handoff.
+    published: Condvar,
     tokens: AtomicU64,
     engines: AtomicU64,
     #[cfg(test)]
@@ -222,9 +240,28 @@ struct Shared {
 
 impl Shared {
     fn emit(&self, event: AirPlayEvent) {
-        // Unbounded: a send never fails, and the engine never waits for
-        // the UI. The events are few; the samples go through `emit_sample`.
-        let _ = self.events.0.try_send(event);
+        let mut readers = self.readers.lock().unwrap();
+        // Unbounded queues: a send never fails while its reader lives, and
+        // the engine never waits for the UI. The events are few; the
+        // samples go through `emit_sample`.
+        readers.queues.retain(|queue| queue.try_send(event.clone()).is_ok());
+        if readers.queues.is_empty() {
+            if readers.early.len() == EARLY_EVENTS {
+                readers.early.pop_front();
+            }
+            readers.early.push_back(event);
+        }
+    }
+
+    /// A queue for one more reader, with what was told before any came.
+    fn reader(&self) -> async_channel::Receiver<AirPlayEvent> {
+        let (tx, rx) = async_channel::unbounded();
+        let mut readers = self.readers.lock().unwrap();
+        for event in readers.early.drain(..) {
+            let _ = tx.try_send(event);
+        }
+        readers.queues.push(tx);
+        rx
     }
 
     fn emit_sample(&self, sample: Sample) {
@@ -283,7 +320,7 @@ impl Drop for PlayerRef {
     }
 }
 
-/// The events of the engine, for one reader. A `Position` carries the
+/// The events of the engine, for one reader; each reader gets them all. A `Position` carries the
 /// latest look at the time of the read: the engine looks four times a
 /// second, and a reader that fell behind gets one event, not the backlog.
 pub struct Events {
@@ -311,7 +348,8 @@ type CommandSlot = Mutex<Option<(Generation, mpsc::Sender<Cmd>)>>;
 pub struct AirPlay {
     shared: Arc<Shared>,
     commands: Arc<CommandSlot>,
-    routes: Arc<OnceLock<Arc<routes::Routes>>>,
+    /// The browse for receivers while it runs.
+    routes: Arc<Mutex<Option<Arc<routes::Routes>>>>,
 }
 
 impl Default for AirPlay {
@@ -319,29 +357,37 @@ impl Default for AirPlay {
         Self {
             shared: Arc::new(Shared {
                 status: Mutex::new(AirPlayStatus { volume: 1., ..Default::default() }),
-                events: async_channel::unbounded(),
+                readers: Mutex::new(Readers::default()),
                 sample: Mutex::new((None, false)),
                 handoff: Mutex::new(Handoff::default()),
+                published: Condvar::new(),
                 tokens: AtomicU64::new(0),
                 engines: AtomicU64::new(0),
                 #[cfg(test)]
                 gates: Mutex::new(Gates::default()),
             }),
             commands: Arc::new(Mutex::new(None)),
-            routes: Arc::new(OnceLock::new()),
+            routes: Arc::new(Mutex::new(None)),
         }
     }
 }
 
 impl AirPlay {
     pub fn status(&self) -> AirPlayStatus {
-        self.shared.status.lock().unwrap().clone()
+        let mut status = self.shared.status.lock().unwrap().clone();
+        if status.external
+            && let Some(browse) = &*self.routes.lock().unwrap()
+            && let [only] = &browse.names()[..]
+        {
+            status.route = Some(only.clone());
+        }
+        status
     }
 
     /// The stream of events, for the panel; the debug channel reads the
-    /// status instead.
+    /// status instead. Each call is a reader of its own.
     pub fn events(&self) -> Events {
-        Events { rx: self.shared.events.1.clone(), shared: self.shared.clone() }
+        Events { rx: self.shared.reader(), shared: self.shared.clone() }
     }
 
     /// An item is loaded or loading.
@@ -352,8 +398,8 @@ impl AirPlay {
         )
     }
 
-    /// Names of the receivers on the network. The first call starts the
-    /// browse; the names come in over the next seconds.
+    /// Names of the receivers on the network. A call starts the browse
+    /// when it does not run; the names come in over the next seconds.
     pub fn routes(&self) -> Vec<String> {
         self.browse().names()
     }
@@ -363,8 +409,27 @@ impl AirPlay {
         self.browse().error()
     }
 
-    fn browse(&self) -> &routes::Routes {
-        self.routes.get_or_init(routes::browse)
+    fn browse(&self) -> Arc<routes::Routes> {
+        self.routes.lock().unwrap().get_or_insert_with(routes::browse).clone()
+    }
+
+    /// The browse for receivers runs.
+    pub fn browsing(&self) -> bool {
+        self.routes.lock().unwrap().is_some()
+    }
+
+    /// Ends the browse for receivers and the route detection of the
+    /// engine: both listen on the network and cost power, and nobody reads
+    /// them while the panel is closed. The next [`Self::routes`] and
+    /// [`Self::detect_routes`] start them again.
+    pub fn stop_routes(&self) {
+        if let Some(browse) = self.routes.lock().unwrap().take() {
+            browse.stop();
+        }
+        // To an engine that runs; none starts for this.
+        if let Some((_, tx)) = &*self.commands.lock().unwrap() {
+            let _ = tx.send(Cmd::Undetect);
+        }
     }
 
     /// Starts the engine when it does not run. The player exists a moment
@@ -417,23 +482,17 @@ impl AirPlay {
     /// engine; none when its player is not there within [`START_WAIT`].
     pub fn player(&self) -> Option<PlayerRef> {
         self.start();
-        let until = Instant::now() + START_WAIT;
-        loop {
-            {
-                let handoff = self.shared.handoff.lock().unwrap();
-                // Retained under the lock that takes it away: what goes
-                // out lives.
-                if let Some((owner, PlayerId(id))) = handoff.player
-                    && owner == handoff.current
-                {
-                    return Some(PlayerRef(crate::macos::send!(Id, id, c"retain")));
-                }
-            }
-            if Instant::now() > until {
-                return None;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
+        let published = |handoff: &Handoff| handoff.player.filter(|(owner, _)| *owner == handoff.current);
+        // The engine tells when its player is there: no sleep between two
+        // looks, and no wait at all when the engine runs already.
+        let (handoff, _) = self
+            .shared
+            .published
+            .wait_timeout_while(self.shared.handoff.lock().unwrap(), START_WAIT, |handoff| published(handoff).is_none())
+            .unwrap();
+        // Retained under the lock that takes it away: what goes out lives.
+        let (_, PlayerId(id)) = published(&handoff)?;
+        Some(PlayerRef(crate::macos::send!(Id, id, c"retain")))
     }
 
     fn next_token(&self) -> u64 {
@@ -488,7 +547,7 @@ impl AirPlay {
     /// once goes to the new engine, not into the one on its way out; and
     /// so does its player, so the next picker waits for the next engine's.
     ///
-    /// The engine that leaves says nothing from here on (`Engine::speaks`):
+    /// The engine that leaves says nothing from here on (`Engine::speaking`):
     /// the next one may run before it got to its disconnect, and what it
     /// said then would undo what the next one set. So the end of its item
     /// is told here, in the same step that withdraws it.
@@ -534,7 +593,8 @@ fn clear_item(status: &mut AirPlayStatus) {
 
 /// The item that plays, for the reports and the end of its transcode.
 struct Session {
-    client: Client,
+    /// None for a URL with no server behind it: nothing to report to.
+    client: Option<Client>,
     item_id: String,
     play_session_id: String,
     token: u64,
@@ -592,6 +652,7 @@ impl Engine {
             let mut handoff = shared.handoff.lock().unwrap();
             if handoff.current == generation {
                 handoff.player = Some((generation, PlayerId(player.id())));
+                shared.published.notify_all();
             }
         }
         Self {
@@ -645,29 +706,28 @@ impl Engine {
     /// that runs. An engine that was told to go says nothing more; the
     /// disconnect said the end of its item for it (`AirPlay::disconnect`),
     /// and what it did late would undo what the next engine set.
-    fn speaks(&self, handoff: &Handoff) -> bool {
-        handoff.current == self.generation
+    ///
+    /// The handoff stays locked while the caller speaks, so a
+    /// disconnect cannot come between the question and the word.
+    fn speaking(&self) -> Option<MutexGuard<'_, Handoff>> {
+        let handoff = self.shared.handoff.lock().unwrap();
+        (handoff.current == self.generation).then_some(handoff)
     }
 
     fn set_status(&self, change: impl FnOnce(&mut AirPlayStatus)) {
-        let handoff = self.shared.handoff.lock().unwrap();
-        if self.speaks(&handoff) {
+        if let Some(_speaking) = self.speaking() {
             change(&mut self.shared.status.lock().unwrap());
         }
     }
 
     fn emit(&self, event: AirPlayEvent) {
-        let handoff = self.shared.handoff.lock().unwrap();
-        if self.speaks(&handoff) {
+        if let Some(_speaking) = self.speaking() {
             self.shared.emit(event);
         }
     }
 
     fn set_state(&self, state: AirPlayState) {
-        let handoff = self.shared.handoff.lock().unwrap();
-        if !self.speaks(&handoff) {
-            return;
-        }
+        let Some(_speaking) = self.speaking() else { return };
         let changed = {
             let mut status = self.shared.status.lock().unwrap();
             let changed = status.state != state;
@@ -685,10 +745,9 @@ impl Engine {
         match cmd {
             Cmd::Send(request, token) => self.send(request, token),
             Cmd::SendUrl(url, token) => {
-                // No server: the reports go to a port with nobody on it.
-                let client = Client::new("http://127.0.0.1:9", "airplay-url").with_token("none", "none");
+                // No server: no client, and so no report.
                 let stream = stream::Stream { url, play_session_id: "url".into() };
-                self.send_stream(client, "url".into(), "A URL".into(), 0., stream, token);
+                self.send_stream(None, "url".into(), "A URL".into(), 0., stream, token);
             }
             Cmd::Play => {
                 self.expect = Some(("play", now, Expect::Playing));
@@ -722,6 +781,10 @@ impl Engine {
                     self.detector = Some(RouteDetector::new());
                 }
             }
+            Cmd::Undetect => {
+                self.detector = None;
+                self.set_status(|s| s.multiple_routes = None);
+            }
             Cmd::Disconnect => {
                 #[cfg(test)]
                 self.shared.gate(self.generation, |g| &mut g.leave);
@@ -748,13 +811,19 @@ impl Engine {
             }
         };
         log::info!("airplay: send {} from {:.1} s: {}", request.item_id, request.start_secs, redact(&stream.url));
-        self.send_stream(request.client, request.item_id, request.title, request.start_secs, stream, token);
+        self.send_stream(Some(request.client), request.item_id, request.title, request.start_secs, stream, token);
     }
 
     /// Hands the stream to the player and opens the session of the item.
-    fn send_stream(&mut self, client: Client, item_id: String, title: String, start_secs: f64, stream: stream::Stream, token: u64) {
+    fn send_stream(&mut self, client: Option<Client>, item_id: String, title: String, start_secs: f64, stream: stream::Stream, token: u64) {
         let now = Instant::now();
-        self.player.load(&stream.url);
+        if let Err(error) = self.player.load(&stream.url) {
+            log::warn!("airplay: {error}");
+            self.set_status(|s| s.error = Some(error.clone()));
+            self.set_state(AirPlayState::Failed);
+            self.emit(AirPlayEvent::LoadFailed { token, error });
+            return;
+        }
         self.control.send(token, start_secs, true);
         self.await_first_run = true;
         self.expect = None;
@@ -788,7 +857,6 @@ impl Engine {
             Some(Action::Play) => self.player.play(),
             Some(Action::Pause) => self.player.pause(),
             Some(Action::Seek(secs)) => self.player.seek(secs),
-            Some(Action::Unload) => self.player.unload(),
             None => {}
         }
     }
@@ -859,8 +927,6 @@ impl Engine {
         let position = position.filter(|_| !self.control.seeking());
         if let Some(position) = position {
             self.measure(now, position, time_control);
-        }
-        if let Some(position) = position {
             self.seen.0 = position;
         }
         self.set_status(|status| {
@@ -894,8 +960,7 @@ impl Engine {
     }
 
     fn emit_sample(&self, sample: Sample) {
-        let handoff = self.shared.handoff.lock().unwrap();
-        if self.speaks(&handoff) {
+        if let Some(_speaking) = self.speaking() {
             self.shared.emit_sample(sample);
         }
     }
@@ -903,10 +968,7 @@ impl Engine {
     /// Keeps the status in step with the player's route, and tells the app
     /// when it changes.
     fn note_external(&self, external: bool) {
-        let handoff = self.shared.handoff.lock().unwrap();
-        if !self.speaks(&handoff) {
-            return;
-        }
+        let Some(_speaking) = self.speaking() else { return };
         let changed = {
             let mut status = self.shared.status.lock().unwrap();
             let changed = status.external != external;
@@ -949,6 +1011,7 @@ impl Engine {
 
     fn report(&mut self, kind: ReportKind) {
         let Some(session) = &mut self.session else { return };
+        let Some(client) = session.client.clone() else { return };
         let (position, paused) = self.seen;
         // The volume is the app's, the same for every engine.
         let status = self.shared.status.lock().unwrap();
@@ -964,7 +1027,7 @@ impl Engine {
         };
         drop(status);
         session.last_report = Instant::now();
-        let _ = self.reports.send(Report { client: session.client.clone(), kind, progress });
+        let _ = self.reports.send(Report { client, kind, progress });
     }
 
     /// Ends the session: the stop report, the end of the transcode, and
@@ -973,8 +1036,9 @@ impl Engine {
         if self.session.is_some() {
             self.report(ReportKind::Stopped);
         }
-        if let Some(session) = self.session.take() {
-            let client = session.client;
+        if let Some(session) = self.session.take()
+            && let Some(client) = session.client
+        {
             let id = session.play_session_id;
             // The request blocks; the engine must not wait on the server.
             // The server makes the job when the first playlist request
@@ -993,14 +1057,11 @@ impl Engine {
         self.await_first_run = false;
         self.expect = None;
         self.told = None;
+        self.control.stop();
         if unload {
-            for action in self.control.stop() {
-                self.apply(Some(action));
-            }
+            self.player.unload();
             self.set_status(clear_item);
             self.set_state(AirPlayState::Idle);
-        } else {
-            self.control.stop();
         }
     }
 }
@@ -1195,6 +1256,50 @@ mod tests {
         let gone = gate(&airplay, 2, |g| &mut g.gone);
         airplay.disconnect();
         gone.wait();
+    }
+
+    /// Each reader of the events gets every event: a second reader takes
+    /// nothing from the first. And what was told before the first reader
+    /// came is its to read.
+    #[test]
+    fn every_reader_gets_every_event() {
+        let airplay = AirPlay::default();
+        airplay.shared.emit(AirPlayEvent::External(true));
+        let (first, second) = (airplay.events(), airplay.events());
+        assert_eq!(first.try_recv(), Some(AirPlayEvent::External(true)));
+        airplay.shared.emit(AirPlayEvent::Loaded { token: 1 });
+        airplay.shared.emit(AirPlayEvent::Ended);
+        for reader in [&first, &second] {
+            assert_eq!(reader.try_recv(), Some(AirPlayEvent::Loaded { token: 1 }));
+            assert_eq!(reader.try_recv(), Some(AirPlayEvent::Ended));
+            assert_eq!(reader.try_recv(), None);
+        }
+        // A reader that is gone leaves the list at the next event.
+        drop(first);
+        airplay.shared.emit(AirPlayEvent::Stopped);
+        assert_eq!(airplay.shared.readers.lock().unwrap().queues.len(), 1);
+        assert_eq!(second.try_recv(), Some(AirPlayEvent::Stopped));
+    }
+
+    /// The browse for receivers ends when it is told to, and a new ask
+    /// for the names starts one again.
+    #[test]
+    fn the_browse_for_receivers_stops_and_starts_again() {
+        let airplay = AirPlay::default();
+        assert!(!airplay.browsing());
+        airplay.routes();
+        let browse = airplay.routes.lock().unwrap().clone().expect("a browse");
+        airplay.stop_routes();
+        assert!(!airplay.browsing());
+        let until = Instant::now() + Duration::from_secs(3);
+        // The thread holds the list for as long as it runs.
+        while Arc::strong_count(&browse) > 1 {
+            assert!(Instant::now() < until, "the thread of the browse still runs");
+            thread::sleep(Duration::from_millis(10));
+        }
+        airplay.routes();
+        assert!(airplay.browsing());
+        airplay.stop_routes();
     }
 
     /// Many looks at the position between two reads make one event with

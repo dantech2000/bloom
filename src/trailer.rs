@@ -113,6 +113,9 @@ struct Shared {
     target_h: AtomicU32,
     /// Wakes the worker: mpv has an event or a frame, or a command came.
     wake: (Mutex<bool>, std::sync::Condvar),
+    /// The worker could not start (no mpv core, no GL context): the next
+    /// trailer would fail the same way, so none is tried.
+    broken: AtomicBool,
 }
 
 impl Shared {
@@ -145,6 +148,7 @@ impl Default for TrailerPlayer {
                 target_w: AtomicU32::new(1280),
                 target_h: AtomicU32::new(720),
                 wake: (Mutex::new(false), std::sync::Condvar::new()),
+                broken: AtomicBool::new(false),
             }),
             commands: Arc::new(Mutex::new(None)),
             ytdl: find_ytdl(),
@@ -153,9 +157,10 @@ impl Default for TrailerPlayer {
 }
 
 impl TrailerPlayer {
-    /// False when yt-dlp is missing; trailers cannot play then.
+    /// False when yt-dlp is missing or the worker could not start;
+    /// trailers cannot play then.
     pub fn available(&self) -> bool {
-        self.ytdl.is_some()
+        self.ytdl.is_some() && !self.shared.broken.load(Ordering::Relaxed)
     }
 
     pub fn status(&self) -> TrailerStatus {
@@ -180,7 +185,7 @@ impl TrailerPlayer {
 
     /// Starts a trailer, replacing the running one.
     pub fn play(&self, url: String, load: u64, muted: bool) {
-        let Some(ytdl) = self.ytdl.clone() else {
+        let Some(ytdl) = self.ytdl.clone().filter(|_| self.available()) else {
             return;
         };
         *self.shared.status.lock().unwrap() = TrailerStatus {
@@ -229,16 +234,19 @@ impl TrailerPlayer {
         }
         let shared = self.shared.clone();
         let commands = self.commands.clone();
-        thread::Builder::new()
-            .name("mpv-trailer".into())
-            .spawn(move || {
-                if let Err(err) = run(shared.clone(), rx, ytdl) {
-                    log::warn!("trailer worker failed: {err:#}");
-                    shared.status.lock().unwrap().failed = true;
-                }
-                *commands.lock().unwrap() = None;
-            })
-            .expect("spawn trailer thread");
+        let spawned = thread::Builder::new().name("mpv-trailer".into()).spawn(move || {
+            if let Err(err) = run(shared.clone(), rx, ytdl) {
+                log::warn!("trailer worker failed: {err:#}");
+                shared.broken.store(true, Ordering::Relaxed);
+                shared.status.lock().unwrap().failed = true;
+            }
+            *commands.lock().unwrap() = None;
+        });
+        if let Err(err) = spawned {
+            log::warn!("no thread for the trailer worker: {err}");
+            self.shared.status.lock().unwrap().failed = true;
+            *slot = None;
+        }
     }
 }
 
@@ -269,6 +277,9 @@ fn find_ytdl() -> Option<PathBuf> {
 struct Renderer {
     ctx: *mut sys::mpv_render_context,
     gl: GlRenderer,
+    /// What the update callback of `ctx` points at: it lives until the
+    /// context is freed, after which mpv calls no more.
+    _ask: Arc<RenderAsk>,
 }
 
 #[cfg(target_os = "macos")]
@@ -280,8 +291,8 @@ impl Drop for Renderer {
 }
 
 unsafe extern "C" fn on_render_update(ctx: *mut c_void) {
-    // SAFETY: the context is the leaked `RenderAsk` of `run`, alive for the
-    // process; mpv calls this from its own threads.
+    // SAFETY: the context is the `RenderAsk` the `Renderer` holds until
+    // its render context is freed; mpv calls this from its own threads.
     let ask = unsafe { &*(ctx as *const RenderAsk) };
     ask.needed.store(true, Ordering::Release);
     ask.shared.wake();
@@ -340,9 +351,8 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Cmd>, ytdl: PathBuf) -> Result<()
         let shared = shared.clone();
         mpv.set_wakeup_callback(move || shared.wake());
     }
-    let needs_render: &'static RenderAsk =
-        Box::leak(Box::new(RenderAsk { needed: AtomicBool::new(false), shared: shared.clone() }));
-    let mut renderer = create_renderer(&mpv, needs_render)?;
+    let needs_render = Arc::new(RenderAsk { needed: AtomicBool::new(false), shared: shared.clone() });
+    let mut renderer = create_renderer(&mpv, needs_render.clone())?;
 
     mpv.observe_property("time-pos", Format::Double, 1)?;
     mpv.observe_property("duration", Format::Double, 2)?;
@@ -505,7 +515,9 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Cmd>, ytdl: PathBuf) -> Result<()
         let (lock, cvar) = &shared.wake;
         let mut flag = lock.lock().unwrap();
         if !*flag && !needs_render.needed.load(Ordering::Acquire) {
-            let idle = if active.is_some() { Duration::from_millis(4) } else { Duration::from_secs(1) };
+            // Every cause of work sets the flag under this lock (mpv's
+            // two callbacks and `send`), so none is missed while asleep.
+            let idle = if active.is_some() { Duration::from_millis(100) } else { Duration::from_secs(1) };
             let (guard, _) = cvar.wait_timeout(flag, idle).unwrap();
             flag = guard;
         }
@@ -515,7 +527,7 @@ fn run(shared: Arc<Shared>, rx: mpsc::Receiver<Cmd>, ytdl: PathBuf) -> Result<()
 }
 
 #[cfg(target_os = "macos")]
-fn create_renderer(mpv: &Mpv, needs_render: &'static RenderAsk) -> Result<Renderer> {
+fn create_renderer(mpv: &Mpv, ask: Arc<RenderAsk>) -> Result<Renderer> {
     // The GL context becomes current on this thread; mpv renders with it.
     let gl = GlRenderer::new()?;
     let mut init = sys::mpv_opengl_init_params {
@@ -546,10 +558,10 @@ fn create_renderer(mpv: &Mpv, needs_render: &'static RenderAsk) -> Result<Render
         sys::mpv_render_context_set_update_callback(
             ctx,
             Some(on_render_update),
-            needs_render as *const RenderAsk as *mut c_void,
+            Arc::as_ptr(&ask) as *mut c_void,
         );
     }
-    Ok(Renderer { ctx, gl })
+    Ok(Renderer { ctx, gl, _ask: ask })
 }
 
 /// Frames looked at for black bars before the trailer shows without a crop.

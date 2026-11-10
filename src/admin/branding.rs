@@ -146,8 +146,10 @@ impl Bloom {
             "The splash screen is set.",
             cx,
             move |client| {
+                // The size first: a file of a gigabyte is not read to learn it.
+                let size = std::fs::metadata(&path)?.len();
+                anyhow::ensure!(size <= MAX_BYTES as u64, "the image is larger than 10 MB");
                 let bytes = std::fs::read(&path)?;
-                anyhow::ensure!(bytes.len() <= MAX_BYTES, "the image is larger than 10 MB");
                 client.post_image("/Branding/Splashscreen", &bytes, mime)
             },
         );
@@ -183,7 +185,9 @@ impl Bloom {
         cx: &mut Context<Self>,
         work: impl FnOnce(&Client) -> Result<()> + Send + 'static,
     ) {
-        self.fetch(
+        // The answer is for the server that was asked: after a switch its
+        // key must not go into the Branding page of another server.
+        self.fetch_in_session(
             cx,
             move |client| -> Result<Value> {
                 work(&client)?;

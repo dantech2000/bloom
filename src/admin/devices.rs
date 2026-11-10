@@ -120,22 +120,24 @@ pub fn render(_app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
         let width = content_width(this);
         let (show_user, show_app) = (width >= 620., width >= 820.);
         range
-            .map(|index| {
-                let device = &data.devices[index];
+            .filter_map(|index| {
+                let device = data.devices.get(index)?;
                 let current = *device.id == *session.client.device_id;
-                div()
-                    .h(px(ROW_H))
-                    .flex()
-                    .flex_col()
-                    // The line between two rows.
-                    .child(
-                        div()
-                            .mx(px(12.))
-                            .h(px(1.))
-                            .when(index > 0, |el| el.bg(rgba(0xf5f5f70f))),
-                    )
-                    .child(row(device, index, current, show_user, show_app, cx))
-                    .into_any_element()
+                Some(
+                    div()
+                        .h(px(ROW_H))
+                        .flex()
+                        .flex_col()
+                        // The line between two rows.
+                        .child(
+                            div()
+                                .mx(px(12.))
+                                .h(px(1.))
+                                .when(index > 0, |el| el.bg(rgba(0xf5f5f70f))),
+                        )
+                        .child(row(device, index, current, show_user, show_app, cx))
+                        .into_any_element(),
+                )
             })
             .collect()
     }));
@@ -165,7 +167,8 @@ fn row(
     show_app: bool,
     cx: &mut Context<Bloom>,
 ) -> Div {
-    let t = UiTheme::read(cx).clone();
+    // The colours alone: a row is built for every frame of a scroll.
+    let colors = UiTheme::read(cx).colors;
     let is_active = device.idle_secs().is_some_and(|s| s < ACTIVE_SECS);
     let date = device
         .date_last_activity
@@ -197,7 +200,7 @@ fn row(
                     if is_active {
                         rgba(GREEN)
                     } else {
-                        t.colors.foreground.opacity(0.7)
+                        colors.foreground.opacity(0.7)
                     },
                     40.,
                 ))
@@ -211,7 +214,7 @@ fn row(
                             .size(px(12.))
                             .rounded_full()
                             .border_2()
-                            .border_color(t.colors.background)
+                            .border_color(colors.background)
                             .bg(rgba(0x3ddc84ff)),
                     )
                 }),
@@ -234,7 +237,7 @@ fn row(
                                 .truncate()
                                 .text_size(px(15.))
                                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                .text_color(t.colors.foreground)
+                                .text_color(colors.foreground)
                                 .child(device.title().to_string()),
                         )
                         .when(current, |el| el.child(badge("This device", rgba(BLUE)))),
@@ -243,7 +246,7 @@ fn row(
                     div()
                         .truncate()
                         .text_size(px(13.))
-                        .text_color(t.colors.foreground.opacity(0.55))
+                        .text_color(colors.foreground.opacity(0.55))
                         .child(if compact {
                             format!("{app_line} · {when}")
                         } else if show_app {
@@ -260,7 +263,7 @@ fn row(
                 .flex_shrink_0()
                 .truncate()
                 .text_size(px(14.))
-                .text_color(t.colors.foreground.opacity(0.8))
+                .text_color(colors.foreground.opacity(0.8))
                 .child(app_line),
         );
     }
@@ -278,7 +281,7 @@ fn row(
                             .min_w_0()
                             .truncate()
                             .text_size(px(14.))
-                            .text_color(t.colors.foreground.opacity(0.8))
+                            .text_color(colors.foreground.opacity(0.8))
                             .child(user.clone()),
                     )
                 }),
@@ -293,7 +296,7 @@ fn row(
                 .text_color(if is_active {
                     rgba(0x6ee7a0ff)
                 } else {
-                    t.colors.foreground.opacity(0.6)
+                    colors.foreground.opacity(0.6)
                 })
                 .child(when),
         );

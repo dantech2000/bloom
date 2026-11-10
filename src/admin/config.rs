@@ -6,10 +6,11 @@
 //!
 //! The server gives a configuration as one object and takes the whole
 //! object back. The page keeps the object as it came and a copy the user
-//! edits. A save posts the copy, so every key the page does not show goes
-//! back as it was.
+//! edits (a [`Draft`]). A save reads the object from the server again,
+//! puts the edits in it and posts it, so every key the page does not show
+//! goes back as the server has it.
 
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
 
 use anyhow::Result;
 use gpui_icons::LucideIcon;
@@ -20,14 +21,11 @@ use gpui_kit::{
 use gpui_kit::IntoElement as _;
 use serde_json::{Value, json};
 
-use super::{
-    ButtonKind, Confirm, Section, button,
-    dialogs::{Field as PromptField, Prompt},
-};
+use super::{Ask, ButtonKind, Confirm, Draft, Section, button, choice_box, list_entries, parse_number, text_of};
 use crate::{
     app::{Bloom, Page},
     jellyfin::Client,
-    settings::{Choice, checkbox, field, group, select},
+    settings::{checkbox, field, group},
     ui::{glass::glass, theme::UiTheme},
     views::cards::icon,
 };
@@ -45,9 +43,10 @@ pub enum Kind {
     /// A folder or a file on the server.
     Path,
     /// One of a set of values, each with its label.
-    Choice(Vec<(Value, String)>),
-    /// Lines of text; in the form, separated by commas.
-    List,
+    Choice(Vec<(Value, SharedString)>),
+    /// Lines of text; in the form, separated by commas. A list of numbers
+    /// stays a list of numbers.
+    List { numbers: bool },
     /// Text of many lines, edited in a large dialog; `mono` is for code.
     Multiline { mono: bool },
 }
@@ -81,21 +80,12 @@ pub struct Options {
     users: Vec<(String, String)>,
 }
 
-/// What a save did: the objects the server took (source and body), and
-/// why it refused the others.
-#[derive(Default)]
-struct Sent {
-    /// The source, the object the server took, and the edits it was made from.
-    taken: Vec<(usize, Value, Value)>,
-    refused: Vec<anyhow::Error>,
-}
-
 pub struct Data {
-    /// The objects as the server gave them, in the order of the sources.
-    values: Vec<Value>,
-    /// The copies the user edits.
-    edited: Vec<Value>,
-    options: Options,
+    /// The objects of the page, in the order of the sources: each as the
+    /// server gave it, with the copy the user edits.
+    drafts: Vec<Draft>,
+    /// The fields of the page, made once when it loads.
+    spec: Arc<Spec>,
     /// The address of the splash screen image, for the Branding page.
     splash_preview: String,
 }
@@ -144,25 +134,17 @@ fn put(value: &mut Value, path: &[&str], new: Value) {
     place[*last] = new;
 }
 
-fn text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Null => String::new(),
-        other => other.to_string(),
-    }
-}
-
 fn list(value: &Value) -> Vec<String> {
     value
         .as_array()
-        .map(|items| items.iter().map(text).collect())
+        .map(|items| items.iter().map(text_of).collect())
         .unwrap_or_default()
 }
 
 pub fn load(client: &Client, section: Section) -> Result<Data> {
-    let values = sources(section)
+    let drafts = sources(section)
         .into_iter()
-        .map(|source| client.get::<Value>(&endpoint(source), &[]))
+        .map(|source| client.get::<Value>(&endpoint(source), &[]).map(Draft::new))
         .collect::<Result<Vec<_>>>()?;
     // The lists are a help, not a need: a field shows its raw value
     // without them.
@@ -171,7 +153,7 @@ pub fn load(client: &Client, section: Section) -> Result<Data> {
             .get::<Vec<Value>>(path, &[])
             .unwrap_or_default()
             .iter()
-            .map(|entry| (text(&entry[value]), text(&entry[name])))
+            .map(|entry| (text_of(&entry[value]), text_of(&entry[name])))
             .filter(|(value, _)| !value.is_empty())
             .collect()
     };
@@ -191,7 +173,7 @@ pub fn load(client: &Client, section: Section) -> Result<Data> {
         Section::Branding => client.url("/Branding/Splashscreen", &[]),
         _ => String::new(),
     };
-    Ok(Data { edited: values.clone(), values, options, splash_preview })
+    Ok(Data { drafts, spec: Arc::new(spec(section, &options)), splash_preview })
 }
 
 // ----- the pages --------------------------------------------------------------
@@ -204,24 +186,27 @@ fn whole(min: f64, max: f64, unit: &'static str) -> Kind {
     Kind::Number { min, max, unit, scale: 1., whole: true }
 }
 
-fn choice(options: &[(&str, &str)]) -> Kind {
-    Kind::Choice(options.iter().map(|(value, label)| (json!(value), label.to_string())).collect())
+fn choice(options: &[(&str, &'static str)]) -> Kind {
+    Kind::Choice(options.iter().map(|(value, label)| (json!(value), SharedString::new_static(*label))).collect())
 }
 
-fn named(options: &[(String, String)], first: Option<(&str, &str)>) -> Kind {
+fn named(options: &[(String, String)], first: Option<(&str, &'static str)>) -> Kind {
     Kind::Choice(
         first
             .into_iter()
-            .map(|(value, label)| (json!(value), label.to_string()))
-            .chain(options.iter().map(|(value, label)| (json!(value), label.clone())))
+            .map(|(value, label)| (json!(value), SharedString::new_static(label)))
+            .chain(options.iter().map(|(value, label)| (json!(value), SharedString::from(label.clone()))))
             .collect(),
     )
 }
 
+/// A list of texts.
+const LIST: Kind = Kind::List { numbers: false };
+
 /// The fields of a page. The labels and the option values follow the web
 /// dashboard.
 pub fn spec(section: Section, options: &Options) -> Spec {
-    use Kind::{Bool, InList, List, Path, Text};
+    use Kind::{Bool, InList, Path, Text};
     let mut warning = None;
     let groups = match section {
         Section::General => vec![
@@ -368,7 +353,7 @@ pub fn spec(section: Section, options: &Options) -> Spec {
                     "Images",
                     vec![
                         field("Interval", "Image interval", "Milliseconds between two images.", whole(1., 3_600_000., "ms")),
-                        field("WidthResolutions", "Width resolutions", "The widths, in pixels, the images are made in.", List),
+                        field("WidthResolutions", "Width resolutions", "The widths, in pixels, the images are made in.", Kind::List { numbers: true }),
                         field("TileWidth", "Tile width", "Images in one row of a sheet.", whole(1., 100., "")),
                         field("TileHeight", "Tile height", "Rows of images in a sheet.", whole(1., 100., "")),
                         field("JpegQuality", "JPEG quality", "", whole(0., 100., "")),
@@ -381,9 +366,9 @@ pub fn spec(section: Section, options: &Options) -> Spec {
         Section::Transcoding => {
             warning = Some("A wrong value here can make videos fail to play on devices that need the server to convert them. Hardware acceleration must fit the hardware of the server.");
             let number = |min: f64, max: f64, unit| Kind::Number { min, max, unit, scale: 1., whole: false };
-            let threads: Vec<(Value, String)> = std::iter::once((json!(-1), "Auto".to_string()))
-                .chain((1..=16).map(|n| (json!(n), n.to_string())))
-                .chain(std::iter::once((json!(0), "Max".to_string())))
+            let threads: Vec<(Value, SharedString)> = std::iter::once((json!(-1), "Auto".into()))
+                .chain((1..=16).map(|n| (json!(n), n.to_string().into())))
+                .chain(std::iter::once((json!(0), "Max".into())))
                 .collect();
             let codec = |value: &'static str, label: &'static str| item(0, &["HardwareDecodingCodecs"], label, "", InList(value));
             vec![
@@ -507,9 +492,9 @@ pub fn spec(section: Section, options: &Options) -> Spec {
                         item(0, &["EnableHttps"], "Enable HTTPS", "The server listens on the HTTPS port; it needs a certificate.", Bool),
                         item(0, &["InternalHttpsPort"], "Local HTTPS port number", "", port()),
                         item(0, &["BaseUrl"], "Base URL", "A subdirectory for the address of the server, such as /jellyfin.", Text),
-                        item(0, &["LocalNetworkAddresses"], "Bind to local network address", "Empty binds to every address.", List),
-                        item(0, &["LocalNetworkSubnets"], "LAN networks", "Addresses or subnets that count as the local network.", List),
-                        item(0, &["KnownProxies"], "Known proxies", "Reverse proxies whose forwarded address the server trusts.", List),
+                        item(0, &["LocalNetworkAddresses"], "Bind to local network address", "Empty binds to every address.", LIST),
+                        item(0, &["LocalNetworkSubnets"], "LAN networks", "Addresses or subnets that count as the local network.", LIST),
+                        item(0, &["KnownProxies"], "Known proxies", "Reverse proxies whose forwarded address the server trusts.", LIST),
                     ],
                 ),
                 (
@@ -523,8 +508,8 @@ pub fn spec(section: Section, options: &Options) -> Spec {
                     "Remote access",
                     vec![
                         item(0, &["EnableRemoteAccess"], "Allow remote connections to this server", "Off blocks every connection from outside the local network.", Bool),
-                        item(0, &["RemoteIPFilter"], "Remote IP address filter", "Addresses or subnets for the filter below.", List),
-                        item(0, &["IsRemoteIPFilterBlacklist"], "Remote IP address filter mode", "", Kind::Choice(vec![(json!(false), "Whitelist".to_string()), (json!(true), "Blacklist".to_string())])),
+                        item(0, &["RemoteIPFilter"], "Remote IP address filter", "Addresses or subnets for the filter below.", LIST),
+                        item(0, &["IsRemoteIPFilterBlacklist"], "Remote IP address filter mode", "", Kind::Choice(vec![(json!(false), "Whitelist".into()), (json!(true), "Blacklist".into())])),
                         item(0, &["PublicHttpPort"], "Public HTTP port number", "", port()),
                         item(0, &["PublicHttpsPort"], "Public HTTPS port number", "", port()),
                     ],
@@ -540,7 +525,7 @@ pub fn spec(section: Section, options: &Options) -> Spec {
                     "Discovery",
                     vec![
                         item(0, &["AutoDiscovery"], "Enable auto discovery", "Apps find the server on the local network by UDP port 7359.", Bool),
-                        item(0, &["PublishedServerUriBySubnet"], "Published server URIs", "The address the server names to clients, by subnet: subnet=address.", List),
+                        item(0, &["PublishedServerUriBySubnet"], "Published server URIs", "The address the server names to clients, by subnet: subnet=address.", LIST),
                     ],
                 ),
             ]
@@ -553,14 +538,27 @@ pub fn spec(section: Section, options: &Options) -> Spec {
 // ----- editing ----------------------------------------------------------------
 
 impl Data {
+    fn fields(&self) -> impl Iterator<Item = &Field> {
+        self.spec.groups.iter().flat_map(|(_, fields)| fields)
+    }
+
+    /// The field whose last key is `key`; the case does not matter.
+    fn field_by_key(&self, key: &str) -> Option<&Field> {
+        self.fields()
+            .find(|field| field.path.last().is_some_and(|last| last.eq_ignore_ascii_case(key)))
+    }
+
+    /// The value of a field in the copy the user edits.
+    fn value(&self, field: &Field) -> &Value {
+        at(&self.drafts[field.source].edited, &field.path)
+    }
+
     /// Fields whose value is not the one of the server.
-    fn changes(&self, spec: &Spec) -> usize {
+    fn changes(&self) -> usize {
         let mut places: Vec<(usize, &[&str])> = Vec::new();
-        for field in spec.groups.iter().flat_map(|(_, fields)| fields) {
+        for field in self.fields() {
             let place = (field.source, field.path.as_slice());
-            if !places.contains(&place)
-                && at(&self.values[field.source], &field.path) != at(&self.edited[field.source], &field.path)
-            {
+            if !places.contains(&place) && at(&self.drafts[field.source].original, &field.path) != self.value(field) {
                 places.push(place);
             }
         }
@@ -568,26 +566,69 @@ impl Data {
     }
 
     pub fn dirty(&self) -> bool {
-        self.values != self.edited
+        self.drafts.iter().any(Draft::dirty)
     }
+
+    fn saving(&self) -> bool {
+        self.drafts.iter().any(|draft| draft.saving)
+    }
+}
+
+/// The text the form of a field starts with: a number in the unit the
+/// page shows, a list with commas.
+fn typed_text(kind: &Kind, value: &Value) -> String {
+    match kind {
+        Kind::Number { scale, .. } => (value.as_f64().unwrap_or(0.) / scale).to_string(),
+        _ => text_of(value),
+    }
+}
+
+/// The value of a field from the text of its form.
+fn typed_value(kind: &Kind, typed: &str) -> Result<Value, &'static str> {
+    Ok(match kind {
+        Kind::Number { min, max, scale, whole, .. } => {
+            let number = parse_number(typed).ok_or("That is not a number.")?;
+            let stored = number.clamp(*min, *max) * scale;
+            if *whole || *scale != 1. {
+                json!(stored.round() as i64)
+            } else {
+                json!(stored)
+            }
+        }
+        Kind::List { numbers } => Value::Array(
+            list_entries(typed)
+                .map(|entry| match entry.parse::<i64>() {
+                    Ok(number) if *numbers => json!(number),
+                    _ => json!(entry),
+                })
+                .collect(),
+        ),
+        _ => json!(typed.trim()),
+    })
+}
+
+/// True when `new` is the number `old` already is: the server writes a
+/// whole float as `2`, and the form gives 2.0 back.
+fn same_number(old: &Value, new: &Value) -> bool {
+    old.is_number() && old.as_f64() == new.as_f64()
 }
 
 impl Bloom {
     fn config(&self) -> Option<(Section, &Data)> {
-        let Page::Admin(admin) = &self.page else {
-            return None;
-        };
+        let admin = self.admin_data()?;
         admin.config.get(&admin.section).map(|data| (admin.section, data))
+    }
+
+    fn config_mut(&mut self) -> Option<&mut Data> {
+        let admin = self.admin_data_mut()?;
+        admin.config.get_mut(&admin.section)
     }
 
     /// Changes one value of the copy the user edits. Nothing goes to the
     /// server before a save.
     pub fn config_put(&mut self, source: usize, path: Vec<&'static str>, value: Value, cx: &mut Context<Self>) {
-        if let Page::Admin(admin) = &mut self.page
-            && let Some(data) = admin.config.get_mut(&admin.section)
-            && let Some(object) = data.edited.get_mut(source)
-        {
-            put(object, &path, value);
+        if let Some(draft) = self.config_mut().and_then(|data| data.drafts.get_mut(source)) {
+            put(&mut draft.edited, &path, value);
             cx.notify();
         }
     }
@@ -595,16 +636,10 @@ impl Bloom {
     /// Changes the value of the field with a key, from text; for the debug
     /// channel. It edits the copy only.
     pub fn config_edit(&mut self, key: &str, text: &str, cx: &mut Context<Self>) -> String {
-        let Some((section, data)) = self.config() else {
+        let Some((_, data)) = self.config() else {
             return "error: no configuration page is open".into();
         };
-        let spec = spec(section, &data.options);
-        let found = spec
-            .groups
-            .iter()
-            .flat_map(|(_, fields)| fields)
-            .find(|field| field.path.last().is_some_and(|last| last.eq_ignore_ascii_case(key)));
-        let Some(field) = found.cloned() else {
+        let Some(field) = data.field_by_key(key).cloned() else {
             return format!("error: this page has no field {key:?}");
         };
         let value = serde_json::from_str(text).unwrap_or_else(|_| json!(text));
@@ -614,26 +649,10 @@ impl Bloom {
 
     /// Opens the form of the field with a key, as a click on it does.
     pub fn config_ask_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
-        let Some((section, data)) = self.config() else {
+        let Some(field) = self.config().and_then(|(_, data)| data.field_by_key(key).cloned()) else {
             return false;
         };
-        let spec = spec(section, &data.options);
-        let found = spec
-            .groups
-            .iter()
-            .flat_map(|(_, fields)| fields)
-            .find(|field| field.path.last().is_some_and(|last| last.eq_ignore_ascii_case(key)))
-            .cloned();
-        let Some(field) = found else {
-            return false;
-        };
-        let value = at(&data.edited[field.source], &field.path);
-        let current = match &field.kind {
-            Kind::List => list(value).join(", "),
-            Kind::Number { scale, .. } => (value.as_f64().unwrap_or(0.) / scale).to_string(),
-            _ => text(value),
-        };
-        self.config_ask(field, current, cx);
+        self.config_ask(field, cx);
         true
     }
 
@@ -647,7 +666,7 @@ impl Bloom {
         let Kind::Multiline { mono } = field.kind else {
             return;
         };
-        let value = text(at(&data.edited[field.source], &field.path));
+        let value = text_of(data.value(&field));
         let (source, path) = (field.source, field.path.clone());
         self.open_text_editor(
             super::text_editor::TextEdit {
@@ -667,18 +686,10 @@ impl Bloom {
 
     /// The same for the field with a key.
     pub fn config_open_text(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some((section, data)) = self.config() else {
-            return false;
-        };
-        let spec = spec(section, &data.options);
-        let found = spec
-            .groups
-            .iter()
-            .flat_map(|(_, fields)| fields)
-            .find(|field| {
-                matches!(field.kind, Kind::Multiline { .. })
-                    && field.path.last().is_some_and(|last| last.eq_ignore_ascii_case(key))
-            })
+        let found = self
+            .config()
+            .and_then(|(_, data)| data.field_by_key(key))
+            .filter(|field| matches!(field.kind, Kind::Multiline { .. }))
             .cloned();
         match found {
             Some(field) => {
@@ -693,11 +704,11 @@ impl Bloom {
     /// edited copy, so an edit of another key stays. A key the server does
     /// not send is removed.
     pub fn config_take_key(&mut self, section: Section, source: usize, key: &str, server: &Value, cx: &mut Context<Self>) {
-        if let Page::Admin(admin) = &mut self.page
-            && let Some(data) = admin.config.get_mut(&section)
+        if let Some(admin) = self.admin_data_mut()
+            && let Some(draft) = admin.config.get_mut(&section).and_then(|data| data.drafts.get_mut(source))
         {
-            for copy in [&mut data.values, &mut data.edited] {
-                if let Some(object) = copy.get_mut(source).and_then(Value::as_object_mut) {
+            for copy in [&mut draft.original, &mut draft.edited] {
+                if let Some(object) = copy.as_object_mut() {
                     match server.get(key) {
                         Some(value) => object.insert(key.to_string(), value.clone()),
                         None => object.remove(key),
@@ -712,19 +723,15 @@ impl Bloom {
     pub fn config_state(&self) -> String {
         match self.config() {
             Some((section, data)) => {
-                let spec = spec(section, &data.options);
-                let fields: usize = spec.groups.iter().map(|(_, fields)| fields.len()).sum();
-                format!("{section:?}: {fields} fields, {} changed", data.changes(&spec))
+                format!("{section:?}: {} fields, {} changed", data.fields().count(), data.changes())
             }
             None => "no configuration page".into(),
         }
     }
 
     pub fn config_discard(&mut self, cx: &mut Context<Self>) {
-        if let Page::Admin(admin) = &mut self.page
-            && let Some(data) = admin.config.get_mut(&admin.section)
-        {
-            data.edited = data.values.clone();
+        if let Some(data) = self.config_mut() {
+            data.drafts.iter_mut().for_each(Draft::discard);
             cx.notify();
         }
     }
@@ -735,8 +742,7 @@ impl Bloom {
         let Some((section, data)) = self.config() else {
             return;
         };
-        let spec = spec(section, &data.options);
-        match spec.warning {
+        match data.spec.warning {
             Some(warning) => self.ask_confirm(
                 Confirm {
                     title: format!("Save the {} settings?", section.label().to_lowercase()),
@@ -752,62 +758,71 @@ impl Bloom {
     }
 
     fn config_send(&mut self, cx: &mut Context<Self>) {
-        let Page::Admin(admin) = &mut self.page else {
+        if self.session.is_none() {
+            return;
+        }
+        let Some((section, _)) = self.config() else {
             return;
         };
-        let Some(data) = admin.config.get_mut(&admin.section) else {
+        let Some(data) = self.config_mut() else {
             return;
         };
+        // A save on its way is not sent a second time.
+        if data.saving() {
+            return;
+        }
         // Each object that changed goes back whole: the object the server
         // has at the save, with the edited values in it. The object this
         // page read can be old by then: another page, or another client,
         // saved the same object since, and its values must stay.
-        let posts: Vec<(usize, String, Value, Value)> = sources(admin.section)
-            .into_iter()
-            .enumerate()
-            .filter(|(n, _)| data.values[*n] != data.edited[*n])
-            .map(|(n, source)| (n, endpoint(source), data.values[n].clone(), data.edited[n].clone()))
-            .collect();
+        let mut posts: Vec<(usize, String, Draft)> = Vec::new();
+        for (n, source) in sources(section).into_iter().enumerate() {
+            if data.drafts[n].dirty() {
+                data.drafts[n].saving = true;
+                posts.push((n, endpoint(source), data.drafts[n].clone()));
+            }
+        }
         if posts.is_empty() {
             return;
         }
+        cx.notify();
         // An object counts as the server's once the server took it; a
         // refused one keeps its edits on show, to change or send again. The
-        // answer is for the session that sent the objects.
-        let section = admin.section;
+        // answer is for the session that sent the objects. Each answer is
+        // the source, the edits that went out, and the object the server
+        // took or why it refused.
         self.fetch_in_session(
             cx,
-            move |client| -> Result<Sent> {
-                let mut sent = Sent::default();
-                for (n, path, original, edited) in posts {
-                    let result = client.get::<Value>(&path, &[]).and_then(|fresh| {
-                        let body = super::with_changes(&fresh, &original, &edited);
-                        client.post(&path, &body).map(|_| body)
-                    });
-                    match result {
-                        Ok(body) => sent.taken.push((n, body, edited)),
-                        Err(err) => sent.refused.push(err),
-                    }
-                }
-                Ok(sent)
+            move |client| -> Result<Vec<(usize, Value, Result<Value>)>> {
+                Ok(posts
+                    .into_iter()
+                    .map(|(n, path, draft)| {
+                        let result = client.get::<Value>(&path, &[]).and_then(|fresh| {
+                            let body = draft.body(&fresh);
+                            client.post(&path, &body).map(|_| body)
+                        });
+                        (n, draft.edited, result)
+                    })
+                    .collect())
             },
             move |this, result, cx| {
-                let sent = result.unwrap_or_else(|err| Sent { taken: Vec::new(), refused: vec![err] });
-                match sent.refused.first() {
+                let answers = result.unwrap_or_default();
+                match answers.iter().find_map(|(_, _, result)| result.as_ref().err()) {
                     None => this.toast("Settings saved", "", cx),
                     Some(err) => this.toast("The server refused the change", format!("{err:#}"), cx),
                 }
-                if let Page::Admin(admin) = &mut this.page
-                    && let Some(data) = admin.config.get_mut(&section)
-                {
-                    for (n, body, edited) in sent.taken {
-                        // What the user changed since the save went out
-                        // stays an edit, on top of what the server took.
-                        if let Some(now) = data.edited.get_mut(n) {
-                            *now = super::with_changes(&body, &edited, now);
-                        }
-                        if let Some(value) = data.values.get_mut(n) {
-                            *value = body;
+                // The page that sent the save, also when the user left it
+                // meanwhile (Back returns to it).
+                for data in this.admin_pages_mut().filter_map(|admin| admin.config.get_mut(&section)) {
+                    for (n, sent, result) in &answers {
+                        let Some(draft) = data.drafts.get_mut(*n).filter(|draft| draft.saving) else {
+                            continue;
+                        };
+                        match result {
+                            // What the user changed since the save went
+                            // out stays an edit (`Draft::saved`).
+                            Ok(body) => draft.saved(body.clone(), sent),
+                            Err(_) => draft.saving = false,
                         }
                     }
                 }
@@ -822,81 +837,49 @@ impl Bloom {
     }
 
     /// A form for the value of a text, path, number or list field.
-    fn config_ask(&mut self, field: Field, current: String, cx: &mut Context<Self>) {
-        let (label, kind) = (field.label, field.kind.clone());
-        let placeholder = match &kind {
-            Kind::List => "Values, with a comma between them",
+    fn config_ask(&mut self, field: Field, cx: &mut Context<Self>) {
+        let Some((_, data)) = self.config() else {
+            return;
+        };
+        let placeholder = match &field.kind {
+            Kind::List { .. } => "Values, with a comma between them",
             Kind::Path => "A path on the server",
             Kind::Number { .. } => "A number",
             _ => "",
         };
-        let message = match (&kind, field.help) {
-            (Kind::List, "") => "Put a comma between two values.".to_string(),
-            (Kind::List, help) => format!("{help} Put a comma between two values."),
+        let message = match (&field.kind, field.help) {
+            (Kind::List { .. }, "") => "Put a comma between two values.".to_string(),
+            (Kind::List { .. }, help) => format!("{help} Put a comma between two values."),
             (_, help) => help.to_string(),
         };
-        self.ask_prompt(
-            Prompt {
-                title: label.to_string(),
-                message,
-                action: "Set".to_string(),
-                fields: vec![PromptField {
-                    label: label.to_string(),
-                    placeholder: placeholder.to_string(),
-                    value: current,
-                    masked: false,
-                    required: false,
-                }],
-                run: Rc::new(move |this, values, cx| {
-                    let typed = values.first().map(|v| v.trim()).unwrap_or_default();
-                    let value = match &kind {
-                        Kind::Number { min, max, scale, whole, .. } => {
-                            // "nan" parses as a number, and comes out as 0.
-                            let Some(number) = typed.parse::<f64>().ok().filter(|n| n.is_finite()) else {
-                                this.toast(label, "That is not a number.", cx);
-                                return;
-                            };
-                            let stored = number.clamp(*min, *max) * scale;
-                            if *whole || *scale != 1. {
-                                json!(stored.round() as i64)
-                            } else {
-                                json!(stored)
-                            }
-                        }
-                        Kind::List => {
-                            // A list of numbers stays a list of numbers.
-                            let numbers = list_is_numbers(this, &field);
-                            Value::Array(
-                                typed
-                                    .split([',', '\n'])
-                                    .map(str::trim)
-                                    .filter(|entry| !entry.is_empty())
-                                    .map(|entry| match entry.parse::<i64>() {
-                                        Ok(number) if numbers => json!(number),
-                                        _ => json!(entry),
-                                    })
-                                    .collect(),
-                            )
-                        }
-                        _ => json!(typed),
-                    };
-                    this.config_put(field.source, field.path.clone(), value, cx);
-                }),
-            },
-            cx,
-        );
+        let ask = Ask {
+            title: field.label.to_string(),
+            message,
+            placeholder: placeholder.to_string(),
+            value: typed_text(&field.kind, data.value(&field)),
+            ..Ask::default()
+        };
+        self.ask_value(ask, cx, move |this, typed, cx| {
+            let value = match typed_value(&field.kind, typed) {
+                Ok(value) => value,
+                Err(note) => return this.toast(field.label, note, cx),
+            };
+            if this.config().is_some_and(|(_, data)| same_number(data.value(&field), &value)) {
+                return;
+            }
+            this.config_put(field.source, field.path.clone(), value, cx);
+        });
     }
 
     /// The bar with Save and Discard, while the page has changes.
     pub fn render_config_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let (section, data) = self.config()?;
+        let (_, data) = self.config()?;
         if !data.dirty() {
             return None;
         }
-        let changes = data.changes(&spec(section, &data.options));
         Some(bar_shell(
             self.admin_bar_edges(),
-            changes,
+            unsaved_text(data.changes(), data.saving()),
             button("config.discard", "Discard", ButtonKind::Plain, cx)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.config_discard(cx))),
             button("config.save", "Save", ButtonKind::Primary, cx)
@@ -906,11 +889,21 @@ impl Bloom {
     }
 }
 
-/// The bar at the bottom of a page with unsaved changes: the count, and the
-/// two buttons the caller made.
+/// What the bar of an editor says: that a save is on its way, or how many
+/// changes wait for one.
+pub(super) fn unsaved_text(changes: usize, saving: bool) -> String {
+    match (saving, changes) {
+        (true, _) => "Saving…".to_string(),
+        (_, 1) => "1 change is not saved.".to_string(),
+        (_, n) => format!("{n} changes are not saved."),
+    }
+}
+
+/// The bar at the bottom of a page with unsaved changes: its text
+/// (`unsaved_text`), and the two buttons the caller made.
 pub(super) fn bar_shell(
     (left, right, bottom): (f32, f32, f32),
-    changes: usize,
+    text: String,
     discard: Stateful<Div>,
     save: Stateful<Div>,
     cx: &Context<Bloom>,
@@ -930,29 +923,20 @@ pub(super) fn bar_shell(
         .flex()
         .items_center()
         .gap(px(10.))
-        .child(
-            div()
-                .flex_1()
-                .text_size(px(15.))
-                .text_color(t.colors.foreground)
-                .child(match changes {
-                    1 => "1 change is not saved.".to_string(),
-                    n => format!("{n} changes are not saved."),
-                }),
-        )
+        .child(div().flex_1().text_size(px(15.)).text_color(t.colors.foreground).child(text))
         .child(discard)
         .child(save)
 }
 
-/// The object of the Branding page as the server gave it.
-pub fn branding_of(data: &Data) -> Option<&Value> {
-    data.values.first()
+/// Room for the bar with Save at the foot of a page, so the bar does not
+/// cover the last field.
+pub(super) fn bar_room(dirty: bool) -> Div {
+    div().h(px(if dirty { 72. } else { 0. }))
 }
 
-fn list_is_numbers(app: &Bloom, field: &Field) -> bool {
-    app.config()
-        .and_then(|(_, data)| at(&data.values[field.source], &field.path).as_array().cloned())
-        .is_some_and(|items| !items.is_empty() && items.iter().all(Value::is_number))
+/// The object of the Branding page as the server gave it.
+pub fn branding_of(data: &Data) -> Option<&Value> {
+    data.drafts.first().map(|draft| &draft.original)
 }
 
 // ----- the page -----------------------------------------------------------------
@@ -987,8 +971,17 @@ pub(super) fn value_button(id: SharedString, value: String, cx: &Context<Bloom>)
         .child(icon(LucideIcon::Pencil, 15., t.colors.foreground.opacity(0.7)))
 }
 
+/// What a field of many lines shows on its button: the text when it is
+/// one line, the number of lines when it is more.
+pub(super) fn lines_text(text: String) -> String {
+    match text.split('\n').count() {
+        1 => text,
+        n => format!("{n} lines"),
+    }
+}
+
 /// A group with this many fields or more builds only the fields in view.
-const LAZY_MIN: usize = 4;
+pub(super) const LAZY_MIN: usize = 4;
 
 /// One row of the page: the label and help of a field with its control.
 fn field_row(
@@ -1000,7 +993,7 @@ fn field_row(
     cx: &mut Context<Bloom>,
 ) -> Div {
     let id = SharedString::from(format!("config.{section:?}.{g}.{n}"));
-    let value = at(&data.edited[entry.source], &entry.path).clone();
+    let value = data.value(entry);
     let (source, path) = (entry.source, entry.path.clone());
     let control: Stateful<Div> = match &entry.kind {
         Kind::Bool => {
@@ -1011,7 +1004,7 @@ fn field_row(
         }
         Kind::InList(member) => {
             let member = *member;
-            let items = list(&value);
+            let items = list(value);
             let on = items.iter().any(|entry| entry == member);
             checkbox(id, on, cx).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 let mut items = items.clone();
@@ -1025,78 +1018,40 @@ fn field_row(
         }
         Kind::Choice(options) => {
             // A key the server left out shows as the empty choice.
-            let value = if value.is_null() { json!("") } else { value };
-            let shown = options
-                .iter()
-                .find(|(option, _)| *option == value)
-                .map_or_else(|| text(&value), |(_, label)| label.clone());
-            let longest = options
-                .iter()
-                .map(|(_, label)| label.as_str())
-                .max_by_key(|label| label.chars().count())
-                .unwrap_or_default()
-                .to_string();
-            let options = options.clone();
-            select(id, shown, &longest, cx).on_click(cx.listener(
-                move |this, event: &ClickEvent, window, cx| {
-                    let choices = options
-                        .iter()
-                        .map(|(option, label)| {
-                            let (path, option) = (path.clone(), option.clone());
-                            Choice::new(label.clone(), option == value, move |this, cx| {
-                                this.config_put(source, path.clone(), option.clone(), cx)
-                            })
-                        })
-                        .collect();
-                    this.open_choices(choices, event.position(), window, cx);
-                },
-            ))
-        }
-        Kind::Number { unit, scale, .. } => {
-            let number = value.as_f64().unwrap_or(0.) / scale;
-            let typed = if number.fract() == 0. { format!("{number:.0}") } else { number.to_string() };
-            let shown = if unit.is_empty() { typed.clone() } else { format!("{typed} {unit}") };
-            let entry = entry.clone();
-            value_button(id, shown, cx).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.config_ask(entry.clone(), typed.clone(), cx)
-            }))
+            let current = if value.is_null() { json!("") } else { value.clone() };
+            choice_box(id, options.clone(), current, cx, move |this, option, cx| {
+                this.config_put(source, path.clone(), option.clone(), cx)
+            })
         }
         Kind::Multiline { .. } => {
-            let typed = text(&value);
-            let lines = typed.split('\n').count();
-            let shown = match (typed.is_empty(), lines) {
-                (true, _) => String::new(),
-                (false, 1) => typed.clone(),
-                (false, n) => format!("{n} lines"),
-            };
             let entry = entry.clone();
-            value_button(id, shown, cx).on_click(cx.listener(
+            value_button(id, lines_text(text_of(value)), cx).on_click(cx.listener(
                 move |this, _: &ClickEvent, window, cx| this.open_multiline(entry.clone(), window, cx),
             ))
         }
-        Kind::Text | Kind::Path | Kind::List => {
-            let typed = match &entry.kind {
-                Kind::List => list(&value).join(", "),
-                _ => text(&value),
+        Kind::Number { .. } | Kind::Text | Kind::Path | Kind::List { .. } => {
+            let typed = typed_text(&entry.kind, value);
+            let shown = match &entry.kind {
+                Kind::Number { unit, .. } if !unit.is_empty() => format!("{typed} {unit}"),
+                _ => typed,
             };
             let entry = entry.clone();
-            value_button(id, typed.clone(), cx).on_click(cx.listener(
-                move |this, _: &ClickEvent, _, cx| this.config_ask(entry.clone(), typed.clone(), cx),
-            ))
+            value_button(id, shown, cx).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.config_ask(entry.clone(), cx)
+            }))
         }
     };
     field(entry.label, entry.help, control, cx)
 }
 
 pub fn render(section: Section, data: &Data, cx: &mut Context<Bloom>) -> Div {
-    let spec = spec(section, &data.options);
     let mut page = div().max_w(px(920.)).flex().flex_col().gap(px(18.));
-    for (g, (title, fields)) in spec.groups.iter().enumerate() {
+    for (g, (title, fields)) in data.spec.groups.iter().enumerate() {
         let mut card = group(*title, cx);
         if fields.len() >= LAZY_MIN {
             // A long group: the rows of the fields in view only. They read
             // the edits from the app each time they are built.
-            let fields = fields.clone();
+            let spec = data.spec.clone();
             card = card.child(super::lazy::lazy(
                 cx,
                 format!("config.{section:?}.{g}"),
@@ -1106,7 +1061,7 @@ pub fn render(section: Section, data: &Data, cx: &mut Context<Bloom>) -> Div {
                         return Vec::new();
                     };
                     range
-                        .map(|n| field_row(section, g, n, &fields[n], data, cx).into_any_element())
+                        .map(|n| field_row(section, g, n, &spec.groups[g].1[n], data, cx).into_any_element())
                         .collect()
                 },
             ));
@@ -1117,12 +1072,11 @@ pub fn render(section: Section, data: &Data, cx: &mut Context<Bloom>) -> Div {
         }
         // The splash screen has an image and buttons besides its toggle.
         if section == Section::Branding && *title == "Splash screen" {
-            card = card.child(super::branding::splash_block(&data.values[0], &data.splash_preview, cx));
+            card = card.child(super::branding::splash_block(&data.drafts[0].original, &data.splash_preview, cx));
         }
         page = page.child(card);
     }
-    // Room for the bar with Save, so it does not cover the last field.
-    page.child(div().h(px(if data.dirty() { 72. } else { 0. })))
+    page.child(bar_room(data.dirty()))
 }
 
 #[cfg(test)]
@@ -1180,15 +1134,47 @@ mod tests {
 
     #[test]
     fn counts_changed_fields() {
-        let options = Options::default();
-        let spec = spec(Section::Resume, &options);
-        let values = vec![json!({ "MinResumePct": 5, "MaxResumePct": 90 })];
-        let mut data = Data { edited: values.clone(), values, options, splash_preview: String::new() };
-        assert_eq!(data.changes(&spec), 0);
+        let mut data = Data {
+            drafts: vec![Draft::new(json!({ "MinResumePct": 5, "MaxResumePct": 90 }))],
+            spec: Arc::new(spec(Section::Resume, &Options::default())),
+            splash_preview: String::new(),
+        };
+        assert_eq!(data.changes(), 0);
         assert!(!data.dirty());
-        put(&mut data.edited[0], &["MinResumePct"], json!(10));
-        assert_eq!(data.changes(&spec), 1);
+        put(&mut data.drafts[0].edited, &["MinResumePct"], json!(10));
+        assert_eq!(data.changes(), 1);
         assert!(data.dirty());
+    }
+
+    #[test]
+    fn typed_text_makes_the_value_of_the_kind() {
+        let mbps = Kind::Number { min: 0., max: 10_000., unit: "Mbps", scale: 1_000_000., whole: false };
+        assert_eq!(typed_value(&mbps, " 1.5 "), Ok(json!(1_500_000)));
+        assert_eq!(typed_value(&whole(1., 100., "%"), "250"), Ok(json!(100)));
+        assert!(typed_value(&whole(1., 100., "%"), "nan").is_err());
+        assert_eq!(typed_value(&Kind::Text, " den "), Ok(json!("den")));
+        assert_eq!(typed_value(&LIST, "10.0.0.0/8,\n 80 ,"), Ok(json!(["10.0.0.0/8", "80"])));
+        // A list of numbers is one also when the server's list was empty:
+        // the server refuses "320" as a width.
+        let Some(widths) = spec(Section::Trickplay, &Options::default())
+            .groups
+            .iter()
+            .flat_map(|(_, fields)| fields)
+            .find(|field| field.path.last() == Some(&"WidthResolutions"))
+            .map(|field| field.kind.clone())
+        else {
+            panic!("no WidthResolutions");
+        };
+        assert_eq!(typed_value(&widths, "320, 480"), Ok(json!([320, 480])));
+    }
+
+    /// A number the server wrote as `2` and the form gives back as 2.0 is
+    /// the same number: the page showed "1 change is not saved" for it.
+    #[test]
+    fn a_number_typed_again_is_no_change() {
+        assert!(same_number(&json!(2), &json!(2.0)));
+        assert!(!same_number(&json!(2), &json!(2.5)));
+        assert!(!same_number(&json!(null), &json!(0)));
     }
 }
 
@@ -1240,6 +1226,31 @@ mod race_tests {
         assert_eq!(server.bodies("POST", "/System/Configuration")[1]["ServerName"], json!("den"));
     }
 
+    /// A second Save while the first is on its way sends nothing: the
+    /// server got the same object twice.
+    #[gpui_kit::test]
+    fn a_save_on_its_way_is_not_sent_again(cx: &mut TestAppContext) {
+        let server = MockServer::start(|method, path, _| match (method, path) {
+            ("GET", p) if p.starts_with("/System/Configuration") => (200, r#"{"ServerName":"home"}"#.into()),
+            _ => plain(method, path),
+        });
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            this.session = Some(session(&server.url, "u1"));
+            this.screen = Screen::Main;
+            this.open_admin(Section::General, cx);
+        });
+        cx.run_until_parked();
+        bloom.update(cx, |this, cx| {
+            this.config_edit("ServerName", "den", cx);
+            this.config_save(cx);
+            this.config_save(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(server.count("POST", "/System/Configuration"), 1);
+        bloom.read_with(cx, |this, _| assert!(this.config_state().contains("0 changed"), "{}", this.config_state()));
+    }
+
     /// Two objects on one page: the server takes the first and refuses the
     /// second. The first is clean, the second keeps its edit.
     #[gpui_kit::test]
@@ -1272,10 +1283,11 @@ mod race_tests {
             assert!(this.config_state().contains("1 changed"), "{}", this.config_state());
             let Page::Admin(admin) = &this.page else { panic!("not the dashboard") };
             let data = &admin.config[&Section::LibraryDisplay];
-            assert_eq!(data.values[0], data.edited[0], "the object the server took is still dirty");
-            assert_eq!(data.values[0]["EnableFolderView"], json!(true), "the taken object is not the baseline");
-            assert_ne!(data.values[1], data.edited[1], "the refused edit is gone");
-            assert_eq!(data.edited[1]["UseFileCreationTimeForDateAdded"], json!(true));
+            assert!(!data.drafts[0].dirty(), "the object the server took is still dirty");
+            assert_eq!(data.drafts[0].original["EnableFolderView"], json!(true), "the taken object is not the baseline");
+            assert!(data.drafts[1].dirty(), "the refused edit is gone");
+            assert_eq!(data.drafts[1].edited["UseFileCreationTimeForDateAdded"], json!(true));
+            assert!(data.drafts.iter().all(|draft| !draft.saving));
         });
     }
 }

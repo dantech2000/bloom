@@ -25,8 +25,9 @@ pub struct Request {
     reply: mpsc::Sender<String>,
 }
 
-/// A listener of the debug channel on one socket. Dropping it does not stop
-/// the thread; [`Listener::stop`] does.
+/// A listener of the debug channel on one socket. Its drop ends the thread
+/// and takes the socket away, so a listener goes with the window that
+/// made it: a window that opens again starts its own on the same path.
 pub struct Listener {
     path: String,
     stop: Arc<AtomicBool>,
@@ -95,9 +96,10 @@ impl Listener {
             .expect("spawn debug thread");
         Some(Self { path, stop })
     }
+}
 
-    /// Ends the thread and takes the socket away.
-    fn stop(self) {
+impl Drop for Listener {
+    fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         // The thread waits in `accept`; a connection wakes it.
         let _ = std::os::unix::net::UnixStream::connect(&self.path);
@@ -121,6 +123,21 @@ pub fn setting_socket() -> String {
         .to_string()
 }
 
+/// The verbs of the channel, in the order of `run_debug_command`, for the
+/// answer to an unknown one. A new verb goes here too.
+const COMMANDS: &[&str] = &[
+    "home", "back", "search", "library", "item", "resize", "scroll", "hero", "hover-card", "play",
+    "stop", "track", "tracks", "mute", "playall", "next", "libraries", "previous", "enqueue",
+    "hover", "queue", "pip", "pause", "seek", "admin", "meta", "admin-edit", "admin-config",
+    "admin-discard", "write", "admin-save", "admin-dialog", "connect", "authorize",
+    "authorize-close", "je", "tags", "show", "scrub", "type", "a11y", "menu", "settings",
+    "plugin-config", "branding", "airplay", "access", "triggers", "awake", "updates", "nowplaying",
+    "syncplay", "lists", "events", "socket-inject", "cast", "downloads", "connection",
+    "chromecast", "subs", "quality", "episodes", "rows", "perf", "theme", "glass", "mpv",
+    "mpv-set", "stream", "quit", "pacing", "hero-video", "sizes", "prefs", "catalog", "menubar",
+    "action", "appearance", "reopen", "state",
+];
+
 impl Bloom {
     /// Starts the loop that runs the commands on the UI thread, and the
     /// listeners: one on the socket of `BLOOM_DEBUG_SOCK` (a development
@@ -128,8 +145,8 @@ impl Bloom {
     pub fn start_debug_channel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (tx, rx) = async_channel::unbounded::<Request>();
         if let Some(path) = &crate::options::options().debug_sock {
-            // Lives as long as the app.
-            let _ = Listener::start(path.clone(), tx.clone());
+            // Lives as long as the window.
+            self.debug_env_listener = Listener::start(path.clone(), tx.clone());
         }
         self.debug_requests = Some(tx);
         if self.config.debug_channel == Some(true) {
@@ -168,8 +185,9 @@ impl Bloom {
     pub fn set_debug_channel(&mut self, on: bool, cx: &mut Context<Self>) {
         if on {
             self.listen_for_debug();
-        } else if let Some(listener) = self.debug_listener.take() {
-            listener.stop();
+        } else {
+            // The drop ends the thread.
+            self.debug_listener = None;
         }
         self.config.debug_channel = Some(self.debug_listener.is_some());
         self.save_config(cx);
@@ -418,47 +436,7 @@ impl Bloom {
             },
             // Opens the metadata manager for the item of the detail page, to
             // look at it. `browse <type>` reads the provider images (a GET).
-            "meta" => {
-                use crate::metadata::Tab;
-                let (word, arg) = rest.split_once(' ').unwrap_or((rest, ""));
-                if word == "close" {
-                    self.close_metadata(window, cx);
-                } else if word == "state" {
-                    return self.metadata_describe();
-                } else if word == "search" {
-                    // The Identify form starts with the name, year and ids
-                    // of the item; this sends that search. A search only
-                    // reads.
-                    self.metadata_search(cx);
-                } else if word == "browse" {
-                    self.browse_images(if arg.is_empty() { "Primary" } else { arg }, cx);
-                } else if word == "confirm" {
-                    // Shows the question before an image is deleted; no answer is given.
-                    let first = self
-                        .metadata
-                        .open
-                        .as_ref()
-                        .and_then(|m| m.images.as_ref()?.first().cloned());
-                    if let Some(image) = first {
-                        self.ask_delete_image(&image, cx);
-                    }
-                } else if word == "scroll" {
-                    let y = arg.parse::<f32>().unwrap_or(0.);
-                    self.metadata.scroll.set_offset(gpui_kit::point(px(0.), px(-y)));
-                } else if let Page::Detail(data) = &self.page {
-                    let tab = match word {
-                        "images" => Tab::Images,
-                        "identify" => Tab::Identify,
-                        "refresh" => Tab::Refresh,
-                        _ => Tab::Details,
-                    };
-                    let (id, name, kind) =
-                        (data.item.id.clone(), data.item.name.clone(), data.item.kind.clone());
-                    self.open_metadata(&id, &name, kind.name(), tab, cx);
-                } else {
-                    return "error: open an item first".into();
-                }
-            }
+            "meta" => return self.debug_meta(rest, window, cx),
             // A configuration page of the dashboard. These change the edited
             // copy only; nothing is sent.
             "admin-edit" => {
@@ -470,77 +448,7 @@ impl Bloom {
             // Runs a write to the server the way a click does, so a test can
             // check it and then put the data back. The destructive ones take
             // only names a test made ("jellyui-test...").
-            "write" => {
-                let (verb, arg) = rest.split_once(' ').unwrap_or((rest, ""));
-                match verb {
-                    // "Yes" on the open question of the dashboard.
-                    // Only a question a debug command opened: one a person
-                    // opened (restart, shut down, delete a user) is not
-                    // for this channel to answer.
-                    "confirm" if self.dialogs.confirm.is_some() && !self.debug_opened_confirm() => {
-                        return "error: the open question was not opened by a debug command".into();
-                    }
-                    "submit" if self.dialogs.prompt.is_some() && !self.debug_opened_prompt() => {
-                        return "error: the open form was not opened by a debug command".into();
-                    }
-                    "confirm" => match self.dialogs.confirm.take() {
-                        Some(confirm) => (confirm.run)(self, cx),
-                        None => return "error: no question is open".into(),
-                    },
-                    // Submits the open form; the values are separated by "|".
-                    "submit" => match self.dialogs.prompt.clone() {
-                        Some(prompt) => {
-                            self.close_admin_dialog(window, cx);
-                            (prompt.run)(self, arg.split('|').map(str::to_string).collect(), cx);
-                        }
-                        None => return "error: no form is open".into(),
-                    },
-                    "revoke-key" | "delete-user" | "user-password" if !arg.starts_with("jellyui-test") => {
-                        return "error: only names that start with jellyui-test".into();
-                    }
-                    "revoke-key" => {
-                        if !crate::admin::api_keys::ask_revoke_named(self, arg, cx) {
-                            return "error: no such key on the API Keys page".into();
-                        }
-                    }
-                    "user-password" => {
-                        if !crate::admin::users::ask_password_named(self, arg, cx) {
-                            return "error: no such user on the Users page".into();
-                        }
-                    }
-                    "delete-user" => {
-                        if !crate::admin::users::ask_delete_named(self, arg, cx) {
-                            return "error: no such user on the Users page".into();
-                        }
-                    }
-                    // A yes-or-no field of the user's configuration.
-                    "pref" => {
-                        let (key, value) = arg.split_once(' ').unwrap_or((arg, ""));
-                        let key: &'static str = Box::leak(key.to_string().into_boxed_str());
-                        self.set_user_config(key, serde_json::Value::Bool(value == "true"), cx);
-                    }
-                    // The tagline of the item in the open metadata editor.
-                    "tagline" => {
-                        let index = crate::metadata::FIELDS
-                            .iter()
-                            .position(|field| field.label == "Tagline");
-                        let Some(index) = index.filter(|_| self.metadata.open.is_some()) else {
-                            return "error: the metadata editor is not open".into();
-                        };
-                        let text = arg.to_string();
-                        self.metadata.inputs[index]
-                            .update(cx, |input, cx| input.set_value(text, window, cx));
-                        self.save_metadata(cx);
-                    }
-                    "picture" => self.upload_profile_picture(arg.into(), cx),
-                    "picture-remove" => self.remove_profile_picture(cx),
-                    _ => {
-                        return "error: write confirm|submit <a|b>|revoke-key <name>|delete-user <name>|\
-                                pref <Key> <true|false>|tagline <text>|picture <path>|picture-remove"
-                            .into();
-                    }
-                }
-            }
+            "write" => return self.debug_write(rest, window, cx),
             // Presses Save on the open configuration page. A page that asks
             // before it saves still asks.
             "admin-save" => self.config_save(cx),
@@ -567,75 +475,12 @@ impl Bloom {
             },
             // The sign-in page. `connect add <address>` asks that server who
             // it is; `connect quick` gets a Quick Connect code.
-            "connect" => {
-                let (what, value) = rest.split_once(' ').unwrap_or((rest, ""));
-                match what {
-                    "" => self.show_connect(cx),
-                    "servers" => {
-                        self.show_connect(cx);
-                        self.connect.choosing_server = true;
-                    }
-                    "add" => {
-                        self.connect
-                            .url
-                            .update(cx, |input, cx| input.set_value(value.trim(), window, cx));
-                        self.add_server(cx);
-                    }
-                    // Signs a test account in: `connect signin <name>|<password>`.
-                    "signin" => {
-                        let (name, password) = value.split_once('|').unwrap_or((value, ""));
-                        if !name.starts_with("jellyui-test") {
-                            return "error: only names that start with jellyui-test".into();
-                        }
-                        self.connect
-                            .username
-                            .update(cx, |input, cx| input.set_value(name, window, cx));
-                        self.connect
-                            .password
-                            .update(cx, |input, cx| input.set_value(password, window, cx));
-                        self.sign_in(cx);
-                    }
-                    "quick" => self.start_quick_connect(cx),
-                    "cancel" => self.cancel_quick_connect(cx),
-                    "done" => self.screen = crate::app::Screen::Main,
-                    _ => return "error: connect [servers | add <address> | quick | cancel | done]".into(),
-                }
-                cx.notify();
-                return self.debug_connect();
-            }
+            "connect" => return self.debug_connect_command(rest, window, cx),
             // Opens the dialog that signs in another device; sends nothing.
             "authorize" => self.open_authorize(window, cx),
             "authorize-close" => self.close_authorize(window, cx),
             // Jellyfin Enhanced: state, the list of keys, a switch, an action.
-            "je" => {
-                let (verb, argument) = rest.split_once(' ').unwrap_or((rest, ""));
-                match verb {
-                    "help" => {
-                        if !self.close_panel(Panel::Help) {
-                            self.open_panel(Panel::Help, window, cx);
-                        }
-                    }
-                    "toggle" => match crate::enhanced::TOGGLES
-                        .iter()
-                        .find(|(key, _)| *key == argument)
-                    {
-                        Some((key, _)) => self.toggle_enhanced(key, cx),
-                        None => return format!("error: no switch named {argument:?}"),
-                    },
-                    "do" => {
-                        if !self.enhanced_player_action(argument, cx) {
-                            return format!("error: {argument:?} did nothing");
-                        }
-                    }
-                    other => {
-                        if let Some(text) = self.debug_je(other, argument, window, cx) {
-                            return text;
-                        }
-                    }
-                }
-                cx.notify();
-                return self.enhanced_debug();
-            }
+            "je" => return self.debug_je_command(rest, window, cx),
             "tags" => self.toggle_quality_tags(cx),
             "show" => {
                 use crate::app::LibraryShow;
@@ -734,86 +579,7 @@ impl Bloom {
             "nowplaying" => return self.debug_nowplaying(rest, cx),
             // SyncPlay: the state, the list of groups, and the actions of
             // the panel.
-            "syncplay" => {
-                use crate::syncplay::core::Intent;
-                let (verb, arg) = rest.split_once(' ').unwrap_or((rest, ""));
-                match verb {
-                    "" | "state" => return self.sync_describe(),
-                    "panel" => self.toggle_sync_panel(window, cx),
-                    "list" => {
-                        return self
-                            .sync
-                            .groups
-                            .iter()
-                            .map(|g| format!("{} {:?} [{}]", g.group_id, g.group_name, g.participants.join(",")))
-                            .collect::<Vec<_>>()
-                            .join(" | ");
-                    }
-                    "new" => {
-                        let name = if arg.is_empty() { "jellyui test group" } else { arg };
-                        self.sync_user(Intent::Create { name: name.to_string() }, cx)
-                    }
-                    "join" => self.sync_user(Intent::Join { group_id: arg.to_string() }, cx),
-                    "leave" => self.sync_user(Intent::Leave, cx),
-                    // The queue of the group; an entry is named by its place, from 1.
-                    "queue" => {
-                        let Some(queue) = self.sync.session.as_ref().and_then(|s| s.core.queue()) else {
-                            return "no queue".into();
-                        };
-                        let current = queue.playing_item_index;
-                        let entries: Vec<String> = queue
-                            .playlist
-                            .iter()
-                            .enumerate()
-                            .map(|(n, item)| {
-                                let title = self.sync.titles.get(&item.item_id).cloned().unwrap_or_default();
-                                let mark = if n as i64 == current { "*" } else { "" };
-                                format!("{}{mark} {title}", n + 1)
-                            })
-                            .collect();
-                        return format!(
-                            "shuffle={} repeat={} | {}",
-                            queue.shuffle_mode,
-                            queue.repeat_mode,
-                            entries.join(" | ")
-                        );
-                    }
-                    "enqueue" | "enqueue-next" => self.sync_user(
-                        Intent::Enqueue { item_ids: vec![arg.to_string()], next: verb == "enqueue-next" },
-                        cx,
-                    ),
-                    "remove" | "jump" | "up" | "down" => {
-                        let place = arg.parse::<usize>().unwrap_or(0);
-                        let id = self
-                            .sync
-                            .session
-                            .as_ref()
-                            .and_then(|s| s.core.queue())
-                            .and_then(|q| q.playlist.get(place.wrapping_sub(1)))
-                            .map(|item| item.playlist_item_id.clone());
-                        let Some(playlist_item_id) = id else {
-                            return "error: no such entry".into();
-                        };
-                        let intent = match verb {
-                            "remove" => Intent::Remove { playlist_item_ids: vec![playlist_item_id] },
-                            "jump" => Intent::Jump { playlist_item_id },
-                            "up" => Intent::Move { playlist_item_id, new_index: place.saturating_sub(2) },
-                            _ => Intent::Move { playlist_item_id, new_index: place },
-                        };
-                        self.sync_user(intent, cx)
-                    }
-                    "shuffle" => self.sync_user(Intent::Shuffle(arg.to_string()), cx),
-                    "repeat" => self.sync_user(Intent::Repeat(arg.to_string()), cx),
-                    "unfollow" => self.sync_user(Intent::StopFollowing, cx),
-                    "follow" => self.sync_user(Intent::Follow, cx),
-                    _ => {
-                        return "error: syncplay state|panel|list|new [name]|join <id>|leave|follow|unfollow|\
-                                queue|enqueue <item>|enqueue-next <item>|remove <n>|jump <n>|up <n>|down <n>|\
-                                shuffle <Sorted|Shuffle>|repeat <RepeatNone|RepeatAll|RepeatOne>"
-                            .into();
-                    }
-                }
-            }
+            "syncplay" => return self.debug_syncplay(rest, window, cx),
             // Playlists and collections; see `lists.rs`.
             "lists" => return self.debug_lists(rest, window, cx),
             // Counters of the news of the server, and a way to feed a
@@ -922,61 +688,7 @@ impl Bloom {
             }
             // The events for other programs (`events.rs`): `stream on`,
             // `stream off`, `stream titles on|off`, and the state.
-            "stream" => {
-                match rest {
-                    "on" => self.set_events(true, cx),
-                    "off" => self.set_events(false, cx),
-                    "titles on" => self.set_events_titles(true, cx),
-                    "titles off" => self.set_events_titles(false, cx),
-                    "colours on" => self.set_events_colours(true, cx),
-                    "colours off" => self.set_events_colours(false, cx),
-                    // The newest look at the picture, top band first.
-                    "colours" => return format!("stream colours {:?}", self.player.colours()),
-                    // The lights: the helper, a look for lights, the list,
-                    // a light chosen or told to blink by its place in it.
-                    "helper on" => self.set_lights(true, cx),
-                    "helper off" => self.set_lights(false, cx),
-                    "scan" => self.lights_scan(cx),
-                    "lamps" => {}
-                    // The events of a short film, with no film.
-                    "test" => return format!("stream test: {}", self.events_test_run(cx)),
-                    _ => {}
-                }
-                let row = |text: &str| text.parse::<usize>().ok().and_then(|at| self.lights_rows().into_iter().nth(at));
-                if let Some((lamp, _)) = rest.strip_prefix("choose ").and_then(row) {
-                    self.lights_choose(&lamp, cx);
-                } else if let Some((lamp, _)) = rest.strip_prefix("identify ").and_then(row) {
-                    self.lights_identify(&lamp, cx);
-                }
-                if ["helper", "scan", "lamps", "choose", "identify"].iter().any(|verb| rest.starts_with(verb)) {
-                    let rows: Vec<String> = self.lights_rows().iter().map(|(lamp, chosen)| format!("{}{lamp}", if *chosen { "*" } else { " " })).collect();
-                    return format!("stream lights helper={} lamps=[{}]", self.lights_on(), rows.join(" "));
-                }
-                // `stream lights film=8 gap=0.5 colour=artwork`: the lights
-                // lab, as its sliders set it.
-                if let Some(pairs) = rest.strip_prefix("lights") {
-                    let wrong: Vec<&str> = pairs
-                        .split_whitespace()
-                        .filter(|pair| !pair.split_once('=').is_some_and(|(name, value)| self.lights_set(name, value, cx)))
-                        .collect();
-                    return format!(
-                        "stream lights {} colour_seen={:?} file={}{}",
-                        self.lights_json(cx),
-                        self.events.colour,
-                        crate::events::lights_path(),
-                        if wrong.is_empty() { String::new() } else { format!(" not set: {}", wrong.join(" ")) }
-                    );
-                }
-                let hub = crate::events::hub();
-                return format!(
-                    "stream on={} titles={} readers={} closed_slow={} socket={}",
-                    hub.on(),
-                    self.config.events_titles == Some(true),
-                    hub.readers(),
-                    hub.closed_slow.load(std::sync::atomic::Ordering::Relaxed),
-                    crate::events::socket_path()
-                );
-            }
+            "stream" => return self.debug_stream(rest, cx),
             // Quits as the menu does, so the quit path can be tested.
             "quit" => {
                 cx.quit();
@@ -1071,18 +783,342 @@ impl Bloom {
                 return format!("reopen in {secs}s");
             }
             "state" => {}
+            // Each verb says its own arguments when they are wrong; see
+            // `dev/jctl` and the comment at each arm.
+            _ => return format!("error: commands: {}", COMMANDS.join(", ")),
+        }
+        cx.notify();
+        self.debug_state(window)
+    }
+
+    /// The verb `meta`: the metadata manager of the item of the detail page.
+    fn debug_meta(&mut self, rest: &str, window: &mut Window, cx: &mut Context<Self>) -> String {
+        use crate::metadata::Tab;
+        let (word, arg) = rest.split_once(' ').unwrap_or((rest, ""));
+        if word == "close" {
+            self.close_metadata(window, cx);
+        } else if word == "state" {
+            return self.metadata_describe();
+        } else if word == "search" {
+            // The Identify form starts with the name, year and ids
+            // of the item; this sends that search. A search only
+            // reads.
+            self.metadata_search(cx);
+        } else if word == "browse" {
+            self.browse_images(if arg.is_empty() { "Primary" } else { arg }, cx);
+        } else if word == "confirm" {
+            // Shows the question before an image is deleted; no answer is given.
+            let first = self
+                .metadata
+                .open
+                .as_ref()
+                .and_then(|m| m.images.as_ref()?.first().cloned());
+            if let Some(image) = first {
+                self.ask_delete_image(&image, cx);
+            }
+        } else if word == "scroll" {
+            let y = arg.parse::<f32>().unwrap_or(0.);
+            self.metadata.scroll.set_offset(gpui_kit::point(px(0.), px(-y)));
+        } else if let Page::Detail(data) = &self.page {
+            let tab = match word {
+                "images" => Tab::Images,
+                "identify" => Tab::Identify,
+                "refresh" => Tab::Refresh,
+                _ => Tab::Details,
+            };
+            let (id, name, kind) =
+                (data.item.id.clone(), data.item.name.clone(), data.item.kind.clone());
+            self.open_metadata(&id, &name, kind.name(), tab, cx);
+        } else {
+            return "error: open an item first".into();
+        }
+        cx.notify();
+        self.debug_state(window)
+    }
+
+    /// The verb `write`: a write to the server the way a click does it.
+    fn debug_write(&mut self, rest: &str, window: &mut Window, cx: &mut Context<Self>) -> String {
+        let (verb, arg) = rest.split_once(' ').unwrap_or((rest, ""));
+        match verb {
+            // "Yes" on the open question of the dashboard.
+            // Only a question a debug command opened: one a person
+            // opened (restart, shut down, delete a user) is not
+            // for this channel to answer.
+            "confirm" if self.dialogs.confirm.is_some() && !self.debug_opened_confirm() => {
+                return "error: the open question was not opened by a debug command".into();
+            }
+            "submit" if self.dialogs.prompt.is_some() && !self.debug_opened_prompt() => {
+                return "error: the open form was not opened by a debug command".into();
+            }
+            "confirm" => match self.dialogs.confirm.take() {
+                Some(confirm) => (confirm.run)(self, cx),
+                None => return "error: no question is open".into(),
+            },
+            // Submits the open form; the values are separated by "|".
+            "submit" => match self.dialogs.prompt.clone() {
+                Some(prompt) => {
+                    self.close_admin_dialog(window, cx);
+                    (prompt.run)(self, arg.split('|').map(str::to_string).collect(), cx);
+                }
+                None => return "error: no form is open".into(),
+            },
+            "revoke-key" | "delete-user" | "user-password" if !arg.starts_with("jellyui-test") => {
+                return "error: only names that start with jellyui-test".into();
+            }
+            "revoke-key" => {
+                if !crate::admin::api_keys::ask_revoke_named(self, arg, cx) {
+                    return "error: no such key on the API Keys page".into();
+                }
+            }
+            "user-password" => {
+                if !crate::admin::users::ask_password_named(self, arg, cx) {
+                    return "error: no such user on the Users page".into();
+                }
+            }
+            "delete-user" => {
+                if !crate::admin::users::ask_delete_named(self, arg, cx) {
+                    return "error: no such user on the Users page".into();
+                }
+            }
+            // A yes-or-no field of the user's configuration.
+            "pref" => {
+                let (key, value) = arg.split_once(' ').unwrap_or((arg, ""));
+                let key: &'static str = Box::leak(key.to_string().into_boxed_str());
+                self.set_user_config(key, serde_json::Value::Bool(value == "true"), cx);
+            }
+            // The tagline of the item in the open metadata editor.
+            "tagline" => {
+                let index = crate::metadata::FIELDS
+                    .iter()
+                    .position(|field| field.label == "Tagline");
+                let Some(index) = index.filter(|_| self.metadata.open.is_some()) else {
+                    return "error: the metadata editor is not open".into();
+                };
+                let text = arg.to_string();
+                self.metadata.inputs[index]
+                    .update(cx, |input, cx| input.set_value(text, window, cx));
+                self.save_metadata(cx);
+            }
+            "picture" => self.upload_profile_picture(arg.into(), cx),
+            "picture-remove" => self.remove_profile_picture(cx),
             _ => {
-                return "error: commands: home, back, libraries, library <name>, item <id>, search <text>, type <text>, \
-                        resize <w> <h>, scroll <y>, admin [section], admin-dialog <name>, admin-edit <key> <value>, admin-config, admin-discard, settings [section|password], meta <tab>, \
-                        menubar, action <name>, theme <light|dark|toggle>, appearance <light|dark|system>, reopen <secs>, menu close, \
-                        connect [...], authorize, hero [previous], hover-card [card], tags, \
-                        show <view>, play, stop, pause, pip, seek <s>, playall [shuffle], next, \
-                        previous, queue, enqueue <id>, episodes, syncplay [...], quality [...], subs [...], downloads [...], events, socket-inject <type> <json>, menu <settings|subtitles|profile>, scrub <s|off>, hover <0..1|off>, state, perf"
+                return "error: write confirm|submit <a|b>|revoke-key <name>|delete-user <name>|\
+                        pref <Key> <true|false>|tagline <text>|picture <path>|picture-remove"
                     .into();
             }
         }
         cx.notify();
         self.debug_state(window)
+    }
+
+    /// The verb `connect`: the sign-in page.
+    fn debug_connect_command(&mut self, rest: &str, window: &mut Window, cx: &mut Context<Self>) -> String {
+        let (what, value) = rest.split_once(' ').unwrap_or((rest, ""));
+        match what {
+            "" => self.show_connect(cx),
+            "servers" => {
+                self.show_connect(cx);
+                self.connect.choosing_server = true;
+            }
+            "add" => {
+                self.connect
+                    .url
+                    .update(cx, |input, cx| input.set_value(value.trim(), window, cx));
+                self.add_server(cx);
+            }
+            // Signs a test account in: `connect signin <name>|<password>`.
+            "signin" => {
+                let (name, password) = value.split_once('|').unwrap_or((value, ""));
+                if !name.starts_with("jellyui-test") {
+                    return "error: only names that start with jellyui-test".into();
+                }
+                self.connect
+                    .username
+                    .update(cx, |input, cx| input.set_value(name, window, cx));
+                self.connect
+                    .password
+                    .update(cx, |input, cx| input.set_value(password, window, cx));
+                self.sign_in(cx);
+            }
+            "quick" => self.start_quick_connect(cx),
+            "cancel" => self.cancel_quick_connect(cx),
+            "done" => self.screen = crate::app::Screen::Main,
+            _ => return "error: connect [servers | add <address> | quick | cancel | done]".into(),
+        }
+        cx.notify();
+        return self.debug_connect();
+    }
+
+    /// The verb `je`: Jellyfin Enhanced.
+    fn debug_je_command(&mut self, rest: &str, window: &mut Window, cx: &mut Context<Self>) -> String {
+        let (verb, argument) = rest.split_once(' ').unwrap_or((rest, ""));
+        match verb {
+            "help" => {
+                if !self.close_panel(Panel::Help) {
+                    self.open_panel(Panel::Help, window, cx);
+                }
+            }
+            "toggle" => match crate::enhanced::TOGGLES
+                .iter()
+                .find(|(key, _)| *key == argument)
+            {
+                Some((key, _)) => self.toggle_enhanced(key, cx),
+                None => return format!("error: no switch named {argument:?}"),
+            },
+            "do" => {
+                if !self.enhanced_player_action(argument, cx) {
+                    return format!("error: {argument:?} did nothing");
+                }
+            }
+            other => {
+                if let Some(text) = self.debug_je(other, argument, window, cx) {
+                    return text;
+                }
+            }
+        }
+        cx.notify();
+        return self.enhanced_debug();
+    }
+
+    /// The verb `syncplay`: the state, the groups, and the actions of the panel.
+    fn debug_syncplay(&mut self, rest: &str, window: &mut Window, cx: &mut Context<Self>) -> String {
+        use crate::syncplay::core::Intent;
+        let (verb, arg) = rest.split_once(' ').unwrap_or((rest, ""));
+        match verb {
+            "" | "state" => return self.sync_describe(),
+            "panel" => self.toggle_sync_panel(window, cx),
+            "list" => {
+                return self
+                    .sync
+                    .groups
+                    .iter()
+                    .map(|g| format!("{} {:?} [{}]", g.group_id, g.group_name, g.participants.join(",")))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+            }
+            "new" => {
+                let name = if arg.is_empty() { "jellyui test group" } else { arg };
+                self.sync_user(Intent::Create { name: name.to_string() }, cx)
+            }
+            "join" => self.sync_user(Intent::Join { group_id: arg.to_string() }, cx),
+            "leave" => self.sync_user(Intent::Leave, cx),
+            // The queue of the group; an entry is named by its place, from 1.
+            "queue" => {
+                let Some(queue) = self.sync.session.as_ref().and_then(|s| s.core.queue()) else {
+                    return "no queue".into();
+                };
+                let current = queue.playing_item_index;
+                let entries: Vec<String> = queue
+                    .playlist
+                    .iter()
+                    .enumerate()
+                    .map(|(n, item)| {
+                        let title = self.sync.titles.get(&item.item_id).cloned().unwrap_or_default();
+                        let mark = if n as i64 == current { "*" } else { "" };
+                        format!("{}{mark} {title}", n + 1)
+                    })
+                    .collect();
+                return format!(
+                    "shuffle={} repeat={} | {}",
+                    queue.shuffle_mode,
+                    queue.repeat_mode,
+                    entries.join(" | ")
+                );
+            }
+            "enqueue" | "enqueue-next" => self.sync_user(
+                Intent::Enqueue { item_ids: vec![arg.to_string()], next: verb == "enqueue-next" },
+                cx,
+            ),
+            "remove" | "jump" | "up" | "down" => {
+                let place = arg.parse::<usize>().unwrap_or(0);
+                let id = self
+                    .sync
+                    .session
+                    .as_ref()
+                    .and_then(|s| s.core.queue())
+                    .and_then(|q| q.playlist.get(place.wrapping_sub(1)))
+                    .map(|item| item.playlist_item_id.clone());
+                let Some(playlist_item_id) = id else {
+                    return "error: no such entry".into();
+                };
+                let intent = match verb {
+                    "remove" => Intent::Remove { playlist_item_ids: vec![playlist_item_id] },
+                    "jump" => Intent::Jump { playlist_item_id },
+                    "up" => Intent::Move { playlist_item_id, new_index: place.saturating_sub(2) },
+                    _ => Intent::Move { playlist_item_id, new_index: place },
+                };
+                self.sync_user(intent, cx)
+            }
+            "shuffle" => self.sync_user(Intent::Shuffle(arg.to_string()), cx),
+            "repeat" => self.sync_user(Intent::Repeat(arg.to_string()), cx),
+            "unfollow" => self.sync_user(Intent::StopFollowing, cx),
+            "follow" => self.sync_user(Intent::Follow, cx),
+            _ => {
+                return "error: syncplay state|panel|list|new [name]|join <id>|leave|follow|unfollow|\
+                        queue|enqueue <item>|enqueue-next <item>|remove <n>|jump <n>|up <n>|down <n>|\
+                        shuffle <Sorted|Shuffle>|repeat <RepeatNone|RepeatAll|RepeatOne>"
+                    .into();
+            }
+        }
+        cx.notify();
+        self.debug_state(window)
+    }
+
+    /// The verb `stream`: the events for other programs, and the lights.
+    fn debug_stream(&mut self, rest: &str, cx: &mut Context<Self>) -> String {
+        match rest {
+            "on" => self.set_events(true, cx),
+            "off" => self.set_events(false, cx),
+            "titles on" => self.set_events_titles(true, cx),
+            "titles off" => self.set_events_titles(false, cx),
+            "colours on" => self.set_events_colours(true, cx),
+            "colours off" => self.set_events_colours(false, cx),
+            // The newest look at the picture, top band first.
+            "colours" => return format!("stream colours {:?}", self.player.colours()),
+            // The lights: the helper, a look for lights, the list,
+            // a light chosen or told to blink by its place in it.
+            "helper on" => self.set_lights(true, cx),
+            "helper off" => self.set_lights(false, cx),
+            "scan" => self.lights_scan(cx),
+            "lamps" => {}
+            // The events of a short film, with no film.
+            "test" => return format!("stream test: {}", self.events_test_run(cx)),
+            _ => {}
+        }
+        let row = |text: &str| text.parse::<usize>().ok().and_then(|at| self.lights_rows().into_iter().nth(at));
+        if let Some((lamp, _)) = rest.strip_prefix("choose ").and_then(row) {
+            self.lights_choose(&lamp, cx);
+        } else if let Some((lamp, _)) = rest.strip_prefix("identify ").and_then(row) {
+            self.lights_identify(&lamp, cx);
+        }
+        if ["helper", "scan", "lamps", "choose", "identify"].iter().any(|verb| rest.starts_with(verb)) {
+            let rows: Vec<String> = self.lights_rows().iter().map(|(lamp, chosen)| format!("{}{lamp}", if *chosen { "*" } else { " " })).collect();
+            return format!("stream lights helper={} lamps=[{}]", self.lights_on(), rows.join(" "));
+        }
+        // `stream lights film=8 gap=0.5 colour=artwork`: the lights
+        // lab, as its sliders set it.
+        if let Some(pairs) = rest.strip_prefix("lights") {
+            let wrong: Vec<&str> = pairs
+                .split_whitespace()
+                .filter(|pair| !pair.split_once('=').is_some_and(|(name, value)| self.lights_set(name, value, cx)))
+                .collect();
+            return format!(
+                "stream lights {} colour_seen={:?} file={}{}",
+                self.lights_json(cx),
+                self.events.colour,
+                crate::events::lights_path(),
+                if wrong.is_empty() { String::new() } else { format!(" not set: {}", wrong.join(" ")) }
+            );
+        }
+        let hub = crate::events::hub();
+        return format!(
+            "stream on={} titles={} readers={} closed_slow={} socket={}",
+            hub.on(),
+            self.config.events_titles == Some(true),
+            hub.readers(),
+            hub.closed_slow.load(std::sync::atomic::Ordering::Relaxed),
+            crate::events::socket_path()
+        );
     }
 
     /// The menu bar with, for each entry that runs an action, whether this
@@ -1264,5 +1300,32 @@ fn page_items(page: &Page) -> usize {
         Page::Search(d) => d.results.len(),
         Page::Playlist(d) => d.entries.len(),
         Page::Admin(_) | Page::Settings(_) | Page::Downloads => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A listener ends with its owner: the thread stops and the socket goes,
+    /// so the window that opens next can listen on the same path. Before,
+    /// each window that closed left its thread in `accept` for good.
+    #[test]
+    fn a_listener_that_is_dropped_ends_its_thread() {
+        let path = std::env::temp_dir().join(format!("bloom-debug-test-{}.sock", std::process::id()));
+        let path = path.display().to_string();
+        let (tx, rx) = async_channel::unbounded::<Request>();
+        // The thread holds the one sender.
+        let listener = Listener::start(path.clone(), tx).expect("listen");
+        assert!(std::path::Path::new(&path).exists());
+        drop(listener);
+        assert!(!std::path::Path::new(&path).exists(), "the socket stays after the listener");
+        for _ in 0..400 {
+            if rx.sender_count() == 0 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the thread of a dropped listener still runs");
     }
 }

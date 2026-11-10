@@ -13,7 +13,6 @@ use gpui_kit::{
 /// A Nova presentation of retained Kit slider state.
 pub struct Slider {
     state: Entity<SliderState>,
-    disabled: bool,
     label: Option<SharedString>,
     style: StyleRefinement,
 }
@@ -22,15 +21,9 @@ impl Slider {
     pub fn new(state: &Entity<SliderState>) -> Self {
         Self {
             state: state.clone(),
-            disabled: false,
             label: None,
             style: Default::default(),
         }
-    }
-    /// Disables interaction and applies the disabled appearance.
-    pub fn disabled(mut self, value: bool) -> Self {
-        self.disabled = value;
-        self
     }
     /// Sets the accessible name of the control.
     pub fn aria_label(mut self, value: impl Into<SharedString>) -> Self {
@@ -45,28 +38,26 @@ impl Styled for Slider {
 }
 impl RenderOnce for Slider {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let theme = UiTheme::read(cx).clone();
-        let colors = theme.colors;
         let state = self.state.read(cx);
-        assert!(
-            state.value().is_single(),
-            "Slider expects single-value state"
-        );
         let (min, max, step, value) = (
             state.min_value(),
             state.max_value(),
             state.step_value(),
             state.value().end(),
         );
-        assert!(
-            min.is_finite()
-                && max.is_finite()
-                && min < max
-                && step.is_finite()
-                && step > 0.
-                && value.is_finite()
-        );
-        let percent = state.percentage().end;
+        // A range that is none (no length yet, a value that is no number)
+        // shows as a slider that takes no input. An assert here ended the
+        // app from inside a frame.
+        let valid = state.value().is_single()
+            && min.is_finite()
+            && max.is_finite()
+            && min < max
+            && step.is_finite()
+            && step > 0.
+            && value.is_finite();
+        let disabled = !valid;
+        let (min, max, step, value) = if valid { (min, max, step, value) } else { (0., 1., 1., 0.) };
+        let percent = if valid { state.percentage().end } else { 0. };
         let focus = window
             .use_keyed_state(
                 ElementId::from(("slider-focus", self.state.entity_id())),
@@ -75,16 +66,8 @@ impl RenderOnce for Slider {
             )
             .read(cx)
             .clone()
-            .tab_stop(!self.disabled);
+            .tab_stop(!disabled);
         let focused = focus.is_focused(window);
-        let click_focus = focus.clone();
-        let thumb_focus = focus.clone();
-        let input_state = self.state.clone();
-        let increment = self.state.clone();
-        let decrement = self.state.clone();
-        let set_value = self.state.clone();
-        let release = self.state.clone();
-        let release_out = self.state.clone();
         // A finger on a touch screen: the drag is claimed at its start, or
         // GPUI takes it for a scroll and the thumb stays. The flag lives
         // across frames, since the listener is registered at each paint.
@@ -93,6 +76,16 @@ impl RenderOnce for Slider {
             cx,
             |_, _| false,
         );
+        let theme = UiTheme::read(cx);
+        let colors = theme.colors;
+        let click_focus = focus.clone();
+        let thumb_focus = focus.clone();
+        let input_state = self.state.clone();
+        let increment = self.state.clone();
+        let decrement = self.state.clone();
+        let set_value = self.state.clone();
+        let release = self.state.clone();
+        let release_out = self.state.clone();
         let touch_state = self.state.clone();
         let touch = canvas(
             |_, _, _| {},
@@ -108,17 +101,17 @@ impl RenderOnce for Slider {
                             }
                             claimed.update(cx, |on, _| *on = true);
                             window.prevent_default();
-                            set_from_x(&touch_state, bounds, event.position.x, false, window, cx);
+                            set_from_x(&touch_state, event.position.x, false, window, cx);
                         }
                         TouchPhase::Moved => {
                             if *claimed.read(cx) {
-                                set_from_x(&touch_state, bounds, event.position.x, false, window, cx);
+                                set_from_x(&touch_state, event.position.x, false, window, cx);
                             }
                         }
                         TouchPhase::Ended | TouchPhase::Cancelled => {
                             if *claimed.read(cx) {
                                 claimed.update(cx, |on, _| *on = false);
-                                set_from_x(&touch_state, bounds, event.position.x, true, window, cx);
+                                set_from_x(&touch_state, event.position.x, true, window, cx);
                             }
                         }
                     }
@@ -128,7 +121,7 @@ impl RenderOnce for Slider {
         .absolute()
         .inset_0();
         let thumb = SliderThumb::new(&self.state)
-            .disabled(self.disabled)
+            .disabled(disabled)
             .absolute()
             .left(relative(percent))
             .ml(-theme.space(1.5))
@@ -136,10 +129,10 @@ impl RenderOnce for Slider {
             .size(theme.space(3.))
             .rounded_full()
             .bg(colors.primary)
-            .when(focused && !self.disabled, |t| {
+            .when(focused && !disabled, |t| {
                 t.border_1().border_color(colors.ring)
             })
-            .when(!self.disabled, |t| {
+            .when(!disabled, |t| {
                 t.on_mouse_down(MouseButton::Left, move |_, window, cx| {
                     thumb_focus.focus(window, cx)
                 })
@@ -158,8 +151,8 @@ impl RenderOnce for Slider {
             .h(theme.space(5.))
             .flex()
             .items_center()
-            .when(self.disabled, |root| root.opacity(0.5).cursor_not_allowed())
-            .when(!self.disabled, |root| {
+            .when(disabled, |root| root.opacity(0.5).cursor_not_allowed())
+            .when(!disabled, |root| {
                 root.track_focus(&focus)
                     .cursor_pointer()
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
@@ -209,7 +202,7 @@ impl RenderOnce for Slider {
                 // the line it shows is thin. A click a few pixels off the line
                 // would miss a track of the line's own height.
                 SliderTrack::new(&self.state)
-                    .disabled(self.disabled)
+                    .disabled(disabled)
                     .relative()
                     .w_full()
                     .h(theme.space(5.))
@@ -232,22 +225,15 @@ impl RenderOnce for Slider {
                     )
                     .child(thumb),
             )
-            .when(!self.disabled, |root| root.child(touch));
+            .when(!disabled, |root| root.child(touch));
         apply_style(root, &self.style)
     }
 }
 
 /// Sets the value from a position along the track, as the track does for
 /// the mouse (`update_value_by_position` marks the drag, so the release
-/// emits its event and the player seeks). `bounds` is the track's own.
-fn set_from_x(
-    state: &Entity<SliderState>,
-    _bounds: Bounds<Pixels>,
-    x: Pixels,
-    release: bool,
-    window: &mut Window,
-    cx: &mut App,
-) {
+/// emits its event and the player seeks).
+fn set_from_x(state: &Entity<SliderState>, x: Pixels, release: bool, window: &mut Window, cx: &mut App) {
     state.update(cx, |state, cx| {
         let y = state.bounds().center().y;
         state.update_value_by_position(Axis::Horizontal, gpui_kit::point(x, y), false, window, cx);
@@ -267,4 +253,29 @@ fn update_value(state: &Entity<SliderState>, value: f32, window: &mut Window, cx
         state.set_value(value, window, cx);
         state.handle_release(cx);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::{AppContext as _, Context, Render, TestAppContext, VisualTestContext};
+
+    struct View {
+        state: Entity<SliderState>,
+    }
+    impl Render for View {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(gpui_kit::px(200.)).child(Slider::new(&self.state))
+        }
+    }
+
+    /// A slider with no range (the seek slider of an item whose length
+    /// is not known yet) draws; its assert ended the app.
+    #[gpui_kit::test]
+    fn a_slider_with_no_range_draws(cx: &mut TestAppContext) {
+        cx.update(super::super::theme::init);
+        let window = cx.add_window(|_, cx| View { state: cx.new(|_| SliderState::new().min(0.).max(0.)) });
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+    }
 }

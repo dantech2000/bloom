@@ -19,7 +19,7 @@ use serde::Deserialize;
 
 use crate::{
     app::Bloom,
-    jellyfin::{Client, Item, TICKS_PER_SECOND},
+    jellyfin::{Client, Item, MediaSource, MediaStream, TICKS_PER_SECOND},
     player::{PlayRequest, PlayState, Player, PlayerStatus, SubtitleFile},
     ui::{glass::glass, menu::MenuItem},
 };
@@ -95,15 +95,27 @@ pub fn max_bitrate() -> Option<u64> {
 /// app (a transcode left on the server would run on).
 static CURRENT: Mutex<Option<Arc<Resolved>>> = Mutex::new(None);
 
-/// What plays now, as the server resolved it; none before the first load.
+/// The last answer of the server, whatever its item; none before the
+/// first load. While a load is on its way this is still the answer for
+/// the item before: ask with [`current_of`] for what belongs to an item.
 pub fn current() -> Option<Arc<Resolved>> {
     CURRENT.lock().unwrap().clone()
 }
 
-/// True while the item in the player is a transcode: the server chose
+/// The answer of the server for this item; none while its load is on its
+/// way, and for a downloaded item, which plays with no answer.
+pub fn current_of(item_id: &str) -> Option<Arc<Resolved>> {
+    of_item(current(), item_id)
+}
+
+fn of_item(held: Option<Arc<Resolved>>, item_id: &str) -> Option<Arc<Resolved>> {
+    held.filter(|r| r.item_id == item_id)
+}
+
+/// True while this item is in the player as a transcode: the server chose
 /// its tracks, so the player must not choose them again.
-pub fn transcoding() -> bool {
-    current().is_some_and(|r| r.play_method == PlayMethod::Transcode)
+pub fn transcoding(item_id: &str) -> bool {
+    current_of(item_id).is_some_and(|r| r.play_method == PlayMethod::Transcode)
 }
 
 /// What the detail page chose for the next item.
@@ -116,6 +128,10 @@ pub struct State {
     /// Subtitle files of the item that did not come (server indexes): a
     /// choice of one of them burns it in at once.
     pub failed_files: Vec<i64>,
+    /// A reload asked for while a load was on its way: the audio, the
+    /// subtitle and the burn-in of `stream_reload_with`. It runs when the
+    /// item plays (`stream_poll`).
+    pending_reload: Option<(Option<i64>, Option<i64>, bool)>,
 }
 
 /// Takes the settings of the config and ends a transcode when the app
@@ -145,10 +161,14 @@ pub fn end_current() {
 
 // ----- the answer of the server ------------------------------------------------
 
+/// How the item gets to the player: the file itself, or the stream the
+/// server makes of it (`TranscodingUrl`). The second is a transcode for
+/// every rule of the app, also when the server only repacks the file (a
+/// remux, see `Resolved::remux`): the server runs a job for it that must
+/// end, and the stream has the one audio track the server chose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlayMethod {
     DirectPlay,
-    DirectStream,
     Transcode,
 }
 
@@ -157,16 +177,7 @@ impl PlayMethod {
     pub fn as_str(self) -> &'static str {
         match self {
             PlayMethod::DirectPlay => "DirectPlay",
-            PlayMethod::DirectStream => "DirectStream",
             PlayMethod::Transcode => "Transcode",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            PlayMethod::DirectPlay => "Direct play",
-            PlayMethod::DirectStream => "Direct stream",
-            PlayMethod::Transcode => "Transcoding",
         }
     }
 }
@@ -175,79 +186,42 @@ impl PlayMethod {
 #[serde(rename_all = "PascalCase")]
 pub struct PlaybackInfo {
     #[serde(default)]
-    pub media_sources: Vec<Source>,
+    pub media_sources: Vec<MediaSource>,
     #[serde(default)]
     pub play_session_id: Option<String>,
     #[serde(default)]
     pub error_code: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct Source {
-    #[serde(default)]
-    pub id: String,
-    #[serde(default)]
-    pub supports_direct_play: bool,
-    #[serde(default)]
-    pub supports_direct_stream: bool,
-    #[serde(default)]
-    pub supports_transcoding: bool,
-    /// Relative to the server, with the token in its query.
-    #[serde(default)]
-    pub transcoding_url: Option<String>,
-    #[serde(default)]
-    pub transcoding_container: Option<String>,
-    #[serde(default)]
-    pub transcoding_sub_protocol: Option<String>,
-    #[serde(default)]
-    pub bitrate: Option<u64>,
-    #[serde(default)]
-    pub media_streams: Vec<Stream>,
-    #[serde(default)]
-    pub default_audio_stream_index: Option<i64>,
-    #[serde(default)]
-    pub default_subtitle_stream_index: Option<i64>,
-}
-
-/// One stream of the file, as the server describes it.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct Stream {
-    /// "Video", "Audio" or "Subtitle".
-    #[serde(rename = "Type", default)]
-    pub kind: String,
-    #[serde(default)]
-    pub index: i64,
-    #[serde(default)]
-    pub codec: Option<String>,
-    #[serde(default)]
-    pub language: Option<String>,
-    #[serde(default)]
-    pub display_title: Option<String>,
-    #[serde(default)]
-    pub is_external: bool,
-    /// A subtitle of text (SubRip, ASS, VTT); false for an image track.
-    #[serde(default)]
-    pub is_text_subtitle_stream: bool,
-    /// How a subtitle gets to the player: "Embed" (in the stream),
-    /// "External" (a file at `delivery_url`), "Encode" (burned in).
-    #[serde(default)]
-    pub delivery_method: Option<String>,
-    #[serde(default)]
-    pub delivery_url: Option<String>,
-    #[serde(default)]
-    pub width: Option<u32>,
-    #[serde(default)]
-    pub height: Option<u32>,
-}
-
-impl Stream {
-    pub fn title(&self) -> String {
-        self.display_title
-            .clone()
-            .unwrap_or_else(|| format!("Track {}", self.index))
+impl PlaybackInfo {
+    /// The source of the item: the one with its id, else the first.
+    fn source(&self, item_id: &str) -> Option<&MediaSource> {
+        self.media_sources
+            .iter()
+            .find(|s| s.id == item_id)
+            .or_else(|| self.media_sources.first())
     }
+}
+
+/// The name of a stream in a menu.
+pub fn stream_title(stream: &MediaStream) -> String {
+    stream
+        .display_title
+        .clone()
+        .unwrap_or_else(|| format!("Track {}", stream.index))
+}
+
+/// mpv's id of a stream of the file, by its server index: mpv numbers the
+/// tracks of a kind ("Audio", "Subtitle") from 1 in file order, and the
+/// server numbers every stream of the source in one list. A stream in a
+/// file of its own is not in mpv's list, so it has none. Every choice of
+/// a track by its server index goes through this.
+pub fn mpv_id(streams: &[MediaStream], kind: &str, index: i64) -> Option<i64> {
+    streams
+        .iter()
+        .filter(|s| s.kind == kind && !s.is_external)
+        .position(|s| s.index == index)
+        .map(|place| place as i64 + 1)
 }
 
 /// What the server encodes to.
@@ -261,24 +235,16 @@ pub struct Target {
     pub protocol: String,
 }
 
-/// A subtitle in a file of its own that mpv adds to the item.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExternalSub {
-    /// Index of the stream on the server.
-    pub index: i64,
-    pub url: String,
-    pub title: String,
-    pub language: String,
-    /// An image track (PGS, VobSub), fetched when chosen.
-    pub graphical: bool,
-}
-
 /// The decision of the server for one load.
 #[derive(Clone)]
 pub struct Resolved {
     pub client: Client,
+    /// The item this answer is for.
+    pub item_id: String,
     pub url: String,
     pub play_method: PlayMethod,
+    /// The server repacks the file and keeps its video as it is.
+    pub remux: bool,
     pub play_session_id: String,
     pub media_source_id: String,
     /// Why the server transcodes, as it names them
@@ -287,13 +253,14 @@ pub struct Resolved {
     /// Bits per second of the file.
     pub source_bitrate: Option<u64>,
     pub target: Option<Target>,
-    pub streams: Vec<Stream>,
+    pub streams: Vec<MediaStream>,
     /// The audio stream in a transcode (server index); none for direct play.
     pub audio_index: Option<i64>,
     /// The subtitle burned into a transcode (server index); none otherwise.
     pub burned_subtitle: Option<i64>,
-    /// Subtitles mpv adds after the load, in the order of their ids in mpv.
-    pub external_subs: Vec<ExternalSub>,
+    /// The subtitles in files of their own that mpv adds to the item; the
+    /// one that starts shown has `select`.
+    pub external_subs: Vec<SubtitleFile>,
     /// The external subtitle that starts selected, by server index.
     pub selected_external: Option<i64>,
     /// The load asked for the subtitle burned in (see `Load::burn_in`).
@@ -301,14 +268,23 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    /// "Direct play", "Direct stream" or "Transcoding", for the user.
+    pub fn label(&self) -> &'static str {
+        match (self.play_method, self.remux) {
+            (PlayMethod::DirectPlay, _) => "Direct play",
+            (PlayMethod::Transcode, true) => "Direct stream",
+            (PlayMethod::Transcode, false) => "Transcoding",
+        }
+    }
+
     /// The source video stream.
-    pub fn video(&self) -> Option<&Stream> {
+    pub fn video(&self) -> Option<&MediaStream> {
         self.streams.iter().find(|s| s.kind == "Video")
     }
 
     /// The streams of one kind that are in the file itself, in the order
     /// mpv numbers them (from 1).
-    pub fn embedded(&self, kind: &str) -> Vec<&Stream> {
+    pub fn embedded(&self, kind: &str) -> Vec<&MediaStream> {
         self.streams
             .iter()
             .filter(|s| s.kind == kind && !s.is_external)
@@ -352,14 +328,17 @@ impl Resolved {
     /// fetches one; it starts shown.
     pub fn external_file(&self, index: i64) -> Option<SubtitleFile> {
         let sub = self.external_subs.iter().find(|s| s.index == index)?;
-        Some(SubtitleFile {
-            index: sub.index,
-            url: sub.url.clone(),
-            title: sub.title.clone(),
-            lang: sub.language.clone(),
-            select: true,
-            graphical: sub.graphical,
-        })
+        Some(SubtitleFile { select: true, ..sub.clone() })
+    }
+
+    /// True when a subtitle file that did not come is to be burned in
+    /// instead: the item is a transcode (the server burns nothing into a
+    /// file it sends as it is), the load did not ask for the burn-in
+    /// already, and the server offered the track as a file.
+    fn burns_in_instead(&self, index: i64) -> bool {
+        self.play_method == PlayMethod::Transcode
+            && !self.burn_in
+            && self.external_subs.iter().any(|s| s.index == index)
     }
 }
 
@@ -531,29 +510,6 @@ pub(crate) impl Client {
             ],
         )
     }
-
-    /// The audio language the user prefers, when the user does not play
-    /// the default track of the file whatever its language.
-    fn audio_language(&self) -> Option<String> {
-        #[derive(Default, Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Me {
-            #[serde(default)]
-            configuration: Audio,
-        }
-        #[derive(Default, Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Audio {
-            #[serde(default)]
-            audio_language_preference: Option<String>,
-            #[serde(default)]
-            play_default_audio_track: bool,
-        }
-        let audio = self.get::<Me>("/Users/Me", &[]).ok()?.configuration;
-        audio
-            .audio_language_preference
-            .filter(|language| !language.is_empty() && !audio.play_default_audio_track)
-    }
 }
 
 /// The value of one name in the query of a URL.
@@ -578,10 +534,7 @@ pub fn resolve(
         return Err(anyhow!("the server cannot play this item: {code}"));
     }
     let source = info
-        .media_sources
-        .iter()
-        .find(|s| s.id == item_id)
-        .or_else(|| info.media_sources.first())
+        .source(item_id)
         .ok_or_else(|| anyhow!("the server has no media source for this item"))?;
     let play_session_id = info
         .play_session_id
@@ -595,14 +548,9 @@ pub fn resolve(
         .as_deref()
         .filter(|_| source.supports_transcoding || source.supports_direct_stream)
     {
-        let method = if source.supports_direct_stream {
-            PlayMethod::DirectStream
-        } else {
-            PlayMethod::Transcode
-        };
         // mpv sends the token in a header, so the key leaves the URL and
         // cannot show in the statistics of the player or in a log.
-        (format!("{}{}", client.base, without_key(path)), method)
+        (format!("{}{}", client.base, without_key(path)), PlayMethod::Transcode)
     } else {
         return Err(anyhow!("the server offers no way to play this item"));
     };
@@ -641,7 +589,7 @@ pub fn resolve(
     let chosen = wanted_subtitle
         .or(source.default_subtitle_stream_index)
         .filter(|i| *i >= 0);
-    let external_subs: Vec<ExternalSub> = source
+    let mut external_subs: Vec<SubtitleFile> = source
         .media_streams
         .iter()
         .filter(|s| s.kind == "Subtitle" && s.delivery_method.as_deref() == Some("External"))
@@ -649,21 +597,29 @@ pub fn resolve(
             let url = s.delivery_url.as_deref()?;
             // The player sends the token in a header; the key in the
             // address would show in a log.
-            Some(ExternalSub {
+            Some(SubtitleFile {
                 index: s.index,
                 url: format!("{}{}", client.base, without_key(url)),
-                title: s.title(),
-                language: s.language.clone().unwrap_or_default(),
+                title: stream_title(s),
+                lang: s.language.clone().unwrap_or_default(),
+                select: false,
                 graphical: !s.is_text_subtitle_stream,
             })
         })
         .collect();
     let selected_external = chosen.filter(|i| external_subs.iter().any(|s| s.index == *i));
+    for sub in &mut external_subs {
+        sub.select = selected_external == Some(sub.index);
+    }
 
     Ok(Resolved {
         client: client.clone(),
+        item_id: item_id.to_string(),
         url,
         play_method,
+        // The server offers the stream it makes as a "direct stream" when
+        // it keeps the video of the file.
+        remux: transcoding && source.supports_direct_stream,
         play_session_id,
         media_source_id: source.id.clone(),
         reasons,
@@ -678,63 +634,63 @@ pub fn resolve(
     })
 }
 
-/// Asks the server and resolves. For a transcode without a choice of the
-/// user, a track in the audio language of the user takes the place of the
-/// one the server names: the server can name the track of an earlier
-/// playback instead (the rule of the timeline, see `timeline_info`).
+/// Asks the server and resolves. The first answer names the file; a
+/// second request follows when that answer changes what to ask for:
+///
+/// - "Auto": when the connection does not carry the bitrate of the file,
+///   the rung that fits is the limit (see `adaptive`). A manual limit
+///   skips this.
+/// - A transcode without a choice of the user: a track in the audio
+///   language of the user takes the place of the one the server names,
+///   since the server can name the track of an earlier playback instead
+///   (the rule of the timeline, see `timeline_info`).
 pub fn negotiate(client: &Client, load: &Load) -> Result<Resolved> {
     let mut max_bitrate = max_bitrate();
-    let mut info = client.playback_info(load, max_bitrate)?;
-    // "Auto": the first answer names the bitrate of the file; when the
-    // connection does not carry it, the server is asked again with the
-    // rung that fits (see `adaptive`). A manual limit skips this.
+    let info = client.playback_info(load, max_bitrate)?;
+    let first = resolve(client, &load.item_id, &info, load.subtitle)?;
+    let mut again = None;
     if max_bitrate.is_none() {
-        let source = info
-            .media_sources
-            .iter()
-            .find(|s| s.id == load.item_id)
-            .or_else(|| info.media_sources.first());
-        let file = source.and_then(|s| s.bitrate);
-        let codec = source.and_then(|s| {
-            s.media_streams.iter().find(|m| m.kind == "Video").and_then(|m| m.codec.clone())
-        });
-        if let Some(cap) = crate::adaptive::auto_cap(file, codec.as_deref()) {
+        let codec = first.video().and_then(|v| v.codec.as_deref());
+        if let Some(cap) = crate::adaptive::auto_cap(first.source_bitrate, codec) {
             max_bitrate = Some(cap);
-            info = client.playback_info(load, max_bitrate)?;
+            again = Some(load.clone());
         }
     }
-    let finish = |mut resolved: Resolved| {
-        resolved.burn_in = load.burn_in;
-        // The track the server burns in on request is not wanted as a
-        // file as well (the server still names it as one).
-        if load.burn_in && let Some(burned) = resolved.burned_subtitle {
-            resolved.external_subs.retain(|s| s.index != burned);
-            if resolved.selected_external == Some(burned) {
-                resolved.selected_external = None;
-            }
+    // A limit under the file makes the second answer a transcode.
+    let transcode = first.play_method == PlayMethod::Transcode || again.is_some();
+    if transcode
+        && load.audio.is_none()
+        && let Some(language) = client.audio_language()
+    {
+        let named = first.audio_index.or_else(|| {
+            info.source(&load.item_id).and_then(|s| s.default_audio_stream_index)
+        });
+        let preferred = first
+            .embedded("Audio")
+            .iter()
+            .find(|s| s.language.as_deref().is_some_and(|l| crate::subtitles::same_language(l, &language)))
+            .map(|s| s.index);
+        if preferred.is_some() && preferred != named {
+            again = Some(Load { audio: preferred, ..load.clone() });
         }
-        resolved
-    };
-    let resolved = finish(resolve(client, &load.item_id, &info, load.subtitle)?);
-    if resolved.play_method != PlayMethod::Transcode || load.audio.is_some() {
-        return Ok(resolved);
     }
-    let Some(language) = client.audio_language() else {
-        return Ok(resolved);
-    };
-    let preferred = resolved
-        .embedded("Audio")
-        .iter()
-        .find(|s| s.language.as_deref() == Some(language.as_str()))
-        .map(|s| s.index);
-    match preferred {
-        Some(index) if Some(index) != resolved.audio_index => {
-            let again = Load { audio: Some(index), ..load.clone() };
+    let mut resolved = match again {
+        Some(again) => {
             let info = client.playback_info(&again, max_bitrate)?;
-            resolve(client, &load.item_id, &info, load.subtitle).map(finish)
+            resolve(client, &load.item_id, &info, load.subtitle)?
         }
-        _ => Ok(resolved),
+        None => first,
+    };
+    resolved.burn_in = load.burn_in;
+    // The track the server burns in on request is not wanted as a file
+    // as well (the server still names it as one).
+    if load.burn_in && let Some(burned) = resolved.burned_subtitle {
+        resolved.external_subs.retain(|s| s.index != burned);
+        if resolved.selected_external == Some(burned) {
+            resolved.selected_external = None;
+        }
     }
+    Ok(resolved)
 }
 
 /// A URL path without its `ApiKey` (or `api_key`) query value.
@@ -791,18 +747,7 @@ pub fn start(player: &Player, client: Client, load: Load) {
                     resolved.reasons.join(",")
                 );
                 let resolved = Arc::new(resolved);
-                let subtitles = resolved
-                    .external_subs
-                    .iter()
-                    .map(|sub| SubtitleFile {
-                        index: sub.index,
-                        url: sub.url.clone(),
-                        title: sub.title.clone(),
-                        lang: sub.language.clone(),
-                        select: resolved.selected_external == Some(sub.index),
-                        graphical: sub.graphical,
-                    })
-                    .collect();
+                let subtitles = resolved.external_subs.clone();
                 let request = PlayRequest {
                     client,
                     item_id: load.item_id,
@@ -852,21 +797,37 @@ fn hand_over(player: &Player, generation: u64, resolved: Arc<Resolved>, request:
     }
 }
 
+/// The streams of an item as its lists have them: those of its first
+/// source, else its own.
+fn item_streams(item: &Item) -> &[MediaStream] {
+    item.media_sources
+        .first()
+        .map_or(&item.media_streams, |source| &source.media_streams)
+}
+
+/// The track after `now` in a list, round and round; none when that is
+/// `now` itself or the list is empty.
+fn next_track(tracks: &[i64], now: Option<i64>) -> Option<i64> {
+    let place = now.and_then(|now| tracks.iter().position(|t| *t == now));
+    let next = *tracks.get(place.map_or(0, |p| (p + 1) % tracks.len()))?;
+    (Some(next) != now).then_some(next)
+}
+
 // ----- the app ---------------------------------------------------------------------
 
 impl Bloom {
+    /// The answer of the server for the item in the player.
+    fn stream_resolved(&self) -> Option<Arc<Resolved>> {
+        current_of(&self.playing.as_ref()?.id)
+    }
+
     /// Starts an item for the app: with the tracks the detail page chose,
     /// when it chose some.
     pub fn stream_begin(&mut self, item: &Item, start_secs: f64) {
+        let (audio, subtitle) = self.stream_take_choice(item);
         let Some(session) = &self.session else { return };
-        let audio = self.stream.wanted_audio.take().and_then(|place| {
-            item.streams("Audio").get(place).map(|s| s.index)
-        });
-        let subtitle = self.stream.wanted_subtitle.take().map(|choice| match choice {
-            Some(place) => item.streams("Subtitle").get(place).map_or(-1, |s| s.index),
-            None => -1,
-        });
         self.stream.failed_files.clear();
+        self.stream.pending_reload = None;
         start(
             &self.player,
             session.client.clone(),
@@ -881,6 +842,52 @@ impl Bloom {
                 burn_in: false,
             },
         );
+        // The server got the choice, for a transcode.
+        self.stream_choice_to_player(item, audio, subtitle);
+    }
+
+    /// The tracks the detail page chose for the next item, as server
+    /// indexes (-1 is no subtitle); taken, so they count once.
+    fn stream_take_choice(&mut self, item: &Item) -> (Option<i64>, Option<i64>) {
+        let audio = self.stream.wanted_audio.take().and_then(|place| {
+            item.streams("Audio").get(place).map(|s| s.index)
+        });
+        let subtitle = self.stream.wanted_subtitle.take().map(|choice| match choice {
+            Some(place) => item.streams("Subtitle").get(place).map_or(-1, |s| s.index),
+            None => -1,
+        });
+        (audio, subtitle)
+    }
+
+    /// The choice of the detail page that no load of the app took: the
+    /// item went to a SyncPlay group, whose load asks for no track. mpv
+    /// keeps the choice for that load.
+    pub fn stream_choice_left(&mut self, item: &Item) {
+        let (audio, subtitle) = self.stream_take_choice(item);
+        self.stream_choice_to_player(item, audio, subtitle);
+    }
+
+    /// Gives mpv the tracks chosen for the load that comes, by their
+    /// server indexes: the file itself has all its tracks. The load of a
+    /// transcode drops the choice (`player.rs`), as the server made it. A
+    /// subtitle in a file of its own has no id yet: it starts shown
+    /// (`SubtitleFile::select`).
+    fn stream_choice_to_player(&mut self, item: &Item, audio: Option<i64>, subtitle: Option<i64>) {
+        let streams = item_streams(item);
+        if let Some(index) = audio {
+            self.queue.explicit_audio = true;
+            if let Some(aid) = mpv_id(streams, "Audio", index) {
+                self.player.set_audio(Some(aid));
+            }
+        }
+        if let Some(index) = subtitle {
+            self.queue.explicit_subtitle = true;
+            if index < 0 {
+                self.player.set_subtitle(None);
+            } else if let Some(sid) = mpv_id(streams, "Subtitle", index) {
+                self.player.set_subtitle(Some(sid));
+            }
+        }
     }
 
     /// Loads the item again at its position, with the tracks that play
@@ -893,10 +900,14 @@ impl Bloom {
 
     /// A subtitle file the user chose did not come (a server before 12.2
     /// cannot serve a VobSub as a file): the item loads again with the
-    /// track burned in, once.
+    /// track burned in, once. Not for a file the server sends as it is:
+    /// the server burns nothing into that, so a load would change nothing.
     pub fn subtitle_file_failed(&mut self, index: i64) {
-        let Some(resolved) = current() else { return };
-        if resolved.burn_in || !resolved.external_subs.iter().any(|s| s.index == index) {
+        let Some(resolved) = self.stream_resolved() else { return };
+        if !resolved.burns_in_instead(index) {
+            if resolved.play_method != PlayMethod::Transcode {
+                log::warn!("subtitle {index} did not come as a file");
+            }
             return;
         }
         log::info!("subtitle {index} did not come as a file: burned in instead");
@@ -907,19 +918,27 @@ impl Bloom {
     }
 
     fn stream_reload_with(&mut self, audio: Option<i64>, subtitle: Option<i64>, burn_in: bool) {
-        let (Some(item), Some(resolved), Some(session)) =
-            (self.playing.as_ref(), current(), self.session.as_ref())
-        else {
+        let (Some(item), Some(session)) = (self.playing.as_ref(), self.session.as_ref()) else {
             return;
         };
-        if self.player_status.state != PlayState::Playing {
-            return;
+        match self.player_status.state {
+            PlayState::Playing => {}
+            // A load is on its way, and it took the settings as they
+            // were: this one follows it (`stream_poll`).
+            PlayState::Starting => {
+                let before = self.stream.pending_reload.take().unwrap_or_default();
+                self.stream.pending_reload =
+                    Some((audio.or(before.0), subtitle.or(before.1), burn_in || before.2));
+                return;
+            }
+            _ => return,
         }
+        let Some(resolved) = current_of(&item.id) else { return };
         let status = &self.player_status;
         let selected = |kind: &str| status.tracks.iter().find(|t| t.kind == kind && t.selected);
         let audio = audio.or_else(|| match resolved.play_method {
             PlayMethod::Transcode => resolved.audio_index,
-            _ => selected("audio").and_then(|t| resolved.audio_of(t.id)),
+            PlayMethod::DirectPlay => selected("audio").and_then(|t| resolved.audio_of(t.id)),
         });
         let subtitle = subtitle.or_else(|| {
             resolved.burned_subtitle.or_else(|| {
@@ -940,6 +959,23 @@ impl Bloom {
                 burn_in,
             },
         );
+    }
+
+    /// Called with every poll of the player: a reload that waited for the
+    /// load before it runs once the item plays.
+    pub fn stream_poll(&mut self) {
+        if self.stream.pending_reload.is_none() {
+            return;
+        }
+        match self.player_status.state {
+            PlayState::Starting => {}
+            PlayState::Playing => {
+                if let Some((audio, subtitle, burn_in)) = self.stream.pending_reload.take() {
+                    self.stream_reload_with(audio, subtitle, burn_in);
+                }
+            }
+            _ => self.stream.pending_reload = None,
+        }
     }
 
     /// Sets the bitrate the user allows (none is "Auto"), keeps it in the
@@ -963,7 +999,7 @@ impl Bloom {
     /// rungs of the ladder under the bitrate of the file.
     pub fn quality_menu_item(&self, cx: &mut Context<Self>) -> MenuItem {
         let this = cx.weak_entity();
-        let resolved = current();
+        let resolved = self.stream_resolved();
         let cap = max_bitrate();
         let source = resolved.as_ref().and_then(|r| r.source_bitrate);
         let codec = resolved
@@ -971,9 +1007,13 @@ impl Bloom {
             .and_then(|r| r.video().and_then(|v| v.codec.clone()));
         let mut items = Vec::new();
         let handle = this.clone();
-        let auto_detail = match source {
-            Some(bitrate) => format!("The file as it is · {}", bitrate_label(bitrate)),
-            None => "The file as it is".to_string(),
+        // What Auto does: the file, or less when the connection is slow.
+        let lowered = matches!(crate::adaptive::auto_choice(), crate::adaptive::Choice::Rung(_));
+        let auto_detail = match (lowered, source) {
+            (true, Some(bitrate)) => format!("Lowered for the connection · the file has {}", bitrate_label(bitrate)),
+            (true, None) => "Lowered for the connection".to_string(),
+            (false, Some(bitrate)) => format!("The file as it is · {}", bitrate_label(bitrate)),
+            (false, None) => "The file as it is".to_string(),
         };
         items.push(
             MenuItem::new(
@@ -1015,7 +1055,7 @@ impl Bloom {
     /// and a choice loads the item again. None with direct play, where
     /// mpv switches its own tracks.
     pub fn stream_track_items(&self, kind: &str, cx: &mut Context<Self>) -> Option<Vec<MenuItem>> {
-        let resolved = current().filter(|r| r.play_method == PlayMethod::Transcode)?;
+        let resolved = self.stream_resolved().filter(|r| r.play_method == PlayMethod::Transcode)?;
         let this = cx.weak_entity();
         let mut items = Vec::new();
         if kind == "audio" {
@@ -1024,22 +1064,17 @@ impl Bloom {
                 items.push(
                     MenuItem::new(
                         SharedString::from(format!("track.audio.{index}")),
-                        stream.title(),
+                        stream_title(stream),
                     )
                     .radio(resolved.audio_index == Some(index))
                     .on_click(move |_, _, cx| {
-                        handle.update(cx, |t, _| t.stream_reload(Some(index), None)).ok();
+                        handle.update(cx, |t, _| t.stream_audio(index)).ok();
                     }),
                 );
             }
         } else {
             let status = &self.player_status;
-            let shown = status
-                .tracks
-                .iter()
-                .find(|t| t.kind == "sub" && t.selected)
-                .and_then(|t| resolved.subtitle_of(t.id, status))
-                .or(resolved.burned_subtitle);
+            let shown = self.shown_subtitle(&resolved);
             let handle = this.clone();
             items.push(
                 MenuItem::new("track.sub.none", "Off")
@@ -1060,7 +1095,7 @@ impl Bloom {
                     true => "",
                 };
                 items.push(
-                    MenuItem::new(SharedString::from(format!("track.sub.{index}")), stream.title())
+                    MenuItem::new(SharedString::from(format!("track.sub.{index}")), stream_title(stream))
                         .detail(detail)
                         .radio(shown == Some(index))
                         .on_click(move |_, _, cx| {
@@ -1081,13 +1116,64 @@ impl Bloom {
         Some(items)
     }
 
+    /// The subtitle on the picture, by server index: the one mpv shows,
+    /// else the one burned in.
+    fn shown_subtitle(&self, resolved: &Resolved) -> Option<i64> {
+        let status = &self.player_status;
+        status
+            .tracks
+            .iter()
+            .find(|t| t.kind == "sub" && t.selected)
+            .and_then(|t| resolved.subtitle_of(t.id, status))
+            .or(resolved.burned_subtitle)
+    }
+
+    /// Plays an audio track by its server index. In a transcode the
+    /// server picks the track, so the item loads again; the file itself
+    /// has all its tracks, and mpv switches. With `stream_subtitle` this
+    /// is the one way to a track by its server index: the menus, a remote
+    /// control and the keys come here.
+    pub fn stream_audio(&mut self, index: i64) {
+        let Some(item) = self.playing.as_ref() else { return };
+        let resolved = current_of(&item.id);
+        let transcode = resolved.as_ref().is_some_and(|r| r.play_method == PlayMethod::Transcode);
+        // With no answer of the server (a downloaded item, or a load on
+        // its way) the streams are those of the item.
+        let streams = resolved.as_ref().map_or(item_streams(item), |r| r.streams.as_slice());
+        let Some(aid) = mpv_id(streams, "Audio", index) else {
+            log::debug!("no audio track for stream {index}");
+            return;
+        };
+        self.queue.explicit_audio = true;
+        if !transcode {
+            self.player.set_audio(Some(aid));
+        } else if resolved.is_some_and(|r| r.audio_index != Some(index)) {
+            self.stream_reload(Some(index), None);
+        }
+    }
+
     /// Shows a subtitle by server index (-1 for none): a subtitle the
     /// server gives as a file switches in mpv (an image track is fetched
     /// first, when it is chosen), one in the file of a direct play is
     /// mpv's own track, and any other one is burned in by the server, so
     /// the item loads again.
     pub fn stream_subtitle(&mut self, index: i64) {
-        let Some(resolved) = current() else { return };
+        let Some(item) = self.playing.as_ref() else { return };
+        let Some(resolved) = current_of(&item.id) else {
+            // A downloaded item, or a load on its way: the tracks of the
+            // file are mpv's.
+            let sid = mpv_id(item_streams(item), "Subtitle", index);
+            if index < 0 || sid.is_some() {
+                self.queue.explicit_subtitle = true;
+                self.player.set_subtitle(sid);
+            }
+            return;
+        };
+        if index >= 0 && !resolved.streams.iter().any(|s| s.kind == "Subtitle" && s.index == index) {
+            log::debug!("no subtitle for stream {index}");
+            return;
+        }
+        self.queue.explicit_subtitle = true;
         let burned = resolved.burned_subtitle.is_some();
         if index < 0 {
             if burned {
@@ -1097,7 +1183,7 @@ impl Bloom {
             }
             return;
         }
-        if self.stream.failed_files.contains(&index) {
+        if self.stream.failed_files.contains(&index) && resolved.play_method == PlayMethod::Transcode {
             self.stream_reload_with(None, Some(index), true);
             return;
         }
@@ -1115,27 +1201,55 @@ impl Bloom {
             }
         }
         if resolved.play_method != PlayMethod::Transcode
-            && let Some(place) = resolved.embedded("Subtitle").iter().position(|s| s.index == index)
+            && let Some(sid) = mpv_id(&resolved.streams, "Subtitle", index)
         {
-            self.player.set_subtitle(Some(place as i64 + 1));
+            self.player.set_subtitle(Some(sid));
             return;
         }
         self.stream_reload(None, Some(index));
     }
 
+    /// The next track of a kind ("audio" or "sub"), for a key. The file
+    /// itself has all its tracks and mpv steps through them; in a
+    /// transcode the tracks are the server's, in the order of the menu
+    /// (for subtitles "Off" first).
+    pub fn stream_cycle(&mut self, kind: &str) {
+        let Some(resolved) = self.stream_resolved().filter(|r| r.play_method == PlayMethod::Transcode) else {
+            match kind {
+                "audio" => self.queue.explicit_audio = true,
+                _ => self.queue.explicit_subtitle = true,
+            }
+            self.player.command("cycle", &[kind]);
+            return;
+        };
+        if kind == "audio" {
+            let tracks: Vec<i64> = resolved.embedded("Audio").iter().map(|s| s.index).collect();
+            if let Some(next) = next_track(&tracks, resolved.audio_index) {
+                self.stream_audio(next);
+            }
+        } else {
+            let tracks: Vec<i64> = std::iter::once(-1)
+                .chain(resolved.streams.iter().filter(|s| s.kind == "Subtitle").map(|s| s.index))
+                .collect();
+            let shown = self.shown_subtitle(&resolved).unwrap_or(-1);
+            if let Some(next) = next_track(&tracks, Some(shown)) {
+                self.stream_subtitle(next);
+            }
+        }
+    }
+
     /// The card of the "Playback info" overlay: how the item plays.
-    pub fn render_stream_info(&self, cx: &mut Context<Self>) -> Option<Div> {
+    pub fn render_stream_info(&self, _cx: &mut Context<Self>) -> Option<Div> {
         if !self.playback_info || !self.player_open {
             return None;
         }
-        let _ = cx;
-        let resolved = current();
+        let resolved = self.stream_resolved();
         let ink = rgba(0xf5f5f7ff);
         let quiet = rgba(0xf5f5f7b3);
         let line = |text: String| div().text_size(px(12.)).text_color(quiet).child(text);
         let mut lines: Vec<Div> = Vec::new();
         let title = match &resolved {
-            Some(r) => r.play_method.label().to_string(),
+            Some(r) => r.label().to_string(),
             None => "Opening".to_string(),
         };
         if let Some(r) = &resolved {
@@ -1217,7 +1331,7 @@ impl Bloom {
             "" | "state" => {
                 let status = &self.player_status;
                 let cap = max_bitrate().map_or("auto".to_string(), |b| (b / 1000).to_string());
-                let link = crate::adaptive::describe();
+                let link = crate::adaptive::describe(self.sync.in_group());
                 match current() {
                     Some(r) => format!(
                         "method={} cap={cap} session={} reasons=[{}] source={} target={} decoded={}x{} \
@@ -1502,6 +1616,89 @@ mod tests {
         installer.join().unwrap();
         server.join().unwrap();
         assert!(waited < Duration::from_millis(500), "current() waited {waited:?} for the server");
+    }
+
+    /// The stream the server makes of a file is a transcode for the app,
+    /// also when the server calls it a direct stream (it keeps the video):
+    /// the server chose the audio track, and its job must be ended.
+    #[test]
+    fn a_direct_stream_over_the_transcoding_url_is_a_transcode() {
+        let mut info: PlaybackInfo = serde_json::from_str(TRANSCODE).unwrap();
+        info.media_sources[0].supports_direct_stream = true;
+        let resolved = resolve(&client(), ITEM, &info, None).unwrap();
+        assert_eq!(resolved.play_method, PlayMethod::Transcode);
+        assert!(resolved.remux);
+        assert_eq!(resolved.label(), "Direct stream");
+        assert_eq!(resolved.play_method.as_str(), "Transcode");
+        assert!(resolved.target.is_some());
+        assert_eq!(resolved.audio_index, Some(1));
+        let plain: PlaybackInfo = serde_json::from_str(TRANSCODE).unwrap();
+        assert_eq!(resolve(&client(), ITEM, &plain, None).unwrap().label(), "Transcoding");
+    }
+
+    /// The answer of the server for the item before is not the answer for
+    /// the item that loads: after a transcode, the next item is no
+    /// transcode until the server said so.
+    #[test]
+    fn the_answer_for_another_item_does_not_count() {
+        let info: PlaybackInfo = serde_json::from_str(TRANSCODE).unwrap();
+        let resolved = resolve(&client(), ITEM, &info, None).unwrap();
+        assert_eq!(resolved.item_id, ITEM);
+        let held = Some(Arc::new(resolved));
+        assert!(of_item(held.clone(), ITEM).is_some());
+        assert!(of_item(held, "ffeeddccbbaa99887766554433221100").is_none());
+    }
+
+    /// A subtitle file that did not come is burned in only where the
+    /// server burns: in a transcode, once, and for a track it offered as
+    /// a file.
+    #[test]
+    fn a_lost_subtitle_file_is_burned_in_only_in_a_transcode() {
+        let info: PlaybackInfo = serde_json::from_str(TRANSCODE).unwrap();
+        let mut resolved = resolve(&client(), ITEM, &info, None).unwrap();
+        assert!(resolved.burns_in_instead(2));
+        assert!(!resolved.burns_in_instead(7), "not offered as a file");
+        resolved.burn_in = true;
+        assert!(!resolved.burns_in_instead(2), "burned in once already");
+        resolved.burn_in = false;
+        resolved.play_method = PlayMethod::DirectPlay;
+        assert!(!resolved.burns_in_instead(2), "the server burns nothing into the file itself");
+    }
+
+    #[test]
+    fn a_server_index_maps_to_the_track_of_mpv() {
+        let stream = |kind: &str, index, is_external| MediaStream {
+            kind: kind.into(),
+            index,
+            is_external,
+            ..Default::default()
+        };
+        // The external subtitle comes first in the list of the server.
+        let streams = [
+            stream("Subtitle", 0, true),
+            stream("Video", 1, false),
+            stream("Audio", 2, false),
+            stream("Audio", 3, false),
+            stream("Subtitle", 4, false),
+            stream("Subtitle", 5, false),
+        ];
+        assert_eq!(mpv_id(&streams, "Audio", 2), Some(1));
+        assert_eq!(mpv_id(&streams, "Audio", 3), Some(2));
+        assert_eq!(mpv_id(&streams, "Subtitle", 4), Some(1));
+        assert_eq!(mpv_id(&streams, "Subtitle", 5), Some(2));
+        assert_eq!(mpv_id(&streams, "Subtitle", 0), None, "a file of its own is not a track of the file");
+        assert_eq!(mpv_id(&streams, "Audio", 9), None);
+        assert_eq!(mpv_id(&streams, "Subtitle", -1), None);
+    }
+
+    #[test]
+    fn the_next_track_goes_round() {
+        assert_eq!(next_track(&[-1, 2, 3], Some(-1)), Some(2));
+        assert_eq!(next_track(&[-1, 2, 3], Some(3)), Some(-1));
+        assert_eq!(next_track(&[1, 2], None), Some(1));
+        assert_eq!(next_track(&[1, 2], Some(9)), Some(1));
+        assert_eq!(next_track(&[1], Some(1)), None);
+        assert_eq!(next_track(&[], None), None);
     }
 
     #[test]

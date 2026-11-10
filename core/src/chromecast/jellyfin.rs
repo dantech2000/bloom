@@ -16,6 +16,10 @@
 
 use serde_json::{Value, json};
 
+use super::{
+    messages::LoadMedia,
+    session::{JellyfinLoad, LoadRequest},
+};
 use crate::jellyfin::{Client, Item, ItemKind, TICKS_PER_SECOND};
 
 pub const APP_STABLE: &str = "F007D354";
@@ -36,7 +40,6 @@ pub fn is_jellyfin_app(app_id: &str) -> bool {
 pub struct Identity {
     pub server_address: String,
     pub server_id: String,
-    pub server_version: String,
     pub user_id: String,
     pub device_id: String,
     pub access_token: String,
@@ -44,11 +47,10 @@ pub struct Identity {
 
 impl Identity {
     /// From the session of the app; `None` before sign-in.
-    pub fn from_client(client: &Client, server_id: &str, server_version: &str) -> Option<Self> {
+    pub fn from_client(client: &Client, server_id: &str) -> Option<Self> {
         Some(Self {
             server_address: client.base.to_string(),
             server_id: server_id.to_string(),
-            server_version: server_version.to_string(),
             user_id: client.user_id.as_deref()?.to_string(),
             device_id: client.device_id.to_string(),
             access_token: client.token.as_deref()?.to_string(),
@@ -86,7 +88,9 @@ impl ItemStub {
 }
 
 /// A message for the receiver app: the command, its options and the
-/// identity jellyfin-web adds to every message.
+/// identity jellyfin-web adds to every message. The app does not know the
+/// version of the server, and the receiver plays without it: the field
+/// goes empty, as it always has.
 pub fn message(identity: &Identity, receiver_name: &str, command: &str, options: Value) -> Value {
     json!({
         "command": command,
@@ -96,7 +100,7 @@ pub fn message(identity: &Identity, receiver_name: &str, command: &str, options:
         "accessToken": identity.access_token,
         "serverAddress": identity.server_address,
         "serverId": identity.server_id,
-        "serverVersion": identity.server_version,
+        "serverVersion": "",
         "receiverName": receiver_name,
     })
 }
@@ -166,9 +170,6 @@ pub struct Report {
     pub paused: bool,
     pub duration: Option<f64>,
     pub item_id: Option<String>,
-    /// 0 to 100.
-    pub volume: Option<f64>,
-    pub muted: bool,
     pub audio_index: Option<i64>,
     pub subtitle_index: Option<i64>,
 }
@@ -190,8 +191,6 @@ pub fn parse_report(payload: &Value) -> Option<Report> {
             .as_str()
             .or_else(|| data["ItemId"].as_str())
             .map(str::to_string),
-        volume: state["VolumeLevel"].as_f64(),
-        muted: state["IsMuted"].as_bool().unwrap_or(false),
         audio_index: state["AudioStreamIndex"].as_i64(),
         subtitle_index: state["SubtitleStreamIndex"].as_i64(),
     })
@@ -217,6 +216,52 @@ pub fn stream_url(client: &Client, item_id: &str, play_session_id: &str) -> Opti
 
 pub const STREAM_CONTENT_TYPE: &str = "application/x-mpegURL";
 
+/// A URL with the token of the server taken out, for a log line: a stream
+/// address carries it as `ApiKey` (or `api_key`).
+pub fn redact(url: &str) -> String {
+    let Some((path, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let query: Vec<String> = query
+        .split('&')
+        .map(|part| match part.split_once('=') {
+            Some((key, _)) if key.eq_ignore_ascii_case("apikey") || key.eq_ignore_ascii_case("api_key") => {
+                format!("{key}=***")
+            }
+            _ => part.to_string(),
+        })
+        .collect();
+    format!("{path}?{}", query.join("&"))
+}
+
+/// The items both ways in one request: all of them for the Jellyfin
+/// receiver app, which keeps a queue, and the stream of the first one for
+/// the Default Media Receiver, which plays one URL. Nothing to load (an
+/// empty request) before sign-in or with no item.
+pub fn load_request(client: &Client, server_id: &str, items: &[Item], start_secs: f64) -> LoadRequest {
+    let Some(first) = items.first() else {
+        return LoadRequest::default();
+    };
+    let jellyfin = Identity::from_client(client, server_id).map(|identity| JellyfinLoad {
+        identity,
+        items: items.iter().map(ItemStub::from_item).collect(),
+        start_secs,
+        audio_index: None,
+        subtitle_index: None,
+    });
+    let play_session_id = uuid::Uuid::new_v4().simple().to_string();
+    let media = stream_url(client, &first.id, &play_session_id).map(|url| LoadMedia {
+        url,
+        content_type: STREAM_CONTENT_TYPE.into(),
+        title: first.display_title(),
+        subtitle: first.series_name.clone().unwrap_or_default(),
+        image_url: Some(client.image_url(&first.id, "Primary", None, 480)),
+        start_secs,
+        duration: first.run_time_ticks.map(|t| t as f64 / TICKS_PER_SECOND as f64),
+    });
+    LoadRequest { jellyfin, media }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,7 +270,6 @@ mod tests {
         Identity {
             server_address: "https://jellyfin.example".into(),
             server_id: "srv1".into(),
-            server_version: "12.1.0".into(),
             user_id: "u1".into(),
             device_id: "d1".into(),
             access_token: "fake-token".into(),
@@ -293,7 +337,6 @@ mod tests {
         assert!(report.paused);
         assert_eq!(report.duration, Some(6000.));
         assert_eq!(report.item_id.as_deref(), Some("i1"));
-        assert_eq!(report.volume, Some(35.));
         assert_eq!(report.subtitle_index, Some(-1));
         assert!(parse_report(&json!({"type": "error", "message": "x"})).is_none());
     }
@@ -307,5 +350,32 @@ mod tests {
             assert!(url.contains(part), "{part} missing in {url}");
         }
         assert!(stream_url(&Client::new("https://x", "d"), "i1", "p").is_none(), "no token, no URL");
+    }
+
+    #[test]
+    fn redact_hides_the_token_only() {
+        assert_eq!(redact("https://x/a.m3u8?PlaySessionId=ps1&ApiKey=secret"), "https://x/a.m3u8?PlaySessionId=ps1&ApiKey=***");
+        assert_eq!(redact("https://x/a.m3u8?api_key=abc&b=1"), "https://x/a.m3u8?api_key=***&b=1");
+        assert_eq!(redact("https://x/a.m3u8?b=1"), "https://x/a.m3u8?b=1");
+        assert_eq!(redact("no query"), "no query");
+    }
+
+    /// A queue goes to the Jellyfin receiver app whole, in its order; the
+    /// media receiver gets the stream of the first item.
+    #[test]
+    fn a_load_request_carries_every_item() {
+        let item = |id: &str| -> Item {
+            serde_json::from_value(json!({ "Id": id, "Name": id, "Type": "Episode", "RunTimeTicks": 6_000_000_000_i64 })).unwrap()
+        };
+        let client = Client::new("https://jellyfin.example/", "dev-1").with_session("fake-token", "u1");
+        let request = load_request(&client, "srv1", &[item("e1"), item("e2"), item("e3")], 12.);
+        let jellyfin = request.jellyfin.unwrap();
+        assert_eq!(jellyfin.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["e1", "e2", "e3"]);
+        assert_eq!(jellyfin.start_secs, 12.);
+        let media = request.media.unwrap();
+        assert!(media.url.contains("/Videos/e1/master.m3u8"), "{}", media.url);
+        assert_eq!(media.duration, Some(600.));
+        let nothing = load_request(&client, "srv1", &[], 0.);
+        assert!(nothing.jellyfin.is_none() && nothing.media.is_none());
     }
 }

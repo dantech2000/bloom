@@ -10,8 +10,9 @@
 //! a list of strings a list field, and a nested object a titled group. A
 //! list of objects and a null value show as they are, read-only.
 //!
-//! A save posts the edited copy of the object. Every key the editor does not
-//! change goes back as it came, in the same order and with the same type.
+//! A save reads the object from the server again, puts the edits in it and
+//! posts it (a [`Draft`]). Every key the editor does not change goes back
+//! as the server has it, in the same order and with the same type.
 //!
 //! The value of a setting whose name says "key", "token", "password" or
 //! "secret" is hidden until the user chooses Reveal. It is never written to
@@ -27,9 +28,9 @@ use gpui_kit::{
 use serde_json::{Number, Value};
 
 use super::{
-    ButtonKind, Confirm, button,
-    config::{bar_shell, value_button},
-    dialogs::{Field as PromptField, Prompt},
+    Ask, ButtonKind, Confirm, Draft, button,
+    config::{LAZY_MIN, bar_room, bar_shell, lines_text, unsaved_text, value_button},
+    list_entries, parse_flag, parse_number, text_of,
     text_editor::TextEdit,
 };
 use crate::{
@@ -43,8 +44,6 @@ use crate::{
 
 /// With more fields than this the page has a filter box.
 const FILTER_MIN: usize = 15;
-/// A group with this many fields or more builds only the fields in view.
-const LAZY_MIN: usize = 4;
 /// A text longer than this, or with a new line, is edited in the large dialog.
 const LONG_TEXT: usize = 120;
 /// What a hidden value shows. It has the same length for every value.
@@ -240,11 +239,7 @@ pub fn put(root: &mut Value, path: &[String], new: Value) -> bool {
 pub fn from_text(kind: &Kind, typed: &str) -> Result<Value, String> {
     let typed_trim = typed.trim();
     match kind {
-        Kind::Bool => match typed_trim.to_lowercase().as_str() {
-            "true" | "on" | "yes" | "1" => Ok(Value::Bool(true)),
-            "false" | "off" | "no" | "0" => Ok(Value::Bool(false)),
-            _ => Err("That is not true or false.".to_string()),
-        },
+        Kind::Bool => parse_flag(typed).map(Value::Bool).ok_or_else(|| "That is not true or false.".to_string()),
         Kind::Int => {
             if let Ok(n) = typed_trim.parse::<i64>() {
                 Ok(Value::from(n))
@@ -259,7 +254,7 @@ pub fn from_text(kind: &Kind, typed: &str) -> Result<Value, String> {
         Kind::Text | Kind::LongText => Ok(Value::String(typed.to_string())),
         Kind::List { numbers } => {
             let mut items = Vec::new();
-            for entry in typed.split([',', '\n']).map(str::trim).filter(|e| !e.is_empty()) {
+            for entry in list_entries(typed) {
                 items.push(if *numbers {
                     match entry.parse::<i64>() {
                         Ok(n) => Value::from(n),
@@ -276,30 +271,10 @@ pub fn from_text(kind: &Kind, typed: &str) -> Result<Value, String> {
 }
 
 fn float(typed: &str) -> Result<Value, String> {
-    typed
-        .parse::<f64>()
-        .ok()
+    parse_number(typed)
         .and_then(Number::from_f64)
         .map(Value::Number)
         .ok_or_else(|| "That is not a number.".to_string())
-}
-
-/// A value as the text of its field.
-fn shown(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Number(n) => n.to_string(),
-        Value::Array(items) => items
-            .iter()
-            .map(|item| match item {
-                Value::String(text) => text.clone(),
-                other => other.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
-        Value::Null => String::new(),
-        other => other.to_string(),
-    }
 }
 
 // ----- the editor ----------------------------------------------------------------
@@ -308,18 +283,15 @@ pub struct Editor {
     pub id: String,
     pub name: String,
     pub version: String,
-    /// The object as the server gave it.
-    original: Value,
+    /// The object as the server gave it, and the copy the user edits.
+    draft: Draft,
     /// The text the server sent, to check the round trip.
     raw: String,
-    /// The copy the user edits.
-    edited: Value,
     fields: Vec<PField>,
     filter: String,
     filter_input: Entity<InputState>,
     /// Paths of the secret values that are on show.
     revealed: HashSet<String>,
-    saving: bool,
     /// This instance of the editor, among the opens of the same plugin:
     /// the answer of a save belongs to the instance that sent it.
     revision: Revision,
@@ -328,14 +300,14 @@ pub struct Editor {
 
 impl Editor {
     pub fn dirty(&self) -> bool {
-        self.original != self.edited
+        self.draft.dirty()
     }
 
     /// The fields whose value is not the one of the server.
     pub fn changed(&self) -> Vec<&PField> {
         self.fields
             .iter()
-            .filter(|f| get(&self.original, &f.path) != get(&self.edited, &f.path))
+            .filter(|f| get(&self.draft.original, &f.path) != get(&self.draft.edited, &f.path))
             .collect()
     }
 
@@ -365,52 +337,35 @@ impl Editor {
     }
 
     fn value(&self, field: &PField) -> &Value {
-        get(&self.edited, &field.path).unwrap_or(&Value::Null)
+        get(&self.draft.edited, &field.path).unwrap_or(&Value::Null)
     }
 
     /// Sets a field from text. The error never holds the text.
     fn set_text(&mut self, n: usize, typed: &str) -> Result<(), String> {
         let field = &self.fields[n];
         let value = from_text(&field.kind, typed)?;
-        put(&mut self.edited, &field.path.clone(), value);
+        put(&mut self.draft.edited, &field.path, value);
         Ok(())
     }
 
-    /// The server took a save and sent back what it holds now. The editor
-    /// shows that, except at the fields the user changed since the save
-    /// went out (`sent`): those keep the user's value, and stay to save.
-    fn take_saved(&mut self, server: Value, sent: &Value) {
-        let fields = fields_of(&server);
-        let mut edited = server.clone();
-        for field in &fields {
-            let now = get(&self.edited, &field.path);
-            if now != get(sent, &field.path)
-                && let Some(value) = now
-            {
-                put(&mut edited, &field.path, value.clone());
-            }
-        }
-        self.fields = fields;
-        self.raw = serde_json::to_string(&server).unwrap_or_default();
-        self.original = server;
-        self.edited = edited;
-        self.saving = false;
+    /// The server took a save and sent back what it holds now (`raw` is
+    /// its text). The editor shows that, except at the places the user
+    /// changed since the save went out (`sent`): those keep the user's
+    /// value, and stay to save (`Draft::saved`).
+    fn take_saved(&mut self, server: Value, raw: String, sent: &Value) {
+        self.fields = fields_of(&server);
+        self.raw = raw;
+        self.draft.saved(server, sent);
     }
 }
 
 impl Bloom {
     pub fn plugin_editor(&self) -> Option<&Editor> {
-        match &self.page {
-            Page::Admin(admin) => admin.plugin_editor.as_ref(),
-            _ => None,
-        }
+        self.admin_data()?.plugin_editor.as_ref()
     }
 
     fn plugin_editor_mut(&mut self) -> Option<&mut Editor> {
-        match &mut self.page {
-            Page::Admin(admin) => admin.plugin_editor.as_mut(),
-            _ => None,
-        }
+        self.admin_data_mut()?.plugin_editor.as_mut()
     }
 
     /// Loads the settings of a plugin and shows them in the editor.
@@ -467,8 +422,7 @@ impl Bloom {
                 });
                 let editor = Editor {
                     fields: fields_of(&object),
-                    original: object.clone(),
-                    edited: object,
+                    draft: Draft::new(object),
                     id,
                     name,
                     version,
@@ -476,7 +430,6 @@ impl Bloom {
                     filter: String::new(),
                     filter_input,
                     revealed: HashSet::new(),
-                    saving: false,
                     revision,
                     _filter_change: change,
                 };
@@ -489,17 +442,19 @@ impl Bloom {
         );
     }
 
-    fn plugin_put(&mut self, n: usize, value: Value, cx: &mut Context<Self>) {
+    /// Changes the value at a path of the copy the user edits. A form
+    /// names its field by the path, not by its place in the list: the
+    /// answer of a save makes the list again while the form is open.
+    fn plugin_put(&mut self, path: &[String], value: Value, cx: &mut Context<Self>) {
         if let Some(editor) = self.plugin_editor_mut() {
-            let path = editor.fields[n].path.clone();
-            put(&mut editor.edited, &path, value);
+            put(&mut editor.draft.edited, path, value);
             cx.notify();
         }
     }
 
     fn plugin_discard(&mut self, cx: &mut Context<Self>) {
         if let Some(editor) = self.plugin_editor_mut() {
-            editor.edited = editor.original.clone();
+            editor.draft.discard();
             cx.notify();
         }
     }
@@ -547,40 +502,49 @@ impl Bloom {
         let Some(editor) = self.plugin_editor_mut() else {
             return;
         };
-        if !(editor.dirty() || force) || editor.saving {
+        if !(editor.dirty() || force) || editor.draft.saving {
             return;
         }
-        editor.saving = true;
-        let (path, body) = (format!("/Plugins/{}/Configuration", editor.id), editor.edited.clone());
-        let original = editor.original.clone();
+        editor.draft.saving = true;
+        let path = format!("/Plugins/{}/Configuration", editor.id);
         // The answer is for this instance of the editor: the user may have
         // left it and opened another one (of this plugin or another, on
         // this server or another) meanwhile.
         let revision = editor.revision;
-        let sent = body.clone();
+        let sent = editor.draft.clone();
+        let edits = sent.edited.clone();
         self.fetch_in_session(
             cx,
-            move |client| -> Result<Value> {
+            move |client| -> Result<(String, Value)> {
                 // The object of the server now, with the edits in it: what
                 // changed there since the editor opened stays.
                 let fresh = client.get::<Value>(&path, &[])?;
-                client.post(&path, &super::with_changes(&fresh, &original, &body))?;
-                client.get::<Value>(&path, &[])
+                client.post(&path, &sent.body(&fresh))?;
+                let raw = client.get_text(&path, &[])?;
+                let server = serde_json::from_str(&raw)?;
+                Ok((raw, server))
             },
             move |this, result, cx| {
-                match result {
-                    Ok(server) => {
-                        this.toast("Settings saved", "", cx);
-                        if let Some(editor) = this.plugin_editor_mut().filter(|e| e.revision == revision) {
-                            editor.take_saved(server, &sent);
-                        }
+                // The editor that sent the save, also on a page the user
+                // left meanwhile (Back returns to it).
+                let editor = this
+                    .admin_pages_mut()
+                    .filter_map(|admin| admin.plugin_editor.as_mut())
+                    .find(|editor| editor.revision == revision);
+                let note = match (result, editor) {
+                    (Ok((raw, server)), Some(editor)) => {
+                        editor.take_saved(server, raw, &edits);
+                        None
                     }
-                    Err(err) => {
-                        this.toast("The server refused the change", format!("{err:#}"), cx);
-                        if let Some(editor) = this.plugin_editor_mut().filter(|e| e.revision == revision) {
-                            editor.saving = false;
-                        }
+                    (Err(err), Some(editor)) => {
+                        editor.draft.saving = false;
+                        Some(err)
                     }
+                    (result, None) => result.err(),
+                };
+                match note {
+                    None => this.toast("Settings saved", "", cx),
+                    Some(err) => this.toast("The server refused the change", format!("{err:#}"), cx),
                 }
                 cx.notify();
             },
@@ -603,54 +567,44 @@ impl Bloom {
         let Some(editor) = self.plugin_editor() else {
             return;
         };
-        let field = editor.fields[n].clone();
-        let current = shown(editor.value(&field));
-        let run_kind = field.kind.clone();
-        let label = field.label.clone();
-        match field.kind {
+        let Some(field) = editor.fields.get(n).cloned() else {
+            return;
+        };
+        let current = text_of(editor.value(&field));
+        let (path, kind, label) = (field.path, field.kind, field.label);
+        match kind {
             // A secret is typed into the masked field of the form, also
             // when it is long: the large editor shows its text in clear.
             Kind::LongText if !field.secret => self.open_text_editor(
                 TextEdit {
-                    title: field.label.clone(),
+                    title: label,
                     message: "The text as the plugin stores it.".to_string(),
                     action: "Use this text".to_string(),
                     mono: false,
                     value: current,
-                    apply: Rc::new(move |this, value, cx| this.plugin_put(n, Value::String(value), cx)),
+                    apply: Rc::new(move |this, value, cx| this.plugin_put(&path, Value::String(value), cx)),
                 },
                 window,
                 cx,
             ),
             Kind::Int | Kind::Float | Kind::Text | Kind::LongText | Kind::List { .. } => {
-                let message = match &field.kind {
+                let message = match &kind {
                     Kind::List { .. } => "Put a comma between two values.",
                     Kind::Int => "A whole number.",
                     Kind::Float => "A number.",
                     _ => "",
                 };
-                self.ask_prompt(
-                    Prompt {
-                        title: field.label.clone(),
-                        message: message.to_string(),
-                        action: "Set".to_string(),
-                        fields: vec![PromptField {
-                            label: field.label.clone(),
-                            placeholder: String::new(),
-                            value: current,
-                            masked: field.secret,
-                            required: false,
-                        }],
-                        run: Rc::new(move |this, values, cx| {
-                            let typed = values.first().map(String::as_str).unwrap_or_default();
-                            match from_text(&run_kind, typed) {
-                                Ok(value) => this.plugin_put(n, value, cx),
-                                Err(note) => this.toast(label.clone(), note, cx),
-                            }
-                        }),
-                    },
-                    cx,
-                );
+                let ask = Ask {
+                    title: label.clone(),
+                    message: message.to_string(),
+                    value: current,
+                    masked: field.secret,
+                    ..Ask::default()
+                };
+                self.ask_value(ask, cx, move |this, typed, cx| match from_text(&kind, typed) {
+                    Ok(value) => this.plugin_put(&path, value, cx),
+                    Err(note) => this.toast(label.clone(), note, cx),
+                });
             }
             Kind::Bool | Kind::Fixed(_) => {}
         }
@@ -673,7 +627,7 @@ impl Bloom {
         let changes = editor.changed().len().max(1);
         Some(bar_shell(
             self.admin_bar_edges(),
-            changes,
+            unsaved_text(changes, editor.draft.saving),
             button("plugin.discard", "Discard", ButtonKind::Plain, cx)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.plugin_discard(cx))),
             button("plugin.save", "Save", ButtonKind::Primary, cx)
@@ -766,8 +720,8 @@ impl Bloom {
             shown,
             editor.filter,
             editor.dirty(),
-            editor.saving,
-            serde_json::to_string(&editor.original).is_ok_and(|text| text == editor.raw),
+            editor.draft.saving,
+            serde_json::to_string(&editor.draft.original).is_ok_and(|text| text == editor.raw),
             changed.join(", ")
         )
     }
@@ -779,15 +733,16 @@ impl Bloom {
 fn field_row(editor: &Editor, n: usize, cx: &mut Context<Bloom>) -> Div {
     let f = &editor.fields[n];
     let id = SharedString::from(format!("plugin.field.{n}"));
-    let value = editor.value(f).clone();
+    let value = editor.value(f);
     let revealed = editor.revealed.contains(&f.key());
     let hidden = f.secret && !revealed;
     let t = UiTheme::read(cx).clone();
     let control: Div = match &f.kind {
         Kind::Bool => {
             let on = value.as_bool().unwrap_or(false);
+            let path = f.path.clone();
             div().child(checkbox(id, on, cx).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.plugin_put(n, Value::Bool(!on), cx)
+                this.plugin_put(&path, Value::Bool(!on), cx)
             })))
         }
         Kind::Fixed(note) => div()
@@ -796,20 +751,15 @@ fn field_row(editor: &Editor, n: usize, cx: &mut Context<Bloom>) -> Div {
             .text_color(t.colors.foreground.opacity(0.5))
             .child(note.clone()),
         _ => {
-            let text = shown(&value);
-            let lines = text.split('\n').count();
-            let on_screen = match (text.is_empty(), hidden) {
-                (true, _) => String::new(),
-                (false, true) => HIDDEN.to_string(),
-                (false, false) if lines > 1 => format!("{lines} lines"),
-                (false, false) => text.clone(),
-            };
+            let text = text_of(value);
+            let filled = !text.is_empty();
+            let on_screen = if hidden && filled { HIDDEN.to_string() } else { lines_text(text) };
             let mut control = div().flex().items_center().gap(px(8.)).child(
                 value_button(id, on_screen, cx).on_click(cx.listener(
                     move |this, _: &ClickEvent, window, cx| this.plugin_ask(n, window, cx),
                 )),
             );
-            if f.secret && !text.is_empty() {
+            if f.secret && filled {
                 control = control.child(
                     button(
                         SharedString::from(format!("plugin.reveal.{n}")),
@@ -825,7 +775,7 @@ fn field_row(editor: &Editor, n: usize, cx: &mut Context<Bloom>) -> Div {
             control
         }
     };
-    let help = if hidden && !shown(&value).is_empty() {
+    let help = if hidden && !text_of(value).is_empty() {
         "Hidden until you choose Reveal."
     } else {
         ""
@@ -910,25 +860,19 @@ pub fn render(app: &Bloom, editor: &Editor, cx: &mut Context<Bloom>) -> Div {
     for (title, members) in groups {
         let mut card = group(title.clone(), cx);
         if members.len() >= LAZY_MIN {
-            let (plugin, filter, group_title) = (editor.id.clone(), editor.filter.clone(), title.clone());
-            card = card.child(super::lazy::lazy(
-                cx,
-                format!("plugin.{plugin}.{group_title}.{filter}.{}", members.len()),
-                members.len(),
-                move |app, range, cx| {
-                    let Some(editor) = app.plugin_editor() else {
-                        return Vec::new();
-                    };
-                    let groups = editor.groups();
-                    let Some((_, members)) = groups.iter().find(|(t, _)| *t == group_title) else {
-                        return Vec::new();
-                    };
-                    range
-                        .filter_map(|i| members.get(i))
-                        .map(|&n| gpui_kit::IntoElement::into_any_element(field_row(editor, n, cx)))
-                        .collect()
-                },
-            ));
+            // The rows are built in this frame, so the members found for
+            // it are the ones the list shows.
+            let id = format!("plugin.{}.{title}.{}.{}", editor.id, editor.filter, members.len());
+            let count = members.len();
+            card = card.child(super::lazy::lazy(cx, id, count, move |app, range, cx| {
+                let Some(editor) = app.plugin_editor() else {
+                    return Vec::new();
+                };
+                range
+                    .filter_map(|i| members.get(i).copied().filter(|n| *n < editor.fields.len()))
+                    .map(|n| gpui_kit::IntoElement::into_any_element(field_row(editor, n, cx)))
+                    .collect()
+            }));
         } else {
             for &n in &members {
                 card = card.child(field_row(editor, n, cx));
@@ -936,8 +880,7 @@ pub fn render(app: &Bloom, editor: &Editor, cx: &mut Context<Bloom>) -> Div {
         }
         page = page.child(card);
     }
-    // Room for the bar with Save, so it does not cover the last field.
-    page.child(div().h(px(if editor.dirty() { 72. } else { 0. })))
+    page.child(bar_room(editor.dirty()))
 }
 
 #[cfg(test)]
@@ -1172,12 +1115,60 @@ mod race_tests {
             let editor = this.plugin_editor().expect("the editor of B is open");
             assert_eq!(editor.id, "B");
             assert_eq!(
-                editor.original["Name"],
+                editor.draft.original["Name"],
                 json!("beta"),
                 "the editor of Beta shows the settings of Alpha: {}",
                 this.plugin_config_state()
             );
-            assert!(!editor.saving);
+            assert!(!editor.draft.saving);
+        });
+    }
+
+    /// The user leaves the dashboard before the answer of the save comes,
+    /// and returns with Back: the editor is not left with a save on its way.
+    #[gpui_kit::test]
+    fn a_save_answered_on_another_page_unlocks_the_editor(cx: &mut TestAppContext) {
+        let server = server();
+        let (bloom, cx) = on_plugins_page(&server, cx);
+        bloom.update_in(cx, |this, window, cx| open(this, "A", window, cx));
+        cx.run_until_parked();
+        bloom.update_in(cx, |this, window, cx| {
+            assert!(!this.debug_plugin_config("set Count 5", window, cx).starts_with("error"));
+            this.debug_plugin_config("save", window, cx);
+            this.navigate(Page::Downloads, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(server.count("POST", "/Plugins/A/"), 1);
+        bloom.update(cx, |this, cx| this.back(cx));
+        cx.run_until_parked();
+        bloom.read_with(cx, |this, _| {
+            let editor = this.plugin_editor().expect("the editor is open");
+            assert!(!editor.draft.saving, "the editor still says it saves");
+            assert_eq!(editor.draft.original["Count"], json!(5));
+            assert!(!editor.dirty());
+        });
+    }
+
+    /// A click on a section in the sidebar shows the list of the section:
+    /// an editor without edits closes, one with edits stays.
+    #[gpui_kit::test]
+    fn the_sidebar_closes_an_editor_without_edits(cx: &mut TestAppContext) {
+        let server = server();
+        let (bloom, cx) = on_plugins_page(&server, cx);
+        bloom.update_in(cx, |this, window, cx| open(this, "A", window, cx));
+        cx.run_until_parked();
+        bloom.update(cx, |this, cx| {
+            assert!(this.plugin_editor().is_some());
+            this.open_admin(Section::Plugins, cx);
+            assert!(this.plugin_editor().is_none(), "the editor stayed over the list of the plugins");
+        });
+        cx.run_until_parked();
+        bloom.update_in(cx, |this, window, cx| open(this, "A", window, cx));
+        cx.run_until_parked();
+        bloom.update_in(cx, |this, window, cx| {
+            assert!(!this.debug_plugin_config("set Count 5", window, cx).starts_with("error"));
+            this.open_admin(Section::Plugins, cx);
+            assert!(this.plugin_editor().is_some_and(|editor| editor.dirty()), "the edits are gone");
         });
     }
 
@@ -1226,10 +1217,10 @@ mod race_tests {
         assert_eq!(server.count("POST", "/Plugins/A/"), 1);
         bloom.read_with(cx, |this, _| {
             let editor = this.plugin_editor().expect("the editor is open");
-            assert_eq!(editor.original, json!({"Name": "alpha", "Count": 5}), "the baseline is not what the server holds");
-            assert_eq!(editor.edited["Name"], json!("mine"), "the edit after the submit is gone");
-            assert_eq!(editor.edited["Count"], json!(5));
-            assert!(editor.dirty() && !editor.saving);
+            assert_eq!(editor.draft.original, json!({"Name": "alpha", "Count": 5}), "the baseline is not what the server holds");
+            assert_eq!(editor.draft.edited["Name"], json!("mine"), "the edit after the submit is gone");
+            assert_eq!(editor.draft.edited["Count"], json!(5));
+            assert!(editor.dirty() && !editor.draft.saving);
         });
     }
 }

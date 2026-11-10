@@ -16,6 +16,15 @@ use gpui_kit::{
 
 use crate::app::Bloom;
 
+/// A grid of cards in a width: how many fit across at `min_w` each with
+/// `gap` between them (`least` to `most` of them), and the width each gets
+/// so the row is full.
+pub fn grid(content_w: f32, min_w: f32, gap: f32, least: usize, most: usize) -> (usize, f32) {
+    let fit = ((content_w + gap) / (min_w + gap)).floor() as usize;
+    let columns = fit.clamp(least.max(1), most.max(least).max(1));
+    (columns, ((content_w - gap * (columns - 1) as f32) / columns as f32).floor())
+}
+
 /// Rows this far outside the viewport are built too, so a scroll step does
 /// not show an empty band before the next frame.
 const MARGIN: f32 = 160.;
@@ -151,5 +160,21 @@ impl Element for Rows {
         for item in items {
             item.paint(window, cx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::grid;
+
+    #[test]
+    fn a_grid_fills_its_width() {
+        // Three cards of 300 with two gaps of 18 need 936.
+        assert_eq!(grid(936., 300., 18., 1, usize::MAX), (3, 300.));
+        assert_eq!(grid(935., 300., 18., 1, usize::MAX), (2, 458.));
+        // Never fewer than `least`, never more than `most`.
+        assert_eq!(grid(100., 300., 18., 1, usize::MAX), (1, 100.));
+        assert_eq!(grid(100., 300., 18., 2, usize::MAX), (2, 41.));
+        assert_eq!(grid(936., 300., 18., 1, 2), (2, 459.));
     }
 }

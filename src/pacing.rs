@@ -451,18 +451,26 @@ pub fn late(tick_ns: u64, now_ns: u64, period_ns: u64) -> bool {
     tick_ns != 0 && now_ns.saturating_sub(tick_ns) >= period_ns * 3 / 2
 }
 
-/// Histograms for `pacing clock`, in bins of 1 ms: where in the period the
-/// draws of the UI land after our tick, and the times between our ticks.
-static PHASES: std::sync::Mutex<[u32; 24]> = std::sync::Mutex::new([0; 24]);
-static INTERVALS: std::sync::Mutex<[u32; 24]> = std::sync::Mutex::new([0; 24]);
+/// A histogram in bins of 1 ms. Counters and no lock: the display link
+/// and each draw of the UI write one.
+type Bins = [AtomicU32; 24];
+
+/// Histograms for `pacing clock`: where in the period the draws of the UI
+/// land after our tick, and the times between our ticks.
+static PHASES: Bins = [const { AtomicU32::new(0) }; 24];
+static INTERVALS: Bins = [const { AtomicU32::new(0) }; 24];
 /// `outputTime - now` of the display link callback, and how long after
 /// its `now` the callback ran (with the trace on).
-static LEADS: std::sync::Mutex<[u32; 24]> = std::sync::Mutex::new([0; 24]);
-static WAKES: std::sync::Mutex<[u32; 24]> = std::sync::Mutex::new([0; 24]);
+static LEADS: Bins = [const { AtomicU32::new(0) }; 24];
+static WAKES: Bins = [const { AtomicU32::new(0) }; 24];
 
-fn bin(list: &std::sync::Mutex<[u32; 24]>, ns: u64) {
-    let bin = (ns / 1_000_000).min(23) as usize;
-    list.lock().unwrap()[bin] += 1;
+fn bin(list: &Bins, ns: u64) {
+    list[(ns / 1_000_000).min(23) as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The counts of a histogram since the last call.
+fn take_bins(list: &Bins) -> [u32; 24] {
+    std::array::from_fn(|bin| list[bin].swap(0, Ordering::Relaxed))
 }
 
 pub fn note_phase(ns: u64) {
@@ -481,7 +489,19 @@ pub fn ui_watching(seen_ns: u64, now_ns: u64) -> bool {
     seen_ns == 0 || now_ns.saturating_sub(seen_ns) < UI_GONE.as_nanos() as u64
 }
 
+/// Whether the frame mpv asks for is drawn. A repeat of the frame before
+/// is not, and no frame is while the window draws nothing. `unseen` says
+/// the frame before was not drawn for that reason: its repeat is then the
+/// first chance to draw the picture, and is taken.
+pub fn draws(repeat: bool, watching: bool, unseen: bool) -> bool {
+    watching && (!repeat || unseen)
+}
+
 // ----- counters for `dev/jctl pacing` -----------------------------------------
+//
+// The counters, the histograms, the phase loop and the trace are of the
+// process, not of a `Player`: one player with a render thread runs at a
+// time (the trailer has no display pacing). A second one would share them.
 
 /// Frames the UI held for the next tick, because its draw came after the
 /// frame of the same tick.
@@ -528,10 +548,10 @@ pub fn report() -> String {
         NO_SIZE.swap(0, Ordering::Relaxed),
         SYNCED.swap(0, Ordering::Relaxed),
         UNSYNCED.swap(0, Ordering::Relaxed),
-        std::mem::take(&mut *PHASES.lock().unwrap()),
-        std::mem::take(&mut *INTERVALS.lock().unwrap()),
-        std::mem::take(&mut *LEADS.lock().unwrap()),
-        std::mem::take(&mut *WAKES.lock().unwrap()),
+        take_bins(&PHASES),
+        take_bins(&INTERVALS),
+        take_bins(&LEADS),
+        take_bins(&WAKES),
     )
 }
 
@@ -885,7 +905,7 @@ impl Bloom {
             // screen <display id>` moves the window onto that display
             // (a test with a virtual display of another refresh rate).
             "screen" => screen_verb(arg, window),
-            _ => "error: pacing [clock | file <path> | front | poke | screen [<display>]]".into(),
+            _ => "error: pacing [clock | file <path> | front | hide | show | poke | speed <x> | stall <ms> | screen [<display>]]".into(),
         }
     }
 }
@@ -1848,6 +1868,29 @@ mod tests {
         assert_eq!(r.early, 0);
         assert!(r.late >= 72 && r.late <= r.unavoidable + r.spikes + 2, "{r:?}");
         assert!(r.steps.0 <= 5, "a step per settle time, then the floor: {r:?}");
+    }
+
+    /// A frame skipped while the window drew nothing is drawn at its
+    /// repeat, once the window draws again: before 2026-11-10 the repeat
+    /// was skipped as well, and the picture of before stayed up.
+    #[test]
+    fn a_frame_nobody_saw_is_drawn_at_its_repeat() {
+        assert!(draws(false, true, false));
+        assert!(!draws(true, true, false), "a repeat of a frame that was drawn");
+        assert!(!draws(false, false, false), "nobody draws");
+        assert!(!draws(true, false, true), "nobody draws yet");
+        assert!(draws(true, true, true), "the repeat of a frame nobody saw");
+    }
+
+    #[test]
+    fn the_histograms_count_and_empty_at_a_report() {
+        static LIST: Bins = [const { AtomicU32::new(0) }; 24];
+        bin(&LIST, 2_400_000);
+        bin(&LIST, 2_900_000);
+        bin(&LIST, 90_000_000);
+        let counts = take_bins(&LIST);
+        assert_eq!((counts[2], counts[23]), (2, 1));
+        assert_eq!(take_bins(&LIST), [0; 24]);
     }
 
     #[test]

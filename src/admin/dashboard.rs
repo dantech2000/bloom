@@ -18,6 +18,8 @@ use super::{
     ButtonKind, Confirm,
     activity::{PLAYED, collapse},
     ago, badge, button, card, fact, panel, parse_date,
+    plugin_config,
+    users::{avatar, icon_disc},
 };
 use crate::{
     app::Bloom,
@@ -252,14 +254,12 @@ pub fn refresh(client: &Client) -> Result<Live> {
             })
             .unwrap_or_default()
     };
-    let entries = |with_user: bool| {
+    // What the server did by itself: no user is named.
+    let alerts = || {
         client
             .get::<Entries>(
                 "/System/ActivityLog/Entries",
-                &[
-                    ("Limit", "7".to_string()),
-                    ("HasUserId", with_user.to_string()),
-                ],
+                &[("Limit", "7".to_string()), ("HasUserId", "false".to_string())],
             )
             .map(|e| e.items)
             .unwrap_or_default()
@@ -269,7 +269,7 @@ pub fn refresh(client: &Client) -> Result<Live> {
             client.get::<Vec<Task>>("/ScheduledTasks", &[("IsHidden", "false".to_string())])
         });
         let activity = scope.spawn(played);
-        let alerts = scope.spawn(|| entries(false));
+        let alerts = scope.spawn(alerts);
         let devices = scope.spawn(|| client.get::<Devices>("/Devices", &[]));
         let mut sessions: Vec<Session> = client.get(
             "/Sessions",
@@ -474,17 +474,7 @@ fn server_card(data: &Data, wide: bool, cx: &mut Context<Bloom>) -> Div {
         .items_center()
         .gap(px(16.))
         .min_w_0()
-        .child(
-            div()
-                .size(px(56.))
-                .flex_shrink_0()
-                .rounded_full()
-                .bg(rgba(super::DISC))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(icon(LucideIcon::Server, 28., t.colors.foreground)),
-        )
+        .child(icon_disc(LucideIcon::Server, t.colors.foreground, 56.))
         .child(
             div()
                 .min_w_0()
@@ -557,18 +547,18 @@ fn count_tiles(data: &Data, width: f32, cx: &mut Context<Bloom>) -> Div {
         .count() as u64;
     // The main kinds always show; the others only when the server has some.
     let all = [
-        (LucideIcon::Film, "Movies", c.movie_count, 0x6ea8ff, true),
-        (LucideIcon::Tv, "Series", c.series_count, 0xb38cff, true),
-        (LucideIcon::Clapperboard, "Episodes", c.episode_count, 0xff9e6e, true),
-        (LucideIcon::Layers, "Collections", c.box_set_count, 0x5fd3a8, false),
-        (LucideIcon::Disc3, "Albums", c.album_count, 0xf2c14e, false),
-        (LucideIcon::Music, "Songs", c.song_count, 0xf2c14e, false),
-        (LucideIcon::CirclePlay, "Music Videos", c.music_video_count, 0xff7eb6, false),
-        (LucideIcon::Library, "Books", c.book_count, 0x8fd3ff, false),
-        (LucideIcon::MonitorPlay, "Trailers", c.trailer_count, 0xff7eb6, false),
-        (LucideIcon::Activity, "Active Streams", streams, 0x5fd38a, true),
+        (LucideIcon::Film, "Movies", c.movie_count, true),
+        (LucideIcon::Tv, "Series", c.series_count, true),
+        (LucideIcon::Clapperboard, "Episodes", c.episode_count, true),
+        (LucideIcon::Layers, "Collections", c.box_set_count, false),
+        (LucideIcon::Disc3, "Albums", c.album_count, false),
+        (LucideIcon::Music, "Songs", c.song_count, false),
+        (LucideIcon::CirclePlay, "Music Videos", c.music_video_count, false),
+        (LucideIcon::Library, "Books", c.book_count, false),
+        (LucideIcon::MonitorPlay, "Trailers", c.trailer_count, false),
+        (LucideIcon::Activity, "Active Streams", streams, true),
     ];
-    let tiles: Vec<_> = all.into_iter().filter(|t| t.4 || t.2 > 0).collect();
+    let tiles: Vec<_> = all.into_iter().filter(|t| t.3 || t.2 > 0).collect();
     // A phone fits two tiles a row.
     let tile_min = if crate::views::shell::compact_now() { 150. } else { 190. };
     let columns = ((width + GAP) / (tile_min + GAP)).floor().clamp(1., tiles.len() as f32);
@@ -578,7 +568,7 @@ fn count_tiles(data: &Data, width: f32, cx: &mut Context<Bloom>) -> Div {
         .flex()
         .flex_wrap()
         .gap(px(GAP))
-        .children(tiles.into_iter().map(|(glyph, label, count, _, _)| {
+        .children(tiles.into_iter().map(|(glyph, label, count, _)| {
             card(cx)
                 .w(px(tile_w))
                 // A set least and most width spares a layout pass (`Bloom::render_settings`).
@@ -587,17 +577,7 @@ fn count_tiles(data: &Data, width: f32, cx: &mut Context<Bloom>) -> Div {
                 .flex_row()
                 .items_center()
                 .gap(px(14.))
-                .child(
-                    div()
-                        .size(px(44.))
-                        .flex_shrink_0()
-                        .rounded_full()
-                        .bg(rgba(super::DISC))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(icon(glyph, 21., t.colors.foreground)),
-                )
+                .child(icon_disc(glyph, t.colors.foreground, 44.))
                 .child(
                     div()
                         .min_w_0()
@@ -679,25 +659,11 @@ fn session_card(
 ) -> gpui_kit::AnyElement {
     let t = UiTheme::read(cx).clone();
     let user = session.user_name.clone().unwrap_or_default();
-    let avatar = match (&session.user_id, &session.user_primary_image_tag) {
-        (Some(id), Some(tag)) => div().size(px(36.)).flex_shrink_0().relative().child(
-            crate::images::remote_with(client.user_image_url(id, tag), px(18.), ObjectFit::Cover)
-                .absolute()
-                .inset_0(),
-        ),
-        _ => div()
-            .size(px(36.))
-            .flex_shrink_0()
-            .rounded_full()
-            .bg(rgba(0xffffff2e))
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_size(px(15.))
-            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-            .text_color(t.colors.foreground)
-            .child(user.chars().next().unwrap_or('?').to_uppercase().to_string()),
+    let image = match (&session.user_id, &session.user_primary_image_tag) {
+        (Some(id), Some(tag)) => Some(client.user_image_url(id, tag)),
+        _ => None,
     };
+    let avatar = avatar(&user, image, 36.);
     let device = format!(
         "{} {} · {}",
         session.client, session.application_version, session.device_name
@@ -793,10 +759,7 @@ fn session_card(
         (Some("DirectStream"), _) => badge("Direct Stream", rgb(BLUE)),
         _ => badge("Direct Play", rgb(GREEN)),
     };
-    let title = match (&item.series_name, item.episode_code()) {
-        (Some(series), _) => series.clone(),
-        _ => item.name.clone(),
-    };
+    let title = item.series_name.clone().unwrap_or_else(|| item.name.clone());
     let subtitle = match (&item.series_name, item.episode_code()) {
         (Some(_), Some(code)) => format!("{code} · {}", item.name),
         (Some(_), None) => item.name.clone(),
@@ -934,29 +897,15 @@ fn transcode_line(info: &Transcoding) -> String {
         serde_json::Value::Array(list) => list
             .iter()
             .filter_map(|r| r.as_str())
-            .map(spaced)
+            .map(plugin_config::label)
             .collect(),
-        serde_json::Value::String(text) => text.split(',').map(|r| spaced(r.trim())).collect(),
+        serde_json::Value::String(text) => text.split(',').map(|r| plugin_config::label(r.trim())).collect(),
         _ => Vec::new(),
     };
     if !reasons.is_empty() {
         parts.push(reasons.join(", "));
     }
     parts.join(" · ")
-}
-
-/// "VideoCodecNotSupported" as "Video codec not supported".
-fn spaced(name: &str) -> String {
-    let mut out = String::new();
-    for (i, ch) in name.chars().enumerate() {
-        if ch.is_uppercase() && i > 0 {
-            out.push(' ');
-            out.extend(ch.to_lowercase());
-        } else {
-            out.push(ch);
-        }
-    }
-    out
 }
 
 fn device_glyph(client: &str, device: &str) -> LucideIcon {
@@ -1026,21 +975,7 @@ fn entries(title: &'static str, entries: &[Entry], empty: &'static str, cx: &mut
                 .flex()
                 .items_center()
                 .gap(px(12.))
-                .child(
-                    div()
-                        .size(px(30.))
-                        .flex_shrink_0()
-                        .rounded_full()
-                        .bg(rgba(super::DISC))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(icon(
-                            glyph,
-                            15.,
-                            super::state_color(tint).unwrap_or(t.colors.foreground),
-                        )),
-                )
+                .child(icon_disc(glyph, tint, 30.))
                 .child(
                     div()
                         .flex_1()

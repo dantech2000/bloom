@@ -18,14 +18,14 @@ use gpui_kit::{
 use crate::{
     app::Bloom,
     config::{Profile, Server, normalize_url},
-    jellyfin::{Branding, Client, User},
+    jellyfin::{Branding, Client, User, urls},
     ui::{
         glass::glass,
         input::{Input, InputEvent, InputState, Keyboard},
         motion::{Enter, enter},
         scroll_area::ScrollArea,
     },
-    views::cards::icon,
+    views::{cards::icon, parts::initial},
 };
 use crate::ui::tip::tip;
 
@@ -137,9 +137,7 @@ impl ConnectState {
 fn explain(err: &anyhow::Error, url: &str) -> String {
     use crate::connection::{Verdict, Why, classify, plain_words};
     let text = format!("{err:#}");
-    let host = url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
+    let host = host(url);
     // Nothing of the server answered: the same rule as the offline state.
     match classify(err) {
         Verdict::Unreachable(Why::Gateway(code)) => {
@@ -171,6 +169,24 @@ fn explain(err: &anyhow::Error, url: &str) -> String {
         format!("{host} refused the request ({}).", status(&text))
     } else {
         format!("Could not reach {host}. Check the address and your network connection.")
+    }
+}
+
+/// True when the server answered a request with 401. The text of an
+/// error has the status as "HTTP 401 at <path>"; a bare "401" can be part
+/// of an address or a port in the text of a network error, which then
+/// read "Wrong username or password".
+fn unauthorized(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("HTTP 401")
+}
+
+/// The profile of a user who has just signed in.
+fn profile_of(auth: &crate::jellyfin::AuthResult) -> Profile {
+    Profile {
+        user_id: auth.user.id.clone(),
+        name: auth.user.name.clone(),
+        token: auth.access_token.clone(),
+        image_tag: auth.user.primary_image_tag.clone(),
     }
 }
 
@@ -375,18 +391,12 @@ impl Bloom {
                 this.connect.signing_in = false;
                 match result {
                     Ok(auth) => {
-                        let profile = Profile {
-                            user_id: auth.user.id.clone(),
-                            name: auth.user.name.clone(),
-                            token: auth.access_token.clone(),
-                            image_tag: auth.user.primary_image_tag.clone(),
-                        };
                         this.connect.clear_password = true;
-                        this.add_profile(&server_id, profile, cx);
+                        this.add_profile(&server_id, profile_of(&auth), cx);
                     }
                     Err(err) => {
                         log::warn!("sign-in failed: {err:#}");
-                        this.connect.error = Some(if format!("{err:#}").contains("401") {
+                        this.connect.error = Some(if unauthorized(&err) {
                             "Wrong username or password.".to_string()
                         } else {
                             explain(&err, &url)
@@ -437,7 +447,7 @@ impl Bloom {
                     }
                     Err(err) => {
                         log::warn!("quick connect did not start: {err:#}");
-                        this.connect.error = Some(if format!("{err:#}").contains("401") {
+                        this.connect.error = Some(if unauthorized(&err) {
                             "Quick Connect is off on this server.".to_string()
                         } else {
                             explain(&err, &url)
@@ -496,15 +506,7 @@ impl Bloom {
             this.update(cx, |this, cx| {
                 this.connect.quick = None;
                 match outcome {
-                    Ok(auth) => {
-                        let profile = Profile {
-                            user_id: auth.user.id.clone(),
-                            name: auth.user.name.clone(),
-                            token: auth.access_token.clone(),
-                            image_tag: auth.user.primary_image_tag.clone(),
-                        };
-                        this.add_profile(&server_id, profile, cx);
-                    }
+                    Ok(auth) => this.add_profile(&server_id, profile_of(&auth), cx),
                     Err(text) => this.connect.error = Some(text),
                 }
                 cx.notify();
@@ -585,7 +587,7 @@ impl Bloom {
                             dialog.error = Some(if text.contains("HTTP 404") {
                                 "The server does not know this code. Check it and try again."
                                     .to_string()
-                            } else if text.contains("HTTP 403") || text.contains("401") {
+                            } else if text.contains("HTTP 403") || unauthorized(&err) {
                                 "The server did not accept the code.".to_string()
                             } else {
                                 "The server could not be reached.".to_string()
@@ -645,7 +647,7 @@ impl Bloom {
         let splash = server
             .as_ref()
             .filter(|_| self.connect.branding.splashscreen_enabled)
-            .map(|s| Client::new(&s.url, &self.config.device_id).splashscreen_url());
+            .map(|s| urls::splashscreen(&s.url));
 
         // The keyboard slides: the page scrolls to its end at each frame of
         // the slide (the scroll's reach is the last frame's, a step behind
@@ -925,17 +927,7 @@ impl Bloom {
                     .flex_col()
                     .gap(px(10.))
                     .child(label("Server address"))
-                    .child(
-                        Input::new(&self.connect.url)
-                            .keyboard(Keyboard::url())
-                            .aria_label("Server address")
-                            .disabled(probing)
-                            .w_full()
-                            .h(px(metrics().field_h))
-                            .when(crate::views::shell::compact_now(), |el| {
-                                el.text_size(px(17.)).line_height(px(22.))
-                            }),
-                    )
+                    .child(field(&self.connect.url, Keyboard::url(), "Server address").disabled(probing))
                     .children(self.error_note())
                     .child(
                         action(
@@ -962,7 +954,8 @@ impl Bloom {
 
     /// The user step: saved profiles, the users the server shows, the form.
     fn render_sign_in(&self, server: &Server, cx: &mut Context<Self>) -> Div {
-        let client = Client::new(&server.url, &self.config.device_id);
+        // The addresses of the pictures need no client (`jellyfin::urls`):
+        // a client holds a connection pool, and a render made one each.
 
         // Saved profiles: one click opens the session.
         let mut saved: Vec<Stateful<Div>> = Vec::new();
@@ -970,7 +963,7 @@ impl Bloom {
             let image = profile
                 .image_tag
                 .as_ref()
-                .map(|tag| client.user_image_url(&profile.user_id, tag));
+                .map(|tag| urls::user_image(&server.url, &profile.user_id, tag));
             let (sid, uid) = (server.id.clone(), profile.user_id.clone());
             let (sid2, uid2) = (server.id.clone(), profile.user_id.clone());
             let armed = self.connect.confirm.as_deref() == Some(&format!("profile.{uid2}"));
@@ -1029,7 +1022,7 @@ impl Bloom {
             let image = user
                 .primary_image_tag
                 .as_ref()
-                .map(|tag| client.user_image_url(&user.id, tag));
+                .map(|tag| urls::user_image(&server.url, &user.id, tag));
             let name = user.name.clone();
             let needs_password = user.has_password;
             public.push(
@@ -1072,28 +1065,8 @@ impl Bloom {
             .when(!saved.is_empty() || !public.is_empty(), |el| {
                 el.child(label("Sign in as another user"))
             })
-            .child(
-                Input::new(&self.connect.username)
-                    .keyboard(Keyboard::username())
-                    .aria_label("Username")
-                    .disabled(busy)
-                    .w_full()
-                    .h(px(metrics().field_h))
-                    .when(crate::views::shell::compact_now(), |el| {
-                        el.text_size(px(17.)).line_height(px(22.))
-                    }),
-            )
-            .child(
-                Input::new(&self.connect.password)
-                    .keyboard(Keyboard::password())
-                    .aria_label("Password")
-                    .disabled(busy)
-                    .w_full()
-                    .h(px(metrics().field_h))
-                    .when(crate::views::shell::compact_now(), |el| {
-                        el.text_size(px(17.)).line_height(px(22.))
-                    }),
-            )
+            .child(field(&self.connect.username, Keyboard::username(), "Username").disabled(busy))
+            .child(field(&self.connect.password, Keyboard::password(), "Password").disabled(busy))
             .children(self.error_note())
             .child(
                 action(
@@ -1330,16 +1303,9 @@ impl Bloom {
                                         )),
                                 )
                                 .child(
-                                    Input::new(&self.connect.code)
-                                        .keyboard(Keyboard::code())
-                                        .aria_label("Quick Connect code")
+                                    field(&self.connect.code, Keyboard::code(), "Quick Connect code")
                                         .disabled(busy)
-                                        .invalid(dialog.error.is_some())
-                                        .w_full()
-                                        .h(px(metrics().field_h))
-                                        .when(crate::views::shell::compact_now(), |el| {
-                                            el.text_size(px(17.)).line_height(px(22.))
-                                        }),
+                                        .invalid(dialog.error.is_some()),
                                 )
                                 .when_some(dialog.error.clone(), |el, error| {
                                     el.child(
@@ -1397,6 +1363,9 @@ const FIELD_H: f32 = 44.;
 /// width on a 402 pt screen. The Mac keeps its sizes.
 struct Metrics {
     field_h: f32,
+    /// Size and line height of the text of a field; the Mac keeps the
+    /// field's own.
+    field_text: Option<(f32, f32)>,
     button_text: f32,
     label_text: f32,
     link_text: f32,
@@ -1405,11 +1374,43 @@ struct Metrics {
 
 fn metrics() -> Metrics {
     if crate::views::shell::compact_now() {
-        Metrics { field_h: 50., button_text: 17., label_text: 13., link_text: 15., pad: 24. }
+        Metrics {
+            field_h: 50.,
+            field_text: Some((17., 22.)),
+            button_text: 17.,
+            label_text: 13.,
+            link_text: 15.,
+            pad: 24.,
+        }
     } else {
-        Metrics { field_h: FIELD_H, button_text: 15., label_text: 12., link_text: 13., pad: 32. }
+        Metrics {
+            field_h: FIELD_H,
+            field_text: None,
+            button_text: 15.,
+            label_text: 12.,
+            link_text: 13.,
+            pad: 32.,
+        }
     }
 }
+
+/// A text field across the card, in the sizes of `metrics`.
+fn field(
+    state: &gpui_kit::Entity<InputState>,
+    keyboard: Keyboard,
+    label: &'static str,
+) -> Input {
+    let m = metrics();
+    Input::new(state)
+        .keyboard(keyboard)
+        .aria_label(label)
+        .w_full()
+        .h(px(m.field_h))
+        .when_some(m.field_text, |el, (size, line)| {
+            el.text_size(px(size)).line_height(px(line))
+        })
+}
+
 /// Time between two questions about a Quick Connect code.
 const QUICK_POLL: Duration = Duration::from_secs(3);
 /// The app stops the wait for an approval after this time.
@@ -1492,11 +1493,6 @@ fn link(id: &'static str, text: &'static str) -> Stateful<Div> {
 
 /// A user as a round picture with the name under it.
 fn person(id: SharedString, name: &str, image: Option<String>) -> Stateful<Div> {
-    let initial: String = name
-        .chars()
-        .next()
-        .map(|c| c.to_uppercase().to_string())
-        .unwrap_or_default();
     div()
         .id(id)
         .role(gpui_kit::Role::Button)
@@ -1526,7 +1522,7 @@ fn person(id: SharedString, name: &str, image: Option<String>) -> Stateful<Div> 
                 .justify_center()
                 .text_size(px(28.))
                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                .child(initial)
+                .child(initial(name))
                 .when_some(image, |el, url| {
                     el.child(
                         crate::images::remote_with(url, px(36.), ObjectFit::Cover)
@@ -1545,4 +1541,27 @@ fn person(id: SharedString, name: &str, image: Option<String>) -> Stateful<Div> 
                 .truncate()
                 .child(name.to_string()),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A sign-in that failed on the network read "Wrong username or
+    /// password" when the text of the error had "401" in an address.
+    #[test]
+    fn only_a_401_of_the_server_is_a_wrong_password() {
+        let refused = anyhow::anyhow!("HTTP 401 at /Users/AuthenticateByName");
+        assert!(unauthorized(&refused));
+        let network = anyhow::anyhow!("io: connection refused to 10.0.4.1:8401");
+        assert!(!unauthorized(&network));
+        let gateway = anyhow::anyhow!("HTTP 502 at /Users/AuthenticateByName");
+        assert!(!unauthorized(&gateway));
+    }
+
+    #[test]
+    fn the_host_of_an_address() {
+        assert_eq!(host("https://media.example.com"), "media.example.com");
+        assert_eq!(host("http://192.168.1.2:8096"), "192.168.1.2:8096");
+    }
 }

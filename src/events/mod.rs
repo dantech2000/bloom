@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Events for other programs: what the player does, as it happens, as one
-//! line of JSON for each event on a socket of this Mac. A program reads the
+//! line of JSON for each event on a socket of this machine. A program reads the
 //! lines and does what its user wants with them (dims the lights at the
 //! start of a film, sets a status). The design is in
 //! `specs/outbound-events.md`; this is its first stage, a proof of concept.
@@ -34,7 +34,7 @@ mod ui;
 pub use colours::{artwork_colour, picture_bands};
 pub use diff::{ItemInfo, Snapshot, between};
 pub use hub::hub;
-pub use lights::{Lights, FilmColour, lights_path};
+pub use lights::{FilmColour, Lights, lights_path};
 pub use tap::State;
 
 /// The version of the format. 0 while the feature is a proof of concept:

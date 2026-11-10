@@ -1,37 +1,66 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! SyncPlay in the app: the threads that feed the session, what the app
-//! does with its answers, and the panel of the groups.
+//! SyncPlay in the app: the tasks that feed the session, what the app
+//! does with its answers, and the panel of the groups. The socket of the
+//! server and its news are in `crate::socket`.
 
 use std::{collections::HashMap, time::Duration};
 
 use gpui_icons::LucideIcon;
 use gpui_kit::{
     ClickEvent, Context, Div, InteractiveElement as _, MouseButton, MouseDownEvent,
-    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled, Task, Window, div,
-    prelude::FluentBuilder as _, px, rgba,
+    ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _, Styled, Task,
+    Window, div, prelude::FluentBuilder as _, px, rgba,
 };
 
 use super::{
-    core::{Intent, Notice},
-    protocol::{GroupInfo, GroupState},
+    core::{Intent, Notice, PhaseKind},
+    protocol::{GroupInfo, GroupState, RepeatMode, ShuffleMode, same_id},
     session::{Session, Ui},
 };
 use crate::{
-    app::{Bloom, Page, Panel},
-    jellyfin::{Item, ItemKind},
-    realtime::{self, Realtime},
+    app::{Bloom, Panel},
+    jellyfin::{Item, ItemKind, ItemQuery},
+    socket::ServerSocket,
     ui::{glass::glass, scroll_area::ScrollArea, theme::UiTheme, tip::tip},
     views::cards::icon,
 };
 
 /// Width of the panel.
 const PANEL_W: f32 = 420.;
+/// Titles of queue items asked of the server in one request.
+const TITLES_AT_ONCE: usize = 40;
+
+/// A small button at the end of a row of the queue.
+fn queue_button(
+    id: String,
+    glyph: LucideIcon,
+    hint: &'static str,
+    intent: Intent,
+    cx: &mut Context<Bloom>,
+) -> Stateful<Div> {
+    div()
+        .id(SharedString::from(id))
+        .size(px(28.))
+        .rounded(px(8.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .hover(|s| s.bg(rgba(0xffffff29)))
+        .tooltip(tip(hint))
+        .child(icon(glyph, 15., rgba(0xf5f5f7b3)))
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+            this.sync_user(intent.clone(), cx)
+        }))
+}
 
 /// SyncPlay as the app holds it.
 #[derive(Default)]
 pub struct SyncState {
     pub session: Option<Session>,
-    realtime: Option<Realtime>,
+    /// The socket of the server. It is here for the callers that reach it
+    /// through `sync`; its code is `crate::socket`.
+    pub socket: ServerSocket,
     tasks: Vec<Task<()>>,
     /// What the server lets this user do: "CreateAndJoinGroups",
     /// "JoinGroups" or "None".
@@ -43,20 +72,6 @@ pub struct SyncState {
     pub titles: HashMap<String, String>,
     /// The player must get the keyboard focus at the next frame.
     pub focus_player: bool,
-    /// Waits for the news of the server to go quiet before a page loads
-    /// again; a scan of the library sends a message for every few items.
-    news: Option<Task<()>>,
-    /// The news that waits is about the library, not only about the user.
-    news_library: bool,
-    /// News waits for its quiet moment.
-    news_pending: bool,
-    /// When the first message that no reload has handled arrived.
-    news_first: Option<std::time::Instant>,
-    /// A reload came due while the player was open; it runs when the
-    /// player closes.
-    news_owed: bool,
-    /// What the news did, for the debug command `events`.
-    pub news_stats: crate::news::NewsStats,
     /// The load of the group's item whose answer is wanted, see
     /// `sync_now_playing`.
     now_playing_load: crate::app::Revision,
@@ -75,7 +90,7 @@ impl SyncState {
     /// to decide, and the app must not close it.
     pub fn holds_player(&self) -> bool {
         self.session.as_ref().is_some_and(|s| {
-            s.core.following() && (s.core.loaded().is_some() || s.core.phase_name() == "loading")
+            s.core.following() && (s.core.loaded().is_some() || s.core.phase() == PhaseKind::Loading)
         })
     }
 
@@ -86,13 +101,7 @@ impl SyncState {
     /// Sends a message over the socket of the server, such as a
     /// subscription. False without a socket.
     pub fn socket_send(&self, kind: &str, data: Option<serde_json::Value>) -> bool {
-        match &self.realtime {
-            Some(realtime) => {
-                realtime.send(kind, data);
-                true
-            }
-            None => false,
-        }
+        self.socket.send(kind, data)
     }
 }
 
@@ -109,26 +118,17 @@ impl Bloom {
         if crate::options::options().no_socket {
             return;
         }
-        let (realtime, socket) = realtime::start(client.clone());
-        let (mut session, exchanges) = Session::new(client, self.player.clone());
+        self.start_socket(client.clone(), cx);
+        let (mut session, found) = Session::new(client, self.player.clone());
         session.core.correct = self.config.sync_correction.unwrap_or(true);
         session.clock.extra_offset = -self.config.sync_offset_ms;
         let events = self.player.events();
-        self.sync.realtime = Some(realtime);
         self.sync.session = Some(session);
         self.sync.tasks = vec![
             cx.spawn(async move |this, cx| {
-                while let Ok(event) = socket.recv().await {
-                    let fed = this.update(cx, |this, cx| this.on_socket_event(event, cx));
-                    if fed.is_err() {
-                        break;
-                    }
-                }
-            }),
-            cx.spawn(async move |this, cx| {
-                while let Ok(exchange) = exchanges.recv().await {
+                while let Ok(found) = found.recv().await {
                     let fed = this.update(cx, |this, cx| {
-                        let ui = this.sync.session.as_mut().map(|s| s.exchange(exchange));
+                        let ui = this.sync.session.as_mut().map(|s| s.background(found));
                         this.sync_apply(ui.unwrap_or_default(), cx);
                     });
                     if fed.is_err() {
@@ -166,41 +166,20 @@ impl Bloom {
         ];
     }
 
-    /// A message of the socket: a real one, or one the debug command
-    /// `socket-inject` makes. Both go the same way.
-    pub fn on_socket_event(&mut self, event: realtime::SocketEvent, cx: &mut Context<Self>) {
-        if let realtime::SocketEvent::Message { kind, .. } = &event {
-            self.sync.news_stats.message(kind);
-        }
-        // Remote control reads the socket as well.
-        self.cast_socket(&event, cx);
-        // A socket that opens again may mean another network.
-        self.adaptive_socket(&event);
-        // A lost socket asks whether the server is there; one that opens
-        // again ends the offline state.
-        self.connection_socket(&event, cx);
-        let ui = match self.sync.session.as_mut() {
-            Some(session) => session.socket(event),
-            // No session (the socket is off in a test instance): the news
-            // still reaches the pages.
-            None => match event {
-                realtime::SocketEvent::Message { kind, data } => vec![Ui::Server { kind, data }],
-                _ => Vec::new(),
-            },
-        };
-        self.sync_apply(ui, cx);
-    }
-
-    /// Ends the session: on sign-out, and before a new one starts.
+    /// Ends the session: on sign-out, when the app goes offline, and before
+    /// a new one starts. A player that still plays is the user's own again.
     pub fn stop_sync(&mut self) {
-        if let Some(session) = &mut self.sync.session
-            && session.core.in_group()
-        {
-            session.user(Intent::Leave);
+        if let Some(session) = &mut self.sync.session {
+            let in_group = session.core.in_group();
+            session.end();
+            if in_group {
+                // The group played at one speed.
+                self.player.set_speed(self.speed as f64);
+            }
         }
         self.sync.tasks.clear();
         self.sync.session = None;
-        self.sync.realtime = None;
+        self.stop_socket();
         self.sync.groups.clear();
         self.close_panel(Panel::SyncPlay);
     }
@@ -223,7 +202,11 @@ impl Bloom {
                     // The poll of the player sees the end and closes the view.
                     self.start_player_poll(cx);
                 }
-                Ui::Server { kind, .. } => self.server_news(&kind, cx),
+                Ui::Failed(what) => {
+                    self.toast("SyncPlay", format!("{what} The server did not answer."), cx);
+                    // The panel may show a group that is not there any more.
+                    self.load_groups(cx);
+                }
             }
         }
         cx.notify();
@@ -313,63 +296,6 @@ impl Bloom {
                 }
             },
         );
-    }
-
-    /// News of the server that is not SyncPlay's: the pages that show what
-    /// changed load again, once the news has been quiet for a moment.
-    fn server_news(&mut self, kind: &str, cx: &mut Context<Self>) {
-        let Some(library) = crate::news::kind_of(kind) else {
-            return;
-        };
-        log::debug!("server news: {kind}");
-        self.sync.news_library |= library;
-        self.sync.news_pending = true;
-        let first = *self.sync.news_first.get_or_insert_with(std::time::Instant::now);
-        let wait = crate::news::delay(first.elapsed());
-        // A new message replaces the task; `delay` caps the total wait.
-        self.sync.news = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(wait).await;
-            this.update(cx, |this, cx| this.settle_news(cx)).ok();
-        }));
-    }
-
-    /// Runs the reload that the news asks for. While the player is open the
-    /// reload stays owed until the player closes.
-    fn settle_news(&mut self, cx: &mut Context<Self>) {
-        self.sync.news_first = None;
-        if self.player_open {
-            self.sync.news_owed = true;
-            return;
-        }
-        self.sync.news_owed = false;
-        let library = std::mem::take(&mut self.sync.news_library);
-        self.sync.news_pending = false;
-        let shows = match self.page {
-            Page::Home(_) => crate::news::Shows::Home,
-            Page::Library(_) => crate::news::Shows::Library,
-            _ => crate::news::Shows::Other,
-        };
-        let outcome = crate::news::outcome(library, shows, false);
-        log::info!("server news settled: {outcome:?}");
-        self.sync.news_stats.reloaded(&outcome);
-        if outcome.catalog {
-            self.reload_catalog(cx);
-        }
-        if outcome.page {
-            self.load_page(cx);
-        }
-    }
-
-    /// The player view closed: runs the reload that came due under it.
-    pub fn news_player_closed(&mut self, cx: &mut Context<Self>) {
-        if self.sync.news_owed {
-            self.settle_news(cx);
-        }
-    }
-
-    /// The counters of `events`.
-    pub fn news_describe(&self) -> String {
-        self.sync.news_stats.describe(self.sync.news_pending)
     }
 
     /// Plays items in the group when this player is in one. False when it
@@ -470,10 +396,22 @@ impl Bloom {
         self.fetch(
             cx,
             move |client| {
-                Ok(missing
-                    .into_iter()
-                    .filter_map(|id| client.item(&id).ok().map(|item| (id, item.display_title())))
-                    .collect::<Vec<_>>())
+                // One request for a set of items, not one for each: a
+                // season in the queue is some tens of them.
+                let mut titles = Vec::new();
+                for ids in missing.chunks(TITLES_AT_ONCE) {
+                    let query = ItemQuery { ids: ids.to_vec(), recursive: Some(true), ..Default::default() };
+                    match client.items(&query) {
+                        // By the id the queue has: the server writes an id
+                        // with hyphens in some places.
+                        Ok(found) => titles.extend(found.items.iter().filter_map(|item| {
+                            let id = ids.iter().find(|id| same_id(id, &item.id))?;
+                            Some((id.clone(), item.display_title()))
+                        })),
+                        Err(err) => log::warn!("syncplay: titles of the queue: {err:#}"),
+                    }
+                }
+                Ok(titles)
             },
             |this, result, cx| {
                 this.sync.titles.extend(result.unwrap_or_default());
@@ -491,9 +429,9 @@ impl Bloom {
         let state = if !session.core.following() {
             "not following"
         } else {
-            match (session.core.phase_name(), group.state) {
-                ("loading", _) => "loading",
-                ("catching-up" | "seeking", _) => "catching up",
+            match (session.core.phase(), group.state) {
+                (PhaseKind::Loading, _) => "loading",
+                (PhaseKind::CatchingUp | PhaseKind::Seeking, _) => "catching up",
                 (_, GroupState::Waiting) => "waiting for a member",
                 (_, GroupState::Paused) => "paused",
                 (_, GroupState::Playing) => "in sync",
@@ -649,9 +587,11 @@ impl Bloom {
                             .get(&item.item_id)
                             .cloned()
                             .unwrap_or_else(|| "…".to_string());
-                        let (jump, remove) = (item.playlist_item_id.clone(), item.playlist_item_id.clone());
+                        let id = &item.playlist_item_id;
+                        let jump = id.clone();
+                        let moved = |new_index| Intent::Move { playlist_item_id: id.clone(), new_index };
                         list = list.child(
-                            row(SharedString::from(format!("sync.queue.{}", item.playlist_item_id)))
+                            row(SharedString::from(format!("sync.queue.{id}")))
                                 .when(playing, |el| el.bg(rgba(0xffffff1f)))
                                 .child(
                                     div()
@@ -665,72 +605,20 @@ impl Bloom {
                                     this.sync_user(Intent::Jump { playlist_item_id: jump.clone() }, cx)
                                 }))
                                 .children((n > 0).then(|| {
-                                    let moved = item.playlist_item_id.clone();
-                                    div()
-                                        .id(SharedString::from(format!("sync.up.{moved}")))
-                                        .size(px(28.))
-                                        .rounded(px(8.))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .hover(|s| s.bg(rgba(0xffffff29)))
-                                        .tooltip(tip("Move up"))
-                                        .child(icon(LucideIcon::ChevronUp, 15., soft))
-                                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            this.sync_user(
-                                                Intent::Move {
-                                                    playlist_item_id: moved.clone(),
-                                                    new_index: n - 1,
-                                                },
-                                                cx,
-                                            )
-                                        }))
+                                    queue_button(format!("sync.up.{id}"), LucideIcon::ChevronUp, "Move up", moved(n - 1), cx)
                                 }))
                                 .children((n + 1 < queue.playlist.len()).then(|| {
-                                    let moved = item.playlist_item_id.clone();
-                                    div()
-                                        .id(SharedString::from(format!("sync.down.{moved}")))
-                                        .size(px(28.))
-                                        .rounded(px(8.))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .hover(|s| s.bg(rgba(0xffffff29)))
-                                        .tooltip(tip("Move down"))
-                                        .child(icon(LucideIcon::ChevronDown, 15., soft))
-                                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            this.sync_user(
-                                                Intent::Move {
-                                                    playlist_item_id: moved.clone(),
-                                                    new_index: n + 1,
-                                                },
-                                                cx,
-                                            )
-                                        }))
+                                    queue_button(format!("sync.down.{id}"), LucideIcon::ChevronDown, "Move down", moved(n + 1), cx)
                                 }))
-                                .when(!playing, |el| {
-                                    el.child(
-                                        div()
-                                            .id(SharedString::from(format!("sync.remove.{remove}")))
-                                            .size(px(28.))
-                                            .rounded(px(8.))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .hover(|s| s.bg(rgba(0xffffff29)))
-                                            .tooltip(tip("Remove from the queue"))
-                                            .child(icon(LucideIcon::X, 15., soft))
-                                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                                cx.stop_propagation();
-                                                this.sync_user(
-                                                    Intent::Remove { playlist_item_ids: vec![remove.clone()] },
-                                                    cx,
-                                                )
-                                            })),
+                                .children((!playing).then(|| {
+                                    queue_button(
+                                        format!("sync.remove.{id}"),
+                                        LucideIcon::X,
+                                        "Remove from the queue",
+                                        Intent::Remove { playlist_item_ids: vec![id.clone()] },
+                                        cx,
                                     )
-                                }),
+                                })),
                         );
                     }
                     let height = (queue.playlist.len() as f32 * 46.).min(230.);
@@ -739,23 +627,17 @@ impl Bloom {
                             ScrollArea::new("sync.queue.scroll").size_full().child(list),
                         ),
                     );
-                    let (shuffle, repeat) = (queue.shuffle_mode.clone(), queue.repeat_mode.clone());
-                    let next_shuffle = if shuffle == "Shuffle" { "Sorted" } else { "Shuffle" };
-                    let next_repeat = match repeat.as_str() {
-                        "RepeatNone" => "RepeatAll",
-                        "RepeatAll" => "RepeatOne",
-                        _ => "RepeatNone",
-                    };
+                    let (shuffle, repeat) = (queue.shuffle_mode, queue.repeat_mode);
                     body = body
                         .child(
                             row("sync.shuffle".into())
                                 .child(icon(LucideIcon::Shuffle, 18., t.colors.foreground))
                                 .child(label(
                                     "Shuffle".into(),
-                                    if shuffle == "Shuffle" { "On".into() } else { "Off".into() },
+                                    if shuffle == ShuffleMode::Shuffle { "On".into() } else { "Off".into() },
                                 ))
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.sync_user(Intent::Shuffle(next_shuffle.to_string()), cx)
+                                    this.sync_user(Intent::Shuffle(shuffle.next().to_string()), cx)
                                 })),
                         )
                         .child(
@@ -763,14 +645,14 @@ impl Bloom {
                                 .child(icon(LucideIcon::Repeat, 18., t.colors.foreground))
                                 .child(label(
                                     "Repeat".into(),
-                                    match repeat.as_str() {
-                                        "RepeatAll" => "The queue".into(),
-                                        "RepeatOne" => "This item".into(),
-                                        _ => "Off".into(),
+                                    match repeat {
+                                        RepeatMode::RepeatAll => "The queue".into(),
+                                        RepeatMode::RepeatOne => "This item".into(),
+                                        RepeatMode::RepeatNone => "Off".into(),
                                     },
                                 ))
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.sync_user(Intent::Repeat(next_repeat.to_string()), cx)
+                                    this.sync_user(Intent::Repeat(repeat.next().to_string()), cx)
                                 })),
                         );
                 }

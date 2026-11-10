@@ -1,6 +1,5 @@
 //! Nova menus composed from Kit buttons and popup positioning.
 use super::{
-    button::{ButtonSize, ButtonVariant, style_button},
     motion::{Enter, enter},
     theme::{UiTheme, apply_style},
 };
@@ -8,7 +7,7 @@ use gpui_icons::{LucideIcon, lucide};
 use gpui_kit::base::{Align, Button, ElementExt as _, Placement, Positioner};
 use gpui_kit::{
     AnyElement, App, Bounds, ClickEvent, Context, ElementId, Entity, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Point, Render,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Render,
     RenderOnce, Role, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled,
     Window, div, prelude::FluentBuilder as _,
 };
@@ -23,9 +22,10 @@ pub struct MenuItem {
     disabled: bool,
     checked: Option<bool>,
     radio: bool,
-    link: bool,
     handler: Option<Handler>,
-    children: Vec<MenuItem>,
+    /// Shared, so the copy of an entry a frame makes does not copy the
+    /// tree under it.
+    children: Rc<Vec<MenuItem>>,
     separator: bool,
     /// A heading: small, quiet text over a group of entries.
     heading: bool,
@@ -42,9 +42,8 @@ impl MenuItem {
             disabled: false,
             checked: None,
             radio: false,
-            link: false,
             handler: None,
-            children: Vec::new(),
+            children: Rc::new(Vec::new()),
             separator: false,
             heading: false,
             icon: None,
@@ -85,11 +84,6 @@ impl MenuItem {
         self.handler = Some(Rc::new(handler));
         self
     }
-    /// Marks a link; the caller handles navigation through `on_click`.
-    pub fn link(mut self) -> Self {
-        self.link = true;
-        self
-    }
     /// Creates an item containing another level of menu entries.
     pub fn submenu(
         id: impl Into<ElementId>,
@@ -97,15 +91,15 @@ impl MenuItem {
         items: impl IntoIterator<Item = MenuItem>,
     ) -> Self {
         let mut item = Self::new(id, label);
-        item.children = items.into_iter().collect();
+        item.children = Rc::new(items.into_iter().collect());
         item
     }
-    /// Creates a non-interactive separator between menu entries.
     /// The text of an entry, for the debug channel; none for a separator.
     pub fn debug_label(&self) -> Option<String> {
         (!self.separator).then(|| self.label.to_string())
     }
 
+    /// Creates a non-interactive separator between menu entries.
     pub fn separator() -> Self {
         let mut item = Self::new("separator", "");
         item.separator = true;
@@ -122,17 +116,7 @@ impl MenuItem {
     }
 }
 
-/// A committed leaf action, including its new checked state when applicable.
-#[derive(Clone, Debug)]
-pub struct MenuEvent {
-    /// Indices from the root menu to the activated leaf.
-    pub path: Vec<usize>,
-    /// The committed checked state, or `None` for a plain action.
-    pub checked: Option<bool>,
-}
-impl gpui_kit::EventEmitter<MenuEvent> for MenuState {}
-
-/// Retained popup visibility, item state and keyboard navigation. Emits `MenuEvent` on leaf activation.
+/// Retained popup visibility, item state and keyboard navigation.
 pub struct MenuState {
     items: Vec<MenuItem>,
     open: bool,
@@ -192,10 +176,6 @@ impl MenuState {
         self.path.clear();
         self.highlighted = vec![self.items.iter().position(MenuItem::enabled)];
         cx.notify();
-    }
-    /// Returns the handle used by the menu trigger.
-    pub fn trigger_focus(&self) -> FocusHandle {
-        self.trigger.clone()
     }
     /// Opens the menu at its trigger and transfers keyboard focus into it.
     pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -259,16 +239,6 @@ impl MenuState {
         }
         cx.notify();
     }
-    pub(crate) fn submenu_key(&self, right: bool) -> bool {
-        if !right {
-            return !self.path.is_empty();
-        }
-        self.highlighted
-            .last()
-            .copied()
-            .flatten()
-            .is_some_and(|i| !self.level(self.path.len())[i].children.is_empty())
-    }
     fn level(&self, depth: usize) -> &[MenuItem] {
         let mut items = self.items.as_slice();
         for &index in self.path.iter().take(depth) {
@@ -312,23 +282,28 @@ impl MenuState {
                 .push(item.children.iter().position(MenuItem::enabled));
             cx.notify();
         } else {
-            let mut path = self.path[..depth].to_vec();
-            path.push(index);
             let checked = item.checked.map(|value| item.radio || !value);
             if let Some(checked) = checked {
                 let mut items = &mut self.items;
-                for &parent in &path[..depth] {
-                    items = &mut items[parent].children;
+                for &parent in &self.path[..depth] {
+                    items = Rc::make_mut(&mut items[parent].children);
                 }
                 if item.radio {
-                    for sibling in items.iter_mut().filter(|item| item.radio) {
+                    // The group of a radio entry: the radio entries next
+                    // to it, up to a separator or a heading. A menu can
+                    // hold two groups at one level (the sort key and the
+                    // direction of a library), and a choice in one cleared
+                    // the mark of the other.
+                    let group = |item: &MenuItem| item.radio && !item.separator && !item.heading;
+                    let first = items[..index].iter().rposition(|item| !group(item)).map_or(0, |n| n + 1);
+                    let end = items[index..].iter().position(|item| !group(item)).map_or(items.len(), |n| index + n);
+                    for sibling in &mut items[first..end] {
                         sibling.checked = Some(false);
                     }
                 }
                 items[index].checked = Some(checked);
             }
             self.close(true, window, cx);
-            cx.emit(MenuEvent { path, checked });
             if let Some(handler) = item.handler {
                 let event = event.clone();
                 window.defer(cx, move |window, cx| {
@@ -419,7 +394,6 @@ impl Focusable for MenuState {
 }
 impl Render for MenuState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = UiTheme::read(cx).clone();
         // Liquid glass prototype: in the light theme the ink inside the
         // panel is the dark ink of the theme (`ui::glass::liquid_light`);
         // otherwise the light ink, with the exact values of before (a
@@ -457,6 +431,7 @@ impl Render for MenuState {
         if !self.open {
             return root;
         }
+        let t = UiTheme::read(cx).clone();
         self.row_bounds.resize_with(self.path.len() + 1, Vec::new);
         self.popup_bounds
             .resize(self.path.len() + 1, Default::default());
@@ -591,8 +566,6 @@ impl Render for MenuState {
                 let submenu = !item.children.is_empty();
                 let role = if submenu {
                     Role::MenuItem
-                } else if item.link {
-                    Role::Link
                 } else if item.radio {
                     Role::MenuItemRadio
                 } else if item.checked.is_some() {
@@ -746,14 +719,12 @@ impl Render for MenuState {
 }
 
 #[derive(IntoElement)]
-/// A named menu trigger or context area backed by retained menu state.
+/// A named menu trigger backed by retained menu state. The trigger has no
+/// look of its own: its content is the whole button.
 pub struct Menu {
     state: Entity<MenuState>,
     label: SharedString,
-    disabled: bool,
-    context: Option<AnyElement>,
     trigger: Option<AnyElement>,
-    trigger_style: Option<Box<dyn FnOnce(Button) -> Button>>,
     style: StyleRefinement,
 }
 impl Menu {
@@ -762,31 +733,13 @@ impl Menu {
         Self {
             state: state.clone(),
             label: label.into(),
-            disabled: false,
-            context: None,
             trigger: None,
-            trigger_style: None,
             style: Default::default(),
         }
     }
     /// Supplies custom content for the named trigger button.
     pub fn trigger(mut self, child: impl IntoElement) -> Self {
         self.trigger = Some(child.into_any_element());
-        self
-    }
-    /// Replaces trigger styling while retaining menu behavior. Include a visible keyboard focus treatment.
-    pub fn trigger_style_with(mut self, style: impl FnOnce(Button) -> Button + 'static) -> Self {
-        self.trigger_style = Some(Box::new(style));
-        self
-    }
-    /// Disables interaction and applies the disabled appearance.
-    pub fn disabled(mut self, value: bool) -> Self {
-        self.disabled = value;
-        self
-    }
-    /// Replaces the button trigger with content that opens a menu on secondary click or Shift+F10.
-    pub fn context_area(mut self, child: impl IntoElement) -> Self {
-        self.context = Some(child.into_any_element());
         self
     }
 }
@@ -800,11 +753,9 @@ impl RenderOnce for Menu {
         let state = self.state.clone();
         let keyboard = state.clone();
         let measured = state.clone();
-        let context = self.context.is_some();
-        let disabled = self.disabled;
         let focus = state.read(cx).trigger.clone();
         let open = state.read(cx).open;
-        let mut base = div()
+        let base = div()
             .id(("menu-trigger", state.entity_id()))
             .relative()
             .on_prepaint(move |bounds, _, cx| {
@@ -816,67 +767,31 @@ impl RenderOnce for Menu {
             })
             .capture_key_down(move |event, window, cx| {
                 let key = event.keystroke.key.as_str();
-                if !disabled
-                    && keyboard.read(cx).trigger.is_focused(window)
-                    && ((!context && (key == "down" || key == "up"))
-                        || (context && key == "f10" && event.keystroke.modifiers.shift))
-                {
+                if keyboard.read(cx).trigger.is_focused(window) && (key == "down" || key == "up") {
                     keyboard.update(cx, |this, cx| this.open(window, cx));
                     cx.stop_propagation();
                 }
             });
-        if let Some(area) = self.context {
-            base = base
-                .track_focus(&focus.tab_stop(!disabled))
-                .aria_label(self.label)
-                // Keep the content's focus for selection and context-menu restoration.
-                .capture_any_mouse_down(|event, window, _| {
-                    if matches!(event.button, MouseButton::Left | MouseButton::Right) {
-                        window.prevent_default();
-                    }
-                })
-                .on_mouse_down(MouseButton::Right, move |event, window, cx| {
-                    if !disabled {
-                        state.update(cx, |this, cx| {
-                            this.open_at(Some(event.position), window, cx)
-                        });
-                        cx.stop_propagation();
-                    }
-                })
-                .child(area);
-        } else {
-            base = base.child(
-                Button::new(("menu-button", state.entity_id()))
-                    .track_focus(&focus)
-                    .tab_stop(focus.tab_stop)
-                    .disabled(disabled)
-                    .accessibility_label(self.label.clone())
-                    .aria_expanded(open)
-                    .map(|button| match self.trigger_style {
-                        Some(style) => style(button),
-                        None => style_button(
-                            button,
-                            disabled,
-                            ButtonVariant::Outline,
-                            ButtonSize::Default,
-                            UiTheme::read(cx),
-                        ),
+        let base = base.child(
+            Button::new(("menu-button", state.entity_id()))
+                .track_focus(&focus)
+                .tab_stop(focus.tab_stop)
+                .accessibility_label(self.label.clone())
+                .aria_expanded(open)
+                .on_click(move |_, window, cx| {
+                    state.update(cx, |this, cx| {
+                        if this.open {
+                            this.close(true, window, cx);
+                        } else {
+                            this.open(window, cx);
+                        }
                     })
-                    .on_click(move |_, window, cx| {
-                        state.update(cx, |this, cx| {
-                            if this.open {
-                                this.close(true, window, cx);
-                            } else {
-                                this.open(window, cx);
-                            }
-                        })
-                    })
-                    .child(
-                        self.trigger
-                            .unwrap_or_else(|| self.label.into_any_element()),
-                    ),
-            );
-        }
+                })
+                .child(
+                    self.trigger
+                        .unwrap_or_else(|| self.label.into_any_element()),
+                ),
+        );
         apply_style(base.child(self.state), &self.style)
     }
 }
@@ -911,6 +826,21 @@ mod tests {
                 assert_eq!(menu.items[2].checked, Some(true));
                 menu.activate(0, 3, &ClickEvent::default(), window, cx);
                 assert_eq!(menu.items[3].checked, Some(true));
+                // Two groups at one level: a choice in the second leaves
+                // the mark of the first.
+                menu.set_items(
+                    [
+                        MenuItem::new("name", "Name").radio(true),
+                        MenuItem::new("date", "Date").radio(false),
+                        MenuItem::separator(),
+                        MenuItem::new("up", "Ascending").radio(true),
+                        MenuItem::new("down", "Descending").radio(false),
+                    ],
+                    cx,
+                );
+                menu.activate(0, 4, &ClickEvent::default(), window, cx);
+                let marks: Vec<Option<bool>> = menu.items.iter().map(|item| item.checked).collect();
+                assert_eq!(marks, [Some(true), Some(false), None, Some(false), Some(true)]);
             })
             .unwrap();
     }

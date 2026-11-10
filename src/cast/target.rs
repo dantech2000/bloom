@@ -115,10 +115,7 @@ impl Target {
     /// sent to the engine makes AirPlay the target; the end of external
     /// playback, or of a local run, gives it up.
     pub fn after_airplay(self, event: &AirPlayEvent, status: &AirPlayStatus) -> Target {
-        let loaded = matches!(
-            status.state,
-            AirPlayState::Loading | AirPlayState::Playing | AirPlayState::Paused | AirPlayState::Buffering
-        );
+        let loaded = airplay_loaded(status.state);
         match event {
             AirPlayEvent::External(true) | AirPlayEvent::Loaded { .. } => Target::AirPlay,
             AirPlayEvent::State(AirPlayState::Loading) => Target::AirPlay,
@@ -142,7 +139,6 @@ impl Target {
 /// its kind. A control the kind lacks is hidden (`can_*`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TargetView {
-    pub kind: Option<Kind>,
     pub name: String,
     /// A second line under the name: the client, the model, or the kind.
     pub detail: String,
@@ -174,7 +170,7 @@ pub struct TargetView {
 impl TargetView {
     /// This device.
     pub fn local() -> Self {
-        Self { kind: Some(Kind::Local), name: "This device".into(), detail: "Plays here".into(), connected: true, ..Default::default() }
+        Self { name: "This device".into(), detail: "Plays here".into(), connected: true, ..Default::default() }
     }
 
     pub fn fraction(&self) -> f32 {
@@ -197,7 +193,6 @@ pub fn from_session(session: &SessionInfo, at: Option<Instant>) -> TargetView {
         if duration > 0. { moved.min(duration) } else { moved }
     };
     TargetView {
-        kind: Some(Kind::Jellyfin),
         name: session.device_name.clone(),
         detail: session.client.clone(),
         connected: true,
@@ -228,10 +223,9 @@ pub struct CastTracks {
 /// A cast device: the status of the connection, with the title of the item
 /// this app loaded on it (the device reports only the id).
 pub fn from_chromecast(device: &Device, status: &Status, title: Option<String>, tracks: CastTracks) -> TargetView {
-    let loaded = matches!(status.player_state.as_str(), "PLAYING" | "PAUSED" | "BUFFERING");
+    let loaded = status.loaded();
     let jellyfin_app = status.playing_jellyfin_app();
     TargetView {
-        kind: Some(Kind::Chromecast),
         name: device.name.clone(),
         detail: if device.model.is_empty() { "Chromecast".into() } else { device.model.clone() },
         connected: status.connected,
@@ -253,20 +247,21 @@ pub fn from_chromecast(device: &Device, status: &Status, title: Option<String>, 
     }
 }
 
+/// The AirPlay engine holds an item: the transport shows.
+fn airplay_loaded(state: AirPlayState) -> bool {
+    matches!(state, AirPlayState::Loading | AirPlayState::Playing | AirPlayState::Paused | AirPlayState::Buffering)
+}
+
 /// The AirPlay engine: the item it holds, playing on the receiver or, in a
 /// local run, on this Mac.
 pub fn from_airplay(status: &AirPlayStatus) -> TargetView {
-    let loaded = matches!(
-        status.state,
-        AirPlayState::Loading | AirPlayState::Playing | AirPlayState::Paused | AirPlayState::Buffering
-    );
+    let loaded = airplay_loaded(status.state);
     let position = match status.position_at {
         Some(at) if status.state == AirPlayState::Playing => status.position + at.elapsed().as_secs_f64(),
         _ => status.position,
     };
     let position = if status.duration > 0. { position.min(status.duration) } else { position };
     TargetView {
-        kind: Some(Kind::AirPlay),
         name: "AirPlay".into(),
         detail: match (status.external, status.route.as_deref()) {
             (_, Some(route)) => route.to_string(),
@@ -385,7 +380,6 @@ mod tests {
     fn maps_a_jellyfin_session() {
         let s = session("s1", "TV");
         let view = from_session(&s, Some(Instant::now() - Duration::from_secs(2)));
-        assert_eq!(view.kind, Some(Kind::Jellyfin));
         assert_eq!(view.name, "TV");
         assert_eq!(view.detail, "Jellyfin Web");
         assert!(view.connected && view.loaded);
@@ -439,7 +433,6 @@ mod tests {
         };
         let tracks = CastTracks { audio_index: Some(2), subtitle_index: Some(-1) };
         let view = from_chromecast(&device("c1"), &status, Some("Film".into()), tracks);
-        assert_eq!(view.kind, Some(Kind::Chromecast));
         assert_eq!(view.name, "Living room");
         assert_eq!(view.detail, "Google TV");
         assert!(view.connected && view.loaded && !view.paused);
@@ -480,7 +473,6 @@ mod tests {
             ..Default::default()
         };
         let view = from_airplay(&status);
-        assert_eq!(view.kind, Some(Kind::AirPlay));
         assert_eq!(view.name, "AirPlay");
         assert_eq!(view.detail, "Apple TV or AirPlay device");
         assert!(view.loaded && !view.paused);

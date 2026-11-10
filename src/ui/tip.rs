@@ -13,7 +13,7 @@ struct Tip {
 }
 
 impl Render for Tip {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // gpui puts the view at the pointer; the space keeps it clear of it.
         div().pt(px(6.)).child(
             div()
@@ -24,7 +24,7 @@ impl Render for Tip {
                 .border_color(rgba(0xf5f5f733))
                 .bg(rgba(0x1c1c1cf2))
                 .shadow_md()
-                .font_family("Google Sans")
+                .font_family(super::theme::UiTheme::read(cx).fonts.body.clone())
                 .text_size(px(12.5))
                 .font_weight(gpui_kit::FontWeight::MEDIUM)
                 .text_color(rgba(0xf5f5f7f2))

@@ -4,7 +4,11 @@
 //! Each feature follows the setting of the user in the plugin; the profile
 //! menu can set it for this app alone.
 
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use gpui_icons::LucideIcon;
@@ -28,24 +32,119 @@ use crate::{
     },
 };
 
-/// The features with a switch, as config key and menu text.
-pub const TOGGLES: [(&str, &str); 11] = [
-    ("seerr_rows", "Seerr recommendations"),
-    ("links", "Seerr, Sonarr and Radarr links"),
-    ("rating_in_player", "Ratings in the player"),
-    ("auto_pause", "Pause when the window is hidden"),
-    ("auto_resume", "Resume when the window returns"),
-    ("auto_skip_intro", "Skip intros automatically"),
-    ("auto_skip_outro", "Skip credits automatically"),
-    ("shortcuts", "Enhanced keyboard shortcuts"),
-    ("bookmarks", "Bookmarks"),
-    ("hidden_content", "Hidden content"),
-    ("request_more", "Request more seasons"),
-];
+/// A feature with a switch. A name that does not exist does not compile
+/// (a key as text gave `false` for a typo).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Feature {
+    SeerrRows,
+    Links,
+    RatingInPlayer,
+    AutoPause,
+    AutoResume,
+    AutoSkipIntro,
+    AutoSkipOutro,
+    Shortcuts,
+    Bookmarks,
+    HiddenContent,
+    RequestMore,
+}
 
-/// Switches that exist only when the server has the feature on: the menu and
-/// the settings page leave the others out.
-pub const SERVER_GATED: [&str; 3] = ["bookmarks", "hidden_content", "request_more"];
+impl Feature {
+    /// In the order of the menu.
+    pub const ALL: [Feature; 11] = [
+        Feature::SeerrRows,
+        Feature::Links,
+        Feature::RatingInPlayer,
+        Feature::AutoPause,
+        Feature::AutoResume,
+        Feature::AutoSkipIntro,
+        Feature::AutoSkipOutro,
+        Feature::Shortcuts,
+        Feature::Bookmarks,
+        Feature::HiddenContent,
+        Feature::RequestMore,
+    ];
+
+    /// The key of the switch in the config file.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Feature::SeerrRows => "seerr_rows",
+            Feature::Links => "links",
+            Feature::RatingInPlayer => "rating_in_player",
+            Feature::AutoPause => "auto_pause",
+            Feature::AutoResume => "auto_resume",
+            Feature::AutoSkipIntro => "auto_skip_intro",
+            Feature::AutoSkipOutro => "auto_skip_outro",
+            Feature::Shortcuts => "shortcuts",
+            Feature::Bookmarks => "bookmarks",
+            Feature::HiddenContent => "hidden_content",
+            Feature::RequestMore => "request_more",
+        }
+    }
+
+    /// The text of the switch in the menu.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Feature::SeerrRows => "Seerr recommendations",
+            Feature::Links => "Seerr, Sonarr and Radarr links",
+            Feature::RatingInPlayer => "Ratings in the player",
+            Feature::AutoPause => "Pause when the window is hidden",
+            Feature::AutoResume => "Resume when the window returns",
+            Feature::AutoSkipIntro => "Skip intros automatically",
+            Feature::AutoSkipOutro => "Skip credits automatically",
+            Feature::Shortcuts => "Enhanced keyboard shortcuts",
+            Feature::Bookmarks => "Bookmarks",
+            Feature::HiddenContent => "Hidden content",
+            Feature::RequestMore => "Request more seasons",
+        }
+    }
+
+    /// A switch that exists only when the server has the feature on: the
+    /// menu and the settings page leave the others out.
+    pub const fn server_gated(self) -> bool {
+        matches!(self, Feature::Bookmarks | Feature::HiddenContent | Feature::RequestMore)
+    }
+
+    pub fn of(key: &str) -> Option<Feature> {
+        Feature::ALL.into_iter().find(|feature| feature.key() == key)
+    }
+}
+
+/// What names a feature: the feature, or its config key (the settings
+/// page and the debug channel have the key as text). TODO: the callers in
+/// other modules pass the key; they can pass the `Feature`.
+pub trait AsFeature {
+    fn feature(self) -> Option<Feature>;
+}
+
+impl AsFeature for Feature {
+    fn feature(self) -> Option<Feature> {
+        Some(self)
+    }
+}
+
+impl AsFeature for &str {
+    fn feature(self) -> Option<Feature> {
+        Feature::of(self)
+    }
+}
+
+impl AsFeature for &&str {
+    fn feature(self) -> Option<Feature> {
+        Feature::of(self)
+    }
+}
+
+/// The features with a switch, as config key and menu text.
+pub const TOGGLES: [(&str, &str); 11] = {
+    let mut toggles = [("", ""); 11];
+    let mut i = 0;
+    while i < toggles.len() {
+        toggles[i] = (Feature::ALL[i].key(), Feature::ALL[i].label());
+        i += 1;
+    }
+    toggles
+};
 
 /// Speed change of one key press.
 const SPEED_STEP: f32 = 0.25;
@@ -81,7 +180,7 @@ pub struct SubtitleStyle {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
     /// Server values of the switches in [`TOGGLES`].
-    flags: HashMap<&'static str, bool>,
+    flags: HashMap<Feature, bool>,
     pub seerr_similar: bool,
     pub seerr_recommended: bool,
     /// Leaves titles of the library out of the Seerr rows.
@@ -91,6 +190,13 @@ pub struct Settings {
     pub arr_links: bool,
     pub shortcuts: Vec<Shortcut>,
     pub subtitle: Option<SubtitleStyle>,
+}
+
+impl Settings {
+    /// The server value of a switch; off when the plugin did not say.
+    fn flag(&self, feature: Feature) -> bool {
+        self.flags.get(&feature).copied().unwrap_or(false)
+    }
 }
 
 /// What the detail page shows on top of the library's own data.
@@ -138,23 +244,35 @@ pub struct State {
 
 #[easy_ext::ext(EnhancedApi)]
 pub(crate) impl Client {
-    /// Settings of the user in the Jellyfin Enhanced plugin. `None` when the
-    /// server has no such plugin.
+    /// The settings, or none when they could not be read, whatever the
+    /// cause. The tests of the features read them this way.
+    #[cfg(test)]
     fn enhanced_settings(&self) -> Option<Settings> {
-        let public: Value = self.get("/JellyfinEnhanced/public-config", &[]).ok()?;
-        let user = self.user().ok()?.to_string();
-        let own: Value = self
-            .get(
-                &format!("/JellyfinEnhanced/user-settings/{user}/settings.json"),
-                &[],
-            )
-            .unwrap_or(Value::Null);
-        let keys: Value = self
-            .get(
-                &format!("/JellyfinEnhanced/user-settings/{user}/shortcuts.json"),
-                &[],
-            )
-            .unwrap_or(Value::Null);
+        self.read_enhanced_settings().ok().flatten()
+    }
+
+    /// Settings of the user in the Jellyfin Enhanced plugin. `None` when the
+    /// server has no such plugin; an error when the server did not say (it
+    /// did not answer, or was in trouble), so the caller can ask again.
+    fn read_enhanced_settings(&self) -> Result<Option<Settings>> {
+        let Ok(user) = self.user().map(str::to_string) else {
+            return Ok(None);
+        };
+        // The three requests run at the same time.
+        let (public, own, keys) = std::thread::scope(|scope| {
+            let file = |name: &'static str| {
+                let path = format!("/JellyfinEnhanced/user-settings/{user}/{name}");
+                scope.spawn(move || self.get::<Value>(&path, &[]).unwrap_or(Value::Null))
+            };
+            let (own, keys) = (file("settings.json"), file("shortcuts.json"));
+            let public = self.get::<Value>("/JellyfinEnhanced/public-config", &[]);
+            (public, own.join().unwrap_or(Value::Null), keys.join().unwrap_or(Value::Null))
+        });
+        let public = match public {
+            Ok(public) => public,
+            Err(err) if settings_unknown(crate::jellyfin::status_of(&err)) => return Err(err),
+            Err(_) => return Ok(None),
+        };
         // The user's own value wins over the server default.
         let flag = |name: &str| {
             own.get(name)
@@ -176,18 +294,18 @@ pub(crate) impl Client {
         let seerr_link = seerr && flag("JellyseerrShowDetailPageLink");
         let arr_links = flag("ArrLinksEnabled");
         let flags = HashMap::from([
-            ("seerr_rows", seerr_similar || seerr_recommended),
-            ("links", seerr_link || arr_links),
-            ("rating_in_player", flag("ShowRatingInPlayer")),
-            ("auto_pause", flag("AutoPauseEnabled")),
-            ("auto_resume", flag("AutoResumeEnabled")),
-            ("auto_skip_intro", flag("AutoSkipIntro")),
-            ("auto_skip_outro", flag("AutoSkipOutro")),
-            ("shortcuts", !flag("DisableAllShortcuts")),
-            ("bookmarks", public_flag("BookmarksEnabled", false)),
-            ("hidden_content", public_flag("HiddenContentEnabled", false)),
+            (Feature::SeerrRows, seerr_similar || seerr_recommended),
+            (Feature::Links, seerr_link || arr_links),
+            (Feature::RatingInPlayer, flag("ShowRatingInPlayer")),
+            (Feature::AutoPause, flag("AutoPauseEnabled")),
+            (Feature::AutoResume, flag("AutoResumeEnabled")),
+            (Feature::AutoSkipIntro, flag("AutoSkipIntro")),
+            (Feature::AutoSkipOutro, flag("AutoSkipOutro")),
+            (Feature::Shortcuts, !flag("DisableAllShortcuts")),
+            (Feature::Bookmarks, public_flag("BookmarksEnabled", false)),
+            (Feature::HiddenContent, public_flag("HiddenContentEnabled", false)),
             (
-                "request_more",
+                Feature::RequestMore,
                 seerr && public_flag("JellyseerrShowRequestMoreOnSeries", true),
             ),
         ]);
@@ -272,7 +390,7 @@ pub(crate) impl Client {
             }
         });
 
-        Some(Settings {
+        Ok(Some(Settings {
             flags,
             seerr_similar,
             seerr_recommended,
@@ -286,7 +404,7 @@ pub(crate) impl Client {
             arr_links,
             shortcuts,
             subtitle,
-        })
+        }))
     }
 
     /// Titles Seerr relates to a title: `list` is "similar" or
@@ -347,6 +465,33 @@ pub(crate) impl Client {
             })
             .collect()
     }
+}
+
+/// Whether a failed read of the plugin's settings says nothing about the
+/// plugin, by the status of the answer: no answer at all, or a server in
+/// trouble (5xx). Any other answer (404 above all) is "no such plugin".
+fn settings_unknown(status: Option<u16>) -> bool {
+    status.is_none_or(|code| code >= 500)
+}
+
+/// Waits before the settings of the plugin are asked for again, after a
+/// read that failed. Without them every feature of the plugin is off, and
+/// before, one failed request at the start left them off for the session.
+const SETTINGS_RETRIES: [Duration; 3] =
+    [Duration::from_secs(5), Duration::from_secs(30), Duration::from_secs(120)];
+
+/// The player has a subtitle look of the app or the plugin on it. It
+/// outlives a session, as the player does.
+static SUBTITLES_STYLED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the subtitle look goes to the player. A plain look (no plugin
+/// style, nothing set in the app) leaves the player as it is, but for a
+/// player that has a look on it: that one gets the plain look back.
+/// Before, a reset to the defaults in the settings left the old look on
+/// the video that played.
+fn style_goes(plain: bool, styled: &AtomicBool) -> bool {
+    let before = styled.swap(!plain, Ordering::Relaxed);
+    !plain || before
 }
 
 /// "#RRGGBBAA" as mpv writes a colour: "#AARRGGBB".
@@ -410,48 +555,52 @@ fn app_in_view() -> bool {
 }
 
 impl Bloom {
-    /// True when a feature of [`TOGGLES`] is on: the choice made in this
-    /// app, or else the user's setting in the plugin.
-    pub fn je(&self, key: &str) -> bool {
-        if SERVER_GATED.contains(&key) {
-            return self.enhanced_feature(key);
+    /// True when a feature is on: the choice made in this app, or else the
+    /// user's setting in the plugin.
+    pub fn je(&self, feature: impl AsFeature) -> bool {
+        let Some(feature) = feature.feature() else {
+            return false;
+        };
+        if feature.server_gated() {
+            return self.enhanced_feature(feature);
         }
-        self.config.enhanced.get(key).copied().unwrap_or_else(|| {
-            self.enhanced
-                .settings
-                .flags
-                .get(key)
-                .copied()
-                .unwrap_or(false)
+        self.config
+            .enhanced
+            .get(feature.key())
+            .copied()
+            .unwrap_or_else(|| self.enhanced.settings.flag(feature))
+    }
+
+    /// True when the server has a server-gated feature on and the user has
+    /// not switched it off in this app.
+    pub fn enhanced_feature(&self, feature: impl AsFeature) -> bool {
+        feature.feature().is_some_and(|feature| {
+            self.enhanced.settings.flag(feature)
+                && self.config.enhanced.get(feature.key()).copied().unwrap_or(true)
         })
     }
 
-    /// True when the server has a feature of [`SERVER_GATED`] on and the user
-    /// has not switched it off in this app.
-    pub fn enhanced_feature(&self, key: &str) -> bool {
-        self.enhanced.settings.flags.get(key).copied().unwrap_or(false)
-            && self.config.enhanced.get(key).copied().unwrap_or(true)
-    }
-
     /// True when the switch shows in the menu and in the settings.
-    pub fn enhanced_toggle_shown(&self, key: &str) -> bool {
-        !SERVER_GATED.contains(&key)
-            || self.enhanced.settings.flags.get(key).copied().unwrap_or(false)
+    pub fn enhanced_toggle_shown(&self, feature: impl AsFeature) -> bool {
+        feature
+            .feature()
+            .is_some_and(|feature| !feature.server_gated() || self.enhanced.settings.flag(feature))
     }
 
     /// Reads the plugin's settings for the open session.
     pub fn load_enhanced(&mut self, cx: &mut Context<Self>) {
         self.enhanced = State::default();
-        let Some(opened) = self.session.as_ref().map(|s| s.user_id.clone()) else {
-            return;
-        };
-        self.fetch(
+        self.load_enhanced_settings(0, cx);
+    }
+
+    /// One read of the settings; `attempt` counts the reads that failed
+    /// before it.
+    fn load_enhanced_settings(&mut self, attempt: usize, cx: &mut Context<Self>) {
+        self.fetch_in_session(
             cx,
-            |client| Ok(client.enhanced_settings()),
-            move |this, result, cx| {
-                if let (Ok(Some(settings)), Some(session)) = (result, this.session.as_ref())
-                    && session.user_id == opened
-                {
+            |client| client.read_enhanced_settings(),
+            move |this, result, cx| match result {
+                Ok(Some(settings)) => {
                     this.enhanced.settings = settings;
                     this.load_bookmarks(cx);
                     this.load_hidden(cx);
@@ -460,25 +609,48 @@ impl Bloom {
                     this.load_enhanced_detail(cx);
                     cx.notify();
                 }
+                // The server has no such plugin.
+                Ok(None) => {}
+                Err(_) => {
+                    let Some(wait) = SETTINGS_RETRIES.get(attempt).copied() else {
+                        return;
+                    };
+                    // For the session that asked alone.
+                    let epoch = this.session_epoch;
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(wait).await;
+                        this.update(cx, |this, cx| {
+                            if this.session_epoch == epoch {
+                                this.load_enhanced_settings(attempt + 1, cx);
+                            }
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
             },
         );
     }
 
-    pub fn toggle_enhanced(&mut self, key: &'static str, cx: &mut Context<Self>) {
-        let on = !self.je(key);
-        self.config.enhanced.insert(key.to_string(), on);
+    pub fn toggle_enhanced(&mut self, feature: impl AsFeature, cx: &mut Context<Self>) {
+        let Some(feature) = feature.feature() else {
+            return;
+        };
+        let on = !self.je(feature);
+        self.config.enhanced.insert(feature.key().to_string(), on);
         self.save_config(cx);
         self.rebuild_menu(cx);
-        if matches!(key, "seerr_rows" | "links") {
-            self.enhanced.detail = None;
-            self.load_enhanced_detail(cx);
-        }
-        if key == "bookmarks" {
-            self.load_bookmarks(cx);
-        }
-        if key == "request_more" {
-            self.enhanced.seasons.probe = None;
-            self.load_request_more(cx);
+        match feature {
+            Feature::SeerrRows | Feature::Links => {
+                self.enhanced.detail = None;
+                self.load_enhanced_detail(cx);
+            }
+            Feature::Bookmarks => self.load_bookmarks(cx),
+            Feature::RequestMore => {
+                self.enhanced.seasons.probe = None;
+                self.load_request_more(cx);
+            }
+            _ => {}
         }
         cx.notify();
     }
@@ -491,16 +663,17 @@ impl Bloom {
         let this = cx.weak_entity();
         // A phone has no keyboard: its shortcuts and their help stay out.
         let compact = self.compact_w();
-        let mut entries: Vec<MenuItem> = TOGGLES
-            .iter()
-            .filter(|(key, _)| self.enhanced_toggle_shown(key) && !(compact && *key == "shortcuts"))
-            .map(|(key, label)| {
+        let mut entries: Vec<MenuItem> = Feature::ALL
+            .into_iter()
+            .filter(|feature| {
+                self.enhanced_toggle_shown(*feature) && !(compact && *feature == Feature::Shortcuts)
+            })
+            .map(|feature| {
                 let handle = this.clone();
-                let key: &'static str = key;
-                MenuItem::new(SharedString::from(format!("menu.je.{key}")), *label)
-                    .checked(self.je(key))
+                MenuItem::new(SharedString::from(format!("menu.je.{}", feature.key())), feature.label())
+                    .checked(self.je(feature))
                     .on_click(move |_, _, cx| {
-                        handle.update(cx, |this, cx| this.toggle_enhanced(key, cx)).ok();
+                        handle.update(cx, |this, cx| this.toggle_enhanced(feature, cx)).ok();
                     })
             })
             .collect();
@@ -540,9 +713,14 @@ impl Bloom {
         let id_of = |name: &str| item.provider_ids.get(name).cloned().flatten();
         let Some(tmdb) = id_of("Tmdb") else { return };
         let tvdb = id_of("Tvdb");
-        let settings = self.enhanced.settings.clone();
-        let rows = self.je("seerr_rows");
-        let links = self.je("links");
+        // What the work needs of the settings, not the whole of them.
+        let settings = &self.enhanced.settings;
+        let (skip_library, recommended_on, similar_on) =
+            (settings.seerr_skip_library, settings.seerr_recommended, settings.seerr_similar);
+        let (arr_on, seerr_link, seerr_url) =
+            (settings.arr_links, settings.seerr_link, settings.seerr_url.clone());
+        let rows = self.je(Feature::SeerrRows);
+        let links = self.je(Feature::Links);
         let admin = self.is_admin();
         if !rows && !links {
             return;
@@ -557,7 +735,7 @@ impl Bloom {
                         return Vec::new();
                     }
                     let mut found = client.seerr_related(media, &tmdb, name).unwrap_or_default();
-                    if settings.seerr_skip_library {
+                    if skip_library {
                         found.retain(|item| item.library_id().is_none());
                     }
                     found
@@ -565,9 +743,9 @@ impl Bloom {
                 // The three requests run at the same time.
                 let (recommended, similar, arr) = std::thread::scope(|scope| {
                     let recommended =
-                        scope.spawn(|| list(settings.seerr_recommended, "recommendations"));
-                    let similar = scope.spawn(|| list(settings.seerr_similar, "similar"));
-                    let arr = if links && settings.arr_links && admin {
+                        scope.spawn(|| list(recommended_on, "recommendations"));
+                    let similar = scope.spawn(|| list(similar_on, "similar"));
+                    let arr = if links && arr_on && admin {
                         match (movie, &tvdb) {
                             (true, _) => client.arr_links(true, &tmdb),
                             (false, Some(tvdb)) => client.arr_links(false, tvdb),
@@ -583,7 +761,7 @@ impl Bloom {
                     )
                 });
                 let mut all_links = Vec::new();
-                if let (true, true, Some(base)) = (links, settings.seerr_link, &settings.seerr_url)
+                if let (true, true, Some(base)) = (links, seerr_link, &seerr_url)
                 {
                     all_links.push(("Seerr".to_string(), format!("{base}/{media}/{tmdb}")));
                 }
@@ -618,7 +796,7 @@ impl Bloom {
             .map(|extras| extras.links.as_slice())
             .unwrap_or_default();
         let tags = if crate::jellyfin::quality_tags() {
-            crate::quality::labels(item)
+            crate::quality_tags::labels(item)
         } else {
             Vec::new()
         };
@@ -639,7 +817,7 @@ impl Bloom {
                     .flex()
                     .flex_wrap()
                     .gap(px(6.))
-                    .children(tags.into_iter().map(crate::quality::pill)),
+                    .children(tags.into_iter().map(crate::quality_tags::pill)),
             );
         }
         if !links.is_empty() || request_more {
@@ -647,20 +825,7 @@ impl Bloom {
             if request_more {
                 let series_id = item.id.clone();
                 row = row.child(
-                    div()
-                        .id("detail.je.request-more")
-                        .h(px(30.))
-                        .px(px(12.))
-                        .rounded(px(10.))
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .cursor_pointer()
-                        .bg(rgba(0xffffff1f))
-                        .hover(|s| s.bg(rgba(0xffffff33)))
-                        .font_weight(gpui_kit::FontWeight::MEDIUM)
-                        .child(icon(LucideIcon::Download, 14., t.colors.foreground))
-                        .child("Request more seasons")
+                    Self::detail_pill("detail.je.request-more", "Request more seasons", LucideIcon::Download, true, cx)
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.open_seasons_dialog(series_id.clone(), cx)
                         })),
@@ -669,21 +834,14 @@ impl Bloom {
             for (name, url) in links {
                 let url = url.clone();
                 row = row.child(
-                    div()
-                        .id(SharedString::from(format!("detail.je.link.{name}")))
-                        .h(px(30.))
-                        .px(px(12.))
-                        .rounded(px(10.))
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .cursor_pointer()
-                        .bg(rgba(0xffffff1f))
-                        .hover(|s| s.bg(rgba(0xffffff33)))
-                        .font_weight(gpui_kit::FontWeight::MEDIUM)
-                        .child(name.clone())
-                        .child(icon(LucideIcon::ExternalLink, 14., t.colors.foreground))
-                        .on_click(move |_: &ClickEvent, _, cx| crate::macos::open_web_url(cx, &url)),
+                    Self::detail_pill(
+                        format!("detail.je.link.{name}"),
+                        name.clone(),
+                        LucideIcon::ExternalLink,
+                        false,
+                        cx,
+                    )
+                    .on_click(move |_: &ClickEvent, _, cx| crate::macos::open_web_url(cx, &url)),
                 );
             }
             block = block.child(row);
@@ -700,7 +858,7 @@ impl Bloom {
         cx: &mut Context<Self>,
     ) -> Vec<Div> {
         let mut rows = Vec::new();
-        let Some(extras) = self.detail_extras(item).filter(|_| self.je("seerr_rows")) else {
+        let Some(extras) = self.detail_extras(item).filter(|_| self.je(Feature::SeerrRows)) else {
             return rows;
         };
         let w = self.metrics().portrait_w;
@@ -731,7 +889,7 @@ impl Bloom {
 
     /// Community and critic rating of the item in the player.
     pub fn enhanced_player_rating(&self) -> Option<Div> {
-        let item = self.playing.as_ref().filter(|_| self.je("rating_in_player"))?;
+        let item = self.playing.as_ref().filter(|_| self.je(Feature::RatingInPlayer))?;
         let community = item.community_rating.filter(|r| *r > 0.);
         let critic = item.critic_rating.filter(|r| *r > 0.);
         if community.is_none() && critic.is_none() {
@@ -765,7 +923,8 @@ impl Bloom {
     pub fn apply_subtitle_style(&self) {
         let look = &self.config.subtitle_look;
         let plugin = self.enhanced.settings.subtitle.clone();
-        if plugin.is_none() && *look == crate::config::SubtitleLook::default() {
+        let plain = plugin.is_none() && *look == crate::config::SubtitleLook::default();
+        if !style_goes(plain, &SUBTITLES_STYLED) {
             return;
         }
         // The look set in this app goes over the style of the plugin.
@@ -797,6 +956,33 @@ impl Bloom {
         if let Some(font) = &style.font {
             self.player.set_property("sub-font", font);
         }
+    }
+
+    /// A pill of the detail page: a link to another tool, or an action.
+    fn detail_pill(
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        glyph: LucideIcon,
+        glyph_first: bool,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let ink = UiTheme::read(cx).colors.foreground;
+        let (before, after) = if glyph_first { (Some(glyph), None) } else { (None, Some(glyph)) };
+        div()
+            .id(id.into())
+            .h(px(30.))
+            .px(px(12.))
+            .rounded(px(10.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .cursor_pointer()
+            .bg(rgba(0xffffff1f))
+            .hover(|s| s.bg(rgba(0xffffff33)))
+            .font_weight(gpui_kit::FontWeight::MEDIUM)
+            .children(before.map(|glyph| icon(glyph, 14., ink)))
+            .child(label.into())
+            .children(after.map(|glyph| icon(glyph, 14., ink)))
     }
 
     /// Work that follows the player: the position before a seek, automatic
@@ -832,8 +1018,8 @@ impl Bloom {
         // Skips a marked intro or credits range once.
         if let Some(segment) = self.current_segment() {
             let wanted = match segment.kind.as_str() {
-                "Intro" => self.je("auto_skip_intro"),
-                "Outro" => self.je("auto_skip_outro"),
+                "Intro" => self.je(Feature::AutoSkipIntro),
+                "Outro" => self.je(Feature::AutoSkipOutro),
                 _ => false,
             };
             let mark = (item_id, (segment.start_secs() * 1000.) as i64);
@@ -854,14 +1040,14 @@ impl Bloom {
         if std::mem::take(&mut self.enhanced.remote_pending) {
             self.enhanced.remote_activity = Some(activity);
         }
-        if !due || !(self.je("auto_pause") || self.enhanced.auto_paused) || !auto_pause_allowed() {
+        if !due || !(self.je(Feature::AutoPause) || self.enhanced.auto_paused) || !auto_pause_allowed() {
             return;
         }
         self.enhanced.visibility_checked = Some(Instant::now());
         let in_view = app_in_view();
         let paused = self.player_status.paused;
         let wanted = auto_pause_wanted(
-            self.je("auto_pause"),
+            self.je(Feature::AutoPause),
             self.enhanced.remote_activity,
             activity,
         );
@@ -872,7 +1058,7 @@ impl Bloom {
             self.enhanced.auto_paused = true;
         } else if in_view && self.enhanced.auto_paused {
             self.enhanced.auto_paused = false;
-            if paused && self.je("auto_resume") {
+            if paused && self.je(Feature::AutoResume) {
                 self.player.set_paused(false);
             }
         }
@@ -891,7 +1077,7 @@ impl Bloom {
 
     /// Name of the plugin action bound to a key, for the player or the pages.
     fn enhanced_action(&self, event: &KeyDownEvent, player: bool) -> Option<String> {
-        if !self.je("shortcuts") {
+        if !self.je(Feature::Shortcuts) {
             return None;
         }
         let pressed = combo(event)?;
@@ -923,8 +1109,8 @@ impl Bloom {
                 self.toast(format!("Aspect ratio: {next:?}"), "", cx);
             }
             "ShowPlaybackInfo" => self.toggle_playback_info(cx),
-            "CycleSubtitleTracks" => self.player.command("cycle", &["sub"]),
-            "CycleAudioTracks" => self.player.command("cycle", &["audio"]),
+            "CycleSubtitleTracks" => self.stream_cycle("sub"),
+            "CycleAudioTracks" => self.stream_cycle("audio"),
             "IncreasePlaybackSpeed" | "DecreasePlaybackSpeed" | "ResetPlaybackSpeed" => {
                 let speed = match name {
                     "IncreasePlaybackSpeed" => (self.speed + SPEED_STEP).min(4.),
@@ -954,8 +1140,7 @@ impl Bloom {
                 let Ok(tenth) = argument.parse::<f64>() else {
                     return false;
                 };
-                self.player
-                    .seek_absolute(self.player_status.duration * tenth / 10.);
+                self.request_seek_to(self.player_status.duration * tenth / 10., cx);
             }
             _ => return false,
         }
@@ -984,7 +1169,7 @@ impl Bloom {
             self.close_panel(Panel::Help);
             return true;
         }
-        if combo(event).as_deref() == Some("?") && self.je("shortcuts") {
+        if combo(event).as_deref() == Some("?") && self.je(Feature::Shortcuts) {
             self.open_panel(Panel::Help, window, cx);
             return true;
         }
@@ -1086,6 +1271,9 @@ impl Bloom {
                 .items_center()
                 .justify_center()
                 .bg(rgba(0x00000099))
+                // The page behind takes no click meanwhile: the click that
+                // closes the list also pressed what was under the pointer.
+                .occlude()
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.close_panel(Panel::Help);
                     cx.notify();
@@ -1192,24 +1380,24 @@ impl Bloom {
                 };
                 match client.item(argument) {
                     Ok(item) => {
-                        let input = crate::quality::Input::of(&item);
-                        let raw = crate::quality::detect(&input);
-                        let shown = crate::quality::arrange(&raw, &crate::quality::prefs());
+                        let input = crate::quality_tags::Input::of(&item);
+                        let raw = crate::quality_tags::detect(&input);
+                        let shown = crate::quality_tags::arrange(&raw, &crate::quality_tags::prefs());
                         format!(
                             "{}: derived={raw:?} shown={shown:?} master={} prefs={:?}",
                             item.name,
                             crate::jellyfin::quality_tags(),
-                            crate::quality::prefs()
+                            crate::quality_tags::prefs()
                         )
                     }
                     Err(err) => format!("error: {err:#}"),
                 }
             }
             // A category the plugin has off, shown anyway, to look at it.
-            "tags-force" => match crate::quality::force_categories(argument) {
+            "tags-force" => match crate::quality_tags::force_categories(argument) {
                 Ok(()) => {
                     cx.notify();
-                    format!("forced: {:?}", crate::quality::prefs())
+                    format!("forced: {:?}", crate::quality_tags::prefs())
                 }
                 Err(err) => format!("error: {err}"),
             },
@@ -1219,9 +1407,9 @@ impl Bloom {
 
     /// State of the plugin features, for the debug channel.
     pub fn enhanced_debug(&self) -> String {
-        let flags: Vec<String> = TOGGLES
-            .iter()
-            .map(|(key, _)| format!("{key}={}", self.je(key)))
+        let flags: Vec<String> = Feature::ALL
+            .into_iter()
+            .map(|feature| format!("{}={}", feature.key(), self.je(feature)))
             .collect();
         let detail = self.enhanced.detail.as_ref().map(|d| {
             format!(
@@ -1270,6 +1458,41 @@ impl Bloom {
 fn auto_pause_allowed() -> bool {
     let options = crate::options::options();
     !options.config_readonly || options.auto_pause
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plain look goes to a player that has another look on it, once.
+    #[test]
+    fn a_reset_look_reaches_a_styled_player() {
+        let styled = AtomicBool::new(false);
+        // Nothing set, nothing on the player: the player is left alone.
+        assert!(!style_goes(true, &styled));
+        // A look goes, and the reset after it goes too.
+        assert!(style_goes(false, &styled));
+        assert!(style_goes(true, &styled), "the reset did not reach the player");
+        assert!(!style_goes(true, &styled));
+    }
+
+    /// Only an answer that says nothing about the plugin is asked for again.
+    #[test]
+    fn a_missing_plugin_is_not_asked_for_again() {
+        assert!(settings_unknown(None));
+        assert!(settings_unknown(Some(502)));
+        assert!(!settings_unknown(Some(404)));
+        assert!(!settings_unknown(Some(403)));
+    }
+
+    #[test]
+    fn every_feature_has_its_own_key() {
+        for (i, feature) in Feature::ALL.into_iter().enumerate() {
+            assert_eq!(Feature::of(feature.key()), Some(feature));
+            assert_eq!(TOGGLES[i], (feature.key(), feature.label()));
+        }
+        assert_eq!(Feature::of("auto_puase"), None);
+    }
 }
 
 #[cfg(test)]

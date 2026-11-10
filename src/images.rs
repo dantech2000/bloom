@@ -7,7 +7,7 @@
 //! again in the GPU atlas), so the cache is bounded by decoded bytes.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -23,6 +23,14 @@ pub use loader::{fetch_bytes, looks_like_image, pixels, seed_file};
 
 /// Decoded bytes kept before the least recently shown images are dropped.
 const MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Decoded sheets of tiles kept for [`tile`]: the one under the pointer
+/// and the one before it, so a drag over the border between two sheets
+/// does not decode each of them again at every step (some 24 MB each).
+const SHEETS_KEPT: usize = 2;
+/// Failed downloads remembered. A 404 is never asked for again, so its
+/// slot stays; past this many the slots of the failures are dropped, and
+/// an image that still fails is asked for once more.
+const MAX_SLOTS: usize = 4096;
 
 enum Slot {
     Loading,
@@ -48,9 +56,12 @@ struct ImageStore {
     raw: HashMap<String, Arc<Vec<u8>>>,
     /// Counts the calls of [`preload`]; a download of an older call is dropped.
     raw_epoch: u64,
-    /// The sheet of tiles decoded last, for [`tile`]. It is never painted,
-    /// so the GPU holds no copy of it.
-    sheet: Option<(String, Arc<RenderImage>)>,
+    /// The sheets of tiles decoded last, the newest at the back, for
+    /// [`tile`]. They are never painted, so the GPU holds no copy of them.
+    sheets: VecDeque<(String, Arc<RenderImage>)>,
+    /// When the windows are painted again for the failed images of each
+    /// wait of the retry rule; see [`retry_refresh`].
+    retry_due: HashMap<Duration, Instant>,
 }
 impl Global for ImageStore {}
 
@@ -65,13 +76,31 @@ impl ImageStore {
             refresh_pending: false,
             raw: HashMap::new(),
             raw_epoch: 0,
-            sheet: None,
+            sheets: VecDeque::new(),
+            retry_due: HashMap::new(),
         }
     }
 
     fn agent(&mut self) -> ureq::Agent {
         self.agent.get_or_insert_with(loader::new_agent).clone()
     }
+
+    /// Notes a failed download.
+    fn fail(&mut self, url: String, failures: u32, retry: bool) {
+        if self.slots.len() >= MAX_SLOTS {
+            self.slots.retain(|_, slot| matches!(slot, Slot::Loading));
+        }
+        let session = crate::jellyfin::session_count();
+        self.slots.insert(url, Slot::Failed { failures, at: Instant::now(), session, retry });
+    }
+}
+
+/// The store of the app; the first call makes it.
+fn store(cx: &mut App) -> &mut ImageStore {
+    if !cx.has_global::<ImageStore>() {
+        cx.set_global(ImageStore::new());
+    }
+    cx.global_mut::<ImageStore>()
 }
 
 /// Fetches images ahead of use and keeps their encoded bytes, which are
@@ -80,28 +109,24 @@ impl ImageStore {
 /// them all, and a download for each takes too long during a drag. A new
 /// call replaces the set of the call before it; an empty list frees it.
 pub fn preload(urls: Vec<String>, cx: &mut App) {
-    if !cx.has_global::<ImageStore>() {
-        cx.set_global(ImageStore::new());
-    }
-    let store = cx.global_mut::<ImageStore>();
+    let store = store(cx);
     store.raw_epoch += 1;
     let epoch = store.raw_epoch;
     store.raw.retain(|url, _| urls.contains(url));
-    if store.sheet.as_ref().is_some_and(|(url, _)| !urls.contains(url)) {
-        store.sheet = None;
-    }
+    store.sheets.retain(|(url, _)| urls.contains(url));
     let agent = store.agent();
     cx.spawn(async move |cx| {
         for url in urls {
-            let known = cx.update(|cx| {
+            let (current, known) = cx.update(|cx| {
                 let store = cx.global::<ImageStore>();
-                (store.raw_epoch != epoch).then_some(()).ok_or(store.raw.contains_key(&url))
+                (store.raw_epoch == epoch, store.raw.contains_key(&url))
             });
-            match known {
-                // A newer call took over.
-                Ok(()) => return,
-                Err(true) => continue,
-                Err(false) => {}
+            // A newer call took over.
+            if !current {
+                return;
+            }
+            if known {
+                continue;
             }
             let (agent, target) = (agent.clone(), url.clone());
             let permit = gate().acquire().await;
@@ -133,20 +158,68 @@ pub fn preload(urls: Vec<String>, cx: &mut App) {
 /// Returns the cached image for `url`, starting a download the first time.
 /// Windows are refreshed when the image arrives.
 pub fn image(url: &str, cx: &mut App) -> Option<Arc<RenderImage>> {
-    if !cx.has_global::<ImageStore>() {
-        cx.set_global(ImageStore::new());
-    }
-    let store = cx.global_mut::<ImageStore>();
-    if let Some(image) = store.ready.get(url, Instant::now()) {
+    if let Some(image) = store(cx).ready.get(url, Instant::now()) {
         return Some(image.clone());
     }
+    fetch(url, cx, |url, image, cx| keep(url, Arc::new(image), cx));
+    None
+}
+
+/// One tile out of a sheet of `columns` by `rows` tiles, as its own small
+/// image. The player uses this for the preview frames of its timeline: a
+/// sheet of them is some 24 MB of pixels, and painting from the sheet itself
+/// would put all of it in the GPU atlas for one frame of 230 KB. The sheet is
+/// decoded once and kept while tiles of it are asked for.
+pub fn tile(
+    url: &str,
+    (columns, rows): (u32, u32),
+    (column, row): (u32, u32),
+    cx: &mut App,
+) -> Option<Arc<RenderImage>> {
+    let key = format!("{url}#{column},{row}");
+    let store = store(cx);
+    if let Some(image) = store.ready.get(&key, Instant::now()) {
+        return Some(image.clone());
+    }
+    if let Some((_, sheet)) = store.sheets.iter().find(|(sheet_url, _)| sheet_url == url) {
+        let tile = Arc::new(crop(sheet, (columns, rows), (column, row))?);
+        keep(key, tile.clone(), cx);
+        return Some(tile);
+    }
+    fetch(url, cx, |url, sheet, cx| {
+        let sheets = &mut cx.global_mut::<ImageStore>().sheets;
+        if sheets.len() >= SHEETS_KEPT {
+            sheets.pop_front();
+        }
+        sheets.push_back((url, Arc::new(sheet)));
+    });
+    None
+}
+
+/// Puts a decoded image into the cache and drops what that pushed out.
+fn keep(key: String, image: Arc<RenderImage>, cx: &mut App) {
+    let bytes = image.as_bytes(0).map_or(0, |b| b.len());
+    let evicted = cx.global_mut::<ImageStore>().ready.insert(key, image, bytes, Instant::now());
+    // GPUI keeps a second copy of every painted image in each window's
+    // sprite atlas until it is told to drop it.
+    for old in evicted {
+        cx.drop_image(old, None);
+    }
+}
+
+/// Downloads and decodes `url` off the main thread and hands the image to
+/// `done`, unless a download of it is on its way, or one failed and the
+/// retry rule does not let it be tried yet. An image [`preload`] fetched
+/// needs its decode alone.
+fn fetch(url: &str, cx: &mut App, done: fn(String, RenderImage, &mut App)) {
+    let store = store(cx);
     let failures = match store.slots.get(url) {
         None => 0,
-        Some(Slot::Loading) => return None,
+        Some(Slot::Loading) => return,
         Some(Slot::Failed { failures, at, session, retry }) => {
             let new_session = *session != crate::jellyfin::session_count();
             if !may_retry(*failures, at.elapsed(), *retry, new_session) {
-                return None;
+                return;
             }
             *failures
         }
@@ -177,22 +250,14 @@ pub fn image(url: &str, cx: &mut App) -> Option<Arc<RenderImage>> {
             match fetched {
                 Ok(image) => {
                     store.slots.remove(&key);
-                    let bytes = image.as_bytes(0).map_or(0, |b| b.len());
-                    let evicted = store
-                        .ready
-                        .insert(key, Arc::new(image), bytes, Instant::now());
-                    // GPUI keeps a second copy of every painted image in each
-                    // window's sprite atlas until it is told to drop it.
-                    for old in evicted {
-                        cx.drop_image(old, None);
-                    }
+                    done(key, image, cx);
                 }
                 Err(err) => {
                     // The query can hold the access token; keep it out of the log.
                     let shown = key.split('?').next().unwrap_or_default();
                     log::warn!("image {shown} failed: {err:#}");
                     let retry = retryable(&err);
-                    store.slots.insert(key, failed(failures + 1, retry));
+                    store.fail(key, failures + 1, retry);
                     if retry {
                         retry_refresh(failures + 1, cx);
                     }
@@ -202,91 +267,6 @@ pub fn image(url: &str, cx: &mut App) -> Option<Arc<RenderImage>> {
         });
     })
     .detach();
-    None
-}
-
-/// One tile out of a sheet of `columns` by `rows` tiles, as its own small
-/// image. The player uses this for the preview frames of its timeline: a
-/// sheet of them is some 24 MB of pixels, and painting from the sheet itself
-/// would put all of it in the GPU atlas for one frame of 230 KB. The sheet is
-/// decoded once and kept while tiles of it are asked for.
-pub fn tile(
-    url: &str,
-    (columns, rows): (u32, u32),
-    (column, row): (u32, u32),
-    cx: &mut App,
-) -> Option<Arc<RenderImage>> {
-    if !cx.has_global::<ImageStore>() {
-        cx.set_global(ImageStore::new());
-    }
-    let key = format!("{url}#{column},{row}");
-    let store = cx.global_mut::<ImageStore>();
-    if let Some(image) = store.ready.get(&key, Instant::now()) {
-        return Some(image.clone());
-    }
-    if let Some((_, sheet)) = store.sheet.as_ref().filter(|(sheet_url, _)| sheet_url == url) {
-        let tile = Arc::new(crop(sheet, (columns, rows), (column, row))?);
-        let bytes = tile.as_bytes(0).map_or(0, |b| b.len());
-        let evicted = store.ready.insert(key, tile.clone(), bytes, Instant::now());
-        for old in evicted {
-            cx.drop_image(old, None);
-        }
-        return Some(tile);
-    }
-    let failures = match store.slots.get(url) {
-        None => 0,
-        Some(Slot::Loading) => return None,
-        Some(Slot::Failed { failures, at, session, retry }) => {
-            let new_session = *session != crate::jellyfin::session_count();
-            if !may_retry(*failures, at.elapsed(), *retry, new_session) {
-                return None;
-            }
-            *failures
-        }
-    };
-    store.slots.insert(url.to_string(), Slot::Loading);
-    let agent = store.agent();
-    let raw = store.raw.get(url).cloned();
-    let key = url.to_string();
-    let target = url.to_string();
-    cx.spawn(async move |cx| {
-        let permit = match raw {
-            Some(_) => None,
-            None => Some(gate().acquire().await),
-        };
-        let fetched = cx
-            .background_executor()
-            .spawn(async move {
-                match raw {
-                    Some(bytes) => loader::decode_fetched("", &bytes),
-                    None => loader::download(&agent, &target),
-                }
-                .map(render)
-            })
-            .await;
-        drop(permit);
-        cx.update(|cx| {
-            let store = cx.global_mut::<ImageStore>();
-            match fetched {
-                Ok(sheet) => {
-                    store.slots.remove(&key);
-                    store.sheet = Some((key, Arc::new(sheet)));
-                }
-                Err(err) => {
-                    let shown = key.split('?').next().unwrap_or_default();
-                    log::warn!("image {shown} failed: {err:#}");
-                    let retry = retryable(&err);
-                    store.slots.insert(key, failed(failures + 1, retry));
-                    if retry {
-                        retry_refresh(failures + 1, cx);
-                    }
-                }
-            }
-            schedule_refresh(cx);
-        });
-    })
-    .detach();
-    None
 }
 
 /// The image GPUI paints, from the pixels of the loader.
@@ -311,17 +291,30 @@ fn crop(sheet: &RenderImage, (columns, rows): (u32, u32), (column, row): (u32, u
     Some(render(Bgra::from_raw(w, h, data)?))
 }
 
-fn failed(failures: u32, retry: bool) -> Slot {
-    Slot::Failed { failures, at: Instant::now(), session: crate::jellyfin::session_count(), retry }
-}
-
 /// Paints again when a failed image may be tried again; the paint asks for
-/// the image, and that starts the new try.
+/// the image, and that starts the new try. One timer for each wait of the
+/// retry rule, whatever the number of images: a page that opens with no
+/// network has dozens of failures within a moment. A failure that comes
+/// while the timer runs moves its time on.
 fn retry_refresh(failures: u32, cx: &mut App) {
     let delay = retry_delay(failures);
+    let waiting = store(cx).retry_due.insert(delay, Instant::now() + delay).is_some();
+    if waiting {
+        return;
+    }
     cx.spawn(async move |cx| {
-        cx.background_executor().timer(delay).await;
-        cx.update(|cx| cx.refresh_windows());
+        loop {
+            let due = cx.update(|cx| cx.global::<ImageStore>().retry_due.get(&delay).copied());
+            let left = due.map_or(Duration::ZERO, |due| due.saturating_duration_since(Instant::now()));
+            if left.is_zero() {
+                break;
+            }
+            cx.background_executor().timer(left).await;
+        }
+        cx.update(|cx| {
+            cx.global_mut::<ImageStore>().retry_due.remove(&delay);
+            cx.refresh_windows();
+        });
     })
     .detach();
 }
@@ -360,12 +353,7 @@ pub fn remote_corners(url: String, corners: Corners<Pixels>, fit: ObjectFit) -> 
     canvas(
         |_, _, _| {},
         move |bounds: Bounds<Pixels>, _, window: &mut Window, cx: &mut App| {
-            // The mask is empty when a scrolled ancestor clips the element away.
-            let visible = window.content_mask().bounds;
-            if visible.size.width <= px(0.)
-                || visible.size.height <= px(0.)
-                || !bounds.intersects(&visible)
-            {
+            if !on_screen(bounds, window) {
                 return;
             }
             let Some(image) = image(&url, cx) else {
@@ -377,11 +365,21 @@ pub fn remote_corners(url: String, corners: Corners<Pixels>, fit: ObjectFit) -> 
     )
 }
 
+/// True while part of the element shows. The mask is empty when a scrolled
+/// ancestor clips the element away.
+fn on_screen(bounds: Bounds<Pixels>, window: &Window) -> bool {
+    let visible = window.content_mask().bounds;
+    visible.size.width > px(0.) && visible.size.height > px(0.) && bounds.intersects(&visible)
+}
+
 /// Paints a title logo: scaled to fit, at the left edge, centred vertically.
 pub fn remote_logo(url: String) -> Canvas<()> {
     canvas(
         |_, _, _| {},
         move |bounds: Bounds<Pixels>, _, window: &mut Window, cx: &mut App| {
+            if !on_screen(bounds, window) {
+                return;
+            }
             let Some(image) = image(&url, cx) else {
                 return;
             };
@@ -394,10 +392,7 @@ pub fn remote_logo(url: String) -> Canvas<()> {
 
 /// The HTTP agent of the cache, for a fetch of its own (see [`fetch_bytes`]).
 pub fn agent(cx: &mut App) -> ureq::Agent {
-    if !cx.has_global::<ImageStore>() {
-        cx.set_global(ImageStore::new());
-    }
-    cx.global_mut::<ImageStore>().agent()
+    store(cx).agent()
 }
 
 /// Counts the prewarms started. A run checks it between two fetches and
@@ -432,10 +427,7 @@ pub fn cancel_prewarm() {
 /// none takes memory. A new
 /// prewarm stops the one before it.
 pub fn prewarm(urls: Vec<String>, cx: &mut App) {
-    if !cx.has_global::<ImageStore>() {
-        cx.set_global(ImageStore::new());
-    }
-    let agent = cx.global_mut::<ImageStore>().agent();
+    let agent = store(cx).agent();
     let run = prewarm_run().fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     cx.background_executor()
         .spawn(async move {

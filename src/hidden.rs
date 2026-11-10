@@ -215,14 +215,19 @@ pub struct HideSet {
 }
 
 impl HideSet {
+    #[cfg(test)]
     pub fn of(file: &Value) -> Self {
-        let settings = Settings::of(file);
-        let mut set = Self { settings: settings.clone(), ..Default::default() };
+        Self::of_entries(Settings::of(file), &parse(file))
+    }
+
+    /// The set of the entries of a file ([`parse`]) and its switches.
+    fn of_entries(settings: Settings, entries: &[Hidden]) -> Self {
+        let mut set = Self { settings, ..Default::default() };
         // With the switch off the plugin builds an empty set.
-        if !settings.enabled {
+        if !set.settings.enabled {
             return set;
         }
-        for entry in parse(file) {
+        for entry in entries {
             if entry.item_id.trim().is_empty() {
                 continue;
             }
@@ -453,12 +458,65 @@ pub(crate) impl Client {
     }
 }
 
+/// One change of the file that waits for its write.
+#[derive(Clone, Debug, PartialEq)]
+enum Change {
+    /// A title to hide, and the time it was hidden.
+    Hide(HideRequest, String),
+    /// The key or the item id of the entry to take out.
+    Unhide(String),
+}
+
+impl Change {
+    /// Makes the change in a file. True when the file is another now.
+    fn apply(&self, file: &mut Value) -> bool {
+        match self {
+            Change::Hide(request, now) => {
+                hide(file, request, now);
+                true
+            }
+            Change::Unhide(key) => unhide(file, key),
+        }
+    }
+}
+
+/// The writes of the file, one at a time. A write reads the whole file,
+/// changes it and sends it back; two on their way at once read the same
+/// file, and the second one took the entry of the first out again. So a
+/// change made while a write is on its way waits, and all that wait go as
+/// one write when it ended.
+#[derive(Default)]
+struct Writes {
+    waiting: Vec<Change>,
+    busy: bool,
+}
+
+impl Writes {
+    /// The changes to write now: all that wait. None while a write is on
+    /// its way, or when nothing waits.
+    fn begin(&mut self) -> Option<Vec<Change>> {
+        if self.busy || self.waiting.is_empty() {
+            return None;
+        }
+        self.busy = true;
+        Some(std::mem::take(&mut self.waiting))
+    }
+
+    fn end(&mut self) {
+        self.busy = false;
+    }
+}
+
 /// State of the hidden content in the app.
 #[derive(Default)]
 pub struct HiddenState {
     /// `hidden-content.json` as the server has it.
     pub file: Option<Value>,
     pub set: HideSet,
+    /// The entries of `file`, the newest first: the settings page shows
+    /// them at each frame.
+    entries: Vec<Hidden>,
+    writes: Writes,
     /// For the debug channel: the feature is on in this app only, and nothing
     /// is read from or written to the server. Used to look at the screens
     /// while the server has hidden content off.
@@ -467,12 +525,13 @@ pub struct HiddenState {
 
 impl HiddenState {
     pub fn set_file(&mut self, file: Value) {
-        self.set = HideSet::of(&file);
+        self.entries = parse(&file);
+        self.set = HideSet::of_entries(Settings::of(&file), &self.entries);
         self.file = Some(file);
     }
 
-    pub fn all(&self) -> Vec<Hidden> {
-        self.file.as_ref().map(parse).unwrap_or_default()
+    pub fn all(&self) -> &[Hidden] {
+        &self.entries
     }
 }
 
@@ -514,7 +573,6 @@ impl Bloom {
         if !self.hidden_on() || requests.is_empty() {
             return;
         }
-        let names = requests.iter().map(|r| r.name.clone()).collect::<Vec<_>>().join(", ");
         // The page shows the change before the server answers.
         let mut local = self.enhanced.hidden.file.clone().unwrap_or_else(|| json!({}));
         let now = jiff::Timestamp::now().to_string();
@@ -527,28 +585,9 @@ impl Bloom {
         if self.enhanced.hidden.demo {
             return;
         }
-        self.fetch(
-            cx,
-            move |client| {
-                client.change_hidden(|file| {
-                    for request in &requests {
-                        hide(file, request, &now);
-                    }
-                    true
-                })
-            },
-            move |this, result, cx| match result {
-                Ok(file) => {
-                    this.enhanced.hidden.set_file(file);
-                    this.toast("Hidden", names.clone(), cx);
-                    cx.notify();
-                }
-                Err(err) => {
-                    this.toast("Could not hide it", format!("{err:#}"), cx);
-                    this.load_hidden(cx);
-                }
-            },
-        );
+        let changes = requests.into_iter().map(|request| Change::Hide(request, now.clone()));
+        self.enhanced.hidden.writes.waiting.extend(changes);
+        self.write_hidden(cx);
     }
 
     /// Shows a title again: takes its entry out of the file.
@@ -556,8 +595,7 @@ impl Bloom {
         if !self.hidden_on() {
             return;
         }
-        if let Some(file) = self.enhanced.hidden.file.clone() {
-            let mut local = file;
+        if let Some(mut local) = self.enhanced.hidden.file.clone() {
             unhide(&mut local, &key_or_id);
             self.enhanced.hidden.set_file(local);
             cx.notify();
@@ -566,21 +604,65 @@ impl Bloom {
             self.load_page(cx);
             return;
         }
-        let key = key_or_id.clone();
+        self.enhanced.hidden.writes.waiting.push(Change::Unhide(key_or_id));
+        self.write_hidden(cx);
+    }
+
+    /// Sends the changes that wait to the server, as one write, unless a
+    /// write is on its way ([`Writes`]); its end calls this again.
+    fn write_hidden(&mut self, cx: &mut Context<Self>) {
+        let Some(changes) = self.enhanced.hidden.writes.begin() else {
+            return;
+        };
+        let epoch = self.session_epoch;
+        let sent = changes.clone();
         self.fetch(
             cx,
-            move |client| client.change_hidden(|file| unhide(file, &key)),
-            move |this, result, cx| match result {
-                Ok(file) => {
-                    this.enhanced.hidden.set_file(file);
-                    // The page lost the title when it hid it; load it again.
-                    this.load_page(cx);
-                    cx.notify();
+            move |client| {
+                client.change_hidden(|file| sent.iter().fold(false, |changed, change| change.apply(file) | changed))
+            },
+            move |this, result, cx| {
+                // The answer is for the session that asked: the list of a
+                // profile before is not the list of the one open now, and
+                // that one has a state of its own (`load_enhanced`).
+                if this.session_epoch != epoch {
+                    return;
                 }
-                Err(err) => {
-                    this.toast("Could not unhide it", format!("{err:#}"), cx);
-                    this.load_hidden(cx);
+                this.enhanced.hidden.writes.end();
+                let hidden: Vec<&str> = changes
+                    .iter()
+                    .filter_map(|change| match change {
+                        Change::Hide(request, _) => Some(request.name.as_str()),
+                        Change::Unhide(_) => None,
+                    })
+                    .collect();
+                let unhid = hidden.len() < changes.len();
+                match result {
+                    Ok(mut file) => {
+                        // What still waits for its write stays on the page.
+                        for change in &this.enhanced.hidden.writes.waiting {
+                            change.apply(&mut file);
+                        }
+                        this.enhanced.hidden.set_file(file);
+                        if !hidden.is_empty() {
+                            this.toast("Hidden", hidden.join(", "), cx);
+                        }
+                        // The page lost the title when it hid it; load it again.
+                        if unhid {
+                            this.load_page(cx);
+                        }
+                    }
+                    Err(err) => {
+                        let title = if unhid { "Could not unhide it" } else { "Could not hide it" };
+                        this.toast(title, format!("{err:#}"), cx);
+                        // The page showed the change at once: the list and
+                        // the page are read again as the server has them.
+                        this.load_hidden(cx);
+                        this.load_page(cx);
+                    }
                 }
+                cx.notify();
+                this.write_hidden(cx);
             },
         );
     }
@@ -592,14 +674,14 @@ impl Bloom {
         if !self.hidden_on() {
             return;
         }
-        let set = self.enhanced.hidden.set.clone();
+        let set = &self.enhanced.hidden.set;
         if set.is_empty() {
             return;
         }
         // The pages Back returns to lose them as well.
-        filter_page(&mut self.page, &set);
+        filter_page(&mut self.page, set);
         for page in &mut self.history {
-            filter_page(page, &set);
+            filter_page(page, set);
         }
     }
 
@@ -765,8 +847,8 @@ impl Bloom {
             .session
             .as_ref()
             .map(|s| s.client.clone())
-            .map(|client| match client.hidden_file() {
-                Ok(file) => format!("{} entries: {}", parse(&file).len(), line(&parse(&file))),
+            .map(|client| match client.hidden_file().map(|file| parse(&file)) {
+                Ok(entries) => format!("{} entries: {}", entries.len(), line(&entries)),
                 Err(err) => format!("error {err:#}"),
             })
             .unwrap_or_else(|| "not signed in".into());
@@ -781,7 +863,7 @@ impl Bloom {
             settings.filter_next_up,
             settings.filter_continue_watching,
             self.enhanced.hidden.all().len(),
-            line(&self.enhanced.hidden.all()),
+            line(self.enhanced.hidden.all()),
             server
         )
     }
@@ -933,5 +1015,104 @@ mod tests {
         assert!(s.enabled && s.filter_library && !s.filter_search);
         let s = Settings::of(&json!({ "settings": { "filterSearch": true } }));
         assert!(s.filter_search);
+    }
+}
+
+/// The writes of the file (review of 2026-11-10). See `app::race_harness`.
+#[cfg(test)]
+mod race_tests {
+    use std::sync::{Arc, Mutex};
+
+    use gpui_kit::TestAppContext;
+    use serde_json::{Value, json};
+
+    use super::{Change, HideRequest, Writes};
+    use crate::app::race_harness::{MockServer, app, item, plain, session};
+    use crate::enhanced::EnhancedApi as _;
+
+    /// A server with hidden content on that keeps the file of its user as
+    /// the plugin does: a POST replaces it whole.
+    fn server() -> (MockServer, impl Fn() -> Value) {
+        let kept = Arc::new(Mutex::new(json!({"Items": {}})));
+        let state = kept.clone();
+        let server = MockServer::start(move |method, path, body| match (method, path) {
+            ("GET", p) if p.starts_with("/JellyfinEnhanced/public-config") => {
+                (200, json!({"HiddenContentEnabled": true}).to_string())
+            }
+            ("GET", p) if p.contains("/hidden-content.json") => (200, state.lock().expect("kept").to_string()),
+            ("POST", p) if p.contains("/hidden-content.json") => {
+                *state.lock().expect("kept") = serde_json::from_str(body).unwrap_or(Value::Null);
+                (204, String::new())
+            }
+            _ => plain(method, path),
+        });
+        (server, move || kept.lock().expect("kept").clone())
+    }
+
+    fn request(id: &str) -> HideRequest {
+        HideRequest::of(&item(id, id, "Movie"))
+    }
+
+    #[test]
+    fn changes_during_a_write_wait_and_go_as_one() {
+        let mut writes = Writes::default();
+        assert!(writes.begin().is_none(), "nothing waits");
+        writes.waiting.push(Change::Unhide("a".into()));
+        assert_eq!(writes.begin(), Some(vec![Change::Unhide("a".into())]));
+        writes.waiting.push(Change::Unhide("b".into()));
+        writes.waiting.push(Change::Unhide("c".into()));
+        assert!(writes.begin().is_none(), "a second write started while one was on its way");
+        writes.end();
+        assert_eq!(writes.begin(), Some(vec![Change::Unhide("b".into()), Change::Unhide("c".into())]));
+    }
+
+    /// Three titles hidden one right after the other: each write read the
+    /// file before the write before it landed, and sent it back without
+    /// that entry. Now the first goes, and the two that waited go as one
+    /// write behind it.
+    #[gpui_kit::test]
+    fn titles_hidden_in_a_row_go_one_write_at_a_time(cx: &mut TestAppContext) {
+        let (server, file) = server();
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            let session = session(&server.url, "u1");
+            this.enhanced.settings = session.client.enhanced_settings().expect("the plugin's settings");
+            this.session = Some(session);
+            assert!(this.hidden_on());
+            for id in ["a", "b", "c"] {
+                this.hide_items(vec![request(id)], cx);
+            }
+            // The page shows all three before the server answers.
+            assert_eq!(this.enhanced.hidden.all().len(), 3);
+        });
+        cx.run_until_parked();
+        assert_eq!(server.count("POST", "/hidden-content.json"), 2, "one write at a time, the rest as one");
+        let mut keys: Vec<String> = file()["Items"].as_object().expect("items").keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["a", "b", "c"]);
+        bloom.read_with(cx, |this, _| assert_eq!(this.enhanced.hidden.all().len(), 3));
+    }
+
+    /// The profile changes while a write is on its way: its answer is the
+    /// list of the profile before, and must not become the list of the
+    /// one that is open now.
+    #[gpui_kit::test]
+    fn a_write_of_the_profile_before_leaves_the_new_profile_alone(cx: &mut TestAppContext) {
+        let (server, _) = server();
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            let one = session(&server.url, "u1");
+            this.enhanced.settings = one.client.enhanced_settings().expect("the plugin's settings");
+            this.session = Some(one);
+            this.hide_items(vec![request("a")], cx);
+            // Another profile opens: a new epoch and a new state.
+            this.session = Some(session(&server.url, "u2"));
+            this.session_epoch.0 += 1;
+            this.enhanced = Default::default();
+        });
+        cx.run_until_parked();
+        bloom.read_with(cx, |this, _| {
+            assert!(this.enhanced.hidden.file.is_none(), "the list of the profile before is on the new one");
+        });
     }
 }

@@ -4,18 +4,31 @@
 
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU8, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{APP_NAME, APP_VERSION};
+use crate::config::{APP_NAME, APP_VERSION, Token};
 
 pub const TICKS_PER_SECOND: i64 = 10_000_000;
+
+/// The most bytes of a JSON or text answer. The HTTP client stops at 10 MB
+/// by itself, which the titles of a large library and a server log of a
+/// busy day pass.
+const BODY_LIMIT: u64 = 256 * 1024 * 1024;
+/// A server that does not take the connection is given up after this long,
+/// so the probe of the connection state starts soon; the whole request has
+/// the longer time of the agent.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The answer of `/Users/Me` or its error, with the time it came. Clones
+/// of a client share it.
+type KeptMe = Arc<Mutex<Option<(Instant, Result<serde_json::Value, RequestError>)>>>;
 
 #[derive(Clone)]
 pub struct Client {
@@ -27,12 +40,14 @@ pub struct Client {
     /// The id the server gives itself; with the user id, the identity a
     /// playback report belongs to. Set for the client of a session.
     pub server_id: Option<Arc<str>>,
+    me: KeptMe,
 }
 
 impl Client {
     pub fn new(base: &str, device_id: &str) -> Self {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(30)))
+            .timeout_connect(Some(CONNECT_TIMEOUT))
             .build();
         Self {
             agent: ureq::Agent::new_with_config(config),
@@ -41,6 +56,7 @@ impl Client {
             token: None,
             user_id: None,
             server_id: None,
+            me: KeptMe::default(),
         }
     }
 
@@ -58,6 +74,8 @@ impl Client {
     pub fn with_token(mut self, token: &str, user_id: &str) -> Self {
         self.token = Some(token.into());
         self.user_id = Some(user_id.into());
+        // Another user: the answer kept for the one before is not theirs.
+        self.me = KeptMe::default();
         self
     }
 
@@ -67,38 +85,24 @@ impl Client {
     /// the subtitle rights). Not for a caller that must see a change it
     /// just made; the settings read the user themselves.
     pub fn me(&self) -> Result<serde_json::Value> {
-        const FRESH: std::time::Duration = std::time::Duration::from_secs(10);
-        type Answer = std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>>>;
-        static KEPT: std::sync::Mutex<Vec<(String, Answer)>> = std::sync::Mutex::new(Vec::new());
-        let key = format!("{}\n{}", self.base, self.token.as_deref().unwrap_or_default());
-        // One place for each session. Its lock is held over the request,
-        // so those who ask for the same user at the same time wait for the
-        // one answer; a slow server holds up no other server's callers.
-        let place = {
-            let mut kept = KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Places nobody waits at, with no fresh answer, go.
-            kept.retain(|(_, place)| {
-                std::sync::Arc::strong_count(place) > 1
-                    || place.try_lock().is_ok_and(|answer| answer.as_ref().is_some_and(|(at, _)| at.elapsed() < FRESH))
-            });
-            match kept.iter().find(|(of, _)| *of == key) {
-                Some((_, place)) => place.clone(),
-                None => {
-                    let place = Answer::default();
-                    kept.push((key, place.clone()));
-                    place
-                }
-            }
-        };
-        let mut answer = place.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((at, me)) = &*answer
-            && at.elapsed() < FRESH
-        {
-            return Ok(me.clone());
+        const FRESH: Duration = Duration::from_secs(10);
+        // An error is kept for a moment as well: with the server away,
+        // those who wait get the one error, not a timeout each.
+        const FAILED: Duration = Duration::from_secs(2);
+        // The lock is held over the request, so those who ask at the same
+        // time wait for the one answer. Each session has a place of its own.
+        let mut kept = self.me.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*kept {
+            Some((at, Ok(me))) if at.elapsed() < FRESH => return Ok(me.clone()),
+            Some((at, Err(err))) if at.elapsed() < FAILED => return Err(err.clone().into()),
+            _ => {}
         }
-        let me: serde_json::Value = self.get("/Users/Me", &[])?;
-        *answer = Some((std::time::Instant::now(), me.clone()));
-        Ok(me)
+        let answer = self.get::<serde_json::Value>("/Users/Me", &[]);
+        *kept = match &answer {
+            Ok(me) => Some((Instant::now(), Ok(me.clone()))),
+            Err(err) => err.downcast_ref::<RequestError>().map(|err| (Instant::now(), Err(err.clone()))),
+        };
+        answer
     }
 
     pub fn with_server(mut self, server_id: &str) -> Self {
@@ -160,29 +164,48 @@ impl Client {
         query: &[(&str, String)],
     ) -> Result<T> {
         let url = self.url(path, query);
-        let mut response = self
+        let response = self
             .agent
             .get(&url)
             .header("Authorization", self.auth_header())
             .header("Accept", "application/json")
             .call()
             .map_err(|e| map_err(e, path))?;
-        response
-            .body_mut()
-            .read_json::<T>()
-            .map_err(|e| map_body_err(e, "decode", path))
+        json(response, path)
     }
 
-    pub fn post<B: Serialize>(&self, path: &str, body: &B) -> Result<ureq::Body> {
-        let url = self.url(path, &[]);
-        let response = self
-            .agent
-            .post(&url)
+    /// POST with a JSON body; the answer as it is.
+    fn post_response<B: Serialize>(&self, path: &str, body: &B) -> Result<Answer> {
+        self.agent
+            .post(&self.url(path, &[]))
             .header("Authorization", self.auth_header())
             .header("Accept", "application/json")
             .send_json(body)
-            .map_err(|e| map_err(e, path))?;
-        Ok(response.into_body())
+            .map_err(|e| map_err(e, path))
+    }
+
+    pub fn post<B: Serialize>(&self, path: &str, body: &B) -> Result<ureq::Body> {
+        Ok(self.post_response(path, body)?.into_body())
+    }
+
+    /// POST with a JSON body that decodes a JSON answer. An answer that
+    /// breaks while it comes is a lost connection, as for [`Self::get`].
+    pub fn post_json<B: Serialize, T: serde::de::DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
+        json(self.post_response(path, body)?, path)
+    }
+
+    /// A request with no body: "DELETE" is a DELETE, any other method a POST.
+    fn empty(&self, method: &str, path: &str, query: &[(&str, String)]) -> Result<Answer> {
+        let url = self.url(path, query);
+        let request = match method {
+            "DELETE" => self.agent.delete(&url).force_send_body(),
+            _ => self.agent.post(&url),
+        };
+        request
+            .header("Authorization", self.auth_header())
+            .header("Accept", "application/json")
+            .send_empty()
+            .map_err(|e| map_err(e, path))
     }
 
     /// Body-less request (POST/DELETE) that decodes a JSON response.
@@ -192,34 +215,12 @@ impl Client {
         path: &str,
         query: &[(&str, String)],
     ) -> Result<T> {
-        let url = self.url(path, query);
-        let request = match method {
-            "DELETE" => self.agent.delete(&url).force_send_body(),
-            _ => self.agent.post(&url),
-        };
-        let mut response = request
-            .header("Authorization", self.auth_header())
-            .header("Accept", "application/json")
-            .send_empty()
-            .map_err(|e| map_err(e, path))?;
-        response
-            .body_mut()
-            .read_json::<T>()
-            .map_err(|e| map_body_err(e, "decode", path))
+        json(self.empty(method, path, query)?, path)
     }
 
     /// POST or DELETE with no body, for calls whose answer is empty.
     pub fn call(&self, method: &str, path: &str, query: &[(&str, String)]) -> Result<()> {
-        let url = self.url(path, query);
-        let request = match method {
-            "DELETE" => self.agent.delete(&url).force_send_body(),
-            _ => self.agent.post(&url),
-        };
-        request
-            .header("Authorization", self.auth_header())
-            .send_empty()
-            .map_err(|e| map_err(e, path))?;
-        Ok(())
+        self.empty(method, path, query).map(drop)
     }
 
     /// GET that returns the body as text (log files).
@@ -233,38 +234,15 @@ impl Client {
             .map_err(|e| map_err(e, path))?;
         response
             .body_mut()
+            .with_config()
+            .limit(BODY_LIMIT)
             .read_to_string()
             .map_err(|e| map_body_err(e, "read", path))
     }
-
-    /// True when the signed-in user is a server administrator.
     /// What the server knows of the signed-in user: whether the user is an
     /// administrator, the audio language the user prefers ("eng"), and what
     /// the user may do with SyncPlay.
     pub fn user_settings(&self) -> Result<(bool, Option<String>, String)> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Me {
-            #[serde(default)]
-            policy: Policy,
-            #[serde(default)]
-            configuration: Configuration,
-        }
-        #[derive(Default, Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Policy {
-            #[serde(default)]
-            is_administrator: bool,
-            /// "CreateAndJoinGroups", "JoinGroups" or "None".
-            #[serde(default)]
-            sync_play_access: String,
-        }
-        #[derive(Default, Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Configuration {
-            #[serde(default)]
-            audio_language_preference: Option<String>,
-        }
         let me: Me = serde_json::from_value(self.me()?).context("decode the user")?;
         let language = me
             .configuration
@@ -276,33 +254,27 @@ impl Client {
     /// Sets the picture of the signed-in user. The server takes the image
     /// as base64 text, with the type of the image as the content type.
     pub fn upload_user_image(&self, bytes: &[u8], mime: &str) -> Result<()> {
-        use base64::Engine as _;
         let user = self.user()?.to_string();
-        let body = base64::engine::general_purpose::STANDARD.encode(bytes);
-        let send = |path: &str, query: &[(&str, String)]| {
-            self.agent
-                .post(&self.url(path, query))
-                .header("Authorization", self.auth_header())
-                .header("Content-Type", mime)
-                .send(body.as_str())
-        };
         // The address since server 10.9, then the one before it.
-        match send("/UserImage", &[("userId", user.clone())]) {
-            Ok(_) => Ok(()),
-            Err(ureq::Error::StatusCode(404 | 405)) => send(&format!("/Users/{user}/Images/Primary"), &[])
-                .map(drop)
-                .map_err(|e| map_err(e, "/Users/Images/Primary")),
-            Err(err) => Err(map_err(err, "/UserImage")),
+        match self.post_image_at("/UserImage", &[("userId", user.clone())], bytes, mime) {
+            Err(err) if not_this_address(&err) => {
+                self.post_image(&format!("/Users/{user}/Images/Primary"), bytes, mime)
+            }
+            answer => answer,
         }
     }
 
     /// Posts an image as base64 text with its type as the content type, as
     /// the server expects for the splash screen.
     pub fn post_image(&self, path: &str, bytes: &[u8], mime: &str) -> Result<()> {
+        self.post_image_at(path, &[], bytes, mime)
+    }
+
+    fn post_image_at(&self, path: &str, query: &[(&str, String)], bytes: &[u8], mime: &str) -> Result<()> {
         use base64::Engine as _;
         let body = base64::engine::general_purpose::STANDARD.encode(bytes);
         self.agent
-            .post(&self.url(path, &[]))
+            .post(&self.url(path, query))
             .header("Authorization", self.auth_header())
             .header("Content-Type", mime)
             .send(body.as_str())
@@ -313,20 +285,19 @@ impl Client {
     /// Removes the picture of the signed-in user.
     pub fn delete_user_image(&self) -> Result<()> {
         let user = self.user()?.to_string();
+        // The old address only when the server does not know the new one:
+        // a server that is away would be waited for twice.
         match self.call("DELETE", "/UserImage", &[("userId", user.clone())]) {
-            Ok(()) => Ok(()),
-            Err(_) => self.call("DELETE", &format!("/Users/{user}/Images/Primary"), &[]),
+            Err(err) if not_this_address(&err) => {
+                self.call("DELETE", &format!("/Users/{user}/Images/Primary"), &[])
+            }
+            answer => answer,
         }
     }
 
     /// The tag of the picture of the signed-in user; none without a picture.
+    /// Asked of the server each time: the caller has just changed it.
     pub fn user_image_tag(&self) -> Result<Option<String>> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Me {
-            #[serde(default)]
-            primary_image_tag: Option<String>,
-        }
         Ok(self.get::<Me>("/Users/Me", &[])?.primary_image_tag)
     }
 
@@ -347,22 +318,26 @@ impl Client {
             username: &'a str,
             pw: &'a str,
         }
-        let mut body = self.post(
+        self.post_json(
             "/Users/AuthenticateByName",
             &Body {
                 username,
                 pw: password,
             },
-        )?;
-        body.read_json().context("decode auth response")
+        )
     }
 
     // ----- Browsing ---------------------------------------------------------
 
+    /// The items of a list of the signed-in user: `userId` and `params`.
+    fn item_list(&self, path: &str, params: &[(&str, String)]) -> Result<Vec<Item>> {
+        let mut query = vec![("userId", self.user()?.to_string())];
+        query.extend_from_slice(params);
+        Ok(self.get::<ItemsResult>(path, &query)?.items)
+    }
+
     pub fn views(&self) -> Result<Vec<Item>> {
-        let user = self.user()?.to_string();
-        let result: ItemsResult = self.get("/UserViews", &[("userId", user)])?;
-        Ok(result.items)
+        self.item_list("/UserViews", &[])
     }
 
     /// The user's home screen sections in order, as set in the web client.
@@ -395,11 +370,9 @@ impl Client {
     /// Random unwatched movies and series with a backdrop, for the home hero.
     /// The query mirrors the Media Bar plugin of the web client.
     pub fn hero_items(&self, limit: usize) -> Result<Vec<Item>> {
-        let user = self.user()?.to_string();
-        let result: ItemsResult = self.get(
+        self.item_list(
             "/Items",
             &[
-                ("userId", user),
                 ("includeItemTypes", "Movie,Series".to_string()),
                 ("recursive", "true".to_string()),
                 ("hasOverview", "true".to_string()),
@@ -417,8 +390,7 @@ impl Client {
                 ),
                 ("enableImageTypes", "Primary,Backdrop,Logo".to_string()),
             ],
-        )?;
-        Ok(result.items)
+        )
     }
 
     pub fn item(&self, id: &str) -> Result<Item> {
@@ -444,7 +416,7 @@ impl Client {
                 "startIndex",
                 q.start.map(|n| n.to_string()).unwrap_or_default(),
             ),
-            ("fields", item_fields()),
+            ("fields", q.fields.clone().unwrap_or_else(item_fields)),
             ("enableImageTypes", "Primary,Backdrop,Thumb".to_string()),
             ("imageTypeLimit", "1".to_string()),
         ];
@@ -460,38 +432,36 @@ impl Client {
         if let Some(person) = &q.person_id {
             params.push(("personIds", person.clone()));
         }
+        if !q.ids.is_empty() {
+            params.push(("ids", q.ids.join(",")));
+        }
         self.get("/Items", &params)
     }
 
     pub fn resume(&self, limit: usize) -> Result<Vec<Item>> {
-        let user = self.user()?.to_string();
-        let result: ItemsResult = self.get(
+        self.item_list(
             "/UserItems/Resume",
             &[
-                ("userId", user),
                 ("limit", limit.to_string()),
                 ("fields", item_fields()),
                 ("mediaTypes", "Video".to_string()),
                 ("enableImageTypes", "Primary,Backdrop,Thumb".to_string()),
             ],
-        )?;
-        Ok(result.items)
+        )
     }
 
     pub fn next_up(&self, limit: usize) -> Result<Vec<Item>> {
-        let user = self.user()?.to_string();
-        let result: ItemsResult = self.get(
+        self.item_list(
             "/Shows/NextUp",
             &[
-                ("userId", user),
                 ("limit", limit.to_string()),
                 ("fields", item_fields()),
                 ("enableImageTypes", "Primary,Backdrop,Thumb".to_string()),
             ],
-        )?;
-        Ok(result.items)
+        )
     }
 
+    /// The newest items of a library. The server answers with a bare list.
     pub fn latest(&self, parent_id: &str, limit: usize) -> Result<Vec<Item>> {
         let user = self.user()?.to_string();
         self.get(
@@ -507,67 +477,42 @@ impl Client {
     }
 
     pub fn seasons(&self, series_id: &str) -> Result<Vec<Item>> {
-        let user = self.user()?.to_string();
-        let result: ItemsResult = self.get(
-            &format!("/Shows/{series_id}/Seasons"),
-            &[("userId", user), ("fields", item_fields())],
-        )?;
-        Ok(result.items)
+        self.item_list(&format!("/Shows/{series_id}/Seasons"), &[("fields", item_fields())])
     }
 
     pub fn episodes(&self, series_id: &str, season_id: &str) -> Result<Vec<Item>> {
-        let user = self.user()?.to_string();
-        let result: ItemsResult = self.get(
+        self.item_list(
             &format!("/Shows/{series_id}/Episodes"),
-            &[
-                ("userId", user),
-                ("seasonId", season_id.to_string()),
-                ("fields", item_fields()),
-            ],
-        )?;
-        Ok(result.items)
+            &[("seasonId", season_id.to_string()), ("fields", item_fields())],
+        )
     }
 
     /// The next unwatched episode of a series, if any.
     pub fn series_next_up(&self, series_id: &str) -> Result<Option<Item>> {
-        let user = self.user()?.to_string();
-        let result: ItemsResult = self.get(
+        let items = self.item_list(
             "/Shows/NextUp",
             &[
-                ("userId", user),
                 ("seriesId", series_id.to_string()),
                 ("limit", "1".to_string()),
                 ("fields", item_fields()),
             ],
         )?;
-        Ok(result.items.into_iter().next())
+        Ok(items.into_iter().next())
     }
 
     /// Titles the server ranks as close to an item ("More Like This").
     pub fn similar(&self, item_id: &str, limit: usize) -> Result<Vec<Item>> {
-        let user = self.user()?.to_string();
-        let result: ItemsResult = self.get(
+        self.item_list(
             &format!("/Items/{item_id}/Similar"),
-            &[
-                ("userId", user),
-                ("limit", limit.to_string()),
-                ("fields", item_fields()),
-            ],
-        )?;
-        Ok(result.items)
+            &[("limit", limit.to_string()), ("fields", item_fields())],
+        )
     }
 
     /// Hides an item from "Continue Watching" or "Next Up" without a change
     /// to its played state. This needs the Jellyfin Enhanced server plugin.
     pub fn hide_from_row(&self, next_up: bool, item_id: &str) -> Result<()> {
         let row = if next_up { "next-up" } else { "continue-watching" };
-        let path = format!("/JellyfinEnhanced/{row}/hide/{item_id}");
-        self.agent
-            .post(&self.url(&path, &[]))
-            .header("Authorization", self.auth_header())
-            .send_empty()
-            .map_err(|e| map_err(e, &path))?;
-        Ok(())
+        self.call("POST", &format!("/JellyfinEnhanced/{row}/hide/{item_id}"), &[])
     }
 
     /// Intro, credits and similar ranges of an item. The Intro Skipper plugin
@@ -655,9 +600,11 @@ impl Client {
     }
 
     // ----- Media URLs -------------------------------------------------------
+    // Each is in `urls`, for a caller with the address of a server and no
+    // client; these give it the address of this one.
 
-    /// Image endpoints are anonymous on Jellyfin, so the URL can be handed to
-    /// gpui's image loader directly.
+    /// The address of an image of an item. The image loader sends the
+    /// session with it ([`image_auth_header`]); the token is not in the URL.
     pub fn image_url(
         &self,
         item_id: &str,
@@ -665,47 +612,27 @@ impl Client {
         tag: Option<&str>,
         max_width: u32,
     ) -> String {
-        // A few fixed widths, so the image a card asks for is the same file
-        // at every window size, and the cache on disk can serve it.
-        let max_width = [160, 240, 320, 400, 480, 640, 800, 1000, 1280, 1600, 1920]
-            .into_iter()
-            .find(|step| *step >= max_width)
-            .unwrap_or(max_width);
-        let mut url = format!(
-            "{}/Items/{item_id}/Images/{kind}?maxWidth={max_width}&quality=90",
-            self.base
-        );
-        if let Some(tag) = tag {
-            url.push_str("&tag=");
-            url.push_str(tag);
-        }
-        url
+        urls::image(&self.base, item_id, kind, tag, max_width)
     }
 
     /// Address of an item's page in the web client.
     pub fn web_url(&self, item_id: &str) -> String {
-        format!("{}/web/#/details?id={item_id}", self.base)
+        urls::web_item(&self.base, item_id)
     }
 
     /// Address of a plugin's page in the web dashboard; its settings are there.
     pub fn web_plugin_url(&self, plugin_id: &str) -> String {
-        format!("{}/web/#/dashboard/plugins/{plugin_id}", self.base)
+        urls::web_plugin(&self.base, plugin_id)
     }
 
     /// The file of an item as it is, for the media source the server named
     /// for it (the id of the item itself for the one version of a file).
     pub fn stream_url(&self, item_id: &str, media_source_id: &str) -> String {
-        format!(
-            "{}/Videos/{item_id}/stream?static=true&mediaSourceId={media_source_id}",
-            self.base
-        )
+        urls::stream(&self.base, item_id, media_source_id)
     }
 
     pub fn user_image_url(&self, user_id: &str, tag: &str) -> String {
-        format!(
-            "{}/Users/{user_id}/Images/Primary?maxWidth=96&tag={tag}",
-            self.base
-        )
+        urls::user_image(&self.base, user_id, tag)
     }
 
     // ----- Playback reporting ----------------------------------------------
@@ -745,7 +672,7 @@ impl Client {
 
     /// Image the server makes from the library art, for the sign-in page.
     pub fn splashscreen_url(&self) -> String {
-        format!("{}/Branding/Splashscreen?format=jpg&quality=80", self.base)
+        urls::splashscreen(&self.base)
     }
 
     pub fn quick_connect_enabled(&self) -> Result<bool> {
@@ -770,8 +697,7 @@ impl Client {
         struct Body<'a> {
             secret: &'a str,
         }
-        let mut body = self.post("/Users/AuthenticateWithQuickConnect", &Body { secret })?;
-        body.read_json().context("decode auth response")
+        self.post_json("/Users/AuthenticateWithQuickConnect", &Body { secret })
     }
 
     /// Lets the device that shows `code` sign in as this user.
@@ -789,23 +715,114 @@ impl Client {
     }
 }
 
+/// The addresses of a server that need no request and no session: for a
+/// caller that has the address of a server and no client (the sign-in page
+/// paints the splash image of a server it has not signed in to).
+pub mod urls {
+    fn base(base: &str) -> &str {
+        base.trim_end_matches('/')
+    }
+
+    /// An image of an item, at most `max_width` wide.
+    pub fn image(server: &str, item_id: &str, kind: &str, tag: Option<&str>, max_width: u32) -> String {
+        // A few fixed widths, so the image a card asks for is the same file
+        // at every window size, and the cache on disk can serve it.
+        let max_width = [160, 240, 320, 400, 480, 640, 800, 1000, 1280, 1600, 1920]
+            .into_iter()
+            .find(|step| *step >= max_width)
+            .unwrap_or(max_width);
+        let mut url = format!(
+            "{}/Items/{item_id}/Images/{kind}?maxWidth={max_width}&quality=90",
+            base(server)
+        );
+        if let Some(tag) = tag {
+            url.push_str("&tag=");
+            url.push_str(tag);
+        }
+        url
+    }
+
+    pub fn user_image(server: &str, user_id: &str, tag: &str) -> String {
+        format!("{}/Users/{user_id}/Images/Primary?maxWidth=96&tag={tag}", base(server))
+    }
+
+    /// An item's page in the web client.
+    pub fn web_item(server: &str, item_id: &str) -> String {
+        format!("{}/web/#/details?id={item_id}", base(server))
+    }
+
+    /// A plugin's page in the web dashboard.
+    pub fn web_plugin(server: &str, plugin_id: &str) -> String {
+        format!("{}/web/#/dashboard/plugins/{plugin_id}", base(server))
+    }
+
+    /// The file of an item as it is, for one of its media sources.
+    pub fn stream(server: &str, item_id: &str, media_source_id: &str) -> String {
+        format!("{}/Videos/{item_id}/stream?static=true&mediaSourceId={media_source_id}", base(server))
+    }
+
+    /// The image a server makes from its library art, for the sign-in page.
+    pub fn splashscreen(server: &str) -> String {
+        format!("{}/Branding/Splashscreen?format=jpg&quality=80", base(server))
+    }
+}
+
+/// The user of `/Users/Me`, as far as this file reads it.
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct Me {
+    policy: MePolicy,
+    configuration: MeConfiguration,
+    primary_image_tag: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct MePolicy {
+    is_administrator: bool,
+    /// "CreateAndJoinGroups", "JoinGroups" or "None".
+    sync_play_access: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct MeConfiguration {
+    audio_language_preference: Option<String>,
+    play_default_audio_track: bool,
+}
+
+/// A 404 or 405: the server does not know the address (an older server has
+/// it under another one).
+fn not_this_address(err: &anyhow::Error) -> bool {
+    matches!(status_of(err), Some(404 | 405))
+}
+
+/// The answer of the server to a request.
+type Answer = ureq::http::Response<ureq::Body>;
+
+/// Decodes the JSON body of an answer. A connection that breaks while the
+/// body comes is the network; a body that is not JSON is the server's.
+fn json<T: serde::de::DeserializeOwned>(mut answer: Answer, path: &str) -> Result<T> {
+    answer
+        .body_mut()
+        .with_config()
+        .limit(BODY_LIMIT)
+        .read_json::<T>()
+        .map_err(|e| map_body_err(e, "decode", path))
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct Branding {
-    #[serde(default)]
     pub login_disclaimer: Option<String>,
-    #[serde(default)]
     pub splashscreen_enabled: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct QuickConnect {
-    #[serde(default)]
     pub authenticated: bool,
-    #[serde(default)]
     pub secret: String,
-    #[serde(default)]
     pub code: String,
 }
 
@@ -822,6 +839,12 @@ pub const DEFAULT_HOME_SECTIONS: [&str; 7] = [
 
 const ITEM_FIELDS: &str =
     "Overview,PrimaryImageAspectRatio,ProductionYear,Genres,ParentId,DateCreated,Status,EndDate";
+
+/// The fields of a title in the index of the search ([`ItemQuery::fields`]):
+/// what the search reads and a card of a result shows. The index holds every
+/// title of the library; the overview and the streams of each would make
+/// its answer many times as large.
+pub const CATALOG_FIELDS: &str = "OriginalTitle,PrimaryImageAspectRatio,ProductionYear,Status,EndDate";
 
 /// Quality tags on poster cards, as bits: on, resolution tag, range tag.
 static QUALITY_TAGS: AtomicU8 = AtomicU8::new(0);
@@ -855,28 +878,29 @@ fn item_fields() -> String {
 /// A failed request. Its text is as before ("HTTP 530 at /Items"); the
 /// verdict says, without the text, whether the server is there
 /// (`connection::classify`).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RequestError {
     pub verdict: crate::connection::Verdict,
     text: String,
-    /// The error of the HTTP client, kept as the source.
-    source: Option<ureq::Error>,
+    /// The error of the HTTP client, kept as the source. Shared, so the
+    /// error can be kept and given to more than one caller ([`Client::me`]).
+    source: Option<Arc<ureq::Error>>,
 }
 
 impl RequestError {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn new(verdict: crate::connection::Verdict, text: String) -> Self {
         Self { verdict, text, source: None }
     }
 
     fn from_ureq(verdict: crate::connection::Verdict, text: String, source: ureq::Error) -> Self {
-        Self { verdict, text, source: Some(source) }
+        Self { verdict, text, source: Some(Arc::new(source)) }
     }
 
     /// The status code of the answer, when the server answered.
     pub fn status(&self) -> Option<u16> {
-        match self.source {
-            Some(ureq::Error::StatusCode(code)) => Some(code),
+        match self.source.as_deref() {
+            Some(ureq::Error::StatusCode(code)) => Some(*code),
             _ => None,
         }
     }
@@ -896,7 +920,7 @@ impl std::fmt::Display for RequestError {
 
 impl std::error::Error for RequestError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_ref().map(|e| e as &(dyn std::error::Error + 'static))
+        self.source.as_deref().map(|e| e as &(dyn std::error::Error + 'static))
     }
 }
 
@@ -931,10 +955,6 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-/// Name of this machine for the server's list of devices. It is asked for
-/// once: every request sends it, and the answer takes a process to get.
-/// Characters that are not plain ASCII are replaced, because a header value
-/// with them is refused.
 /// Scheme, host and port of a URL, lower case, with the default port filled
 /// in. `None` for anything that is not an `http(s)` URL with a host.
 fn origin_of(url: &str) -> Option<(String, String, u16)> {
@@ -1001,6 +1021,9 @@ pub fn image_auth_header(url: &str) -> Option<String> {
     header_for(&IMAGE_AUTH.lock().unwrap(), url).map(str::to_string)
 }
 
+/// Name of this machine for the server's list of devices. It is asked for
+/// once: every request sends it. Characters that are not plain ASCII are
+/// replaced, because a header value with them is refused.
 fn hostname() -> &'static str {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     NAME.get_or_init(|| {
@@ -1050,6 +1073,11 @@ pub struct ItemQuery {
     pub name_starts_with: Option<String>,
     pub name_less_than: Option<String>,
     pub person_id: Option<String>,
+    /// Only the items with these ids, in one request.
+    pub ids: Vec<String>,
+    /// The fields of each item, as the server names them; none for the
+    /// fields of a list. [`CATALOG_FIELDS`] for a query of every title.
+    pub fields: Option<String>,
     pub limit: Option<usize>,
     pub start: Option<usize>,
 }
@@ -1066,7 +1094,6 @@ pub struct PublicSystemInfo {
 pub struct User {
     pub id: String,
     pub name: String,
-    #[serde(default)]
     pub primary_image_tag: Option<String>,
     #[serde(default)]
     pub has_password: bool,
@@ -1076,7 +1103,7 @@ pub struct User {
 #[serde(rename_all = "PascalCase")]
 pub struct AuthResult {
     pub user: User,
-    pub access_token: String,
+    pub access_token: Token,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1133,13 +1160,13 @@ impl ItemKind {
         ("Trailer", ItemKind::Trailer),
     ];
 
-    /// The name the server uses, as in `includeItemTypes`.
     /// True for a kind the server did not name: an item opened by its id
     /// alone, before its answer.
     pub fn is_unknown(&self) -> bool {
         self.name().is_empty()
     }
 
+    /// The name the server uses, as in `includeItemTypes`.
     pub fn name(&self) -> &str {
         match self {
             ItemKind::Other(name) => name,
@@ -1183,57 +1210,37 @@ pub struct Item {
     pub name: String,
     #[serde(rename = "Type", default)]
     pub kind: ItemKind,
-    #[serde(default)]
     pub collection_type: Option<String>,
-    #[serde(default)]
     pub overview: Option<String>,
-    #[serde(default)]
     pub production_year: Option<i32>,
-    #[serde(default)]
     pub run_time_ticks: Option<i64>,
-    #[serde(default)]
     pub community_rating: Option<f32>,
-    #[serde(default)]
     pub critic_rating: Option<f32>,
     /// Streams of the file; a list query has them only while the quality
     /// tags are on.
     #[serde(default)]
     pub media_streams: Vec<MediaStream>,
-    #[serde(default)]
     pub child_count: Option<i32>,
-    #[serde(default)]
     pub official_rating: Option<String>,
     #[serde(default)]
     pub genres: Vec<String>,
-    #[serde(default)]
     pub original_title: Option<String>,
-    #[serde(default)]
     pub series_name: Option<String>,
-    #[serde(default)]
     pub series_id: Option<String>,
-    #[serde(default)]
     pub season_id: Option<String>,
-    #[serde(default)]
     pub index_number: Option<i32>,
-    #[serde(default)]
     pub parent_index_number: Option<i32>,
     #[serde(default)]
     pub image_tags: ImageTags,
     #[serde(default)]
     pub backdrop_image_tags: Vec<String>,
-    #[serde(default)]
     pub parent_backdrop_item_id: Option<String>,
     #[serde(default)]
     pub parent_backdrop_image_tags: Vec<String>,
-    #[serde(default)]
     pub series_primary_image_tag: Option<String>,
-    #[serde(default)]
     pub series_thumb_image_tag: Option<String>,
-    #[serde(default)]
     pub parent_thumb_item_id: Option<String>,
-    #[serde(default)]
     pub parent_thumb_image_tag: Option<String>,
-    #[serde(default)]
     pub season_name: Option<String>,
     #[serde(default)]
     pub taglines: Vec<String>,
@@ -1253,9 +1260,7 @@ pub struct Item {
     #[serde(default)]
     pub provider_ids: std::collections::HashMap<String, Option<String>>,
     /// "Continuing" or "Ended" for a series.
-    #[serde(default)]
     pub status: Option<String>,
-    #[serde(default)]
     pub end_date: Option<String>,
     #[serde(default)]
     pub user_data: UserData,
@@ -1263,14 +1268,12 @@ pub struct Item {
 
 /// A marked range of an item, such as its intro.
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct MediaSegment {
     /// "Intro", "Outro", "Recap", "Preview" or "Commercial".
-    #[serde(rename = "Type", default)]
+    #[serde(rename = "Type")]
     pub kind: String,
-    #[serde(default)]
     start_ticks: i64,
-    #[serde(default)]
     end_ticks: i64,
 }
 
@@ -1292,29 +1295,20 @@ pub struct SeerrItem {
     /// "movie" or "tv".
     #[serde(default)]
     pub media_type: String,
-    #[serde(default)]
     title: Option<String>,
-    #[serde(default)]
     name: Option<String>,
-    #[serde(default)]
     pub poster_path: Option<String>,
-    #[serde(default)]
     release_date: Option<String>,
-    #[serde(default)]
     first_air_date: Option<String>,
-    #[serde(default)]
     pub vote_average: Option<f32>,
-    #[serde(default)]
     pub media_info: Option<SeerrMediaInfo>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct SeerrMediaInfo {
     /// 2 pending, 3 processing, 4 partly available, 5 available.
-    #[serde(default)]
     pub status: Option<i32>,
-    #[serde(default)]
     pub jellyfin_media_id: Option<String>,
 }
 
@@ -1355,105 +1349,99 @@ impl SeerrItem {
 
 /// A cast or crew member of an item.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct Person {
-    #[serde(default)]
     pub id: String,
-    #[serde(default)]
     pub name: String,
-    #[serde(default)]
     pub role: Option<String>,
     /// "Actor", "Director", "Writer", "GuestStar", ...
-    #[serde(rename = "Type", default)]
+    #[serde(rename = "Type")]
     pub kind: String,
-    #[serde(default)]
     pub primary_image_tag: Option<String>,
 }
 
 /// A name with an optional link or id (studios, external links, trailers).
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct NamedRef {
-    #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
     pub url: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct MediaSource {
-    #[serde(default)]
     pub media_streams: Vec<MediaStream>,
     /// File name and path; the quality tags read stub, 3D and IMAX hints here.
-    #[serde(default)]
     pub path: Option<String>,
-    #[serde(default)]
     pub name: Option<String>,
+    // The fields below are what the answer to `PlaybackInfo` adds.
+    pub id: String,
+    pub supports_direct_play: bool,
+    pub supports_direct_stream: bool,
+    pub supports_transcoding: bool,
+    /// Relative to the server, with the token in its query.
+    pub transcoding_url: Option<String>,
+    pub transcoding_container: Option<String>,
+    pub transcoding_sub_protocol: Option<String>,
+    /// Bits per second of the file.
+    pub bitrate: Option<u64>,
+    pub default_audio_stream_index: Option<i64>,
+    pub default_subtitle_stream_index: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct MediaStream {
     /// "Video", "Audio" or "Subtitle".
-    #[serde(rename = "Type", default)]
+    #[serde(rename = "Type")]
     pub kind: String,
     /// Place of the stream in the media source; a remote control names a
     /// track by it.
-    #[serde(default)]
     pub index: i64,
-    #[serde(default)]
     pub display_title: Option<String>,
-    #[serde(default)]
     pub is_default: bool,
     /// Three-letter language code, such as "eng".
-    #[serde(default)]
     pub language: Option<String>,
     /// "SDR", "HDR10", "HDR10Plus", "HLG", "DOVI" and its variants.
-    #[serde(default)]
     pub video_range_type: Option<String>,
     // The fields below are what the quality tags of the plugin read.
-    #[serde(default)]
     pub codec: Option<String>,
-    #[serde(default)]
     pub codec_tag: Option<String>,
-    #[serde(default)]
     pub profile: Option<String>,
-    #[serde(default)]
     pub title: Option<String>,
-    #[serde(default)]
     pub channels: Option<i32>,
-    #[serde(default)]
     pub channel_layout: Option<String>,
-    #[serde(default)]
     pub width: Option<i32>,
-    #[serde(default)]
     pub height: Option<i32>,
+    /// In a file of its own, beside the media file.
+    pub is_external: bool,
+    /// The file of an external stream, on the server.
+    pub path: Option<String>,
+    /// A subtitle of text (SubRip, ASS, VTT); false for an image track.
+    pub is_text_subtitle_stream: bool,
+    /// How a subtitle gets to the player, in an answer to `PlaybackInfo`:
+    /// "Embed" (in the stream), "External" (a file at `delivery_url`),
+    /// "Encode" (burned in).
+    pub delivery_method: Option<String>,
+    pub delivery_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct ImageTags {
-    #[serde(default)]
     pub primary: Option<String>,
-    #[serde(default)]
     pub thumb: Option<String>,
-    #[serde(default)]
     pub logo: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct UserData {
-    #[serde(default)]
     pub playback_position_ticks: i64,
-    #[serde(default)]
     pub played: bool,
-    #[serde(default)]
     pub is_favorite: bool,
-    #[serde(default)]
     pub unplayed_item_count: Option<i32>,
-    #[serde(default)]
     pub played_percentage: Option<f32>,
 }
 
@@ -1556,12 +1544,9 @@ impl Item {
 
     /// Display title of the first stream of a kind; the default one wins.
     pub fn stream_title(&self, kind: &str) -> Option<String> {
-        let streams = &self.media_sources.first()?.media_streams;
-        streams
-            .iter()
-            .filter(|s| s.kind == kind)
-            .max_by_key(|s| s.is_default)
-            .and_then(|s| s.display_title.clone())
+        let streams = self.streams(kind);
+        let shown = streams.iter().find(|s| s.is_default).or(streams.first())?;
+        shown.display_title.clone()
     }
 
     /// Names of the people of one kind, in credit order, without repeats.
@@ -1672,6 +1657,221 @@ pub fn format_runtime(secs: i64) -> String {
     }
 }
 
+// ----- Player timeline: chapters, preview images, what plays next ------------
+
+/// A named point in a video.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct Chapter {
+    #[serde(default)]
+    pub start_position_ticks: i64,
+    #[serde(default)]
+    pub name: String,
+}
+
+impl Chapter {
+    pub fn start_secs(&self) -> f64 {
+        self.start_position_ticks as f64 / TICKS_PER_SECOND as f64
+    }
+}
+
+/// The preview images of a video ("trickplay"): sheets of small frames, one
+/// frame for each `interval` of the video.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct Trickplay {
+    /// Size of one frame.
+    pub width: u32,
+    pub height: u32,
+    /// Frames in one row and in one column of a sheet.
+    pub tile_width: u32,
+    pub tile_height: u32,
+    #[serde(default)]
+    pub thumbnail_count: u32,
+    /// Milliseconds between two frames.
+    pub interval: u32,
+}
+
+/// What the player timeline shows for one item.
+#[derive(Clone, Debug, Default)]
+pub struct TimelineInfo {
+    pub chapters: Vec<Chapter>,
+    pub trickplay: Option<Trickplay>,
+    /// The audio track for the user, as its place among the audio tracks of
+    /// the file, from 1 (the way mpv counts them): a track in the audio
+    /// language of the user, else the track the server names.
+    pub default_audio: Option<i64>,
+    /// The subtitle the server chose for the user, counted the same way:
+    /// `Some(None)` is no subtitle, `None` is unknown.
+    pub default_subtitle: Option<Option<i64>>,
+}
+
+impl Client {
+    /// The audio language the user prefers (`/Users/Me`); none when the
+    /// user plays the default track of the file whatever its language, or
+    /// when the server did not answer.
+    pub fn audio_language(&self) -> Option<String> {
+        let audio = self.get::<Me>("/Users/Me", &[]).ok()?.configuration;
+        audio
+            .audio_language_preference
+            .filter(|language| !language.is_empty() && !audio.play_default_audio_track)
+    }
+
+    /// Chapters and preview images of an item. The lists of items leave
+    /// these out, because they are large.
+    pub fn timeline_info(&self, item_id: &str) -> Result<TimelineInfo> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Full {
+            #[serde(default)]
+            chapters: Vec<Chapter>,
+            /// Media source id, then frame width, then the sheet layout.
+            #[serde(default)]
+            trickplay: std::collections::HashMap<
+                String,
+                std::collections::HashMap<String, serde_json::Value>,
+            >,
+            #[serde(default)]
+            media_sources: Vec<Source>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Source {
+            default_audio_stream_index: Option<i64>,
+            default_subtitle_stream_index: Option<i64>,
+            #[serde(default)]
+            media_streams: Vec<Stream>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Stream {
+            #[serde(rename = "Type", default)]
+            kind: String,
+            #[serde(default)]
+            index: i64,
+            #[serde(default)]
+            is_external: bool,
+            language: Option<String>,
+        }
+        let user = self.user()?.to_string();
+        let full: Full = self.get(&format!("/Items/{item_id}"), &[("userId", user)])?;
+        let widths = full
+            .trickplay
+            .get(item_id)
+            .or_else(|| full.trickplay.values().next());
+        // The smallest frames are enough for a preview over the timeline.
+        let trickplay = widths.and_then(|widths| {
+            widths
+                .values()
+                .filter_map(|v| serde_json::from_value::<Trickplay>(v.clone()).ok())
+                .filter(|t| t.width > 0 && t.height > 0 && t.interval > 0)
+                .filter(|t| t.tile_width > 0 && t.tile_height > 0)
+                .min_by_key(|t| t.width)
+        });
+        // The audio settings of the user, read now so a change made a
+        // moment ago in another client counts.
+        let language = self.audio_language();
+        let default_audio = full.media_sources.first().and_then(|source| {
+            let tracks: Vec<&Stream> = source
+                .media_streams
+                .iter()
+                .filter(|stream| stream.kind == "Audio" && !stream.is_external)
+                .collect();
+            // A track in the language of the user comes first. The server
+            // can name another one: it remembers the track of an earlier
+            // playback, also when that was the default track of the file.
+            let preferred = language
+                .as_deref()
+                .and_then(|language| tracks.iter().position(|t| t.language.as_deref() == Some(language)));
+            let chosen = source
+                .default_audio_stream_index
+                .and_then(|wanted| tracks.iter().position(|t| t.index == wanted));
+            preferred.or(chosen).map(|place| place as i64 + 1)
+        });
+        let default_subtitle = full.media_sources.first().and_then(|source| {
+            let Some(wanted) = source.default_subtitle_stream_index.filter(|i| *i >= 0) else {
+                return Some(None);
+            };
+            // A subtitle in a file of its own is not in the stream mpv plays.
+            source
+                .media_streams
+                .iter()
+                .filter(|stream| stream.kind == "Subtitle" && !stream.is_external)
+                .position(|stream| stream.index == wanted)
+                .map(|place| Some(place as i64 + 1))
+        });
+        Ok(TimelineInfo {
+            chapters: full.chapters,
+            trickplay,
+            default_audio,
+            default_subtitle,
+        })
+    }
+
+    /// Address of one sheet of preview images. The server wants the session
+    /// for these; the image loader sends the header (see [`image_auth_header`]),
+    /// so the token is not in the URL.
+    pub fn trickplay_url(&self, item_id: &str, width: u32, sheet: u32) -> String {
+        self.url(&format!("/Videos/{item_id}/Trickplay/{width}/{sheet}.jpg"), &[])
+    }
+
+    /// The episodes that follow an episode in its series, in order.
+    pub fn episodes_after(&self, series_id: &str, episode_id: &str) -> Result<Vec<Item>> {
+        let mut episodes = self.item_list(
+            &format!("/Shows/{series_id}/Episodes"),
+            &[
+                ("startItemId", episode_id.to_string()),
+                ("limit", "50".to_string()),
+                ("fields", ITEM_FIELDS.to_string()),
+            ],
+        )?;
+        episodes.retain(|item| item.id != episode_id);
+        Ok(episodes)
+    }
+
+    /// The episodes of one season of a series, by the number of the season;
+    /// every episode of the series with no number.
+    pub fn season_episodes(&self, series_id: &str, season: Option<i32>) -> Result<Vec<Item>> {
+        // No number is an empty value, which leaves the name out of the URL.
+        let season = season.map(|season| season.to_string()).unwrap_or_default();
+        self.item_list(
+            &format!("/Shows/{series_id}/Episodes"),
+            &[("fields", ITEM_FIELDS.to_string()), ("season", season)],
+        )
+    }
+
+    /// The episodes a series stands for in a play queue: the next unwatched
+    /// one and those after it, or the first ones when all are watched.
+    pub fn series_queue(&self, series_id: &str) -> Result<Vec<Item>> {
+        if let Some(next) = self.series_next_up(series_id)? {
+            let mut episodes = self.episodes_after(series_id, &next.id)?;
+            episodes.insert(0, next);
+            return Ok(episodes);
+        }
+        self.item_list(
+            &format!("/Shows/{series_id}/Episodes"),
+            &[("limit", "50".to_string()), ("fields", ITEM_FIELDS.to_string())],
+        )
+    }
+}
+
+/// `BLOOM_NO_REPORT` keeps playback from the server's records, so a test
+/// does not move a resume point or mark an item as played.
+pub fn no_report() -> bool {
+    crate::options::options().no_report
+}
+
+/// With the reports off, the log still shows what would go to the server,
+/// so a test can check their order.
+fn log_unsent(kind: &str, p: &Progress) {
+    log::debug!(
+        "report {kind} (not sent): item {} session {} at {} s",
+        p.item_id,
+        &p.play_session_id[..p.play_session_id.len().min(8)],
+        p.position_ticks / TICKS_PER_SECOND
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1697,6 +1897,7 @@ mod tests {
     /// ends with the test.
     struct Sender {
         port: u16,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
         stop: Arc<std::sync::atomic::AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
@@ -1708,22 +1909,124 @@ mod tests {
             let port = listener.local_addr().unwrap().port();
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stopping = stop.clone();
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = requests.clone();
             let thread = std::thread::spawn(move || {
                 for mut stream in crate::test_net::connections(listener, stopping) {
                     let mut buffer = [0u8; 4096];
                     let _ = stream.read(&mut buffer);
+                    count.fetch_add(1, Ordering::SeqCst);
                     let _ = stream.write_all(head.as_bytes());
                     let _ = stream.write_all(body.as_bytes());
                     let _ = stream.flush();
                     // Closed with the rest of the body never sent.
                 }
             });
-            Self { port, stop, thread: Some(thread) }
+            Self { port, requests, stop, thread: Some(thread) }
         }
 
         fn client(&self) -> Client {
             Client::new(&format!("http://127.0.0.1:{}", self.port), "d")
         }
+
+        fn requests(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+    }
+
+    /// An answer of more than the 10 MB the HTTP client reads by itself:
+    /// the titles of a large library, a server log of a busy day. Both
+    /// came back as an error, and the search had no index.
+    #[test]
+    fn an_answer_over_ten_megabytes_is_read() {
+        const LETTERS: usize = 11 * 1024 * 1024;
+        let body: &'static str = Box::leak(format!("\"{}\"", "a".repeat(LETTERS)).into_boxed_str());
+        let head: &'static str = Box::leak(
+            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+                .into_boxed_str(),
+        );
+        let server = Sender::start(head, body);
+        let text: String = server.client().get("/Items", &[]).unwrap_or_else(|err| panic!("{err:#}"));
+        assert_eq!(text.len(), LETTERS);
+        let log = server.client().get_text("/System/Logs/Log", &[]).unwrap_or_else(|err| panic!("{err:#}"));
+        assert_eq!(log.len(), body.len());
+    }
+
+    /// The user of a session is asked for once by all who ask within a
+    /// moment, and so is an error: with the server in trouble, four
+    /// callers do not wait for four answers. Another token asks again.
+    #[test]
+    fn the_user_of_a_session_is_asked_for_once() {
+        let server = Sender::start(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n",
+            "{\"Id\":\"u1\"}",
+        );
+        let client = server.client().with_token("t", "u1");
+        let clone = client.clone();
+        assert_eq!(client.me().unwrap()["Id"], "u1");
+        assert_eq!(clone.me().unwrap()["Id"], "u1");
+        assert_eq!(server.requests(), 1);
+        client.with_token("other", "u2").me().unwrap();
+        assert_eq!(server.requests(), 2);
+
+        let down = Sender::start("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", "");
+        let client = down.client().with_token("t", "u1");
+        let first = client.me().unwrap_err();
+        let second = client.clone().me().unwrap_err();
+        assert_eq!(down.requests(), 1, "each caller waited for an answer of its own");
+        assert_eq!((status_of(&first), status_of(&second)), (Some(500), Some(500)));
+        assert_eq!(second.to_string(), "HTTP 500 at /Users/Me");
+    }
+
+    /// The old address of the user's picture is for a server that does not
+    /// know the new one (404, 405). Any other failure is the answer: a
+    /// second request would only wait once more.
+    #[test]
+    fn the_picture_is_removed_at_the_old_address_only_when_the_new_one_is_unknown() {
+        let broken = Sender::start("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", "");
+        let err = broken.client().with_token("t", "u1").delete_user_image().unwrap_err();
+        assert_eq!(status_of(&err), Some(500));
+        assert_eq!(broken.requests(), 1, "a failure that is not \"no such address\" was tried twice");
+        let old = Sender::start("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", "");
+        let _ = old.client().with_token("t", "u1").delete_user_image();
+        assert_eq!(old.requests(), 2);
+    }
+
+    /// A sign-in whose answer breaks while it comes is a lost connection,
+    /// as for any other request, not a wrong answer of the server.
+    #[test]
+    fn a_sign_in_cut_short_is_a_lost_connection() {
+        use crate::connection::{Verdict, Why, classify};
+        let server = Sender::start(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n",
+            "{\"User\": {\"Id\": \"a\"",
+        );
+        let err = server.client().authenticate("name", "word").unwrap_err();
+        assert_eq!(classify(&err), Verdict::Unreachable(Why::Connect), "{err:#}");
+    }
+
+    /// The title of a kind of stream is the default stream's, else the
+    /// first one's.
+    #[test]
+    fn the_title_of_a_stream_is_the_default_or_the_first() {
+        let item = |default: usize| -> Item {
+            let streams: Vec<_> = (0..3)
+                .map(|n| serde_json::json!({ "Type": "Audio", "DisplayTitle": format!("a{n}"), "IsDefault": n == default }))
+                .collect();
+            serde_json::from_value(serde_json::json!({ "Id": "1", "MediaSources": [{ "MediaStreams": streams }] })).unwrap()
+        };
+        assert_eq!(item(1).stream_title("Audio").as_deref(), Some("a1"));
+        assert_eq!(item(9).stream_title("Audio").as_deref(), Some("a0"), "with no default stream: the first");
+        assert_eq!(item(0).stream_title("Video"), None);
+    }
+
+    #[test]
+    fn the_addresses_need_no_client() {
+        assert_eq!(urls::splashscreen("https://jf.example.com/"), "https://jf.example.com/Branding/Splashscreen?format=jpg&quality=80");
+        let client = Client::new("https://jf.example.com/", "d");
+        assert_eq!(client.splashscreen_url(), urls::splashscreen("https://jf.example.com"));
+        assert_eq!(client.image_url("i", "Primary", Some("t"), 300), urls::image("https://jf.example.com", "i", "Primary", Some("t"), 300));
+        assert_eq!(client.web_url("i"), "https://jf.example.com/web/#/details?id=i");
     }
 
     impl Drop for Sender {
@@ -1888,244 +2191,4 @@ mod tests {
         assert_eq!(format_duration(3725), "1:02:05");
         assert_eq!(format_runtime(5400), "1h 30m");
     }
-}
-
-// ----- Player timeline: chapters, preview images, what plays next ------------
-
-/// A named point in a video.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct Chapter {
-    #[serde(default)]
-    pub start_position_ticks: i64,
-    #[serde(default)]
-    pub name: String,
-}
-
-impl Chapter {
-    pub fn start_secs(&self) -> f64 {
-        self.start_position_ticks as f64 / TICKS_PER_SECOND as f64
-    }
-}
-
-/// The preview images of a video ("trickplay"): sheets of small frames, one
-/// frame for each `interval` of the video.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct Trickplay {
-    /// Size of one frame.
-    pub width: u32,
-    pub height: u32,
-    /// Frames in one row and in one column of a sheet.
-    pub tile_width: u32,
-    pub tile_height: u32,
-    #[serde(default)]
-    pub thumbnail_count: u32,
-    /// Milliseconds between two frames.
-    pub interval: u32,
-}
-
-/// What the player timeline shows for one item.
-#[derive(Clone, Debug, Default)]
-pub struct TimelineInfo {
-    pub chapters: Vec<Chapter>,
-    pub trickplay: Option<Trickplay>,
-    /// The audio track for the user, as its place among the audio tracks of
-    /// the file, from 1 (the way mpv counts them): a track in the audio
-    /// language of the user, else the track the server names.
-    pub default_audio: Option<i64>,
-    /// The subtitle the server chose for the user, counted the same way:
-    /// `Some(None)` is no subtitle, `None` is unknown.
-    pub default_subtitle: Option<Option<i64>>,
-}
-
-impl Client {
-    /// Chapters and preview images of an item. The lists of items leave
-    /// these out, because they are large.
-    pub fn timeline_info(&self, item_id: &str) -> Result<TimelineInfo> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Full {
-            #[serde(default)]
-            chapters: Vec<Chapter>,
-            /// Media source id, then frame width, then the sheet layout.
-            #[serde(default)]
-            trickplay: std::collections::HashMap<
-                String,
-                std::collections::HashMap<String, serde_json::Value>,
-            >,
-            #[serde(default)]
-            media_sources: Vec<Source>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Source {
-            #[serde(default)]
-            default_audio_stream_index: Option<i64>,
-            #[serde(default)]
-            default_subtitle_stream_index: Option<i64>,
-            #[serde(default)]
-            media_streams: Vec<Stream>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Stream {
-            #[serde(rename = "Type", default)]
-            kind: String,
-            #[serde(default)]
-            index: i64,
-            #[serde(default)]
-            is_external: bool,
-            #[serde(default)]
-            language: Option<String>,
-        }
-        #[derive(Default, Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Me {
-            #[serde(default)]
-            configuration: Audio,
-        }
-        #[derive(Default, Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Audio {
-            #[serde(default)]
-            audio_language_preference: Option<String>,
-            #[serde(default)]
-            play_default_audio_track: bool,
-        }
-        let user = self.user()?.to_string();
-        let full: Full = self.get(&format!("/Items/{item_id}"), &[("userId", user)])?;
-        let widths = full
-            .trickplay
-            .get(item_id)
-            .or_else(|| full.trickplay.values().next());
-        // The smallest frames are enough for a preview over the timeline.
-        let trickplay = widths.and_then(|widths| {
-            widths
-                .values()
-                .filter_map(|v| serde_json::from_value::<Trickplay>(v.clone()).ok())
-                .filter(|t| t.width > 0 && t.height > 0 && t.interval > 0)
-                .filter(|t| t.tile_width > 0 && t.tile_height > 0)
-                .min_by_key(|t| t.width)
-        });
-        // The audio settings of the user, read now so a change made a
-        // moment ago in another client counts.
-        let audio = self
-            .get::<Me>("/Users/Me", &[])
-            .map(|me| me.configuration)
-            .unwrap_or_default();
-        let language = audio
-            .audio_language_preference
-            .filter(|language| !language.is_empty() && !audio.play_default_audio_track);
-        let default_audio = full.media_sources.first().and_then(|source| {
-            let tracks: Vec<&Stream> = source
-                .media_streams
-                .iter()
-                .filter(|stream| stream.kind == "Audio" && !stream.is_external)
-                .collect();
-            // A track in the language of the user comes first. The server
-            // can name another one: it remembers the track of an earlier
-            // playback, also when that was the default track of the file.
-            let preferred = language
-                .as_deref()
-                .and_then(|language| tracks.iter().position(|t| t.language.as_deref() == Some(language)));
-            let chosen = source
-                .default_audio_stream_index
-                .and_then(|wanted| tracks.iter().position(|t| t.index == wanted));
-            preferred.or(chosen).map(|place| place as i64 + 1)
-        });
-        let default_subtitle = full.media_sources.first().and_then(|source| {
-            let Some(wanted) = source.default_subtitle_stream_index.filter(|i| *i >= 0) else {
-                return Some(None);
-            };
-            // A subtitle in a file of its own is not in the stream mpv plays.
-            source
-                .media_streams
-                .iter()
-                .filter(|stream| stream.kind == "Subtitle" && !stream.is_external)
-                .position(|stream| stream.index == wanted)
-                .map(|place| Some(place as i64 + 1))
-        });
-        Ok(TimelineInfo {
-            chapters: full.chapters,
-            trickplay,
-            default_audio,
-            default_subtitle,
-        })
-    }
-
-    /// Address of one sheet of preview images. The server wants the session
-    /// for these; the image loader sends the header (see [`image_auth_header`]),
-    /// so the token is not in the URL.
-    pub fn trickplay_url(&self, item_id: &str, width: u32, sheet: u32) -> String {
-        self.url(&format!("/Videos/{item_id}/Trickplay/{width}/{sheet}.jpg"), &[])
-    }
-
-    /// The episodes that follow an episode in its series, in order.
-    pub fn episodes_after(&self, series_id: &str, episode_id: &str) -> Result<Vec<Item>> {
-        let user = self.user()?.to_string();
-        let result: ItemsResult = self.get(
-            &format!("/Shows/{series_id}/Episodes"),
-            &[
-                ("userId", user),
-                ("startItemId", episode_id.to_string()),
-                ("limit", "50".to_string()),
-                ("fields", ITEM_FIELDS.to_string()),
-            ],
-        )?;
-        Ok(result
-            .items
-            .into_iter()
-            .filter(|item| item.id != episode_id)
-            .collect())
-    }
-
-    /// The episodes of one season of a series, by the number of the season;
-    /// every episode of the series with no number.
-    pub fn season_episodes(&self, series_id: &str, season: Option<i32>) -> Result<Vec<Item>> {
-        let user = self.user()?.to_string();
-        let mut query = vec![("userId", user), ("fields", ITEM_FIELDS.to_string())];
-        if let Some(season) = season {
-            query.push(("season", season.to_string()));
-        }
-        let result: ItemsResult = self.get(&format!("/Shows/{series_id}/Episodes"), &query)?;
-        Ok(result.items)
-    }
-
-    /// The episodes a series stands for in a play queue: the next unwatched
-    /// one and those after it, or the first ones when all are watched.
-    pub fn series_queue(&self, series_id: &str) -> Result<Vec<Item>> {
-        if let Some(next) = self.series_next_up(series_id)? {
-            let mut episodes = self.episodes_after(series_id, &next.id)?;
-            episodes.insert(0, next);
-            return Ok(episodes);
-        }
-        let user = self.user()?.to_string();
-        let result: ItemsResult = self.get(
-            &format!("/Shows/{series_id}/Episodes"),
-            &[
-                ("userId", user),
-                ("limit", "50".to_string()),
-                ("fields", ITEM_FIELDS.to_string()),
-            ],
-        )?;
-        Ok(result.items)
-    }
-}
-
-/// `BLOOM_NO_REPORT` keeps playback from the server's records, so a test
-/// does not move a resume point or mark an item as played.
-pub fn no_report() -> bool {
-    crate::options::options().no_report
-}
-
-/// With the reports off, the log still shows what would go to the server,
-/// so a test can check their order.
-fn log_unsent(kind: &str, p: &Progress) {
-    log::debug!(
-        "report {kind} (not sent): item {} session {} at {} s",
-        p.item_id,
-        &p.play_session_id[..p.play_session_id.len().min(8)],
-        p.position_ticks / TICKS_PER_SECOND
-    );
 }

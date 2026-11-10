@@ -8,8 +8,6 @@ use std::borrow::Cow;
 use gpui_icons::LucideAssetSource;
 use gpui_kit::{AssetSource, Rgba, SharedString, Styled, Svg, px, svg};
 
-const PREFIX: &str = "icons/filled/";
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Filled {
     Play,
@@ -52,25 +50,27 @@ impl Filled {
         Filled::Cast,
     ];
 
-    fn name(self) -> &'static str {
+    /// The path the asset source serves the icon at. It is the whole
+    /// path, so an icon in a frame costs no string of its own.
+    fn asset(self) -> &'static str {
         match self {
-            Filled::Play => "play",
-            Filled::Pause => "pause",
-            Filled::Star => "star",
-            Filled::Heart => "heart",
-            Filled::More => "more",
-            Filled::Trailer => "trailer",
-            Filled::DropDown => "drop-down",
-            Filled::Rewind => "rewind",
-            Filled::Forward => "forward",
-            Filled::VolumeUp => "volume-up",
-            Filled::VolumeOff => "volume-off",
-            Filled::Settings => "settings",
-            Filled::Fullscreen => "fullscreen",
-            Filled::FullscreenExit => "fullscreen-exit",
-            Filled::Captions => "captions",
-            Filled::Groups => "groups",
-            Filled::Cast => "cast",
+            Filled::Play => "icons/filled/play.svg",
+            Filled::Pause => "icons/filled/pause.svg",
+            Filled::Star => "icons/filled/star.svg",
+            Filled::Heart => "icons/filled/heart.svg",
+            Filled::More => "icons/filled/more.svg",
+            Filled::Trailer => "icons/filled/trailer.svg",
+            Filled::DropDown => "icons/filled/drop-down.svg",
+            Filled::Rewind => "icons/filled/rewind.svg",
+            Filled::Forward => "icons/filled/forward.svg",
+            Filled::VolumeUp => "icons/filled/volume-up.svg",
+            Filled::VolumeOff => "icons/filled/volume-off.svg",
+            Filled::Settings => "icons/filled/settings.svg",
+            Filled::Fullscreen => "icons/filled/fullscreen.svg",
+            Filled::FullscreenExit => "icons/filled/fullscreen-exit.svg",
+            Filled::Captions => "icons/filled/captions.svg",
+            Filled::Groups => "icons/filled/groups.svg",
+            Filled::Cast => "icons/filled/cast.svg",
         }
     }
 
@@ -125,10 +125,7 @@ impl Filled {
 
 /// A filled icon of a size and colour.
 pub fn filled(icon: Filled, size: f32, color: Rgba) -> Svg {
-    svg()
-        .path(SharedString::from(format!("{PREFIX}{}.svg", icon.name())))
-        .size(px(size))
-        .text_color(color)
+    svg().path(icon.asset()).size(px(size)).text_color(color)
 }
 
 const LOGO_PATH: &str = "icons/jellyfin.svg";
@@ -161,21 +158,16 @@ impl AssetSource for Assets {
         if path == APP_ICON_PATH {
             return Ok(Some(Cow::Borrowed(APP_ICON_PNG)));
         }
-        let Some(name) = path
-            .strip_prefix(PREFIX)
-            .and_then(|n| n.strip_suffix(".svg"))
-        else {
+        let Some(icon) = Filled::ALL.iter().find(|icon| icon.asset() == path) else {
             return LucideAssetSource.load(path);
         };
-        Ok(Filled::ALL.iter().find(|i| i.name() == name).map(|icon| {
-            Cow::Owned(
-                format!(
-                    r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="black" d="{}"/></svg>"#,
-                    icon.path()
-                )
-                .into_bytes(),
+        Ok(Some(Cow::Owned(
+            format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="black" d="{}"/></svg>"#,
+                icon.path()
             )
-        }))
+            .into_bytes(),
+        )))
     }
 
     fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {

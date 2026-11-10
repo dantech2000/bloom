@@ -16,7 +16,10 @@
 //! call of the playback facade (`src/playback.rs`), so a remote pause in a
 //! SyncPlay group is a request to the group, as a click is.
 
-pub mod protocol;
+pub mod debug;
+/// The shapes on the wire are in `bloom-core`, where their tests run
+/// without the app.
+pub use bloom_core::cast::protocol;
 pub mod target;
 pub mod ui;
 
@@ -37,24 +40,17 @@ use crate::{
     airplay::{AirPlayEvent, picker},
     app::{Bloom, Panel},
     chromecast::{
-        jellyfin::{self as cast_jellyfin, Identity, ItemStub},
+        jellyfin as cast_jellyfin,
         mdns::{self, Device},
-        messages::LoadMedia,
-        session::{Event as CastEvent, JellyfinLoad, LoadRequest, Session},
+        session::{Event as CastEvent, Session},
     },
-    jellyfin::Item,
+    jellyfin::{Client, Item, ItemsResult},
     realtime::SocketEvent,
 };
 
 /// Time between two reads of the sessions while a target is set and the
 /// socket does not push them.
 const POLL_WITHOUT_SOCKET: Duration = Duration::from_secs(2);
-/// How long after an item was sent to a cast device a status with no app
-/// counts as the launch of its app with no word of the connection: the
-/// load is a command on its way to the connection's thread for a moment.
-/// After that the status itself says whether a load waits for its app
-/// (`Status::launching`), for as long as the launch takes.
-const CAST_LAUNCH_GRACE: Duration = Duration::from_secs(2);
 /// With the socket, a read now and then catches what a push missed.
 const POLL_WITH_SOCKET: Duration = Duration::from_secs(15);
 /// The subscription: the first push after 100 ms, then one a second.
@@ -62,6 +58,18 @@ const SUBSCRIPTION: &str = "100,1000";
 /// How long the panel says "Searching…" for cast devices once the search
 /// starts; after that a list with nobody in it says nothing.
 const SEARCH_NOTE: Duration = Duration::from_secs(6);
+/// Time between two looks of the panel and the chip at what moves with no
+/// event: the position of a target that plays, and the cast devices the
+/// search found.
+const TICK: Duration = Duration::from_secs(1);
+/// The first looks after the panel opens come sooner: the devices answer
+/// the search within a moment.
+const TICK_AT_FIRST: Duration = Duration::from_millis(300);
+/// How long after the AirPlay engine gave no player the picker asks again.
+const PICKER_RETRY: Duration = Duration::from_secs(2);
+/// The ids of one request for the items of a remote `Play`: a request line
+/// has a longest length, and a hundred ids stay well under it.
+const IDS_PER_REQUEST: usize = 100;
 
 /// Where a poll of the sessions stands: the session that asked, and the
 /// choice of the target at the time.
@@ -114,10 +122,15 @@ pub struct CastState {
     /// The item this app loaded on the cast device: the device reports
     /// only its id.
     pub cast_item: Option<Item>,
-    /// An app ran on the cast device since the item was sent there.
-    cast_app_up: bool,
-    /// When the item was sent to the cast device.
-    cast_sent_at: Option<Instant>,
+    /// The number the connection gave the load of that item; the end of
+    /// the item comes with it (`CastEvent::Ended`).
+    cast_load: u64,
+    /// The cast devices the panel lists, as of the last look (`TICK`).
+    pub devices: Vec<Device>,
+    /// Looks at what moves with no event while the panel is open or a
+    /// target is set (`start_cast_tick`); `ticking` until it ends.
+    tick: Option<Task<()>>,
+    ticking: bool,
     /// The streams the Jellyfin receiver app says it plays.
     pub cast_tracks: CastTracks,
     /// When the search for cast devices started, for "Searching…".
@@ -130,6 +143,9 @@ pub struct CastState {
     pub picker_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// Where the picker is in the window now.
     pub picker_place: Option<picker::Place>,
+    /// When the AirPlay engine last gave no player for the picker: the
+    /// ask waits on the UI thread, so it is not made again at every frame.
+    picker_failed: Option<Instant>,
     /// The fake device of `BLOOM_CHROMECAST_MOCK`.
     mock: Option<crate::chromecast::mock::Mock>,
 }
@@ -172,6 +188,45 @@ impl CastState {
     pub fn searching(&self) -> bool {
         self.search_started.is_some_and(|at| at.elapsed() < SEARCH_NOTE)
     }
+}
+
+#[easy_ext::ext(CastApi)]
+impl Client {
+    /// Items by their ids, a hundred to a request, in the order the server
+    /// gives them. An id the server does not know is not in the answer.
+    fn items_by_ids(&self, ids: &[String]) -> anyhow::Result<Vec<Item>> {
+        let user = self.user()?.to_string();
+        let mut items = Vec::new();
+        for ids in ids.chunks(IDS_PER_REQUEST) {
+            let result: ItemsResult = self.get(
+                "/Items",
+                &[
+                    ("userId", user.clone()),
+                    ("ids", ids.join(",")),
+                    ("fields", "Overview,PrimaryImageAspectRatio,ProductionYear,ParentId,MediaSources".to_string()),
+                    ("enableImageTypes", "Primary,Backdrop,Thumb".to_string()),
+                ],
+            )?;
+            items.extend(result.items);
+        }
+        Ok(items)
+    }
+}
+
+/// The items of a remote `Play`, in the order of its ids. The first one
+/// is read whole, as a page reads the item it plays; the rest come in one
+/// request (they were one request each: a season was a hundred round
+/// trips before anything played). An item of the rest that the server
+/// does not give is left out.
+fn play_items(client: &Client, ids: &[String]) -> anyhow::Result<Vec<Item>> {
+    let Some((first, rest)) = ids.split_first() else {
+        return Ok(Vec::new());
+    };
+    let mut items = vec![client.item(first)?];
+    if !rest.is_empty() {
+        items.extend(protocol::in_order(client.items_by_ids(rest)?, rest));
+    }
+    Ok(items)
 }
 
 impl Bloom {
@@ -251,25 +306,14 @@ impl Bloom {
             subtitle_index,
         } = command
         {
+            // The list starts at the index the sender named.
+            let skip = start_index.filter(|n| *n < item_ids.len()).unwrap_or(0);
             // The items come off the UI thread; then the queue takes them.
             self.fetch(
                 cx,
-                move |client| {
-                    item_ids
-                        .iter()
-                        .map(|id| client.item(id))
-                        .collect::<anyhow::Result<Vec<Item>>>()
-                },
+                move |client| play_items(&client, &item_ids[skip..]),
                 move |this, result, cx| match result {
-                    Ok(items) => this.cast_play_local(
-                        items,
-                        command,
-                        start_secs,
-                        start_index,
-                        audio_index,
-                        subtitle_index,
-                        cx,
-                    ),
+                    Ok(items) => this.cast_play_local(items, command, start_secs, audio_index, subtitle_index, cx),
                     Err(err) => log::warn!("remote control: items of a Play: {err:#}"),
                 },
             );
@@ -311,45 +355,27 @@ impl Bloom {
     }
 
     /// Chooses a track of the item in the player by its stream index on
-    /// the server. -1 turns subtitles off.
+    /// the server. -1 turns subtitles off. The choice goes the way of the
+    /// menus (`stream.rs`): in a transcode the server picks the track.
     fn cast_select_track(&mut self, kind: &str, stream_index: i64) {
-        let Some(item) = &self.playing else { return };
-        let track = if stream_index < 0 {
-            None
-        } else {
-            match protocol::mpv_track(item, kind, stream_index) {
-                Some(track) => Some(track),
-                None => {
-                    log::debug!("remote control: no {kind} track for stream {stream_index}");
-                    return;
-                }
-            }
-        };
         if kind == "Audio" {
-            self.queue.explicit_audio = true;
-            self.player.set_audio(track);
+            self.stream_audio(stream_index);
         } else {
-            self.queue.explicit_subtitle = true;
-            self.player.set_subtitle(track);
+            self.stream_subtitle(stream_index);
         }
     }
 
     /// Plays or queues the items of a `Play`, as the user would from a
     /// page: in the group when in one, else in the queue of this app.
-    #[allow(clippy::too_many_arguments)]
     fn cast_play_local(
         &mut self,
         mut items: Vec<Item>,
         command: PlayCommand,
         start_secs: Option<f64>,
-        start_index: Option<usize>,
         audio_index: Option<i64>,
         subtitle_index: Option<i64>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(skip) = start_index.filter(|n| *n > 0 && *n < items.len()) {
-            items.drain(..skip);
-        }
         if items.is_empty() {
             return;
         }
@@ -440,10 +466,17 @@ impl Bloom {
         if place[2] <= 0. || place[3] <= 0. || self.cast.picker_place == Some(place) {
             return;
         }
+        // The ask waits for the engine on this thread: after one that
+        // gave nothing, the next is not at the next frame.
+        if self.cast.picker_failed.is_some_and(|at| at.elapsed() < PICKER_RETRY) {
+            return;
+        }
         let Some(player) = self.airplay.player() else {
             log::warn!("airplay: no player for the route picker");
+            self.cast.picker_failed = Some(Instant::now());
             return;
         };
+        self.cast.picker_failed = None;
         // The retain of `player` holds through the show; the view takes
         // its own.
         if picker::show(window, player.id(), place) {
@@ -463,6 +496,7 @@ impl Bloom {
         if open {
             self.load_cast_sessions(cx);
             self.start_cast_search(cx);
+            self.start_cast_tick(cx);
             self.watch_airplay(cx);
             // The picker needs the engine's player; it starts now so the
             // next frame has it.
@@ -512,8 +546,16 @@ impl Bloom {
                     self.toast("Play On", format!("Playback goes to {}.", session.device_name), cx);
                 }
             }
-            Target::Chromecast(device) => self.chromecast_connect(device, cx),
+            Target::Chromecast(device) => {
+                let name = device.name.clone();
+                if self.chromecast_open(device, cx) {
+                    self.toast("Play On", format!("Playback goes to {name}."), cx);
+                }
+            }
             Target::AirPlay => self.watch_airplay(cx),
+        }
+        if self.cast.active() {
+            self.start_cast_tick(cx);
         }
         if self.cast.active() && self.player_open {
             self.player.stop();
@@ -539,17 +581,11 @@ impl Bloom {
                 if let Some(session) = &self.chromecast.session {
                     // The device keeps what another sender put on it; what
                     // this app loaded ends with the target.
-                    let status = session.status();
-                    let ours = self.cast.cast_item.is_some()
-                        && matches!(status.player_state.as_str(), "PLAYING" | "PAUSED" | "BUFFERING");
-                    if ours {
+                    if self.cast.cast_item.is_some() && session.status().loaded() {
                         session.stop_media();
                     }
                 }
-                self.chromecast.session = None;
-                self.chromecast.task = None;
-                self.cast.cast_item = None;
-                self.cast.cast_tracks = CastTracks::default();
+                self.chromecast_close();
             }
             Leave::AirPlay => self.airplay.disconnect(),
         }
@@ -566,17 +602,22 @@ impl Bloom {
         Ok(name)
     }
 
-    /// Back to local playback. A Jellyfin session goes on as it is; what
-    /// this app put on a cast device or an AirPlay receiver stops.
+    /// Back to local playback, with nothing of a target left: the
+    /// subscription and the poll of a Jellyfin session, the connection to
+    /// a cast device (one the debug channel opened with no target as
+    /// well), the AirPlay engine, and what the panel knew of the target.
+    /// A Jellyfin session goes on as it is; what this app put on a cast
+    /// device or an AirPlay receiver stops. A change of the account calls
+    /// this, so it must leave nothing of the account before.
     pub fn cast_off(&mut self, cx: &mut Context<Self>) {
-        if self.cast.target.is_local() {
-            return;
-        }
         let leave = std::mem::take(&mut self.cast.target).leave();
+        self.cast.target_chosen = self.next_revision();
         self.cast.target_at = None;
+        self.cast.error = None;
         if let Some(leave) = leave {
             self.leave_target(leave, cx);
         }
+        self.chromecast_close();
         cx.notify();
     }
 
@@ -654,7 +695,9 @@ impl Bloom {
 
     /// A push of the sessions over the socket.
     fn cast_sessions_message(&mut self, data: &Value, cx: &mut Context<Self>) {
-        let Ok(sessions) = serde_json::from_value::<Vec<SessionInfo>>(data.clone()) else {
+        // Read in place: the push comes every second, with the item of
+        // every session in it.
+        let Ok(sessions) = <Vec<SessionInfo> as serde::Deserialize>::deserialize(data) else {
             return;
         };
         let mut changed = false;
@@ -726,7 +769,7 @@ impl Bloom {
                 let ids: Vec<String> = items.iter().map(|item| item.id.clone()).collect();
                 self.cast_send_play(ids, PlayCommand::PlayNow, resume.then_some(start), cx);
             }
-            Kind::Chromecast => self.chromecast_load(first, start, cx),
+            Kind::Chromecast => self.chromecast_load(items, start, cx),
             Kind::AirPlay => {
                 self.airplay_send(first, start, cx);
             }
@@ -953,8 +996,8 @@ impl Bloom {
         }
     }
 
-    /// Starts the search for cast devices once; it runs while the app
-    /// does. The panel says "Searching…" for a moment after.
+    /// Starts the search for cast devices, unless it runs. The panel says
+    /// "Searching…" for a moment after.
     pub fn start_cast_search(&mut self, cx: &mut Context<Self>) {
         if self.chromecast.discovery.is_some() {
             return;
@@ -966,6 +1009,7 @@ impl Bloom {
             log::info!("cast: mock device on 127.0.0.1:{}", mock.port);
             self.cast.mock = Some(mock);
         }
+        self.cast.devices = self.chromecast_devices();
         // The note goes away by itself.
         self.cast.search_timer = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SEARCH_NOTE).await;
@@ -973,29 +1017,85 @@ impl Bloom {
         }));
     }
 
-    /// The cast devices the panel lists: what the search found, and the
-    /// fake one of a test.
+    /// Ends the search: its thread asks the network every few seconds, and
+    /// nobody reads the answers with the panel closed. A search the debug
+    /// channel asked for stays, so a test can ask it again.
+    fn stop_cast_search(&mut self) {
+        if self.chromecast.keep_search || self.chromecast.discovery.is_none() {
+            return;
+        }
+        self.chromecast.discovery = None;
+        self.cast.search_started = None;
+        self.cast.search_timer = None;
+        self.cast.devices = self.chromecast_devices();
+    }
+
+    /// Looks, while the panel is open or a target is set, at what moves
+    /// with no event: the cast devices the search found, and the position
+    /// of a target that plays (a cast device says nothing while its item
+    /// runs on). The search ends here when nobody needs it any more.
+    pub fn start_cast_tick(&mut self, cx: &mut Context<Self>) {
+        if self.cast.ticking {
+            return;
+        }
+        self.cast.ticking = true;
+        self.cast.tick = Some(cx.spawn(async move |this, cx| {
+            let mut looks = 0;
+            loop {
+                looks += 1;
+                let wait = if looks <= 3 { TICK_AT_FIRST } else { TICK };
+                cx.background_executor().timer(wait).await;
+                let going = this.update(cx, |this, cx| {
+                    let (panel, chromecast) = (this.panel_is(Panel::Cast), this.cast.kind() == Kind::Chromecast);
+                    if !panel && !chromecast {
+                        this.stop_cast_search();
+                    }
+                    let devices = this.chromecast_devices();
+                    let mut moved = devices != this.cast.devices;
+                    this.cast.devices = devices;
+                    if this.cast.active() {
+                        let view = this.target_view();
+                        moved |= view.loaded && !view.paused;
+                    }
+                    // The picker asks the engine again at a frame.
+                    moved |= this.cast.picker_failed.is_some();
+                    if moved {
+                        cx.notify();
+                    }
+                    let going = panel || this.cast.active();
+                    this.cast.ticking = going;
+                    going
+                });
+                if !matches!(going, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// The cast devices there are now: what the search found, and the fake
+    /// one of a test. The panel reads `CastState::devices`, the list of
+    /// the last look.
     pub fn chromecast_devices(&self) -> Vec<Device> {
         let mut devices: Vec<Device> = self.chromecast.discovery.as_ref().map(mdns::Discovery::devices).unwrap_or_default();
         if let Some(mock) = &self.cast.mock {
             devices.push(mock.device());
         }
-        devices.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        devices.sort_by_cached_key(|device| device.name.to_lowercase());
         devices
     }
 
     /// Opens the connection to the device and reads its state; nothing on
-    /// the device changes until a play or a control.
-    fn chromecast_connect(&mut self, device: Device, cx: &mut Context<Self>) {
+    /// the device changes until a play or a control. False when the
+    /// connection to this device is open already.
+    pub(crate) fn chromecast_open(&mut self, device: Device, cx: &mut Context<Self>) -> bool {
         if self.chromecast.session.as_ref().is_some_and(|s| s.device().id == device.id) {
-            return;
+            return false;
         }
-        let name = device.name.clone();
+        self.chromecast_close();
         let (session, events) = Session::connect(device);
         self.chromecast.session = Some(session);
         self.chromecast.events.clear();
-        self.cast.cast_item = None;
-        self.cast.cast_tracks = CastTracks::default();
         self.chromecast.task = Some(cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {
                 let fed = this.update(cx, |this, cx| this.on_cast_event(event, cx));
@@ -1004,7 +1104,17 @@ impl Bloom {
                 }
             }
         }));
-        self.toast("Play On", format!("Playback goes to {name}."), cx);
+        true
+    }
+
+    /// Closes the connection to the cast device, with what the panel knew
+    /// of the item on it.
+    pub(crate) fn chromecast_close(&mut self) {
+        self.chromecast.session = None;
+        self.chromecast.task = None;
+        self.cast.cast_item = None;
+        self.cast.cast_load = 0;
+        self.cast.cast_tracks = CastTracks::default();
     }
 
     /// An event of the cast connection: the status moves the panel; a
@@ -1026,66 +1136,32 @@ impl Bloom {
                     }
                 }
             }
-            CastEvent::Status(status) => {
-                // The app that played our item is gone: so is the item.
-                // A status with no app before the app is up (the launch
-                // takes a moment, and the device sends its status for a
-                // key on its remote too) is not that.
-                // The same while a new item makes the device change its
-                // app: the app before goes, and the next one is not up
-                // yet. For the time a launch can take, "no app" is the
-                // launch, not the end of the item.
-                // The connection says so while the load waits for its app;
-                // for the moment before it has taken the load, the time
-                // since the item was sent stands in.
-                let launching = status.launching
-                    || self.cast.cast_sent_at.is_some_and(|at| at.elapsed() < CAST_LAUNCH_GRACE);
-                if status.app.is_some() {
-                    self.cast.cast_app_up = true;
-                } else if !launching && std::mem::take(&mut self.cast.cast_app_up) {
-                    self.cast.cast_item = None;
-                }
-            }
+            // The item of a load is gone from the device. Only the load of
+            // the item the panel shows counts: a new item makes the device
+            // change its app, and the end of the app before it comes with
+            // the number of the item before it.
+            CastEvent::Ended { load } if *load == self.cast.cast_load => self.cast.cast_item = None,
             _ => {}
         }
         cx.notify();
     }
 
-    /// Plays an item on the cast device: the Jellyfin receiver app with
-    /// the identity of this session, and the stream URL for the Default
-    /// Media Receiver when that app does not launch.
-    fn chromecast_load(&mut self, item: &Item, start_secs: f64, cx: &mut Context<Self>) {
-        let (Some(session), Some(account)) = (&self.chromecast.session, &self.session) else {
+    /// Plays items on the cast device: the Jellyfin receiver app with the
+    /// identity of this session takes them all as its queue, and the
+    /// Default Media Receiver the stream URL of the first one when that
+    /// app does not launch.
+    pub(crate) fn chromecast_load(&mut self, items: &[Item], start_secs: f64, cx: &mut Context<Self>) {
+        let (Some(session), Some(account), Some(first)) = (&self.chromecast.session, &self.session, items.first()) else {
             self.cast.error = Some("not connected to the device".into());
             cx.notify();
             return;
         };
-        let client = &account.client;
-        let jellyfin = Identity::from_client(client, &account.server_id, "").map(|identity| JellyfinLoad {
-            identity,
-            items: vec![ItemStub::from_item(item)],
-            start_secs,
-            audio_index: None,
-            subtitle_index: None,
-        });
-        let play_session_id = uuid::Uuid::new_v4().simple().to_string();
-        let media = cast_jellyfin::stream_url(client, &item.id, &play_session_id).map(|url| LoadMedia {
-            url,
-            content_type: cast_jellyfin::STREAM_CONTENT_TYPE.into(),
-            title: item.display_title(),
-            subtitle: item.series_name.clone().unwrap_or_default(),
-            image_url: Some(client.image_url(&item.id, "Primary", None, 480)),
-            start_secs,
-            duration: item.run_time_ticks.map(|t| t as f64 / crate::jellyfin::TICKS_PER_SECOND as f64),
-            tracks: Vec::new(),
-            active_tracks: Vec::new(),
-            live: false,
-        });
-        session.load(LoadRequest { jellyfin, media });
-        self.cast.cast_item = Some(item.clone());
-        self.cast.cast_sent_at = Some(Instant::now());
+        let request = cast_jellyfin::load_request(&account.client, &account.server_id, items, start_secs);
+        let name = session.device().name.clone();
+        self.cast.cast_load = session.load(request);
+        self.cast.cast_item = Some(first.clone());
         self.cast.cast_tracks = CastTracks::default();
-        self.toast("Play On", format!("Playing on {}.", self.cast.device_name()), cx);
+        self.toast("Play On", format!("Playing on {name}."), cx);
         cx.notify();
     }
 
@@ -1136,287 +1212,6 @@ impl Bloom {
         }
         cx.notify();
     }
-
-    // ----- debug channel --------------------------------------------------
-
-    /// One line about the target, for the debug channel.
-    pub fn cast_describe(&self) -> String {
-        let view = self.target_view();
-        let picker = match self.cast.picker_place {
-            Some([x, y, w, h]) => format!("{x:.0},{y:.0} {w:.0}x{h:.0}"),
-            None => "off".into(),
-        };
-        match &self.cast.target {
-            Target::Local => format!(
-                "kind=local target=none sessions={} chromecast_devices={} airplay_routes={} searching={} subscribed={} panel={} picker={} error={:?}",
-                self.cast.sessions.len(),
-                self.chromecast_devices().len(),
-                self.airplay.routes().len(),
-                self.cast.searching(),
-                self.cast.subscribed,
-                self.panel_is(Panel::Cast),
-                picker,
-                self.cast.error
-            ),
-            target => format!(
-                "kind={} target={} name={:?} detail={:?} connected={} loaded={} title={:?} item={:?} position={:.1} duration={:.1} paused={} volume={:?} muted={} audio={:?} subtitle={:?} seek={} skip={} tracks={} subscribed={} panel={} picker={} error={:?}",
-                target.kind().name(),
-                match target {
-                    Target::JellyfinSession(s) => s.id.clone(),
-                    Target::Chromecast(d) => d.id.clone(),
-                    _ => "airplay".into(),
-                },
-                view.name,
-                view.detail,
-                view.connected,
-                view.loaded,
-                view.title,
-                view.item_id,
-                view.position,
-                view.duration,
-                view.paused,
-                view.volume,
-                view.muted,
-                view.audio_index,
-                view.subtitle_index,
-                view.can_seek,
-                view.can_skip,
-                view.can_tracks,
-                self.cast.subscribed,
-                self.panel_is(Panel::Cast),
-                picker,
-                view.error.or(self.cast.error.clone()),
-            ),
-        }
-    }
-
-    /// `cast <verb> [arg]`. Reads of the server come back later: `list`
-    /// and `caps` print what the last read gave, and start a new one.
-    pub fn debug_cast(&mut self, rest: &str, window: &mut Window, cx: &mut Context<Self>) -> String {
-        let (verb, arg) = rest.split_once(' ').unwrap_or((rest, ""));
-        let arg = arg.trim();
-        match verb {
-            "" | "state" => return self.cast_describe(),
-            // This player, as a target sees it.
-            "local" => {
-                let tracks: Vec<String> = self
-                    .player_status
-                    .tracks
-                    .iter()
-                    .filter(|t| t.kind != "video")
-                    .map(|t| format!("{}{}:{}{}", t.kind, t.id, t.label(), if t.selected { "*" } else { "" }))
-                    .collect();
-                return format!(
-                    "player={:?} playing={:?} position={:.1} paused={} volume={} muted={} tracks=[{}] fullscreen={} allowed={}",
-                    self.player_status.state,
-                    self.playing.as_ref().map(|i| i.display_title()),
-                    self.player_status.position,
-                    self.player_status.paused,
-                    self.volume,
-                    self.muted,
-                    tracks.join(" "),
-                    window.is_fullscreen(),
-                    self.remote_control_allowed(),
-                );
-            }
-            "panel" => self.toggle_cast_panel(window, cx),
-            "list" => {
-                self.load_cast_sessions(cx);
-                let lines: Vec<String> = self
-                    .cast
-                    .sessions
-                    .iter()
-                    .map(|s| {
-                        format!(
-                            "{} user={:?} device={:?} client={:?} playing={:?}",
-                            s.id, s.user_name, s.device_name, s.client, s.now_playing_title()
-                        )
-                    })
-                    .collect();
-                return if lines.is_empty() {
-                    format!("no sessions yet (loading={})", self.cast.loading)
-                } else {
-                    lines.join("\n")
-                };
-            }
-            // Every section of the panel, as it would list them now.
-            "devices" => {
-                self.start_cast_search(cx);
-                let mut lines = vec![format!("this device: {}", if self.cast.target.is_local() { "chosen" } else { "-" })];
-                for s in &self.cast.sessions {
-                    lines.push(format!("jellyfin: {} device={:?} client={:?}", s.id, s.device_name, s.client));
-                }
-                for d in self.chromecast_devices() {
-                    lines.push(format!("chromecast: {} name={:?} model={:?} at {}:{}", d.id, d.name, d.model, d.address, d.port));
-                }
-                if self.cast.searching() {
-                    lines.push("chromecast: searching".into());
-                }
-                let routes = self.airplay.routes();
-                lines.push(format!(
-                    "airplay: row={} routes={:?} picker={}",
-                    !routes.is_empty(),
-                    routes,
-                    self.cast.picker_place.map_or("off".to_string(), |p| format!("{p:?}"))
-                ));
-                return lines.join("\n");
-            }
-            // Only a session of a test account may be driven by a test.
-            "to" => {
-                let Some(session) = self.cast.sessions.iter().find(|s| s.id == arg) else {
-                    return format!("error: no controllable session {arg:?}; run `cast list` first");
-                };
-                if !session.user_name.starts_with("jellyui-test") {
-                    return "error: only sessions of a jellyui-test user".into();
-                }
-                if let Err(err) = self.cast_to(arg, cx) {
-                    return format!("error: {err}");
-                }
-            }
-            // A cast device by part of its name, its id or its address:
-            // connects and reads its state; nothing plays until `play`.
-            "chromecast" => {
-                self.start_cast_search(cx);
-                let devices = self.chromecast_devices();
-                let wanted = arg.to_lowercase();
-                let found = devices.iter().find(|d| {
-                    d.name.to_lowercase().contains(&wanted) || d.id == arg || d.address.to_string() == arg
-                });
-                let Some(device) = found.cloned() else {
-                    return if devices.is_empty() {
-                        "error: no cast device found yet; ask again".into()
-                    } else {
-                        format!("error: no cast device named {arg:?}")
-                    };
-                };
-                self.select_target(Target::Chromecast(device), cx);
-            }
-            // Opens the panel with the AirPlay row; the user picks the
-            // route in the system picker there.
-            "airplay" => {
-                if !self.panel_is(Panel::Cast) {
-                    self.toggle_cast_panel(window, cx);
-                }
-                let routes = self.airplay.routes();
-                return format!(
-                    "panel={} airplay_row={} routes={:?} picker={}",
-                    self.panel_is(Panel::Cast),
-                    !routes.is_empty(),
-                    routes,
-                    self.cast.picker_place.map_or("pending".to_string(), |p| format!("{p:?}"))
-                );
-            }
-            "off" => self.cast_off(cx),
-            "here" => self.cast_play_here(window, cx),
-            // `play <item id>`: on a Jellyfin session by its id; a cast
-            // device or AirPlay needs the item first.
-            "play" => {
-                if !self.cast.active() {
-                    return "error: no target".into();
-                }
-                if self.cast.kind() == Kind::Jellyfin {
-                    self.cast_send_play(vec![arg.to_string()], PlayCommand::PlayNow, None, cx);
-                } else {
-                    let id = arg.to_string();
-                    self.fetch(
-                        cx,
-                        move |client| client.item(&id),
-                        move |this, result, cx| match result {
-                            Ok(item) => {
-                                this.cast_play(std::slice::from_ref(&item), false, cx);
-                            }
-                            Err(err) => this.toast("Play On", format!("{err:#}"), cx),
-                        },
-                    );
-                    return "loading the item".into();
-                }
-            }
-            // The queue of the target: `queue <item id>`, `queue-next <item id>`.
-            "queue" | "queue-next" => {
-                if self.cast.kind() != Kind::Jellyfin {
-                    return "error: only a Jellyfin session has a queue".into();
-                }
-                self.cast_enqueue(arg.to_string(), verb == "queue-next", cx);
-            }
-            "pause" => self.target_set_paused(true, cx),
-            "unpause" => self.target_set_paused(false, cx),
-            "toggle" => self.target_toggle_pause(cx),
-            "stop" => self.target_stop(cx),
-            "next" => self.target_skip(true, cx),
-            "previous" => self.target_skip(false, cx),
-            "seek" => match arg.parse::<f64>() {
-                Ok(secs) => self.target_seek(secs, cx),
-                Err(_) => return "error: usage: cast seek <seconds>".into(),
-            },
-            "volume" => match arg.parse::<f32>() {
-                Ok(volume) => self.target_set_volume(volume, cx),
-                Err(_) => return "error: usage: cast volume <0-100>".into(),
-            },
-            "mute" => self.target_toggle_mute(cx),
-            // A text the target shows as a toast.
-            "message" => self.cast_general(
-                "DisplayMessage",
-                &[("Header", crate::brand::NAME.to_string()), ("Text", arg.to_string())],
-                cx,
-            ),
-            "audio" | "subtitle" => match arg.parse::<i64>() {
-                Ok(index) => self.target_set_track(if verb == "audio" { "Audio" } else { "Subtitle" }, index, cx),
-                Err(_) => return format!("error: usage: cast {verb} <stream index>"),
-            },
-            "caps" => {
-                let device_id = self.config.device_id.clone();
-                self.fetch(
-                    cx,
-                    move |client| {
-                        let sessions: Vec<SessionInfo> =
-                            client.get("/Sessions", &[("deviceId", device_id)])?;
-                        Ok(sessions
-                            .into_iter()
-                            .map(|s| {
-                                format!(
-                                    "server: session={} user={:?} supports_remote_control={} supports_media_control={} commands={:?}",
-                                    s.id,
-                                    s.user_name,
-                                    s.supports_remote_control,
-                                    s.supports_media_control,
-                                    s.capabilities.map(|c| c.supported_commands).unwrap_or_default()
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" | "))
-                    },
-                    |this, result, cx| {
-                        this.cast.own = Some(match result {
-                            Ok(text) if text.is_empty() => "server: no session of this device".into(),
-                            Ok(text) => text,
-                            Err(err) => format!("server: error {err:#}"),
-                        });
-                        cx.notify();
-                    },
-                );
-                return format!(
-                    "allowed={} posted={} socket={} | {}",
-                    self.remote_control_allowed(),
-                    self.cast.capabilities_posted,
-                    self.sync.session.as_ref().is_some_and(|s| s.connected),
-                    self.cast.own.as_deref().unwrap_or("server: not read yet; ask again")
-                );
-            }
-            "allow" => {
-                if (arg == "on") != self.remote_control_allowed() {
-                    self.toggle_remote_control(cx);
-                }
-            }
-            _ => {
-                return "error: cast state|local|panel|list|devices|to <session id>|chromecast <device>|airplay|off|here|\
-                        play <item id>|queue <item id>|queue-next <item id>|pause|unpause|toggle|seek <s>|stop|next|previous|\
-                        volume <0-100>|mute|audio <index>|subtitle <index>|message <text>|caps|allow <on|off>"
-                    .into();
-            }
-        }
-        cx.notify();
-        self.cast_describe()
-    }
 }
 
 /// A poll of the sessions that answers after the target was chosen
@@ -1430,62 +1225,71 @@ mod race_tests {
 
     use crate::app::{Screen, race_harness::{MockServer, app, plain, session, tick_until}};
 
-    /// A new item makes the device change its app: the app before goes
-    /// (a status with no app) before the next one is up. That is the
-    /// launch, and the new item stays.
+    /// A new item makes the device change its app: the app before goes,
+    /// and its end comes with the number of the item before. That is not
+    /// the end of the new item; the end with its own number is.
     #[gpui_kit::test]
-    fn a_change_of_the_app_for_a_new_item_keeps_the_item(cx: &mut TestAppContext) {
+    fn the_end_of_the_item_before_keeps_the_new_item(cx: &mut TestAppContext) {
         use crate::chromecast::session::{Event, Status};
         let (bloom, cx) = app(cx);
         bloom.update(cx, |this, cx| {
-            // An app ran for the item before; the next item was just sent.
-            this.cast.cast_app_up = true;
             this.cast.cast_item = Some(crate::app::race_harness::item("m2", "Two", "Movie"));
-            this.cast.cast_sent_at = Some(std::time::Instant::now());
+            this.cast.cast_load = 2;
+            this.on_cast_event(Event::Ended { load: 1 }, cx);
+            assert!(this.cast.cast_item.is_some(), "the end of the item before dropped the new item");
+            // A status with no app (the launch takes a moment; a key on
+            // the remote of the TV sends one) says nothing of the item.
             this.on_cast_event(Event::Status(Status::default()), cx);
-            assert!(this.cast.cast_item.is_some(), "the launch of the next app dropped the new item");
-            // Later, the connection says the load still waits for its app.
-            this.cast.cast_sent_at = Some(std::time::Instant::now() - super::CAST_LAUNCH_GRACE);
-            this.on_cast_event(Event::Status(Status { launching: true, ..Default::default() }), cx);
-            assert!(this.cast.cast_item.is_some(), "a slow launch dropped the new item");
-            // The app came up and went within the same half minute: gone.
-            this.cast.cast_app_up = true;
-            // Long after the launch, the same status is the end of the app.
-            this.cast.cast_sent_at = Some(std::time::Instant::now() - super::CAST_LAUNCH_GRACE);
-            this.on_cast_event(Event::Status(Status::default()), cx);
-            assert!(this.cast.cast_item.is_none());
+            assert!(this.cast.cast_item.is_some(), "a status during the launch dropped the item");
+            this.on_cast_event(Event::Ended { load: 2 }, cx);
+            assert!(this.cast.cast_item.is_none(), "the item stays though its app is gone");
         });
     }
 
-    /// A status with no app before the app is up (the launch takes a
-    /// moment; a key on the remote of the TV sends one) does not drop the
-    /// item this app sent. It did: the chip showed the id as the title, and
-    /// leaving the device no longer stopped the item there. The item goes
-    /// when the app that ran is gone.
+    /// The items of a remote `Play` come in two requests, whatever their
+    /// number, and in the order of the ids, whatever order the server
+    /// gives them in. An id the server does not know is left out.
+    #[test]
+    fn the_items_of_a_play_come_in_one_request_in_their_order() {
+        let server = MockServer::start(|method, path, _| match (method, path) {
+            ("GET", p) if p.starts_with("/Items/a") => (200, json!({ "Id": "a", "Name": "A", "Type": "Episode" }).to_string()),
+            ("GET", p) if p.starts_with("/Items?") => {
+                assert!(p.contains("ids=b%2Cgone%2Cc") || p.contains("ids=b,gone,c"), "{p}");
+                let items = json!([{ "Id": "c", "Name": "C", "Type": "Episode" }, { "Id": "b", "Name": "B", "Type": "Episode" }]);
+                (200, json!({ "Items": items, "TotalRecordCount": 2 }).to_string())
+            }
+            _ => plain(method, path),
+        });
+        let client = crate::jellyfin::Client::new(&server.url, "dev-1").with_session("t", "u1");
+        let ids: Vec<String> = ["a", "b", "gone", "c"].map(String::from).to_vec();
+        let items = super::play_items(&client, &ids).unwrap();
+        assert_eq!(items.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+        assert_eq!(server.count("GET", "/Items"), 2);
+        assert!(super::play_items(&client, &[]).unwrap().is_empty());
+        assert_eq!(server.count("GET", "/Items"), 2);
+    }
+
+    /// Back to this device leaves nothing of the target: a change of the
+    /// account calls `cast_off` and counts on it.
     #[gpui_kit::test]
-    fn the_cast_item_stays_until_an_app_that_ran_is_gone(cx: &mut TestAppContext) {
-        use crate::chromecast::{messages::App, session::{Event, Status}};
+    fn cast_off_leaves_nothing_of_the_target(cx: &mut TestAppContext) {
+        use crate::cast::target::Target;
+        let mock = crate::chromecast::mock::Mock::start();
         let (bloom, cx) = app(cx);
-        let with_app = Status {
-            app: Some(App {
-                app_id: "F007D354".into(),
-                display_name: "Jellyfin".into(),
-                session_id: "s".into(),
-                transport_id: "t".into(),
-                status_text: String::new(),
-                is_idle_screen: false,
-                namespaces: Vec::new(),
-            }),
-            ..Default::default()
-        };
         bloom.update(cx, |this, cx| {
+            this.select_target(Target::Chromecast(mock.device()), cx);
             this.cast.cast_item = Some(crate::app::race_harness::item("m1", "One", "Movie"));
-            this.on_cast_event(Event::Status(Status::default()), cx);
-            assert!(this.cast.cast_item.is_some(), "a status during the launch dropped the item");
-            this.on_cast_event(Event::Status(with_app), cx);
-            assert!(this.cast.cast_item.is_some());
-            this.on_cast_event(Event::Status(Status::default()), cx);
-            assert!(this.cast.cast_item.is_none(), "the item stays though its app is gone");
+            this.cast.error = Some("old".into());
+            assert!(this.chromecast.session.is_some());
+            this.cast_off(cx);
+            assert!(this.cast.target.is_local());
+            assert!(this.chromecast.session.is_none() && this.chromecast.task.is_none());
+            assert!(this.cast.cast_item.is_none() && this.cast.error.is_none() && this.cast.target_at.is_none());
+            // A connection with no target (the debug channel opens one)
+            // goes as well.
+            this.chromecast_open(mock.device(), cx);
+            this.cast_off(cx);
+            assert!(this.chromecast.session.is_none());
         });
     }
 

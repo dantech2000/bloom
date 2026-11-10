@@ -206,7 +206,7 @@ pub fn settings() -> Settings {
 
 /// Whether liquid glass is on.
 pub fn liquid() -> bool {
-    settings().mode == Mode::Liquid
+    SETTINGS.read().unwrap().mode == Mode::Liquid
 }
 
 /// Whether the panels are liquid glass in the light theme, where the ink
@@ -400,19 +400,19 @@ fn preset(name: &str) -> Option<[f32; 4]> {
 pub fn apply(line: &str, mode: ThemeMode) -> Result<Settings, String> {
     let mut settings = settings();
     for word in line.split_whitespace() {
+        if let Some([bezel, thickness, rim, frost]) = preset(word) {
+            settings.mode = Mode::Liquid;
+            let set = settings.for_mode_mut(mode);
+            set.bezel = bezel;
+            set.thickness = thickness;
+            set.rim = rim;
+            set.frost = frost;
+            continue;
+        }
         match word {
             "frosted" => settings.mode = Mode::Frosted,
             "liquid" => settings.mode = Mode::Liquid,
             "help" => return Err(HELP.to_string()),
-            _ if preset(word).is_some() => {
-                let [bezel, thickness, rim, frost] = preset(word).unwrap();
-                settings.mode = Mode::Liquid;
-                let set = settings.for_mode_mut(mode);
-                set.bezel = bezel;
-                set.thickness = thickness;
-                set.rim = rim;
-                set.frost = frost;
-            }
             _ => {
                 let (key, value) = word.split_once('=').ok_or_else(|| format!("error: {word:?} is not key=value"))?;
                 let number = || value.parse::<f32>().map_err(|_| format!("error: {key}={value:?} is not a number"));

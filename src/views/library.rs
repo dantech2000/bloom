@@ -19,9 +19,19 @@ use crate::{
         scroll_area::ScrollArea,
         theme::UiTheme,
     },
-    views::cards::{empty_state, grid, icon, skeleton_row},
+    views::{
+        cards::{empty_state, grid, icon, skeleton_row},
+        parts::{TOOL_HOVER, icon_button, icon_menu, menu_over, play_all_pill},
+    },
 };
 use crate::ui::tip::tip;
+
+/// The letters of the rail at the right edge: "#" for a title that starts
+/// with no letter, then the alphabet.
+const LETTERS: [&str; 27] = [
+    "#", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R",
+    "S", "T", "U", "V", "W", "X", "Y", "Z",
+];
 
 impl Bloom {
     pub fn render_library(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -31,9 +41,9 @@ impl Bloom {
         let Some(client) = self.session.as_ref().map(|s| s.client.clone()) else {
             return div();
         };
-        let t = UiTheme::read(cx).clone();
+        let colors = UiTheme::read(cx).colors;
         let m = self.metrics();
-        let fg = t.colors.foreground;
+        let fg = colors.foreground;
         let soft = rgba(0xf5f5f7c7);
         let playable = matches!(
             data.view.collection_type.as_deref(),
@@ -52,25 +62,12 @@ impl Bloom {
         // the size a thumb needs; 38 on the Mac.
         let compact = self.compact_w();
         let tool_size = if compact { 44. } else { 38. };
-        let tool = |id: &'static str, label: &'static str, glyph: gpui_kit::Svg| {
-            div()
-                .id(id)
-                .role(gpui_kit::Role::Button)
-                .aria_label(label)
-                .size(px(tool_size))
-                .rounded(px(12.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(|s| s.bg(rgba(0xf5f5f71f)))
-                .child(glyph)
-        };
         let has_previous = data.start > 0;
         let has_next = data.start + PAGE_SIZE < data.total;
         let page_arrow = |id: &'static str, glyph: LucideIcon, enabled: bool, forward: bool| {
-            tool(id, if forward { "Next page" } else { "Previous page" }, icon(glyph, 22., fg))
-                .tooltip(tip(if forward { "Next page" } else { "Previous page" }))
+            let label = if forward { "Next page" } else { "Previous page" };
+            icon_button(id, label, icon(glyph, 22., fg), tool_size, TOOL_HOVER)
+                .tooltip(tip(label))
                 .when(!enabled, |el| el.opacity(0.3))
                 .when(enabled, |el| {
                     el.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -88,75 +85,27 @@ impl Bloom {
                 })
         };
 
-        let play_all = div()
-            .flex()
-            .items_center()
-            .gap(px(2.))
-            .text_color(t.colors.primary_foreground)
-            .text_size(px(14.))
-            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-            .child(
-                div()
-                    .id("library.play-all")
-                    .role(gpui_kit::Role::Button)
-                    .aria_label("Play all")
-                    .h(px(tool_size))
-                    .pl(px(14.))
-                    .pr(px(16.))
-                    .rounded_l_full()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .cursor_pointer()
-                    .bg(t.colors.primary)
-                    .hover(|s| s.opacity(0.88))
-                    .child(filled(Filled::Play, 20., t.colors.primary_foreground))
-                    .child("Play All")
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.play_library(false, window, cx)
-                    })),
-            )
-            .child(
-                div()
-                    .id("library.shuffle")
-                    .role(gpui_kit::Role::Button)
-                    .aria_label("Shuffle")
-                    .tooltip(tip("Shuffle"))
-                    .h(px(tool_size))
-                    .px(px(14.))
-                    .rounded_r_full()
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .bg(t.colors.primary)
-                    .hover(|s| s.opacity(0.88))
-                    .child(icon(LucideIcon::Shuffle, 18., t.colors.primary_foreground))
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.play_library(true, window, cx)
-                    })),
-            );
+        let play_all = play_all_pill(
+            ("library.play-all", "library.shuffle"),
+            tool_size,
+            cx.listener(|this, _: &ClickEvent, window, cx| this.play_library(false, window, cx)),
+            cx.listener(|this, _: &ClickEvent, window, cx| this.play_library(true, window, cx)),
+            cx,
+        );
 
         let menu = |state: &gpui_kit::Entity<crate::ui::menu::MenuState>,
                     label: &'static str,
                     glyph: LucideIcon,
                     active: bool| {
-            Menu::new(state, label)
-                .trigger_style_with(|button| button)
-                .trigger(
-                    div()
-                        .id(label)
-                        .role(gpui_kit::Role::Button)
-                        .aria_label(label)
-                        .tooltip(tip(label))
-                        .size(px(tool_size))
-                        .rounded(px(12.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .hover(|s| s.bg(rgba(0xf5f5f71f)))
-                        .when(active, |el| el.bg(rgba(0xf5f5f71f)))
-                        .child(icon(glyph, 20., fg)),
-                )
+            menu_over(
+                state,
+                label,
+                icon_button(label, label, icon(glyph, 20., fg), tool_size, TOOL_HOVER)
+                    .tooltip(tip(label))
+                    // A filter or a sort that is not the usual one lights
+                    // its button.
+                    .when(active, |el| el.bg(rgba(TOOL_HOVER))),
+            )
         };
 
         let toolbar_h = if compact { 98. } else { 54. };
@@ -176,7 +125,6 @@ impl Bloom {
                 if compact {
                     if views {
                         Menu::new(&self.show_menu, "View")
-                            .trigger_style_with(|button| button)
                             .trigger(
                                 div()
                                     .id("library.view")
@@ -210,7 +158,6 @@ impl Bloom {
                         .child(data.show.label(&data.title));
                     if views {
                         Menu::new(&self.show_menu, "View")
-                            .trigger_style_with(|button| button)
                             .trigger(title.child(filled(Filled::DropDown, 24., soft)))
                             .into_any_element()
                     } else {
@@ -245,24 +192,14 @@ impl Bloom {
                     .gap(px(4.))
                     // The page of a collection has a menu of its own.
                     .when(data.view.kind == ItemKind::BoxSet, |el| {
-                        el.child(
-                            Menu::new(&self.more_menu, "More")
-                                .trigger_style_with(|button| button)
-                                .trigger(
-                                    div()
-                                        .id("library.more")
-                                        .role(gpui_kit::Role::Button)
-                                        .aria_label("More")
-                                        .tooltip(tip("More"))
-                                        .size(px(tool_size))
-                                        .rounded(px(12.))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .hover(|s| s.bg(rgba(0xf5f5f71f)))
-                                        .child(filled(Filled::More, 22., fg)),
-                                ),
-                        )
+                        el.child(icon_menu(
+                            &self.more_menu,
+                            "library.more",
+                            "More",
+                            filled(Filled::More, 22., fg),
+                            tool_size,
+                            TOOL_HOVER,
+                        ))
                     })
                     .child(menu(
                         &self.filter_menu,
@@ -340,7 +277,6 @@ impl Bloom {
         // Letter picker at the right edge, as on the web. It needs a tall
         // window and a sort by name.
         let picker = (data.sort == "SortName" && self.viewport_h >= 610. && !compact).then(|| {
-            let letters = std::iter::once('#').chain('A'..='Z');
             div()
                 .absolute()
                 .top_0()
@@ -358,12 +294,13 @@ impl Bloom {
                         .flex()
                         .flex_col()
                         .gap(px(1.))
-                        .font_family(t.fonts.mono.clone())
+                        .font_family(UiTheme::read(cx).fonts.mono.clone())
                         .text_size(px(11.))
-                        .children(letters.map(|letter| {
+                        .children(LETTERS.iter().enumerate().map(|(n, text)| {
+                            let letter = text.chars().next().unwrap_or('#');
                             let selected = data.letter == Some(letter);
                             div()
-                                .id(SharedString::from(format!("library.letter.{letter}")))
+                                .id(("library.letter", n))
                                 .w(px(22.))
                                 .h(px(16.))
                                 .rounded_full()
@@ -371,14 +308,10 @@ impl Bloom {
                                 .items_center()
                                 .justify_center()
                                 .cursor_pointer()
-                                .text_color(if selected {
-                                    t.colors.primary_foreground
-                                } else {
-                                    soft
-                                })
-                                .when(selected, |el| el.bg(t.colors.primary))
+                                .text_color(if selected { colors.primary_foreground } else { soft })
+                                .when(selected, |el| el.bg(colors.primary))
                                 .when(!selected, |el| el.hover(|s| s.bg(rgba(0xf5f5f733))))
-                                .child(letter.to_string())
+                                .child(*text)
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     this.update_library(
                                         |d| {

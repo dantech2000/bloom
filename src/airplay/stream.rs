@@ -25,6 +25,9 @@ pub struct StreamOptions {
     /// Let an HEVC source through as it is. An Apple TV 4K plays HEVC; an
     /// Apple TV HD does not and needs H.264.
     pub hevc: bool,
+    /// Bits per second the stream may take, as the user set it for the
+    /// player; none for no limit.
+    pub max_bitrate: Option<u64>,
 }
 
 impl StreamOptions {
@@ -42,9 +45,20 @@ pub struct Stream {
 }
 
 /// Upper bound for the encoder; a copy of the source stays as it is.
-const VIDEO_BITRATE: u32 = 120_000_000;
-const AUDIO_BITRATE: u32 = 640_000;
+const VIDEO_BITRATE: u64 = 120_000_000;
+const AUDIO_BITRATE: u64 = 640_000;
 const AUDIO_CHANNELS: u32 = 6;
+/// The least the video gets of a small limit.
+const VIDEO_BITRATE_FLOOR: u64 = 500_000;
+
+/// The bits per second for the video: what the limit of the user leaves
+/// beside the audio, and never more than the bound of the encoder.
+fn video_bitrate(max_bitrate: Option<u64>) -> u64 {
+    match max_bitrate {
+        Some(limit) => limit.saturating_sub(AUDIO_BITRATE).clamp(VIDEO_BITRATE_FLOOR, VIDEO_BITRATE),
+        None => VIDEO_BITRATE,
+    }
+}
 
 /// The master playlist URL for one item.
 pub fn build_url(
@@ -56,11 +70,12 @@ pub fn build_url(
     options: &StreamOptions,
 ) -> String {
     let video = if options.hevc { "hevc,h264" } else { "h264" };
+    let video_bitrate = video_bitrate(options.max_bitrate);
     let mut url = format!(
         "{}/Videos/{item_id}/master.m3u8?MediaSourceId={item_id}&DeviceId={device_id}\
          &PlaySessionId={play_session_id}&VideoCodec={video}&AudioCodec=aac,ac3,eac3\
          &SegmentContainer=mp4&MinSegments=2&BreakOnNonKeyFrames=true\
-         &VideoBitrate={VIDEO_BITRATE}&AudioBitrate={AUDIO_BITRATE}\
+         &VideoBitrate={video_bitrate}&AudioBitrate={AUDIO_BITRATE}\
          &TranscodingMaxAudioChannels={AUDIO_CHANNELS}&EnableAudioVbrEncoding=true",
         base.trim_end_matches('/')
     );
@@ -139,19 +154,31 @@ mod tests {
         assert_eq!(get("MinSegments"), Some("2"));
         assert_eq!(get("BreakOnNonKeyFrames"), Some("true"));
         assert_eq!(get("ApiKey"), Some("secret-token"));
+        assert_eq!(get("VideoBitrate"), Some("120000000"));
         assert_eq!(get("AudioStreamIndex"), None);
         assert_eq!(get("SubtitleStreamIndex"), None);
     }
 
     #[test]
     fn options_add_their_parameters() {
-        let url = url(&StreamOptions { audio_index: Some(2), subtitle_index: Some(5), hevc: false });
+        let url = url(&StreamOptions { audio_index: Some(2), subtitle_index: Some(5), hevc: false, max_bitrate: Some(8_000_000) });
         let q = query(&url);
         let get = |key: &str| q.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
         assert_eq!(get("VideoCodec"), Some("h264"));
+        assert_eq!(get("VideoBitrate"), Some("7360000"));
         assert_eq!(get("AudioStreamIndex"), Some("2"));
         assert_eq!(get("SubtitleStreamIndex"), Some("5"));
         assert_eq!(get("SubtitleMethod"), Some("Encode"));
+    }
+
+    /// The limit of the user is the limit of the stream: the video takes
+    /// what the audio leaves, within the bounds of the encoder.
+    #[test]
+    fn the_limit_of_the_user_bounds_the_video() {
+        assert_eq!(video_bitrate(None), VIDEO_BITRATE);
+        assert_eq!(video_bitrate(Some(25_000_000)), 25_000_000 - AUDIO_BITRATE);
+        assert_eq!(video_bitrate(Some(400_000)), VIDEO_BITRATE_FLOOR);
+        assert_eq!(video_bitrate(Some(u64::MAX)), VIDEO_BITRATE);
     }
 
     #[test]

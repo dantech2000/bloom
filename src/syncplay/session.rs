@@ -7,14 +7,9 @@
 //! gets back what to show.
 
 use std::{
-    collections::HashMap,
-    sync::{
-        Arc, RwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc,
-    },
+    sync::{Arc, RwLock, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::Deserialize;
@@ -41,8 +36,17 @@ pub enum Ui {
     NowPlaying { item_id: String },
     /// The player stopped for the group; close its view.
     ClosePlayer,
-    /// A socket message that is not SyncPlay's.
-    Server { kind: String, data: serde_json::Value },
+    /// A request of the user did not reach the server; the text says which.
+    Failed(&'static str),
+}
+
+/// What the helper threads of a session send it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Background {
+    /// A measurement of the server clock.
+    Exchange(Exchange),
+    /// A request that failed, see [`Request::asked`].
+    Failed(&'static str),
 }
 
 pub struct Session {
@@ -52,36 +56,31 @@ pub struct Session {
     player: Player,
     client: Client,
     requests: mpsc::Sender<Request>,
-    /// Playlist item of each load token.
-    loads: HashMap<u64, String>,
+    /// The token and the playlist item of the load the group waits for.
+    load: Option<(u64, String)>,
     next_load: u64,
     sample: Option<Sample>,
     /// The token of the seek the player works on; its `Settled` voids the
     /// sample (see `player_event`), the `Settled` of an older seek does not.
     seek_token: Option<u64>,
-    /// Time between two questions for the server time, for the clock thread.
-    poll_ms: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
+    /// Time between two questions for the server time, for the clock
+    /// thread. The thread ends when this is dropped.
+    poll: mpsc::Sender<Duration>,
+    /// What the player was last told about measurements (`Player::follow`).
+    follows: bool,
     /// The socket is open.
     pub connected: bool,
     /// How late the last scheduled action ran.
     pub late: Option<Duration>,
 }
 
-impl Drop for Session {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-    }
-}
-
 impl Session {
-    /// Starts the helper threads. The exchanges of the clock come on the
-    /// returned channel; give each to [`Session::exchange`].
-    pub fn new(client: Client, player: Player) -> (Self, async_channel::Receiver<Exchange>) {
+    /// Starts the helper threads. What they find comes on the returned
+    /// channel; give each to [`Session::background`].
+    pub fn new(client: Client, player: Player) -> (Self, async_channel::Receiver<Background>) {
         let local = Arc::new(RwLock::new(LocalClock::new()));
-        let poll_ms = Arc::new(AtomicU64::new(1000));
-        let stop = Arc::new(AtomicBool::new(false));
-        let exchanges = spawn_clock(client.clone(), local.clone(), poll_ms.clone(), stop.clone());
+        let (background, found) = async_channel::unbounded();
+        let poll = spawn_clock(client.clone(), local.clone(), background.clone());
         let mut clock = ServerClock::default();
         clock.reset_for(local.read().unwrap().epoch);
         let session = Self {
@@ -89,18 +88,18 @@ impl Session {
             clock,
             local,
             player,
-            requests: spawn_requests(client.clone()),
+            requests: spawn_requests(client.clone(), background),
             client,
-            loads: HashMap::new(),
+            load: None,
             next_load: LOAD_TOKENS,
             sample: None,
             seek_token: None,
-            poll_ms,
-            stop,
+            poll,
+            follows: false,
             connected: false,
             late: None,
         };
-        (session, exchanges)
+        (session, found)
     }
 
     fn now(&self) -> f64 {
@@ -136,7 +135,12 @@ impl Session {
             self.run(action, &mut ui);
         }
         // Measurements are only needed while the player follows a group.
-        self.player.follow(self.core.following());
+        // Told at a change: each command wakes the worker of the player.
+        let follows = self.core.following();
+        if follows != self.follows {
+            self.follows = follows;
+            self.player.follow(follows);
+        }
         ui
     }
 
@@ -152,8 +156,7 @@ impl Session {
                 // it replaced gets no answer (the player refuses it in
                 // silence), and a late answer of one must not count for
                 // the item of the newest.
-                self.loads.clear();
-                self.loads.insert(self.next_load, playlist_item_id);
+                self.load = Some((self.next_load, playlist_item_id));
                 self.sample = None;
                 // The server says how the item plays (see `stream`).
                 crate::stream::start(
@@ -195,8 +198,15 @@ impl Session {
             Action::Notice(notice) => {
                 // The video-sync mode of the player differs in a group.
                 match &notice {
-                    Notice::Joined(_) => self.player.set_group(true),
-                    Notice::Left => self.player.set_group(false),
+                    Notice::Joined(_) => {
+                        self.player.set_group(true);
+                        // In a group the clock is asked more often, from now.
+                        self.set_poll();
+                    }
+                    Notice::Left => {
+                        self.player.set_group(false);
+                        self.set_poll();
+                    }
                     _ => {}
                 }
                 ui.push(Ui::Notice(notice))
@@ -204,33 +214,46 @@ impl Session {
         }
     }
 
-    pub fn socket(&mut self, event: SocketEvent) -> Vec<Ui> {
+    /// The time to the next question for the server time, as it is now.
+    fn set_poll(&self) {
+        let _ = self.poll.send(self.clock.next_poll(self.core.in_group()));
+    }
+
+    /// The playlist item of a load the player answers, when it is the load
+    /// the group waits for.
+    fn loaded(&mut self, token: u64) -> Option<String> {
+        self.load.take_if(|(wanted, _)| *wanted == token).map(|(_, playlist_item_id)| playlist_item_id)
+    }
+
+    /// An event of the socket of the server. A message that is not
+    /// SyncPlay's does nothing here.
+    pub fn socket(&mut self, event: &SocketEvent) -> Vec<Ui> {
         match event {
             SocketEvent::Open { again } => {
                 self.connected = true;
-                if again { self.feed(Input::Reconnected) } else { Vec::new() }
+                if *again { self.feed(Input::Reconnected) } else { Vec::new() }
             }
             SocketEvent::Closed => {
                 self.connected = false;
                 Vec::new()
             }
-            SocketEvent::Message { kind, data } => match protocol::parse(&kind, data.clone()) {
+            SocketEvent::Message { kind, data } => match protocol::parse(kind, data) {
                 Some(message) => {
                     log::debug!("syncplay: server {message:?}");
                     self.feed(Input::Server(message))
                 }
-                None => vec![Ui::Server { kind, data }],
+                None => Vec::new(),
             },
         }
     }
 
     pub fn player_event(&mut self, event: PlayerEvent) -> Vec<Ui> {
         let event = match event {
-            PlayerEvent::Loaded { token } => match self.loads.remove(&token) {
+            PlayerEvent::Loaded { token } => match self.loaded(token) {
                 Some(playlist_item_id) => CoreEvent::Loaded { playlist_item_id },
                 None => return Vec::new(),
             },
-            PlayerEvent::LoadFailed { token } => match self.loads.remove(&token) {
+            PlayerEvent::LoadFailed { token } => match self.loaded(token) {
                 Some(playlist_item_id) => CoreEvent::LoadFailed { playlist_item_id },
                 None => return Vec::new(),
             },
@@ -264,11 +287,33 @@ impl Session {
         self.feed(Input::Player(CoreEvent::Closed))
     }
 
+    /// What a helper thread found.
+    pub fn background(&mut self, found: Background) -> Vec<Ui> {
+        match found {
+            Background::Exchange(exchange) => self.exchange(exchange),
+            Background::Failed(what) => vec![Ui::Failed(what)],
+        }
+    }
+
     pub fn exchange(&mut self, exchange: Exchange) -> Vec<Ui> {
         self.clock.record(exchange);
-        let wait = self.clock.next_poll(self.core.in_group());
-        self.poll_ms.store(wait.as_millis() as u64, Ordering::Release);
+        self.set_poll();
         self.feed(Input::ClockUpdated)
+    }
+
+    /// The user leaves the app's session (a sign-out, the app goes
+    /// offline) while the player may still play: the group gets a leave,
+    /// and the player is as it is outside a group. The `Left` of the
+    /// server will not come, because nothing reads the socket after this.
+    pub fn end(&mut self) {
+        if self.core.in_group() {
+            self.feed(Input::User(Intent::Leave));
+            self.player.schedule(None);
+            self.player.set_sync_speed(1.);
+            self.player.set_group(false);
+        }
+        self.follows = false;
+        self.player.follow(false);
     }
 
     pub fn user(&mut self, intent: Intent) -> Vec<Ui> {
@@ -285,7 +330,7 @@ impl Session {
             *self.local.write().unwrap() = fresh;
             // A measurement of the clock before, still on its way, is void.
             self.clock.reset_for(fresh.epoch);
-            self.poll_ms.store(1000, Ordering::Release);
+            self.set_poll();
         }
         self.feed(Input::Tick)
     }
@@ -327,8 +372,9 @@ impl Session {
 
 /// Sends the requests one after another, in the order they were made; on
 /// the shared pool two of them could pass each other. A request that a
-/// later one makes pointless is left out.
-fn spawn_requests(client: Client) -> mpsc::Sender<Request> {
+/// later one makes pointless is left out. A request of the user that fails
+/// is told on `failed`.
+fn spawn_requests(client: Client, failed: async_channel::Sender<Background>) -> mpsc::Sender<Request> {
     let (tx, rx) = mpsc::channel::<Request>();
     let _ = thread::Builder::new().name("syncplay-requests".into()).spawn(move || {
         while let Ok(first) = rx.recv() {
@@ -346,6 +392,9 @@ fn spawn_requests(client: Client) -> mpsc::Sender<Request> {
                 };
                 if let Err(err) = result {
                     log::warn!("syncplay: {} failed: {err:#}", request.path());
+                    if let Some(what) = request.asked() {
+                        let _ = failed.send_blocking(Background::Failed(what));
+                    }
                 }
             }
         }
@@ -353,50 +402,56 @@ fn spawn_requests(client: Client) -> mpsc::Sender<Request> {
     tx
 }
 
-/// Asks the server for its time, again and again.
+/// Asks the server for its time, again and again. The returned sender
+/// sets the time between two questions; the thread ends when it is dropped.
 fn spawn_clock(
     client: Client,
     local: Arc<RwLock<LocalClock>>,
-    poll_ms: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
-) -> async_channel::Receiver<Exchange> {
+    found: async_channel::Sender<Background>,
+) -> mpsc::Sender<Duration> {
     #[derive(Deserialize)]
     #[serde(rename_all = "PascalCase")]
     struct UtcTime {
         request_reception_time: String,
         response_transmission_time: String,
     }
-    let (tx, rx) = async_channel::unbounded();
+    let (poll, polls) = mpsc::channel::<Duration>();
     let _ = thread::Builder::new().name("syncplay-clock".into()).spawn(move || {
-        while !stop.load(Ordering::Acquire) {
+        let mut wait = Duration::from_secs(1);
+        loop {
             // Both local times on one clock: a reset during the request
             // must not mix two origins.
             let clock = *local.read().unwrap();
             let sent = clock.now();
             let answer = client.get::<UtcTime>("/GetUtcTime", &[]);
             let received = clock.now();
+            let asked = Instant::now();
             match answer {
                 Ok(time) => {
                     let times = protocol::parse_time(&time.request_reception_time)
                         .zip(protocol::parse_time(&time.response_transmission_time));
                     if let Some((server_received, server_sent)) = times {
                         let exchange = Exchange { sent, server_received, server_sent, received, epoch: clock.epoch };
-                        if tx.send_blocking(exchange).is_err() {
+                        if found.send_blocking(Background::Exchange(exchange)).is_err() {
                             return;
                         }
                     }
                 }
                 Err(err) => log::debug!("syncplay: server time: {err:#}"),
             }
-            // In small steps, so a shorter wait takes effect soon.
-            let mut waited = 0;
-            while waited < poll_ms.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
-                thread::sleep(Duration::from_millis(100));
-                waited += 100;
+            // Sleeps until the next question is due. A new time between
+            // two questions counts from the last one, so a shorter time
+            // takes effect at once.
+            loop {
+                match polls.recv_timeout(wait.saturating_sub(asked.elapsed())) {
+                    Ok(new) => wait = new,
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
             }
         }
     });
-    rx
+    poll
 }
 
 #[cfg(test)]
@@ -629,7 +684,7 @@ mod tests {
     struct Rig {
         session: Session,
         socket: async_channel::Receiver<SocketEvent>,
-        exchanges: async_channel::Receiver<Exchange>,
+        found: async_channel::Receiver<Background>,
         events: async_channel::Receiver<PlayerEvent>,
         player: Player,
         _realtime: realtime::Realtime,
@@ -644,11 +699,11 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs_f64(secs);
             loop {
                 while let Ok(event) = self.socket.try_recv() {
-                    let ui = self.session.socket(event);
+                    let ui = self.session.socket(&event);
                     self.ui.extend(ui);
                 }
-                while let Ok(exchange) = self.exchanges.try_recv() {
-                    let ui = self.session.exchange(exchange);
+                while let Ok(found) = self.found.try_recv() {
+                    let ui = self.session.background(found);
                     self.ui.extend(ui);
                 }
                 while let Ok(event) = self.events.try_recv() {
@@ -715,11 +770,11 @@ mod tests {
         let _closer = crate::player::Closer(player.clone());
         player.set_target_size(320, 240);
         let (realtime, socket) = realtime::start(client.clone());
-        let (session, exchanges) = Session::new(client, player.clone());
+        let (session, found) = Session::new(client, player.clone());
         let mut rig = Rig {
             session,
             socket,
-            exchanges,
+            found,
             events: player.events(),
             player: player.clone(),
             _realtime: realtime,
@@ -882,6 +937,8 @@ mod tests {
     /// whose status stays at its defaults (position 0).
     fn bare_session() -> (Session, mpsc::Receiver<Request>) {
         let (requests, sent) = mpsc::channel();
+        // No clock thread: the times it would be given go nowhere.
+        let (poll, _) = mpsc::channel();
         let mut clock = ServerClock::default();
         let local = LocalClock::new();
         let now = local.now();
@@ -899,12 +956,12 @@ mod tests {
             player: Player::default(),
             client: Client::new("http://127.0.0.1:9", "bare").with_session("token", "user"),
             requests,
-            loads: HashMap::new(),
+            load: None,
             next_load: LOAD_TOKENS,
             sample: None,
             seek_token: None,
-            poll_ms: Arc::new(AtomicU64::new(1000)),
-            stop: Arc::new(AtomicBool::new(false)),
+            poll,
+            follows: false,
             connected: true,
             late: None,
         };
@@ -925,7 +982,7 @@ mod tests {
         // player.
         let joined = protocol::parse(
             "SyncPlayGroupUpdate",
-            json!({
+            &json!({
                 "GroupId": GROUP, "Type": "GroupJoined",
                 "Data": {
                     "GroupId": GROUP, "GroupName": "Film night", "State": "Paused",
@@ -936,7 +993,7 @@ mod tests {
         .unwrap();
         let queue = protocol::parse(
             "SyncPlayGroupUpdate",
-            json!({
+            &json!({
                 "GroupId": GROUP, "Type": "PlayQueue",
                 "Data": {
                     "Reason": "NewPlaylist", "LastUpdate": format_time(server_now(&session)),
@@ -951,7 +1008,7 @@ mod tests {
             let (now, view) = (session.now(), session.view());
             session.core.handle(Input::Server(message), now, &session.clock, &view);
         }
-        session.loads.insert(LOAD_TOKENS + 1, "p1".into());
+        session.load = Some((LOAD_TOKENS + 1, "p1".into()));
         session.player_event(PlayerEvent::Loaded { token: LOAD_TOKENS + 1 });
         let at = Instant::now();
         let sample = |position: f64| PlayerEvent::Position(Sample { position, at, paused: true, duration: 240. });
@@ -966,7 +1023,7 @@ mod tests {
             "When": format_time(server_now(&session)), "PositionTicks": 302_500_000_i64,
             "Command": "Seek", "EmittedAt": format_time(server_now(&session)),
         });
-        session.socket(SocketEvent::Message { kind: "SyncPlayCommand".into(), data: command });
+        session.socket(&SocketEvent::Message { kind: "SyncPlayCommand".into(), data: command });
         let token = session.seek_token.expect("a seek was asked of the player");
         assert_eq!(session.sample, None);
         // A sample of the audio clock during the seek: still at 9.5 s.
@@ -993,5 +1050,47 @@ mod tests {
         session.player_event(sample(30.25));
         session.player_event(PlayerEvent::Settled { token: token - 1 });
         assert_eq!(session.view().position, 30_250., "an obsolete Settled voided the sample");
+    }
+
+    /// A request of the user that does not reach the server is told, for
+    /// a notice: no message of the socket follows it. A request the rules
+    /// make up for (a pause) fails in silence.
+    #[test]
+    fn a_request_of_the_user_that_fails_is_told() {
+        // Nothing listens at this port.
+        let client = Client::new("http://127.0.0.1:9", "bare").with_session("token", "user");
+        let (failed, found) = async_channel::unbounded();
+        let requests = spawn_requests(client, failed);
+        requests.send(Request::Pause).unwrap();
+        requests.send(Request::Join { group_id: GROUP.into() }).unwrap();
+        assert_eq!(found.recv_blocking(), Ok(Background::Failed("The group could not be joined.")));
+        // The thread ends with its sender, and told nothing else.
+        drop(requests);
+        assert!(found.recv_blocking().is_err());
+    }
+
+    /// The app ends the session of a member (a sign-out, the app goes
+    /// offline): the group is told, and the session asks the player for
+    /// no more measurements.
+    #[test]
+    fn ending_a_session_leaves_the_group() {
+        use crate::syncplay::protocol::{GroupInfo, GroupUpdate, ServerMessage};
+        let (mut session, sent) = bare_session();
+        let info = GroupInfo {
+            group_id: GROUP.into(),
+            group_name: "Film night".into(),
+            last_updated_at: session.clock.to_server(session.now()) - 50.,
+            ..GroupInfo::default()
+        };
+        let joined = ServerMessage::Group { group_id: GROUP.into(), update: GroupUpdate::Joined(info) };
+        session.feed(Input::Server(joined));
+        assert!(session.follows, "a member of a group is measured");
+        session.end();
+        assert!(sent.try_iter().any(|request| request == Request::Leave), "no leave went out");
+        assert!(!session.follows);
+        // Outside a group there is nothing to leave.
+        let (mut alone, sent) = bare_session();
+        alone.end();
+        assert!(sent.try_recv().is_err());
     }
 }

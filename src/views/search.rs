@@ -4,7 +4,7 @@
 
 use gpui_icons::LucideIcon;
 use gpui_kit::{
-    ClickEvent, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
+    ClickEvent, Context, Div, IntoElement, ParentElement as _,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled, div, px, rgb, rgba,
 };
 
@@ -16,11 +16,10 @@ use crate::{
         input::Input,
         motion::{Enter, enter},
         scroll_area::ScrollArea,
-        theme::UiTheme,
     },
     views::cards::{
-        CARD_RADIUS, CARD_TEXT_H, Cards, artwork, empty_state, icon, poster_card, section, skeleton_row,
-        wide_card,
+        CARD_RADIUS, CARD_TEXT_H, Cards, artwork, card_frame, card_second_line, card_text_with,
+        empty_state, icon, image_edge, poster_card, section, skeleton_row, wide_card,
     },
 };
 
@@ -51,14 +50,21 @@ impl Bloom {
                 cx,
             ));
         } else {
-            let of_kind = |kind: ItemKind| -> Vec<&Item> {
-                data.results.iter().filter(|i| i.kind == kind).collect()
-            };
-            for (id, title, kind) in [
-                ("search.movies", "Movies", ItemKind::Movie),
-                ("search.shows", "Shows", ItemKind::Series),
+            // One pass over the results sorts them into the three rows.
+            let (mut movies, mut shows, mut episodes): (Vec<&Item>, Vec<&Item>, Vec<&Item>) =
+                Default::default();
+            for item in &data.results {
+                match item.kind {
+                    ItemKind::Movie => movies.push(item),
+                    ItemKind::Series => shows.push(item),
+                    ItemKind::Episode => episodes.push(item),
+                    _ => {}
+                }
+            }
+            for (id, title, items) in [
+                ("search.movies", "Movies", movies),
+                ("search.shows", "Shows", shows),
             ] {
-                let items = of_kind(kind);
                 if items.is_empty() {
                     continue;
                 }
@@ -75,7 +81,6 @@ impl Bloom {
                     cx,
                 ));
             }
-            let episodes = of_kind(ItemKind::Episode);
             if !episodes.is_empty() {
                 let cards = Cards::new(m.backdrop_w, episodes.len(), |i, cx| {
                     wide_card(episodes[i], &client, m.backdrop_w, CardRow::None, cx)
@@ -154,7 +159,6 @@ impl Bloom {
 
 /// Portrait card of a Seerr title with its type and request state.
 pub(crate) fn seerr_card(item: &SeerrItem, w: f32, cx: &mut Context<Bloom>) -> Stateful<Div> {
-    let t = UiTheme::read(cx).clone();
     let h = (w * 1.5).round();
     // One ink: the kind of a title is a word on a quiet pill, not a
     // colour. A colour says a state: green for there or on its way,
@@ -170,17 +174,10 @@ pub(crate) fn seerr_card(item: &SeerrItem, w: f32, cx: &mut Context<Bloom>) -> S
         Some(2) => Some((LucideIcon::Bell, amber)),
         _ => None,
     };
-    let mut details: Vec<String> = item.year().into_iter().collect();
     let score = item.vote_average.filter(|v| *v > 0.);
     let target = item.clone();
-    let mut second = div()
-        .flex()
-        .items_center()
-        .gap(px(6.))
-        .text_size(px(15.))
-        .line_height(px(21.))
-        .text_color(t.colors.muted_foreground);
-    if let Some(year) = details.pop() {
+    let mut second = card_second_line(cx).flex().items_center().gap(px(6.));
+    if let Some(year) = item.year() {
         second = second.child(year);
     }
     if let Some(score) = score {
@@ -188,19 +185,7 @@ pub(crate) fn seerr_card(item: &SeerrItem, w: f32, cx: &mut Context<Bloom>) -> S
             .child(filled(Filled::Star, 14., rgb(0xbdbdbd)))
             .child(format!("{score:.1}"));
     }
-    div()
-        .id(SharedString::from(format!(
-            "seerr.{}.{}",
-            item.media_type, item.id
-        )))
-        .w(px(w))
-        // A set least and most width spares a layout pass (`Bloom::render_settings`).
-        .min_w(px(w))
-        .max_w(px(w))
-        .flex_shrink_0()
-        .flex()
-        .flex_col()
-        .cursor_pointer()
+    card_frame(SharedString::from(format!("seerr.{}.{}", item.media_type, item.id)), w)
         .child(
             artwork(
                 item.poster_url(),
@@ -237,35 +222,9 @@ pub(crate) fn seerr_card(item: &SeerrItem, w: f32, cx: &mut Context<Bloom>) -> S
                     .justify_center()
                     .child(icon(glyph, 14., rgb(0xffffff)))
             }))
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .rounded(px(CARD_RADIUS))
-                    .border_1()
-                    .border_color(rgba(0xc8c8c81f))
-                    .hover(|s| s.bg(rgba(0x00000066)).border_color(rgba(0xf5f5f733))),
-            ),
+            .child(image_edge(true)),
         )
-        .child(
-            div()
-                .mt(px(4.))
-                .h(px(CARD_TEXT_H - 4.))
-                .pl(px(1.))
-                .pr(px(8.))
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .text_size(px(17.))
-                        .line_height(px(24.))
-                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                        .text_color(t.colors.foreground)
-                        .truncate()
-                        .child(item.display_name()),
-                )
-                .child(second),
-        )
+        .child(card_text_with(item.display_name(), Some(second), cx))
         .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
             // A title in the library opens there; another one can be requested.
             match target.library_id() {

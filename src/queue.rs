@@ -11,7 +11,7 @@ use gpui_kit::{Bounds, Context, Pixels};
 
 use crate::{
     app::Bloom,
-    jellyfin::{Chapter, Item, ItemKind, TimelineInfo},
+    jellyfin::{Chapter, Item, ItemKind, TimelineInfo, Trickplay},
     player::PlayState,
 };
 
@@ -147,9 +147,12 @@ impl Bloom {
                     // The audio track that fits the settings of the user,
                     // unless the user chose one on the detail page. In a
                     // transcode the server chose it (see `stream`).
+                    // The question is about this item: the answer of the
+                    // server for the item before can still be the last one.
+                    let transcoding = crate::stream::transcoding(&item_id);
                     if let Some(track) = timeline.default_audio
                         && !this.queue.explicit_audio
-                        && !crate::stream::transcoding()
+                        && !transcoding
                     {
                         this.player.set_audio(Some(track));
                     }
@@ -157,7 +160,7 @@ impl Bloom {
                     // and language of the user ("no" for none).
                     if let Some(choice) = timeline.default_subtitle
                         && !this.queue.explicit_subtitle
-                        && !crate::stream::transcoding()
+                        && !transcoding
                     {
                         this.player.set_subtitle(choice);
                     }
@@ -179,9 +182,11 @@ impl Bloom {
         ) else {
             return;
         };
-        let per_sheet = (trickplay.tile_width * trickplay.tile_height).max(1);
+        // A layout with an empty sheet or no interval never gets here
+        // (`timeline_info` leaves it out).
+        let per_sheet = trickplay.tile_width * trickplay.tile_height;
         let sheets = trickplay.thumbnail_count.div_ceil(per_sheet);
-        let frame = (item.resume_secs().max(0) as u64 * 1000 / trickplay.interval.max(1) as u64) as u32;
+        let frame = frame_at(trickplay, item.resume_secs().max(0) as f64);
         let start = (frame / per_sheet).min(sheets.saturating_sub(1));
         let mut order: Vec<u32> = (0..sheets).collect();
         order.sort_by_key(|sheet| sheet.abs_diff(start));
@@ -248,11 +253,9 @@ impl Bloom {
     /// Goes to the item before; later than a few seconds into an item, or
     /// with no item before, it starts the item again.
     pub fn play_previous(&mut self, cx: &mut Context<Self>) {
-        if self.player_status.position > RESTART_AFTER_SECS || self.queue.history.is_empty() {
+        let early = self.player_status.position <= RESTART_AFTER_SECS;
+        let Some(previous) = early.then(|| self.queue.history.pop()).flatten() else {
             self.player.seek_absolute(0.);
-            return;
-        }
-        let Some(previous) = self.queue.history.pop() else {
             return;
         };
         if let Some(current) = self.playing.take() {
@@ -388,10 +391,7 @@ impl Bloom {
         let trickplay = self.queue.timeline.trickplay.as_ref()?;
         let item = self.playing.as_ref()?;
         let client = &self.session.as_ref()?.client;
-        let mut index = (secs.max(0.) * 1000. / trickplay.interval as f64) as u32;
-        if trickplay.thumbnail_count > 0 {
-            index = index.min(trickplay.thumbnail_count - 1);
-        }
+        let index = frame_at(trickplay, secs);
         let per_sheet = trickplay.tile_width * trickplay.tile_height;
         let cell = index % per_sheet;
         Some(PreviewFrame {
@@ -402,6 +402,16 @@ impl Bloom {
             rows: trickplay.tile_height,
             aspect: trickplay.height as f32 / trickplay.width as f32,
         })
+    }
+}
+
+/// The preview frame of a time, by its number among all the frames.
+fn frame_at(trickplay: &Trickplay, secs: f64) -> u32 {
+    let index = (secs.max(0.) * 1000. / trickplay.interval as f64) as u32;
+    // The server may leave the count out.
+    match trickplay.thumbnail_count {
+        0 => index,
+        count => index.min(count - 1),
     }
 }
 

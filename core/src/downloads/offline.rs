@@ -11,6 +11,11 @@
 //! owner. Its entries are not read: their positions were never sent, and
 //! the local resume point of such a play is lost. The server's position
 //! stands for those items.
+//!
+//! The file is the engine's folder's: an instance that does not hold the
+//! folder (`Engine::owns_storage`) notes and sends nothing, as it writes
+//! nothing else there. Two instances would write over each other's
+//! positions.
 
 use std::{fs, path::Path, sync::Mutex};
 
@@ -69,26 +74,44 @@ static LOCK: Mutex<()> = Mutex::new(());
 /// positions twice, in any order.
 static FLUSHING: Mutex<()> = Mutex::new(());
 
+/// True when this process may write the file: it holds the download
+/// folder, or no engine is open (a test of this file).
+fn owner() -> bool {
+    super::ENGINE.get().is_none_or(|engine| engine.owns_storage())
+}
+
 fn load(dir: &Path) -> Vec<Kept> {
-    fs::read(dir.join(FILE))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<File>(&bytes).ok())
-        .filter(|file| file.version == VERSION)
-        .map(|file| file.entries)
-        .unwrap_or_default()
+    let path = dir.join(FILE);
+    let Ok(bytes) = fs::read(&path) else {
+        return Vec::new();
+    };
+    match serde_json::from_slice::<File>(&bytes) {
+        Ok(file) if file.version == VERSION => file.entries,
+        // The file before 0.1.3: a map by item id, with no version.
+        _ if serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&bytes)
+            .is_ok_and(|old| !old.contains_key("version")) =>
+        {
+            Vec::new()
+        }
+        // Cut short, or of a later build: the next save writes over it,
+        // and it may hold positions the server never got. A copy stays.
+        _ => {
+            log::warn!("the positions of offline plays do not read; a copy is kept");
+            crate::config::keep_broken_copy(&path, &bytes);
+            Vec::new()
+        }
+    }
 }
 
 fn save(dir: &Path, entries: &[Kept]) {
     let file = dir.join(FILE);
-    if let Some(dir) = file.parent() {
-        let _ = fs::create_dir_all(dir);
-    }
+    let _ = fs::create_dir_all(dir);
     let out = File { version: VERSION, entries: entries.to_vec() };
-    if let Ok(bytes) = serde_json::to_vec_pretty(&out) {
-        let partial = file.with_extension("tmp");
-        if fs::write(&partial, bytes).is_ok() && fs::rename(&partial, &file).is_err() {
-            let _ = fs::remove_file(&partial);
-        }
+    let written = serde_json::to_vec_pretty(&out)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| crate::fsutil::write_atomic(&file, &bytes));
+    if let Err(err) = written {
+        log::warn!("the positions of offline plays are not saved: {err}");
     }
 }
 
@@ -99,7 +122,9 @@ fn find<'a>(entries: &'a mut [Kept], who: &Identity, item_id: &str) -> Option<&'
 /// The player reported the position of a local play of `who`. `failed`
 /// says the server did not take it.
 pub fn note_report(who: &Identity, progress: &Progress, failed: bool) {
-    note_report_in(&super::dir(), who, progress, failed)
+    if owner() {
+        note_report_in(&super::dir(), who, progress, failed)
+    }
 }
 
 fn note_report_in(dir: &Path, who: &Identity, progress: &Progress, failed: bool) {
@@ -124,10 +149,7 @@ fn note_report_in(dir: &Path, who: &Identity, progress: &Progress, failed: bool)
     // older than it.
     entry.unsent = failed;
     entry.rev += 1;
-    entry.at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    entry.at = super::engine::unix_now();
     save(dir, &entries);
 }
 
@@ -145,17 +167,19 @@ fn position_in(dir: &Path, who: &Identity, item_id: &str) -> Option<i64> {
         .filter(|t| *t > 0)
 }
 
-/// The download of an item of a server was removed: the positions of it
-/// that the server has go with it. Kept, a position would be the resume
-/// point of the item when it is downloaded again, however far the user got
-/// on another device since. A position the server has not got stays, for
-/// the next flush.
-pub fn forget(dir: &Path, server_id: &str, item_id: &str) {
+/// The downloads of these items (server id, item id) were removed: the
+/// positions of them that the server has go with them. Kept, a position
+/// would be the resume point of the item when it is downloaded again,
+/// however far the user got on another device since. A position the
+/// server has not got stays, for the next flush. One read and one write
+/// of the file for all of them.
+pub fn forget<'a>(dir: &Path, items: impl IntoIterator<Item = (&'a str, &'a str)>) {
+    let gone: Vec<(&str, &str)> = items.into_iter().collect();
     let _guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let entries = load(dir);
     let kept: Vec<Kept> = entries
         .iter()
-        .filter(|k| k.unsent || k.item_id != item_id || k.who.server_id != server_id)
+        .filter(|k| k.unsent || !gone.contains(&(k.who.server_id.as_str(), k.item_id.as_str())))
         .cloned()
         .collect();
     if kept.len() != entries.len() {
@@ -175,9 +199,13 @@ fn pending_in(dir: &Path, who: &Identity) -> Vec<(String, i64, u64, i64)> {
 }
 
 /// Sends the unsent positions of the client's identity to the server.
-/// Returns how many went. Nothing goes while `BLOOM_NO_REPORT` is set, and
-/// nothing for a client without a server id.
+/// Returns how many went. Nothing goes while `BLOOM_NO_REPORT` is set,
+/// nothing for a client without a server id, and nothing from an instance
+/// that does not hold the folder (it could not note them as sent).
 pub fn flush(client: &Client) -> Result<usize> {
+    if !owner() {
+        return Ok(0);
+    }
     flush_in(&super::dir(), client, crate::jellyfin::no_report())
 }
 
@@ -223,8 +251,8 @@ fn flush_in(dir: &Path, client: &Client, no_report: bool) -> Result<usize> {
             {
                 entry.unsent = false;
                 entry.ticks = theirs;
+                save(dir, &entries);
             }
-            save(dir, &entries);
             continue;
         }
         let body = serde_json::json!({ "PlaybackPositionTicks": ticks });
@@ -242,8 +270,8 @@ fn flush_in(dir: &Path, client: &Client, no_report: bool) -> Result<usize> {
                     && entry.rev == rev
                 {
                     entry.unsent = false;
+                    save(dir, &entries);
                 }
-                save(dir, &entries);
             }
             Err(err) => log::warn!("offline position of {item_id} not sent: {err:#}"),
         }
@@ -254,7 +282,7 @@ fn flush_in(dir: &Path, client: &Client, no_report: bool) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{Read, Write},
+        io::Write,
         net::{TcpListener, TcpStream},
         sync::{
             Arc,
@@ -265,6 +293,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::downloads::test_http::Request;
 
     fn progress(item_id: &str, secs: i64) -> Progress {
         Progress {
@@ -306,37 +335,11 @@ mod tests {
 
     /// Reads one request, notes it, and answers after `delay`.
     fn serve(mut stream: TcpStream, kept: Arc<Mutex<Vec<(String, String)>>>, delay: Duration) {
-        let mut data = Vec::new();
-        let mut buffer = [0u8; 4096];
-        let body_start = loop {
-            let Ok(n) = stream.read(&mut buffer) else { return };
-            if n == 0 {
-                return;
-            }
-            data.extend_from_slice(&buffer[..n]);
-            if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
-                break end + 4;
-            }
-        };
-        let head = String::from_utf8_lossy(&data[..body_start]).to_string();
-        let length: usize = head
-            .lines()
-            .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("content-length")))
-            .and_then(|(_, v)| v.trim().parse().ok())
-            .unwrap_or(0);
-        while data.len() < body_start + length {
-            let Ok(n) = stream.read(&mut buffer) else { break };
-            if n == 0 {
-                break;
-            }
-            data.extend_from_slice(&buffer[..n]);
-        }
-        let line = head.lines().next().unwrap_or_default().to_string();
-        let body = String::from_utf8_lossy(&data[body_start..]).to_string();
+        let Some(request) = Request::read(&mut stream) else { return };
         // What a flush sends is the subject; before each position it
         // asks what the server has (`newer_on_server`), and that is not.
-        if !line.starts_with("GET") {
-            kept.lock().unwrap().push((line, body));
+        if !request.line().starts_with("GET") {
+            kept.lock().unwrap().push((request.line().to_string(), request.body));
         }
         thread::sleep(delay);
         let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -392,30 +395,8 @@ mod tests {
         let kept = seen.clone();
         thread::spawn(move || {
             for mut stream in listener.incoming().flatten() {
-                let mut data = Vec::new();
-                let mut buffer = [0u8; 4096];
-                while !data.windows(4).any(|w| w == b"\r\n\r\n") {
-                    match stream.read(&mut buffer) {
-                        Ok(n) if n > 0 => data.extend_from_slice(&buffer[..n]),
-                        _ => break,
-                    }
-                }
-                // The body is read to its end: an answer sent over unread
-                // bytes can reset the connection under the client.
-                let head_end = data.windows(4).position(|w| w == b"\r\n\r\n").map_or(data.len(), |at| at + 4);
-                let head = String::from_utf8_lossy(&data[..head_end]).to_string();
-                let length: usize = head
-                    .lines()
-                    .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("content-length")))
-                    .and_then(|(_, v)| v.trim().parse().ok())
-                    .unwrap_or(0);
-                while data.len() < head_end + length {
-                    match stream.read(&mut buffer) {
-                        Ok(n) if n > 0 => data.extend_from_slice(&buffer[..n]),
-                        _ => break,
-                    }
-                }
-                let line = head.lines().next().unwrap_or_default().to_string();
+                let Some(request) = Request::read(&mut stream) else { continue };
+                let line = request.line().to_string();
                 let body = if line.starts_with("GET") { user_data } else { "" };
                 kept.lock().unwrap().push(line);
                 let _ = write!(
@@ -547,11 +528,35 @@ mod tests {
         note_report_in(&dir, &b, &progress("item1", 50), true);
         note_report_in(&dir, &other, &progress("item1", 60), false);
         note_report_in(&dir, &a, &progress("item2", 70), false);
-        forget(&dir, "s", "item1");
+        forget(&dir, [("s", "item1")]);
         assert_eq!(position_in(&dir, &a, "item1"), None, "a sent position outlived its download");
         assert_eq!(position_in(&dir, &b, "item1"), Some(50 * crate::jellyfin::TICKS_PER_SECOND), "an unsent position was dropped");
         assert_eq!(position_in(&dir, &other, "item1"), Some(60 * crate::jellyfin::TICKS_PER_SECOND), "another server's item was touched");
         assert_eq!(position_in(&dir, &a, "item2"), Some(70 * crate::jellyfin::TICKS_PER_SECOND), "another item was touched");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file that does not read (cut short, or of a later build) may hold
+    /// positions the server never got: a copy of it stays when the next
+    /// report writes over it. Before, it went without a trace. The file
+    /// before 0.1.3 is dropped as ever, with no copy.
+    #[test]
+    fn a_file_that_does_not_read_is_kept_as_a_copy() {
+        let dir = temp("broken");
+        fs::create_dir_all(&dir).unwrap();
+        let broken = dir.join(format!("{FILE}.broken"));
+        let u = who("s", "u");
+        for unread in [&br#"{"version": 2, "entries": [{"server_id": "s", "user"#[..], br#"{"version": 3, "entries": []}"#] {
+            let _ = fs::remove_file(&broken);
+            fs::write(dir.join(FILE), unread).unwrap();
+            note_report_in(&dir, &u, &progress("a", 10), true);
+            assert_eq!(fs::read(&broken).unwrap(), unread);
+            assert_eq!(pending(&dir, &u).len(), 1);
+        }
+        let _ = fs::remove_file(&broken);
+        fs::write(dir.join(FILE), br#"{"item1": {"ticks": 400000000, "unsent": true, "at": 1}}"#).unwrap();
+        note_report_in(&dir, &u, &progress("a", 10), true);
+        assert!(!broken.exists(), "the file of before 0.1.3 was kept as a broken one");
         let _ = fs::remove_dir_all(&dir);
     }
 

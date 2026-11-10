@@ -110,11 +110,15 @@ fn tail(text: &str) -> (Vec<Line>, usize) {
         .map(|raw| {
             // "[2026-10-03 03:43:28.781 -07:00] [INF] [105] Source: message"
             // (the server), "[2026-10-23 00:21:52] [INFO] message" (a plugin).
-            let (time, rest) = match raw.strip_prefix('[').and_then(|r| r.split_once("] ")) {
-                Some((stamp, rest)) if stamp.len() >= 19 && stamp.is_char_boundary(19) => {
-                    (stamp[11..19].to_string(), rest)
-                }
-                _ => (String::new(), *raw),
+            // A bracket that is not a date stays in the text: FFmpeg starts
+            // its lines with "[libx264 @ 0x5581e0a3b2c0]".
+            let stamped = raw
+                .strip_prefix('[')
+                .and_then(|r| r.split_once("] "))
+                .and_then(|(stamp, rest)| Some((stamp_time(stamp)?, rest)));
+            let (time, rest) = match stamped {
+                Some((time, rest)) => (time.to_string(), rest),
+                None => (String::new(), *raw),
             };
             let (found, rest) = [
                 ("[ERR] ", Level::Error),
@@ -146,13 +150,18 @@ fn tail(text: &str) -> (Vec<Line>, usize) {
     (lines, all.len())
 }
 
-/// 108985 as "106 KB".
-fn file_size(bytes: u64) -> String {
-    match bytes {
-        0..1024 => format!("{bytes} B"),
-        1024..1_048_576 => format!("{:.0} KB", bytes as f64 / 1024.),
-        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.),
-    }
+/// The time of day in the stamp of a log line ("2026-10-03 03:43:28.781
+/// -07:00" or "2026-10-23 00:21:52"). None for a text of another shape.
+fn stamp_time(stamp: &str) -> Option<&str> {
+    let bytes = stamp.as_bytes();
+    let shape = bytes.len() >= 19
+        && bytes[..19].iter().enumerate().all(|(i, b)| match i {
+            4 | 7 => *b == b'-',
+            10 => *b == b' ' || *b == b'T',
+            13 | 16 => *b == b':',
+            _ => b.is_ascii_digit(),
+        });
+    if shape { stamp.get(11..19) } else { None }
 }
 
 /// One line of the log viewer. `timed` keeps the column of the time and
@@ -191,7 +200,8 @@ fn level_style(level: Level) -> (&'static str, Rgba, Rgba) {
     match level {
         Level::Error => ("ERR", rgb(0xef5350), rgb(0xffb4ab)),
         Level::Warning => ("WRN", rgb(0xffb300), rgb(0xffe0a3)),
-        Level::Info => ("INF", rgb(0x64b5f6), rgba(0xf5f5f7cc)),
+        // A level that needs no look has the ink, not a colour of its own.
+        Level::Info => ("INF", rgba(0xf5f5f799), rgba(0xf5f5f7cc)),
         Level::Debug => ("DBG", rgba(0xf5f5f766), rgba(0xf5f5f780)),
     }
 }
@@ -365,7 +375,7 @@ fn file_row(
     if title.is_some() {
         detail.push(file.name.clone());
     }
-    detail.push(file_size(file.size));
+    detail.push(crate::downloads::format_bytes(file.size));
     detail.push(ago(&file.date_modified));
     let detail = detail.join(" \u{b7} ");
     div()
@@ -440,7 +450,9 @@ fn viewer(data: &Data, compact: bool, cx: &mut Context<Bloom>) -> Div {
             let Some(data) = this.admin_data().and_then(|d| d.logs.as_ref()) else {
                 return Vec::new();
             };
-            data.lines[range]
+            data.lines
+                .get(range)
+                .unwrap_or_default()
                 .iter()
                 .map(|line| log_line(line, data.timed).into_any_element())
                 .collect()
@@ -482,4 +494,31 @@ fn viewer(data: &Data, compact: bool, cx: &mut Context<Bloom>) -> Div {
         .when(compact, |el| el.pt(px(4.)))
         .child(heading)
         .child(lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only a date is the stamp of a line. Before, any bracket of 19 bytes
+    /// or more was one: an FFmpeg line showed "0x5581e0" as its time and
+    /// lost its prefix, and a bracket with a letter of two bytes across
+    /// byte 11 was a panic.
+    #[test]
+    fn only_a_date_is_the_time_of_a_line() {
+        let text = "[2026-10-03 03:43:28.781 -07:00] [INF] [105] Main: started\n\
+                    [2026-10-23 00:21:52] [WARN] slow\n\
+                    [libx264 @ 0x5581e0a3b2c0] using SAR=1/1\n\
+                    [1234567890\u{e9}abcdefghijk] text\n\
+                    plain";
+        let (lines, total) = tail(text);
+        assert_eq!(total, 5);
+        assert_eq!((lines[0].time.as_str(), lines[0].text.as_str()), ("03:43:28", "[105] Main: started"));
+        assert!(lines[0].level == Level::Info);
+        assert_eq!((lines[1].time.as_str(), lines[1].text.as_str()), ("00:21:52", "slow"));
+        assert!(lines[1].level == Level::Warning);
+        assert_eq!((lines[2].time.as_str(), lines[2].text.as_str()), ("", "[libx264 @ 0x5581e0a3b2c0] using SAR=1/1"));
+        assert_eq!((lines[3].time.as_str(), lines[3].text.as_str()), ("", "[1234567890\u{e9}abcdefghijk] text"));
+        assert_eq!(lines[4].text, "plain");
+    }
 }

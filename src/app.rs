@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Root view: session, navigation, background fetching, player polling.
 
-use crate::quality::QualityApi as _;
+use crate::quality_tags::QualityApi as _;
 use std::{cell::RefCell, collections::HashMap, time::Duration};
 
 use anyhow::Result;
@@ -270,6 +270,13 @@ pub enum CardRow {
     NextUp,
 }
 
+/// What `Bloom::set_user_data` sets for the user on an item.
+#[derive(Clone, Copy)]
+enum Mark {
+    Played,
+    Favorite,
+}
+
 /// Id prefix of the synthetic library that lists a person's titles.
 pub const PERSON_VIEW: &str = "person";
 
@@ -475,7 +482,6 @@ pub struct Bloom {
     pub subs: crate::subtitles::State,
     pub(crate) tracks_version: u64,
     pub player_focus: FocusHandle,
-    /// Whether the player overlay controls are shown; hidden after pointer idle.
     /// The player shows its data about the video: codecs, bitrates,
     /// dropped frames, cache.
     pub playback_info: bool,
@@ -486,6 +492,7 @@ pub struct Bloom {
     pub(crate) pref_lanes: crate::settings::SaveLanes,
     /// Episode list of the player.
     pub episode_picker: crate::views::episodes::EpisodePicker,
+    /// Whether the player overlay controls are shown; hidden after pointer idle.
     pub controls_visible: bool,
     /// The close, minimise and zoom buttons are hidden (see the root render).
     window_buttons_hidden: bool,
@@ -497,6 +504,9 @@ pub struct Bloom {
     /// listener that the setting turned on.
     pub debug_requests: Option<async_channel::Sender<crate::debug::Request>>,
     pub debug_listener: Option<crate::debug::Listener>,
+    /// The listener on the socket of `BLOOM_DEBUG_SOCK`, kept so it ends
+    /// with the window.
+    pub(crate) debug_env_listener: Option<crate::debug::Listener>,
     /// The question and the form a debug command opened, by the address
     /// of their action; 0 for none. `write confirm` and `write submit`
     /// run these only, never a dialog a person opened.
@@ -617,12 +627,7 @@ impl Bloom {
                 let place = crate::pip::frame(window);
                 if place.is_some() && this.config.pip_window != place {
                     this.config.pip_window = place;
-                    this.window_save = Some(cx.spawn(async move |this, cx| {
-                        cx.background_executor()
-                            .timer(Duration::from_millis(600))
-                            .await;
-                        this.update(cx, |this, cx| this.save_config(cx)).ok();
-                    }));
+                    this.save_config_soon(cx);
                 }
                 return;
             }
@@ -637,12 +642,7 @@ impl Bloom {
                 return;
             }
             this.config.window = Some(place);
-            this.window_save = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor()
-                    .timer(Duration::from_millis(600))
-                    .await;
-                this.update(cx, |this, cx| this.save_config(cx)).ok();
-            }));
+            this.save_config_soon(cx);
         }));
         subscriptions.extend(connect.subscribe(window, cx));
         // Every redraw request passes here. One from the hero tick leaves the
@@ -840,6 +840,7 @@ impl Bloom {
             update_said: None,
             debug_requests: None,
             debug_listener: None,
+            debug_env_listener: None,
             debug_dialogs: (None, None),
             pause_screen: false,
             pip: None,
@@ -884,11 +885,6 @@ impl Bloom {
             .ok();
             true
         });
-        // A field that had the focus and left the page (the search field
-        // after a result opens, a dialog that closed) would keep it: gpui
-        // then sends keys and menu actions to a node that is not there, and
-        // the shortcuts are dead until a click. The screen takes the focus
-        // back the moment the field goes.
         // One popup at a time, in the whole app: a menu that opens closes
         // every other menu and panel. See `close_popups`.
         for menu in this.menus().map(Clone::clone) {
@@ -898,6 +894,11 @@ impl Bloom {
                 }
             }));
         }
+        // A field that had the focus and left the page (the search field
+        // after a result opens, a dialog that closed) would keep it: gpui
+        // then sends keys and menu actions to a node that is not there, and
+        // the shortcuts are dead until a click. The screen takes the focus
+        // back the moment the field goes.
         this._subscriptions.push(cx.on_focus_lost(window, |this, window, cx| {
             if this.screen == Screen::Main {
                 let target = if this.player_open { &this.player_focus } else { &this.app_focus };
@@ -1046,6 +1047,9 @@ impl Bloom {
     /// The session changes: every answer still on its way is for the old one.
     fn next_session_epoch(&mut self) {
         self.session_epoch.0 += 1;
+        // The page of the session before is gone too: an answer for it
+        // must not land in the page of the same kind that opens next.
+        self.next_generation();
         // The posters of the session before are of no use to the next one.
         crate::images::cancel_prewarm();
         // Nor are its hero slides, and a question it left open must not
@@ -1056,6 +1060,10 @@ impl Bloom {
         // to wait for here.
         self.admin_live.busy = false;
         self.admin_live.load += 1;
+        // The devices of the server before, and an editor open on one of
+        // its items, are not for the next one.
+        self.cast.sessions.clear();
+        self.metadata.open = None;
     }
 
     /// Ends the session in the app (the server and the config are the
@@ -1080,6 +1088,9 @@ impl Bloom {
             .with_server(&server.id)
             .with_session(&profile.token, &profile.user_id);
         let (id, server_name, profile) = (server.id.clone(), server.name.clone(), profile.clone());
+        // What plays on another device for the session before stops, while
+        // that session can still say so.
+        self.cast_off(cx);
         self.next_session_epoch();
         let user_image = profile
             .image_tag
@@ -1119,14 +1130,12 @@ impl Bloom {
         self.load_lists(cx);
         // The dashboard entry of the menu shows once the server confirms
         // that this user is an administrator.
-        let opened = user_id.to_string();
-        self.fetch(
+        self.fetch_in_session(
             cx,
             |client| client.user_settings(),
-            move |this, result, cx| {
+            |this, result, cx| {
                 if let (Ok((is_admin, audio_language, sync_access)), Some(session)) =
                     (result, this.session.as_mut())
-                    && session.user_id == opened
                 {
                     session.audio_language = audio_language;
                     this.sync.access = sync_access;
@@ -1142,22 +1151,24 @@ impl Bloom {
         // Quality tags follow the user's Jellyfin Enhanced setting, unless
         // the profile menu of this app set them.
         crate::jellyfin::set_quality_tags(self.config.quality_tags.unwrap_or(false), true, true);
-        let opened = user_id.to_string();
-        self.fetch(
+        self.fetch_in_session(
             cx,
             |client| Ok(client.quality_prefs()),
-            move |this, result, cx| {
-                if let (Ok(Some(settings)), Some(session)) = (result, this.session.as_ref())
-                    && session.user_id == opened
-                {
+            |this, result, cx| {
+                if let Ok(Some(settings)) = result {
                     this.je_quality_tags = settings;
                     this.apply_quality_tags(cx);
                 }
             },
         );
         self.load_enhanced(cx);
-        self.config.active = Some((server_id.to_string(), user_id.to_string()));
-        self.save_config(cx);
+        // The file is written when the profile changed, not at each start:
+        // a save is a write with a full sync of the disk on the UI thread.
+        let active = Some((server_id.to_string(), user_id.to_string()));
+        if self.config.active != active {
+            self.config.active = active;
+            self.save_config(cx);
+        }
         self.screen = Screen::Main;
         self.clear_history();
         self.views.clear();
@@ -1174,14 +1185,17 @@ impl Bloom {
     /// the sign-in page of that server.
     pub fn sign_out(&mut self, cx: &mut Context<Self>) {
         self.stop_sync();
-        if let Some(session) = self.session.as_ref() {
-            let (server_id, user_id) = (session.server_id.clone(), session.user_id.clone());
-            self.forget_profile(&server_id, &user_id, cx);
-            self.select_server(server_id, cx);
-        }
-        // `forget_profile` dropped the session, and with it what it asked for.
+        self.cast_off(cx);
         self.config.active = None;
-        self.save_config(cx);
+        match self.session.as_ref().map(|s| (s.server_id.clone(), s.user_id.clone())) {
+            // `forget_profile` drops the session, and with it what it asked
+            // for, and saves the config.
+            Some((server_id, user_id)) => {
+                self.forget_profile(&server_id, &user_id, cx);
+                self.select_server(server_id, cx);
+            }
+            None => self.save_config(cx),
+        }
         // The pages of the user who left must not show again.
         self.clear_history();
         self.views.clear();
@@ -1202,9 +1216,14 @@ impl Bloom {
     }
 
     pub fn add_profile(&mut self, server_id: &str, profile: Profile, cx: &mut Context<Self>) {
+        let active = self.config.active.clone();
         self.config.upsert_profile(server_id, profile.clone());
-        self.save_config(cx);
-        self.open_session(server_id, &profile.user_id, cx);
+        // `open_session` saves when the active profile changes; a sign-in
+        // to the one that is active already is saved here.
+        let opened = self.open_session(server_id, &profile.user_id, cx);
+        if !opened || self.config.active == active {
+            self.save_config(cx);
+        }
     }
 
     pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {
@@ -1265,30 +1284,53 @@ impl Bloom {
             .clone()
     }
 
-    /// Marks an item watched or unwatched, then reloads the page data.
-    pub fn set_item_played(&mut self, item: &Item, played: bool, cx: &mut Context<Self>) {
-        let item_id = item.id.clone();
+    /// Sets the watched or the favourite state of an item on the server and
+    /// hands the state the server answers to `done`. With `for_page` the
+    /// answer is for the page on show, and is dropped when the user has
+    /// left it by then.
+    fn set_user_data(
+        &mut self,
+        item_id: &str,
+        mark: Mark,
+        on: bool,
+        for_page: bool,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, crate::jellyfin::UserData, &mut Context<Self>) + 'static,
+    ) {
+        let (item_id, generation) = (item_id.to_string(), self.generation);
         self.fetch(
             cx,
-            move |client| client.set_played(&item_id, played),
-            |this, result, cx| match result {
-                Ok(_) => this.load_page(cx),
-                Err(err) => this.toast("Could not update watched state", format!("{err:#}"), cx),
+            move |client| match mark {
+                Mark::Played => client.set_played(&item_id, on),
+                Mark::Favorite => client.set_favorite(&item_id, on),
+            },
+            move |this, result, cx| {
+                if for_page && this.generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(user_data) => done(this, user_data, cx),
+                    Err(err) => {
+                        let title = match mark {
+                            Mark::Played => "Could not update watched state",
+                            Mark::Favorite => "Could not update favorites",
+                        };
+                        this.toast(title, format!("{err:#}"), cx)
+                    }
+                }
+                cx.notify();
             },
         );
     }
 
+    /// Marks an item watched or unwatched, then reloads the page data.
+    pub fn set_item_played(&mut self, item: &Item, played: bool, cx: &mut Context<Self>) {
+        self.set_user_data(&item.id, Mark::Played, played, false, cx, |this, _, cx| this.load_page(cx));
+    }
+
     /// Adds an item to the favourites or removes it, then reloads the page data.
     pub fn set_item_favorite(&mut self, item: &Item, favorite: bool, cx: &mut Context<Self>) {
-        let item_id = item.id.clone();
-        self.fetch(
-            cx,
-            move |client| client.set_favorite(&item_id, favorite),
-            |this, result, cx| match result {
-                Ok(_) => this.load_page(cx),
-                Err(err) => this.toast("Could not update favorites", format!("{err:#}"), cx),
-            },
-        );
+        self.set_user_data(&item.id, Mark::Favorite, favorite, false, cx, |this, _, cx| this.load_page(cx));
     }
 
     // ----- navigation -------------------------------------------------------
@@ -1410,11 +1452,18 @@ impl Bloom {
     }
 
     pub fn open_home(&mut self, cx: &mut Context<Self>) {
+        self.open_root(Page::Home(HomeData::default()), cx);
+    }
+
+    /// Shows a page of the top bar: the page starts at its top, and Back
+    /// and Forward have nothing to return to.
+    fn open_root(&mut self, page: Page, cx: &mut Context<Self>) {
         self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
         self.forget_admin_dialogs();
         self.clear_history();
-        self.page = Page::Home(HomeData::default());
+        self.page = page;
         self.events_page(cx);
+        self.rebuild_library_menus(cx);
         self.load_page(cx);
         cx.notify();
     }
@@ -1428,14 +1477,7 @@ impl Bloom {
     }
 
     pub fn open_library(&mut self, view: Item, cx: &mut Context<Self>) {
-        self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
-        self.forget_admin_dialogs();
-        self.clear_history();
-        self.page = Page::Library(LibraryData::new(view));
-        self.events_page(cx);
-        self.rebuild_library_menus(cx);
-        self.load_page(cx);
-        cx.notify();
+        self.open_root(Page::Library(LibraryData::new(view)), cx);
     }
 
     pub fn open_favorites(&mut self, cx: &mut Context<Self>) {
@@ -1797,16 +1839,14 @@ impl Bloom {
             );
         }
 
-        let (id, name, kind) = (data.item.id.clone(), data.item.name.clone(), data.item.kind.clone());
         let item = data.item.clone();
         let list_items = self.list_menu_items(&item, cx);
         if !list_items.is_empty() {
             more.push(MenuItem::separator());
             more.extend(list_items);
         }
-        let hide = self.hide_menu_items(&data.item.clone(), true, cx);
-        more.extend(hide);
-        more.extend(self.metadata_menu_items(&id, &name, kind.name(), cx));
+        more.extend(self.hide_menu_items(&item, true, cx));
+        more.extend(self.metadata_menu_items(&item.id, &item.name, item.kind.name(), cx));
 
         self.detail_audio_menu
             .update(cx, |menu, cx| menu.set_items(audio, cx));
@@ -1825,19 +1865,12 @@ impl Bloom {
             self.play_series(&item, window, cx);
             return;
         }
-        // The server gets the choice too, for a transcode.
+        // The load takes the choice: the server gets it, for a transcode,
+        // and mpv, for the file itself (`stream_begin`).
         self.stream.wanted_audio = audio;
         self.stream.wanted_subtitle = subtitle;
         self.play(&item, resume, window, cx);
-        // mpv numbers the tracks of a kind from 1 in file order.
-        if let Some(n) = audio {
-            self.queue.explicit_audio = true;
-            self.player.set_audio(Some(n as i64 + 1));
-        }
-        if let Some(choice) = subtitle {
-            self.queue.explicit_subtitle = true;
-            self.player.set_subtitle(choice.map(|n| n as i64 + 1));
-        }
+        self.stream_choice_left(&item);
     }
 
     pub fn open_folder(&mut self, folder: Item, cx: &mut Context<Self>) {
@@ -2666,29 +2699,16 @@ impl Bloom {
         let Page::Detail(data) = &self.page else {
             return;
         };
-        let item_id = data.item.id.clone();
-        let played = !data.item.user_data.played;
-        self.fetch_for_page(
-            cx,
-            move |client| client.set_played(&item_id, played),
-            move |this, result, cx| {
-                match result {
-                    Ok(user_data) => {
-                        if let Page::Detail(data) = &mut this.page {
-                            data.item.user_data = user_data;
-                            if data.item.is_series() {
-                                // Episodes and season counts changed server-side too.
-                                this.load_page(cx);
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        this.toast("Could not update watched state", format!("{err:#}"), cx)
-                    }
+        let (item_id, played) = (data.item.id.clone(), !data.item.user_data.played);
+        self.set_user_data(&item_id, Mark::Played, played, true, cx, |this, user_data, cx| {
+            if let Page::Detail(data) = &mut this.page {
+                data.item.user_data = user_data;
+                if data.item.is_series() {
+                    // Episodes and season counts changed server-side too.
+                    this.load_page(cx);
                 }
-                cx.notify();
-            },
-        );
+            }
+        });
     }
 
     /// Flips the favorite state of the item shown on the detail page.
@@ -2696,23 +2716,12 @@ impl Bloom {
         let Page::Detail(data) = &self.page else {
             return;
         };
-        let item_id = data.item.id.clone();
-        let favorite = !data.item.user_data.is_favorite;
-        self.fetch_for_page(
-            cx,
-            move |client| client.set_favorite(&item_id, favorite),
-            move |this, result, cx| {
-                match result {
-                    Ok(user_data) => {
-                        if let Page::Detail(data) = &mut this.page {
-                            data.item.user_data = user_data;
-                        }
-                    }
-                    Err(err) => this.toast("Could not update favorite", format!("{err:#}"), cx),
-                }
-                cx.notify();
-            },
-        );
+        let (item_id, favorite) = (data.item.id.clone(), !data.item.user_data.is_favorite);
+        self.set_user_data(&item_id, Mark::Favorite, favorite, true, cx, |this, user_data, _| {
+            if let Page::Detail(data) = &mut this.page {
+                data.item.user_data = user_data;
+            }
+        });
     }
 
     // ----- playback ---------------------------------------------------------
@@ -2921,26 +2930,12 @@ impl Bloom {
         let Some(item) = &self.playing else {
             return;
         };
-        let item_id = item.id.clone();
-        let favorite = !item.user_data.is_favorite;
-        self.fetch(
-            cx,
-            {
-                let item_id = item_id.clone();
-                move |client| client.set_favorite(&item_id, favorite)
-            },
-            move |this, result, cx| {
-                match result {
-                    Ok(user_data) => {
-                        if let Some(item) = this.playing.as_mut().filter(|i| i.id == item_id) {
-                            item.user_data = user_data;
-                        }
-                    }
-                    Err(err) => this.toast("Could not update favorites", format!("{err:#}"), cx),
-                }
-                cx.notify();
-            },
-        );
+        let (item_id, favorite) = (item.id.clone(), !item.user_data.is_favorite);
+        self.set_user_data(&item_id.clone(), Mark::Favorite, favorite, false, cx, move |this, user_data, _| {
+            if let Some(item) = this.playing.as_mut().filter(|i| i.id == item_id) {
+                item.user_data = user_data;
+            }
+        });
     }
 
     /// The marked range the playback position is in, if any.
@@ -3273,10 +3268,6 @@ impl Bloom {
                             && !this.advance_at_end(cx)
                             && !this.refind_lost_episode(cx);
                         if ended {
-                            this.player_open = false;
-                            if this.phone() {
-                                crate::set_landscape(false);
-                            }
                             if let Some(err) = this.player_status.error.clone() {
                                 this.toast("Playback stopped", err, cx);
                             }
@@ -3286,8 +3277,10 @@ impl Bloom {
                             this.player.stop();
                             this.player.acknowledge_end();
                             this.player_status = this.player.status();
+                            // The one way out of the player view, as Stop
+                            // takes it: the preview sheets go as well.
+                            this.close_player_view(cx);
                             this.load_page(cx);
-                            this.news_player_closed(cx);
                         }
                         if changed || ended {
                             this.macos_player_changed(cx);
@@ -3592,19 +3585,15 @@ impl Render for Bloom {
             .children(self.render_metadata(window, cx))
             .children(self.render_lists_dialog(cx))
             .children(self.render_authorize(cx))
+            // The open panel, under the top bar; the player places its own.
             .children(
                 (!self.player_open)
-                    .then(|| self.render_sync_panel(Some(crate::views::shell::TOPBAR_H + 4.), cx))
-                    .flatten(),
-            )
-            .children(
-                (!self.player_open)
-                    .then(|| self.render_cast_panel(Some(crate::views::shell::TOPBAR_H + 4.), cx))
-                    .flatten(),
-            )
-            .children(
-                (!self.player_open)
-                    .then(|| self.render_subs_panel(Some(crate::views::shell::TOPBAR_H + 4.), cx))
+                    .then(|| {
+                        let top = Some(crate::views::shell::TOPBAR_H + 4.);
+                        self.render_sync_panel(top, cx)
+                            .or_else(|| self.render_cast_panel(top, cx))
+                            .or_else(|| self.render_subs_panel(top, cx))
+                    })
                     .flatten(),
             )
             .children(self.render_enhanced_help(cx))
@@ -3644,3 +3633,5 @@ impl Render for Bloom {
 pub(crate) mod race_harness;
 #[cfg(test)]
 mod race_tests;
+#[cfg(test)]
+mod shell_tests;

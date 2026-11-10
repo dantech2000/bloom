@@ -136,11 +136,45 @@ pub struct Server {
     pub profiles: Vec<Profile>,
 }
 
+/// An access token of the server. It reads as the text it is (`&token` is
+/// a `&str`) and is a plain string in the config file, but a debug print
+/// of it, or of anything that holds it, shows `***`: a token must not get
+/// into a log.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Token(String);
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
+
+impl std::ops::Deref for Token {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for Token {
+    fn from(token: String) -> Self {
+        Self(token)
+    }
+}
+
+impl From<&str> for Token {
+    fn from(token: &str) -> Self {
+        Self(token.to_string())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Profile {
     pub user_id: String,
     pub name: String,
-    pub token: String,
+    pub token: Token,
     #[serde(default)]
     pub image_tag: Option<String>,
 }
@@ -253,10 +287,12 @@ impl Config {
 /// Normalizes user input like `media.example.com:8096/` into a base URL.
 pub fn normalize_url(input: &str) -> String {
     let trimmed = input.trim().trim_end_matches('/');
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else {
-        format!("http://{trimmed}")
+    // The scheme in any case ("HTTPS://host" from a keyboard with capitals
+    // on), written the way the rest of the app compares it.
+    let scheme = |scheme: &str| trimmed.get(..scheme.len()).is_some_and(|head| head.eq_ignore_ascii_case(scheme));
+    match ["http://", "https://"].into_iter().find(|s| scheme(s)) {
+        Some(found) => format!("{found}{}", &trimmed[found.len()..]),
+        None => format!("http://{trimmed}"),
     }
 }
 
@@ -337,6 +373,33 @@ mod tests {
             normalize_url("https://x.example.com/"),
             "https://x.example.com"
         );
+        // The scheme in capitals is the scheme, not a host named "HTTPS".
+        assert_eq!(normalize_url("HTTPS://x.example.com"), "https://x.example.com");
+        assert_eq!(normalize_url("Http://x.example.com:8096/"), "http://x.example.com:8096");
+        assert_eq!(normalize_url("é"), "http://é");
+    }
+
+    /// A token is a plain string in the file, as before it had a type of
+    /// its own: a config written by an earlier version loads, and what is
+    /// written back is the same JSON.
+    #[test]
+    fn a_config_of_an_earlier_version_round_trips() {
+        let before = r#"{"device_id":"dev","servers":[{"id":"s","name":"S","url":"http://s","profiles":[{"user_id":"u","name":"U","token":"secret-token","image_tag":null}]}],"active":["s","u"]}"#;
+        let config: Config = serde_json::from_str(before).unwrap();
+        let profile = &config.server("s").unwrap().profiles[0];
+        assert_eq!(&*profile.token, "secret-token");
+        let written = serde_json::to_value(&config).unwrap();
+        assert_eq!(written["servers"], serde_json::from_str::<serde_json::Value>(before).unwrap()["servers"]);
+        assert_eq!(written["servers"][0]["profiles"][0]["token"], "secret-token");
+    }
+
+    /// A debug print of a profile, or of the whole config, has no token.
+    #[test]
+    fn a_debug_print_has_no_token() {
+        let config = sample();
+        let printed = format!("{config:?} {:?}", config.servers[0].profiles[0].token);
+        assert!(!printed.contains("secret"), "{printed}");
+        assert!(printed.contains("***"));
     }
 
     #[test]
@@ -411,7 +474,7 @@ mod tests {
         sample().save_to(&path).unwrap();
         let loaded = Config::load_from(&path);
         assert_eq!(loaded.device_id, "dev");
-        assert_eq!(loaded.server("s").unwrap().profiles[0].token, "secret");
+        assert_eq!(&*loaded.server("s").unwrap().profiles[0].token, "secret");
         assert!(!dir.join("config.json.broken").exists());
         let _ = fs::remove_dir_all(&dir);
     }

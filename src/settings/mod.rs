@@ -839,10 +839,10 @@ impl Bloom {
 
 // ----- widgets, in the look of the theme ---------------------------------------
 
-/// A group of settings: the theme's `.verticalSection` on a preferences
-/// page (tinted glass, 32 px corners, thin light border).
-pub fn group(title: impl Into<SharedString>, cx: &Context<Bloom>) -> Div {
-    let t = UiTheme::read(cx);
+/// The card of a settings page: the theme's `.verticalSection` (tinted
+/// glass, 32 px corners, thin light border), with no content and no
+/// padding yet.
+pub fn card(cx: &Context<Bloom>) -> Div {
     // Liquid glass prototype: the card is a glass panel with the ink of the
     // theme; off, it is the flat tint of the dark theme as before.
     let liquid = crate::ui::glass::liquid();
@@ -855,6 +855,12 @@ pub fn group(title: impl Into<SharedString>, cx: &Context<Bloom>) -> Div {
         .when(liquid, |el| {
             el.relative().child(crate::ui::glass::card_glass(px(32.), crate::ui::glass::POPUP_TINT))
         })
+}
+
+/// A group of settings: a [`card`] with a title.
+pub fn group(title: impl Into<SharedString>, cx: &Context<Bloom>) -> Div {
+    let t = UiTheme::read(cx);
+    card(cx)
         .px(px(22.))
         .pt(px(18.))
         .pb(px(10.))

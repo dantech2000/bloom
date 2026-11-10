@@ -3,19 +3,22 @@
 //! entries of the card menu, the chip in the top bar, the Downloads page
 //! and the settings section. One ink; a colour only for a state.
 
-use std::{collections::BTreeMap, rc::Rc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    rc::Rc,
+};
 
 use gpui_icons::LucideIcon;
 use gpui_kit::{
-    Bounds, Canvas, ClickEvent, Context, Div, InteractiveElement as _, ObjectFit,
+    Bounds, Canvas, ClickEvent, Context, Div, InteractiveElement as _, IntoElement as _, ObjectFit,
     ParentElement as _, Path, Pixels, Point, Rgba, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled, Window, canvas, div, point, prelude::FluentBuilder as _,
     px, rgb, rgba,
 };
 
-use super::{Entry, EntryState, engine, format_bytes};
+use super::{Entry, EntryState, engine, engine::Key, format_bytes};
 use crate::{
-    admin::Confirm,
+    admin::{Confirm, rows::rows},
     app::{Bloom, Page},
     jellyfin::{Item, ItemKind},
     settings::{Choice, field, group, icon_button, raised, select},
@@ -100,7 +103,6 @@ fn ring_with_label(progress: f32, ink: Rgba) -> Div {
         )
 }
 
-/// Bytes done and the size of a set of entries, as one progress.
 /// How far a set of downloads is, each file counting the same: a file
 /// that is done counts whole, and one that waits (its size is not known
 /// until its worker starts) counts as not begun. By bytes, the waiting
@@ -116,10 +118,82 @@ fn sum_progress(entries: &[&Entry]) -> f32 {
     entries.iter().map(part).sum::<f32>() / entries.len() as f32
 }
 
-/// Address of a file of an item's folder for the image loader.
-fn file_url(entry: &Entry, name: &str) -> Option<String> {
-    let path = engine().folder_of(Some(&entry.server_id), &entry.item_id)?.join(name);
-    path.is_file().then(|| format!("file://{}", path.display()))
+/// Height of a row of the Downloads page: the artwork (a still of 50
+/// points, a poster of 66) and 6 points over and under it.
+const ROW_EPISODE: f32 = 62.;
+const ROW_MOVIE: f32 = 78.;
+
+/// One row of the Downloads page.
+struct Row {
+    entry: Entry,
+    /// Address of the poster in the folder of the item, for the image
+    /// loader, when the file is there.
+    poster: Option<String>,
+}
+
+/// The rows under one heading: a series, or "Movies".
+struct Group {
+    name: String,
+    /// Bytes of its files, as far as the sizes are known.
+    size: u64,
+    row_h: f32,
+    rows: Vec<Row>,
+}
+
+/// What the Downloads page lists, read from the engine and the disk once
+/// for each change of the engine (`Engine::version`), not at each frame:
+/// the entries by series, the poster of each, and the free space. Before,
+/// a frame of the page asked the disk once for each row and once more
+/// for the space, and a download draws four frames a second.
+#[derive(Default)]
+pub(super) struct Listing {
+    version: u64,
+    groups: Vec<Group>,
+    free: Option<u64>,
+}
+
+impl Listing {
+    fn refresh(&mut self) {
+        let engine = engine();
+        let version = engine.version();
+        if self.version == version {
+            return;
+        }
+        self.version = version;
+        self.free = engine.free_bytes();
+        let dir = engine.dir();
+        // A poster that was found stays for the life of its entry (the
+        // time it was added tells an entry from one made again); only
+        // one that is not there yet is looked for again.
+        let mut found: HashMap<(String, String, i64), String> = std::mem::take(&mut self.groups)
+            .into_iter()
+            .flat_map(|group| group.rows)
+            .filter_map(|row| Some(((row.entry.server_id, row.entry.item_id, row.entry.added), row.poster?)))
+            .collect();
+        // By series, then by season and episode.
+        let mut groups: BTreeMap<String, Vec<Row>> = BTreeMap::new();
+        for entry in engine.entries() {
+            let poster = found
+                .remove(&(entry.server_id.clone(), entry.item_id.clone(), entry.added))
+                .or_else(|| {
+                    let path = dir.join(&entry.server_id).join(&entry.item_id).join(super::engine::POSTER_FILE);
+                    path.is_file().then(|| format!("file://{}", path.display()))
+                });
+            groups.entry(entry.group()).or_default().push(Row { entry, poster });
+        }
+        self.groups = groups
+            .into_iter()
+            .map(|(name, mut rows)| {
+                rows.sort_by_key(|row| (row.entry.season.unwrap_or(0), row.entry.episode.unwrap_or(0), row.entry.name.clone()));
+                let size = rows.iter().map(|row| row.entry.total.unwrap_or(row.entry.done)).sum();
+                let row_h = match rows.iter().all(|row| row.entry.kind == "Episode") {
+                    true => ROW_EPISODE,
+                    false => ROW_MOVIE,
+                };
+                Group { name, size, row_h, rows }
+            })
+            .collect();
+    }
 }
 
 impl Bloom {
@@ -171,9 +245,7 @@ impl Bloom {
                         )))
                         .child(ring_with_label(progress, fg))
                         .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                            for id in &ids {
-                                super::engine().cancel(id);
-                            }
+                            super::engine().cancel_many(&ids);
                             cx.notify();
                         })),
                 );
@@ -202,9 +274,7 @@ impl Bloom {
                     .tooltip(tip("Season downloaded · Click to remove the files"))
                     .child(icon(LucideIcon::CircleCheck, 25., fg))
                     .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                        for id in &ids {
-                            super::engine().remove(id);
-                        }
+                        super::engine().remove_many(&ids);
                         cx.notify();
                     })),
             );
@@ -302,7 +372,7 @@ impl Bloom {
         }
         let id = item.id.clone();
         let target = item.clone();
-        let (label, glyph): (&str, LucideIcon) = match engine().entry(&item.id).map(|e| e.state) {
+        let (label, glyph): (&str, LucideIcon) = match engine().state_of(&item.id) {
             None => ("Download", LucideIcon::Download),
             Some(EntryState::Queued | EntryState::Downloading) => ("Pause download", LucideIcon::Pause),
             Some(EntryState::Paused | EntryState::Failed) => ("Resume download", LucideIcon::RefreshCw),
@@ -316,7 +386,7 @@ impl Bloom {
                     let (id, target) = (id.clone(), target.clone());
                     this.update(cx, |this, cx| {
                         let engine = engine();
-                        match engine.entry(&id).map(|e| e.state) {
+                        match engine.state_of(&id) {
                             None => this.download_item(&target, cx),
                             Some(EntryState::Queued | EntryState::Downloading) => engine.cancel(&id),
                             Some(EntryState::Paused | EntryState::Failed) => engine.resume(&id),
@@ -333,21 +403,19 @@ impl Bloom {
     /// A small chip in the top bar while something downloads: a ring and
     /// the percent. A click opens the Downloads page.
     pub fn render_downloads_chip(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
-        let entries = engine().entries();
-        let active: Vec<&Entry> = entries.iter().filter(|e| e.is_active()).collect();
-        if active.is_empty() {
+        let all = engine().summary();
+        if all.active == 0 {
             return None;
         }
         let t = UiTheme::read(cx).clone();
         let fg = t.colors.foreground;
-        let downloading = active.iter().filter(|e| e.state == EntryState::Downloading).count();
-        let progress = sum_progress(&active);
-        let label = if downloading > 0 {
+        let progress = all.progress;
+        let label = if all.downloading > 0 {
             format!("{}%", (progress * 100.).floor() as u32)
         } else {
             "Queued".to_string()
         };
-        let text = format!("Downloads · {} active · {}", active.len(), label);
+        let text = format!("Downloads · {} active · {}", all.active, label);
         Some(
             div()
                 .id("top.downloads")
@@ -376,18 +444,14 @@ impl Bloom {
         let t = UiTheme::read(cx).clone();
         let quiet = t.colors.foreground.opacity(0.6);
         let engine = engine();
-        let entries = engine.entries();
+        self.downloads.listing.borrow_mut().refresh();
+        let listing = self.downloads.listing.borrow();
+        let all = engine.summary();
         let narrow = self.viewport_w < 860.;
 
         // Summary: count, space in use, space free.
-        let used = engine.used_bytes();
-        let free = engine.free_bytes();
-        let active = entries.iter().filter(|e| e.is_active()).count();
-        let mut facts = vec![format!(
-            "{} item{}",
-            entries.len(),
-            if entries.len() == 1 { "" } else { "s" }
-        )];
+        let (used, free, active) = (all.used, listing.free, all.active);
+        let mut facts = vec![format!("{} item{}", all.entries, if all.entries == 1 { "" } else { "s" })];
         if active > 0 {
             facts.push(format!("{active} downloading"));
         }
@@ -406,7 +470,7 @@ impl Bloom {
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.retry_connection(cx))),
             );
         }
-        if !entries.is_empty() {
+        if all.entries > 0 {
             actions = actions.child(
                 raised("downloads.remove-all", "Remove all", cx).on_click(cx.listener(
                     |this, _: &ClickEvent, _, cx| {
@@ -491,7 +555,7 @@ impl Bloom {
                 .child(actions),
         );
 
-        if entries.is_empty() {
+        if all.entries == 0 {
             page = page.child(
                 div()
                     .py(px(40.))
@@ -501,23 +565,21 @@ impl Bloom {
             );
         }
 
-        // By series, then by season and episode.
-        let mut groups: BTreeMap<String, Vec<Entry>> = BTreeMap::new();
-        for entry in entries {
-            groups.entry(entry.group()).or_default().push(entry);
-        }
-        for (name, mut items) in groups {
-            items.sort_by_key(|e| (e.season.unwrap_or(0), e.episode.unwrap_or(0), e.name.clone()));
-            let size: u64 = items.iter().map(|e| e.total.unwrap_or(e.done)).sum();
-            let mut card = group(
-                SharedString::from(format!("{name} · {}", format_bytes(size))),
-                cx,
-            )
-            .w_full();
-            for entry in &items {
-                card = card.child(self.render_download_row(entry, cx));
-            }
-            page = page.child(card);
+        // A card for each series. Only the rows in view are built (see
+        // `rows`); they read the listing again when they are.
+        for (place, set) in listing.groups.iter().enumerate() {
+            let title = SharedString::from(format!("{} · {}", set.name, format_bytes(set.size)));
+            let list = rows(cx, set.rows.len(), set.row_h, move |this, range, cx| {
+                let listing = this.downloads.listing.borrow();
+                let Some(set) = listing.groups.get(place) else {
+                    return Vec::new();
+                };
+                range
+                    .filter_map(|at| set.rows.get(at))
+                    .map(|row| this.render_download_row(row, cx).into_any_element())
+                    .collect()
+            });
+            page = page.child(group(title, cx).w_full().child(list));
         }
 
         div()
@@ -534,7 +596,8 @@ impl Bloom {
 
     /// One item of the Downloads page: artwork, title, state and size, a
     /// progress bar while it is not done, and its buttons.
-    fn render_download_row(&self, entry: &Entry, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn render_download_row(&self, row: &Row, cx: &mut Context<Self>) -> Stateful<Div> {
+        let entry = &row.entry;
         let t = UiTheme::read(cx).clone();
         let fg = t.colors.foreground;
         let quiet = fg.opacity(0.6);
@@ -552,7 +615,7 @@ impl Bloom {
             .items_center()
             .justify_center()
             .child(icon(if episode { LucideIcon::Tv } else { LucideIcon::Clapperboard }, 20., t.colors.muted_foreground))
-            .when_some(file_url(entry, super::engine::POSTER_FILE), |el, url| {
+            .when_some(row.poster.clone(), |el, url| {
                 el.child(
                     crate::images::remote_with(url, px(8.), ObjectFit::Cover)
                         .absolute()
@@ -610,8 +673,11 @@ impl Bloom {
         }
 
         let mut buttons = div().flex().items_center().gap(px(2.)).flex_shrink_0();
-        let button_id = |what: &str| SharedString::from(format!("downloads.{what}.{}", entry.item_id));
-        // The row is of one server; the actions name it.
+        // The row is of one server: its ids and its actions name it. Two
+        // servers can hold an item under one id, and two elements with
+        // one id stop the accessibility tree.
+        let button_id =
+            |what: &str| SharedString::from(format!("downloads.{what}.{}.{}", entry.server_id, entry.item_id));
         let server = entry.server_id.clone();
         match entry.state {
             EntryState::Done => {
@@ -632,7 +698,7 @@ impl Bloom {
                         .tooltip(tip("Pause"))
                         .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
                             cx.stop_propagation();
-                            super::engine().cancel_of(Some(&server), &pause);
+                            super::engine().cancel(Key::of(Some(&server), &pause));
                             cx.notify();
                         })),
                 );
@@ -647,7 +713,7 @@ impl Bloom {
                             if this.downloads.offline {
                                 return;
                             }
-                            super::engine().resume_of(Some(&server), &resume);
+                            super::engine().resume(Key::of(Some(&server), &resume));
                             cx.notify();
                         })),
                 );
@@ -659,7 +725,7 @@ impl Bloom {
                 .tooltip(tip(format!("Remove from {}", crate::brand::THIS_DEVICE)))
                 .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
                     cx.stop_propagation();
-                    super::engine().remove_of(Some(&server), &remove);
+                    super::engine().remove(Key::of(Some(&server), &remove));
                     cx.notify();
                 })),
         );
@@ -667,7 +733,7 @@ impl Bloom {
         let (open, open_server) = (id.clone(), entry.server_id.clone());
         div()
             .id(button_id("row"))
-            .min_h(px(44.))
+            .h_full()
             .px(px(10.))
             .py(px(6.))
             .rounded(px(12.))

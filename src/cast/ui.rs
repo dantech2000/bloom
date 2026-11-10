@@ -274,7 +274,7 @@ impl Bloom {
 
             // Cast devices: the ones found, or "Searching…" for a moment
             // after the search starts, or nothing.
-            let devices = self.chromecast_devices();
+            let devices = &self.cast.devices;
             if !devices.is_empty() {
                 body = body.child(heading("Chromecast".into()));
                 for device in devices {

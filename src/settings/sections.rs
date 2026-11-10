@@ -209,11 +209,7 @@ impl Bloom {
         }
         // The profile header of the theme: a glass card with the picture
         // and the name.
-        let header = div()
-            .rounded(px(32.))
-            .border_1()
-            .border_color(rgba(0xf5f5f733))
-            .bg(rgba(0x2a2a2ab0))
+        let header = super::card(cx)
             .p(px(22.))
             .flex()
             .items_center()
@@ -453,12 +449,7 @@ impl Bloom {
                         [-250., -200., -150., -100., -50., 0., 50., 100., 150., 200., 250.]
                             .into_iter()
                             .map(|ms: f64| {
-                                let text = match ms {
-                                    ms if ms == 0. => "None".to_string(),
-                                    ms if ms > 0. => format!("{ms:.0} ms later"),
-                                    ms => format!("{:.0} ms earlier", -ms),
-                                };
-                                Choice::new(text, ms == current, move |this, cx| {
+                                Choice::new(offset_text(ms), ms == current, move |this, cx| {
                                     this.set_sync_offset(ms, cx)
                                 })
                             })
@@ -652,11 +643,11 @@ impl Bloom {
                 .child("The home page shows them from top to bottom. The web client uses the same list."),
         );
         const SLOTS: usize = 10;
-        for slot in 0..SLOTS {
-            let kind = self.prefs.home_section(slot);
+        let kinds: [String; SLOTS] = std::array::from_fn(|slot| self.prefs.home_section(slot));
+        for (slot, kind) in kinds.iter().enumerate() {
             // A move changes places with the neighbour, in one save.
             let swap = |other: usize| {
-                let (here, there) = (kind.clone(), self.prefs.home_section(other));
+                let (here, there) = (kind.clone(), kinds[other].clone());
                 move |this: &mut Bloom, _: &ClickEvent, _: &mut gpui_kit::Window, cx: &mut Context<Bloom>| {
                     this.set_custom_prefs(
                         vec![
@@ -696,7 +687,7 @@ impl Bloom {
             };
             let pick = super::select_capped(
                 SharedString::from(format!("settings.home.{slot}")),
-                name_of(&kind),
+                name_of(kind),
                 longest,
                 pick_max,
                 cx,

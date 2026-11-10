@@ -63,7 +63,10 @@ fn counted_types(kind: Option<&str>) -> &'static [(&'static str, &'static str)] 
         Some("musicvideos") => &[("MusicVideo", "videos")],
         Some("books") => &[("Book", "books")],
         Some("homevideos") => &[("Video", "videos"), ("Photo", "photos")],
-        _ => &[("", "items")],
+        Some("playlists") => &[("Playlist", "playlists")],
+        // Mixed content: the titles, not every folder, season and episode
+        // under them (no type at all counted those too).
+        _ => &[("Movie,Series", "titles")],
     }
 }
 
@@ -122,6 +125,41 @@ fn load_with(client: &Client, previous: &[Library]) -> Result<Data> {
     Ok(Data { libraries })
 }
 
+/// The green of a scan that runs (see `tasks::RUNNING`).
+const WORKING: u32 = 0x7ee787;
+
+/// The top of a card with artwork: `base` (its height and fill) with the
+/// card's upper corners, `placeholder` in its middle, the image over it
+/// when there is one and it loads, and a badge in the upper right corner
+/// on a dark back, which a label over artwork needs.
+pub(super) fn image_header(
+    base: Div,
+    placeholder: impl gpui_kit::IntoElement,
+    image: Option<String>,
+    badge: Div,
+) -> Div {
+    base.relative()
+        .w_full()
+        // The corners of the card, inside its 1 px edge.
+        .rounded_t(px(23.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(placeholder)
+        .when_some(image, |el, url| {
+            el.child(
+                crate::images::remote_corners(
+                    url,
+                    gpui_kit::Corners { top_left: px(23.), top_right: px(23.), ..Default::default() },
+                    ObjectFit::Cover,
+                )
+                .absolute()
+                .inset_0(),
+            )
+        })
+        .child(div().absolute().top(px(10.)).right(px(10.)).child(badge.bg(rgba(0x000000a6))))
+}
+
 /// Name and glyph of a library kind.
 fn kind_label(kind: Option<&str>) -> (&'static str, LucideIcon) {
     match kind {
@@ -156,9 +194,7 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
         return div();
     };
     let content_w = app.admin_content_w().max(CARD_MIN_W);
-    let columns = (((content_w + CARD_GAP) / (CARD_MIN_W + CARD_GAP)).floor() as usize)
-        .clamp(1, data.libraries.len().max(1));
-    let card_w = ((content_w - CARD_GAP * (columns - 1) as f32) / columns as f32).floor();
+    let (_, card_w) = super::rows::grid(content_w, CARD_MIN_W, CARD_GAP, 1, data.libraries.len());
     let image_h = (card_w * 9. / 16.).round();
 
     let folders: usize = data.libraries.iter().map(|l| l.locations.len()).sum();
@@ -200,6 +236,14 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
         );
 
     let mut grid = div().flex().flex_wrap().gap(px(CARD_GAP));
+    if data.libraries.is_empty() {
+        grid = grid.child(
+            super::card(cx)
+                .text_size(px(15.))
+                .text_color(t.colors.foreground.opacity(0.6))
+                .child("The server has no libraries."),
+        );
+    }
     for library in &data.libraries {
         let (kind, glyph) = kind_label(library.collection_type.as_deref());
         let image = library
@@ -239,7 +283,6 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
         }
 
         let item_id = library.item_id.clone();
-        let done: &'static str = "Scan started";
         grid = grid.child(
             div()
                 .w(px(card_w))
@@ -251,44 +294,17 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                 .flex()
                 .flex_col()
                 // Artwork; the server draws the name of the library into it.
-                .child(
-                    div()
-                        .relative()
-                        .w_full()
-                        .h(px(image_h))
-                        // The corners of the card, inside its 1 px edge.
-                        .rounded_t(px(23.))
-                        .bg(t.colors.muted)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(icon(glyph, 44., t.colors.muted_foreground))
-                        .when_some(image, |el, url| {
-                            el.child(
-                                crate::images::remote_corners(
-                                    url,
-                                    gpui_kit::Corners { top_left: px(23.), top_right: px(23.), ..Default::default() },
-                                    ObjectFit::Cover,
-                                )
-                                .absolute()
-                                .inset_0(),
-                            )
-                        })
-                        // Over the artwork the label needs a dark back.
-                        .child(div().absolute().top(px(10.)).right(px(10.)).child(
-                            badge(
-                                if !busy {
-                                    "Idle"
-                                } else if status == "Queued" {
-                                    "Queued"
-                                } else {
-                                    "Scanning"
-                                },
-                                rgba(0xffffff2e),
-                            )
-                            .bg(rgba(0x000000a6)),
-                        )),
-                )
+                .child(image_header(
+                    div().h(px(image_h)).bg(t.colors.muted),
+                    icon(glyph, 44., t.colors.muted_foreground),
+                    image,
+                    match status {
+                        "Idle" => badge("Idle", rgba(0xffffff2e)),
+                        "Queued" => badge("Queued", rgba(0xffffff2e)),
+                        // A scan that runs is the live state: the green dot.
+                        _ => badge("Scanning", rgb(WORKING)),
+                    },
+                ))
                 // Scan progress, as a line under the artwork.
                 .when_some(progress.filter(|_| busy), |el, value| {
                     el.child(
@@ -296,7 +312,7 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                             div()
                                 .h_full()
                                 .w(gpui_kit::relative(value))
-                                .bg(rgb(0x42a5f5)),
+                                .bg(rgb(WORKING)),
                         ),
                     )
                 })
@@ -357,7 +373,7 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                                 .on_click(cx.listener(
                                     move |this, _: &ClickEvent, _, cx| {
                                         let item_id = item_id.clone();
-                                        this.admin_action(done, cx, move |client| {
+                                        this.admin_action("Scan started", cx, move |client| {
                                             client.call(
                                                 "POST",
                                                 &format!("/Items/{item_id}/Refresh"),

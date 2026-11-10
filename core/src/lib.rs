@@ -6,10 +6,12 @@
 //! this crate again.
 
 pub mod brand;
+pub mod cast;
 pub mod chromecast;
 pub mod config;
 pub mod connection;
 pub mod downloads;
+pub mod fsutil;
 pub mod images;
 pub mod jellyfin;
 pub mod news;

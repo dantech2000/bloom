@@ -32,6 +32,21 @@ const KEEP_ALIVE: Duration = Duration::from_secs(30);
 const SILENCE: Duration = Duration::from_secs(75);
 /// How long one read waits; the loop looks at its timers between reads.
 const READ_WAIT: Duration = Duration::from_millis(500);
+/// The wait before the first try to connect again, and the longest one.
+const FIRST_WAIT: Duration = Duration::from_secs(1);
+const LONGEST_WAIT: Duration = Duration::from_secs(30);
+/// A socket that stayed open this long was a good one: the next loss
+/// starts the waits from the first again.
+const STABLE: Duration = Duration::from_secs(10);
+
+/// The wait before the next try. `wait` is the one the tries have come to
+/// (it doubles with each); `open_for` is how long the socket was open,
+/// none when it did not open. A socket that opens and is closed at once (a
+/// proxy in front of a server that is down) is no success: the waits go on
+/// to grow, or the app would knock every second for as long as that lasts.
+fn wait_after(wait: Duration, open_for: Option<Duration>) -> Duration {
+    if open_for.is_some_and(|open| open >= STABLE) { FIRST_WAIT } else { wait }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SocketEvent {
@@ -51,7 +66,8 @@ pub struct Realtime {
 impl Realtime {
     /// Sends a message to the server, such as a subscription. One queued
     /// while the socket is down is dropped when it opens again: the caller
-    /// sends again on `Open`.
+    /// sends again on `Open`. It goes out when the read that runs returns,
+    /// up to `READ_WAIT` later.
     pub fn send(&self, kind: &str, data: Option<Value>) {
         let message = match data {
             Some(data) => serde_json::json!({ "MessageType": kind, "Data": data }),
@@ -76,11 +92,12 @@ pub fn start(client: Client) -> (Realtime, async_channel::Receiver<SocketEvent>)
     let stopped = stop.clone();
     let (outbox, outgoing) = mpsc::channel::<String>();
     let _ = thread::Builder::new().name("server-socket".into()).spawn(move || {
-        let (mut again, mut wait) = (false, Duration::from_secs(1));
+        let (mut again, mut wait) = (false, FIRST_WAIT);
         while !stopped.load(Ordering::Acquire) {
+            let mut open_for = None;
             match connect(&client) {
                 Ok(socket) => {
-                    wait = Duration::from_secs(1);
+                    let opened = Instant::now();
                     // Messages from before the socket opened are stale.
                     while outgoing.try_recv().is_ok() {}
                     if tx.send_blocking(SocketEvent::Open { again }).is_err() {
@@ -91,15 +108,17 @@ pub fn start(client: Client) -> (Realtime, async_channel::Receiver<SocketEvent>)
                         log::info!("server socket closed: {err:#}");
                     }
                     let _ = tx.send_blocking(SocketEvent::Closed);
+                    open_for = Some(opened.elapsed());
                 }
                 Err(err) => log::warn!("server socket: {err:#}"),
             }
+            wait = wait_after(wait, open_for);
             // Wait in small steps, so a drop ends the thread soon.
             let until = Instant::now() + wait;
             while Instant::now() < until && !stopped.load(Ordering::Acquire) {
                 thread::sleep(Duration::from_millis(100));
             }
-            wait = (wait * 2).min(Duration::from_secs(30));
+            wait = (wait * 2).min(LONGEST_WAIT);
         }
     });
     (Realtime { stop, outbox }, rx)
@@ -219,4 +238,26 @@ fn serve(
     }
     let _ = socket.close(None);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A socket that is closed as soon as it opens does not start the
+    /// waits again: they grow as for a server that does not answer. One
+    /// that stayed open does.
+    #[test]
+    fn a_socket_closed_at_once_does_not_reset_the_wait() {
+        let mut wait = FIRST_WAIT;
+        let mut waits = Vec::new();
+        for _ in 0..7 {
+            wait = wait_after(wait, Some(Duration::from_millis(40)));
+            waits.push(wait.as_secs());
+            wait = (wait * 2).min(LONGEST_WAIT);
+        }
+        assert_eq!(waits, [1, 2, 4, 8, 16, 30, 30]);
+        assert_eq!(wait_after(wait, None), LONGEST_WAIT);
+        assert_eq!(wait_after(wait, Some(STABLE)), FIRST_WAIT);
+    }
 }

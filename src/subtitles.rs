@@ -13,7 +13,9 @@
 //! /Videos/{id}/Subtitles/{index}` removes an external subtitle. The first
 //! two need the user policy `EnableSubtitleManagement`, the last one an
 //! administrator. A search finds nothing without a subtitle provider
-//! plugin on the server.
+//! plugin on the server. The app has no control that removes a subtitle:
+//! the last call is for the debug channel (`subs remove`), which puts a
+//! test download away again.
 
 use std::{collections::HashMap, time::Duration};
 
@@ -29,7 +31,7 @@ use serde_json::Value;
 
 use crate::{
     app::{Bloom, Panel},
-    jellyfin::Client,
+    jellyfin::{Client, MediaStream},
     ui::{glass::glass, menu::MenuItem, scroll_area::ScrollArea, theme::UiTheme, tip::tip},
     views::cards::icon,
 };
@@ -120,15 +122,11 @@ pub struct Candidate {
     #[serde(default)]
     pub author: String,
     #[serde(default)]
-    pub comment: String,
-    #[serde(default)]
     pub download_count: Option<i64>,
     #[serde(default)]
     pub community_rating: Option<f32>,
     #[serde(default)]
     pub is_hash_match: Option<bool>,
-    #[serde(rename = "ThreeLetterISOLanguageName", default)]
-    pub language: String,
     #[serde(default)]
     pub ai_translated: Option<bool>,
     #[serde(default)]
@@ -273,11 +271,31 @@ const COMMON: [(&str, &str); 14] = [
     ("tur", "Turkish"),
 ];
 
+/// A language with two three-letter codes in ISO 639-2: the one of the
+/// library world ("ger") and the one from its own name ("deu"). Jellyfin
+/// keeps the first in the settings of a user, and a file can have either.
+const TWO_CODES: [(&str, &str); 4] = [("ger", "deu"), ("fre", "fra"), ("dut", "nld"), ("chi", "zho")];
+
+/// The code of `COMMON` for a language code: "ger" is "deu".
+fn one_code(code: &str) -> String {
+    let code = code.trim().to_ascii_lowercase();
+    match TWO_CODES.iter().find(|(other, _)| *other == code) {
+        Some((_, own)) => own.to_string(),
+        None => code,
+    }
+}
+
+/// True when two three-letter codes name one language.
+pub fn same_language(a: &str, b: &str) -> bool {
+    one_code(a) == one_code(b)
+}
+
 /// The name of a language code; the code itself when it is not in the list.
 pub fn language_name(code: &str) -> String {
+    let own = one_code(code);
     COMMON
         .iter()
-        .find(|(c, _)| c.eq_ignore_ascii_case(code))
+        .find(|(c, _)| *c == own)
         .map_or_else(|| code.to_uppercase(), |(_, name)| name.to_string())
 }
 
@@ -291,12 +309,14 @@ pub fn default_language(preference: Option<&str>) -> String {
 }
 
 /// The chips: the language of the user first when it is not a common one,
-/// then the common ones.
+/// then the common ones. A common language keeps the code the user has
+/// for it ("ger"), so it is one chip and the search asks with that code.
 pub fn language_choices(preference: Option<&str>) -> Vec<String> {
     let mut list: Vec<String> = COMMON.iter().map(|(c, _)| c.to_string()).collect();
     let own = default_language(preference);
-    if !list.contains(&own) {
-        list.insert(0, own);
+    match list.iter_mut().find(|code| same_language(code, &own)) {
+        Some(code) => *code = own,
+        None => list.insert(0, own),
     }
     list
 }
@@ -317,63 +337,42 @@ fn segment(value: &str) -> String {
     out
 }
 
-pub fn search_path(item_id: &str, language: &str) -> String {
-    format!("/Items/{}/RemoteSearch/Subtitles/{}", segment(item_id), segment(language))
-}
-
-pub fn download_path(item_id: &str, subtitle_id: &str) -> String {
-    format!("/Items/{}/RemoteSearch/Subtitles/{}", segment(item_id), segment(subtitle_id))
+/// The path of a search (`last` is a language, with GET) and of a
+/// download (`last` is the id of a candidate, with POST).
+pub fn remote_search_path(item_id: &str, last: &str) -> String {
+    format!("/Items/{}/RemoteSearch/Subtitles/{}", segment(item_id), segment(last))
 }
 
 pub fn remove_path(item_id: &str, index: i64) -> String {
     format!("/Videos/{}/Subtitles/{index}", segment(item_id))
 }
 
-/// A subtitle stream of an item, as the server lists it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SubStream {
-    pub index: i64,
-    pub external: bool,
-    pub path: String,
-    pub language: String,
-    pub title: String,
-}
-
-/// The subtitle streams in the JSON of an item.
-pub fn parse_streams(item: &Value) -> Vec<SubStream> {
-    let text = |s: &Value, key: &str| s.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
-    item.get("MediaStreams")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|s| s.get("Type").and_then(Value::as_str) == Some("Subtitle"))
-        .map(|s| SubStream {
-            index: s.get("Index").and_then(Value::as_i64).unwrap_or(-1),
-            external: s.get("IsExternal").and_then(Value::as_bool).unwrap_or(false),
-            path: text(s, "Path"),
-            language: text(s, "Language"),
-            title: text(s, "DisplayTitle"),
-        })
-        .collect()
-}
-
 /// The stream that `after` has and `before` has not: an external one with a
 /// path that was not there. The indexes of the external streams can move
 /// when one is added, so the path names a stream.
-pub fn new_stream<'a>(before: &[SubStream], after: &'a [SubStream]) -> Option<&'a SubStream> {
+pub fn new_stream<'a>(before: &[MediaStream], after: &'a [MediaStream]) -> Option<&'a MediaStream> {
+    let external = |list: &[MediaStream]| list.iter().filter(|s| s.is_external).count();
     after
         .iter()
-        .filter(|s| s.external)
-        .find(|s| !before.iter().any(|b| b.external && b.path == s.path && !s.path.is_empty()))
-        .filter(|_| after.iter().filter(|a| a.external).count() > before.iter().filter(|b| b.external).count())
+        .filter(|s| s.is_external)
+        .find(|s| s.path.is_none() || !before.iter().any(|b| b.is_external && b.path == s.path))
+        .filter(|_| external(after) > external(before))
 }
 
 #[easy_ext::ext(SubtitlesApi)]
 pub(crate) impl Client {
-    fn subtitle_streams(&self, item_id: &str) -> Result<Vec<SubStream>> {
+    /// The subtitle streams of an item, as the server lists them.
+    fn subtitle_streams(&self, item_id: &str) -> Result<Vec<MediaStream>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Streams {
+            #[serde(default)]
+            media_streams: Vec<MediaStream>,
+        }
         let user = self.user()?.to_string();
-        let item: Value = self.get(&format!("/Items/{}", segment(item_id)), &[("userId", user)])?;
-        Ok(parse_streams(&item))
+        let mut item: Streams = self.get(&format!("/Items/{}", segment(item_id)), &[("userId", user)])?;
+        item.media_streams.retain(|s| s.kind == "Subtitle");
+        Ok(item.media_streams)
     }
 
     /// The rights of the user: may manage subtitles, is an administrator,
@@ -385,7 +384,6 @@ pub(crate) impl Client {
         };
         let admin = flag("IsAdministrator");
         Ok(Rights {
-            user: me.get("Id").and_then(Value::as_str).unwrap_or_default().to_string(),
             manage: admin || flag("EnableSubtitleManagement"),
             admin,
             language: me
@@ -405,7 +403,7 @@ pub(crate) impl Client {
     /// Searches the providers of the server.
     fn search_subtitles(&self, item_id: &str, language: &str) -> Result<Search> {
         let body: Value = self.get(
-            &search_path(item_id, language),
+            &remote_search_path(item_id, language),
             &[("isPerfectMatch", "false".to_string())],
         )?;
         let candidates = parse_candidates(&body);
@@ -416,9 +414,9 @@ pub(crate) impl Client {
     /// Downloads a candidate into the library of the server and waits for
     /// the new stream: the server lists it after it refreshes the item.
     /// None when the stream did not appear in time.
-    fn download_subtitle(&self, item_id: &str, subtitle_id: &str) -> Result<Option<SubStream>> {
+    fn download_subtitle(&self, item_id: &str, subtitle_id: &str) -> Result<Option<MediaStream>> {
         let before = self.subtitle_streams(item_id)?;
-        self.call("POST", &download_path(item_id, subtitle_id), &[])?;
+        self.call("POST", &remote_search_path(item_id, subtitle_id), &[])?;
         for _ in 0..16 {
             std::thread::sleep(Duration::from_millis(1500));
             let after = self.subtitle_streams(item_id)?;
@@ -435,7 +433,7 @@ pub(crate) impl Client {
         let streams = self.subtitle_streams(item_id)?;
         match streams.iter().find(|s| s.index == index) {
             None => return Err(anyhow!("the item has no subtitle stream {index}")),
-            Some(s) if !s.external => {
+            Some(s) if !s.is_external => {
                 return Err(anyhow!("stream {index} is not an external subtitle"));
             }
             Some(_) => {}
@@ -447,7 +445,6 @@ pub(crate) impl Client {
 /// The rights of the user for subtitles.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Rights {
-    pub user: String,
     pub manage: bool,
     pub admin: bool,
     pub language: Option<String>,
@@ -494,6 +491,13 @@ impl State {
     pub fn allowed(&self) -> bool {
         self.rights.as_ref().is_some_and(|r| r.manage)
     }
+
+    /// True when the panel that opens has nothing to show for its item
+    /// and language: no list from an earlier search, or a failed one. A
+    /// search goes to the providers, which count the requests of a day.
+    fn needs_search(&self) -> bool {
+        !self.loading && (self.results.is_empty() || self.error.is_some())
+    }
 }
 
 // ----- the app ---------------------------------------------------------------------
@@ -501,7 +505,10 @@ impl State {
 impl Bloom {
     /// True while the item that plays has a subtitle burned in.
     fn subs_burned(&self) -> bool {
-        crate::stream::current().is_some_and(|r| r.burned_subtitle.is_some())
+        self.playing
+            .as_ref()
+            .and_then(|item| crate::stream::current_of(&item.id))
+            .is_some_and(|r| r.burned_subtitle.is_some())
     }
 
     /// Reads the rights of the user once per user, for the menu entry.
@@ -549,10 +556,7 @@ impl Bloom {
         if let Some(reason) = blocked(delay, self.subs_burned()) {
             return MenuItem::new(id, label).detail(reason).disabled(true);
         }
-        let now = match delay {
-            Delay::Subtitle => self.player_status.sub_delay,
-            Delay::Audio => self.player_status.audio_delay,
-        };
+        let now = self.delay_now(delay);
         let this = cx.weak_entity();
         let mut steps = Vec::new();
         for step in [-500, -100, 100, 500] {
@@ -578,11 +582,15 @@ impl Bloom {
 
     /// A step of the delay, from a key or the menu.
     pub fn subs_step(&mut self, delay: Delay, delta_ms: i64, cx: &mut Context<Self>) {
-        let now = match delay {
+        self.subs_set_delay(delay, stepped(self.delay_now(delay), delta_ms), cx);
+    }
+
+    /// The delay mpv reports, in seconds.
+    fn delay_now(&self, delay: Delay) -> f64 {
+        match delay {
             Delay::Subtitle => self.player_status.sub_delay,
             Delay::Audio => self.player_status.audio_delay,
-        };
-        self.subs_set_delay(delay, stepped(now, delta_ms), cx);
+        }
     }
 
     /// Sets a delay in seconds and shows it. Returns false when it cannot
@@ -659,7 +667,7 @@ impl Bloom {
         )
     }
 
-    /// The title and id of the item that plays.
+    /// The id and title of the item that plays.
     pub fn subs_playing(&self) -> Option<(String, String)> {
         self.playing.as_ref().map(|i| (i.id.clone(), i.display_title()))
     }
@@ -674,8 +682,11 @@ impl Bloom {
             self.subs.language = default_language(preference.as_deref());
             self.subs.results.clear();
             self.subs.progress.clear();
+            self.subs.error = None;
         }
-        self.subs_search(cx);
+        if self.subs.needs_search() {
+            self.subs_search(cx);
+        }
         cx.notify();
     }
 
@@ -738,7 +749,7 @@ impl Bloom {
         );
     }
 
-    fn subs_downloaded(&mut self, item_id: &str, found: Option<SubStream>, cx: &mut Context<Self>) {
+    fn subs_downloaded(&mut self, item_id: &str, found: Option<MediaStream>, cx: &mut Context<Self>) {
         let Some(found) = found else {
             self.toast(
                 "Subtitle downloaded",
@@ -747,7 +758,11 @@ impl Bloom {
             );
             return;
         };
-        let name = if found.title.is_empty() { language_name(&found.language) } else { found.title.clone() };
+        let name = found
+            .display_title
+            .clone()
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| language_name(found.language.as_deref().unwrap_or_default()));
         self.toast("Subtitle added", name, cx);
         let on_page = matches!(&self.page, crate::app::Page::Detail(d) if d.item.id == item_id);
         if on_page {
@@ -1049,7 +1064,10 @@ impl Bloom {
                 match client.subtitle_streams(arg) {
                     Ok(list) => list
                         .iter()
-                        .map(|s| format!("{}:{}{}", s.index, s.language, if s.external { ":ext" } else { "" }))
+                        .map(|s| {
+                            let language = s.language.as_deref().unwrap_or_default();
+                            format!("{}:{language}{}", s.index, if s.is_external { ":ext" } else { "" })
+                        })
                         .collect::<Vec<_>>()
                         .join(" "),
                     Err(err) => format!("error: {err:#}"),
@@ -1145,7 +1163,6 @@ mod tests {
         assert_eq!(list[0].badges(), vec!["Hash match", "Forced", "Machine translated"]);
         assert_eq!(list[1].badges(), vec!["Hearing impaired"]);
         assert_eq!(list[1].detail(), "Open Subtitles · SRT · 1,200 downloads · rating 8.1 · by x");
-        assert_eq!(list[1].language, "eng");
         assert!(parse_candidates(&json!({"x": 1})).is_empty());
     }
 
@@ -1159,6 +1176,15 @@ mod tests {
         assert_eq!(language_choices(Some("spa"))[0], "eng");
         assert_eq!(language_name("fra"), "French");
         assert_eq!(language_name("swe"), "SWE");
+        // Jellyfin keeps "ger" for German: one chip, named, with the code
+        // of the user, and not a chip "GER" beside "German".
+        assert_eq!(language_name("ger"), "German");
+        let german = language_choices(Some("ger"));
+        assert_eq!(german.len(), COMMON.len());
+        assert_eq!(german[3], "ger");
+        assert!(!german.contains(&"deu".to_string()));
+        assert!(same_language("fre", "fra") && same_language("CHI", "zho") && same_language("eng", "eng"));
+        assert!(!same_language("ger", "fra"));
     }
 
     #[test]
@@ -1176,9 +1202,9 @@ mod tests {
 
     #[test]
     fn request_paths() {
-        assert_eq!(search_path("abc", "eng"), "/Items/abc/RemoteSearch/Subtitles/eng");
+        assert_eq!(remote_search_path("abc", "eng"), "/Items/abc/RemoteSearch/Subtitles/eng");
         assert_eq!(
-            download_path("abc", "os/1 2"),
+            remote_search_path("abc", "os/1 2"),
             "/Items/abc/RemoteSearch/Subtitles/os%2F1%202"
         );
         assert_eq!(remove_path("abc", 7), "/Videos/abc/Subtitles/7");
@@ -1186,12 +1212,13 @@ mod tests {
 
     #[test]
     fn a_new_external_stream_is_found_by_its_path() {
-        let stream = |index, external, path: &str| SubStream {
+        let stream = |index, is_external, path: &str| MediaStream {
+            kind: "Subtitle".into(),
             index,
-            external,
-            path: path.to_string(),
-            language: "eng".into(),
-            title: String::new(),
+            is_external,
+            path: (!path.is_empty()).then(|| path.to_string()),
+            language: Some("eng".into()),
+            ..Default::default()
         };
         let before = vec![stream(2, false, ""), stream(3, true, "/m/a.srt")];
         assert!(new_stream(&before, &before).is_none());
@@ -1200,16 +1227,18 @@ mod tests {
         assert_eq!(new_stream(&before, &after).map(|s| s.index), Some(3));
     }
 
+    /// The panel that opens again for its item keeps its list: a search
+    /// goes out for an empty list or after a failed one, not at each open.
     #[test]
-    fn streams_parse() {
-        let item = json!({"MediaStreams": [
-            {"Type": "Video", "Index": 0},
-            {"Type": "Subtitle", "Index": 2, "IsExternal": true, "Path": "/m/a.srt", "Language": "eng"},
-            {"Type": "Subtitle", "Index": 3, "Language": "spa"}
-        ]});
-        let list = parse_streams(&item);
-        assert_eq!(list.len(), 2);
-        assert!(list[0].external && !list[1].external);
+    fn an_open_with_results_does_not_search_again() {
+        let mut state = State::default();
+        assert!(state.needs_search());
+        state.results = parse_candidates(&sample());
+        assert!(!state.needs_search());
+        state.error = Some("timeout".into());
+        assert!(state.needs_search());
+        state.loading = true;
+        assert!(!state.needs_search(), "a search runs already");
     }
 
     /// A server that lists the item with one subtitle, then with two after

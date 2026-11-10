@@ -9,6 +9,11 @@
 
 use std::ffi::{CStr, c_char, c_void};
 
+// A struct comes back from `objc_msgSend` itself on arm64 alone; on x86_64
+// it needs `objc_msgSend_stret`, which nothing here calls.
+#[cfg(not(target_arch = "aarch64"))]
+compile_error!("src/airplay/av.rs and picker.rs read struct returns (CMTime, NSRect) the arm64 way");
+
 use crate::macos::{Id, class, send};
 // The pool is shared with the render threads of the players.
 pub use crate::macos::Pool;
@@ -127,10 +132,20 @@ impl Player {
     }
 
     /// Loads the URL as the current item and starts the request for it.
-    pub fn load(&self, url: &str) {
-        let url = send!(Id, class(c"NSURL"), c"URLWithString:", nsstring(url) => Id);
-        let item = send!(Id, class(c"AVPlayerItem"), c"playerItemWithURL:", url => Id);
+    /// An error for a text that is no URL: Foundation gives nil for it, and
+    /// an item made of nil must not reach the player (an exception of
+    /// Objective-C through this code ends the app).
+    pub fn load(&self, url: &str) -> Result<(), String> {
+        let address = send!(Id, class(c"NSURL"), c"URLWithString:", nsstring(url) => Id);
+        if address.is_null() {
+            return Err("the address of the stream is not a URL".into());
+        }
+        let item = send!(Id, class(c"AVPlayerItem"), c"playerItemWithURL:", address => Id);
+        if item.is_null() {
+            return Err("no player item for the stream".into());
+        }
         send!((), self.0, c"replaceCurrentItemWithPlayerItem:", item => Id);
+        Ok(())
     }
 
     /// Takes the item away; the stream stops and the receiver goes idle.

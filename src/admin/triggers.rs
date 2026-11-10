@@ -16,13 +16,14 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::{
-    ButtonKind, Field as Form, Prompt, button,
+    Ask, ButtonKind, Confirm, button, choice_box,
     config::value_button,
+    load_note, sub_page,
     users::action,
 };
 use crate::{
     app::{Bloom, Page},
-    settings::{Choice, field, group, select},
+    settings::{field, group},
     ui::theme::UiTheme,
 };
 
@@ -248,17 +249,19 @@ enum Change {
 
 impl Bloom {
     fn triggers_editor(&self) -> Option<&Editor> {
-        match &self.page {
-            Page::Admin(admin) => admin.triggers.as_ref(),
-            _ => None,
-        }
+        self.admin_data()?.triggers.as_ref()
     }
 
     fn triggers_editor_mut(&mut self) -> Option<&mut Editor> {
-        match &mut self.page {
-            Page::Admin(admin) => admin.triggers.as_mut(),
-            _ => None,
-        }
+        self.admin_data_mut()?.triggers.as_mut()
+    }
+
+    /// The editor of a task that waits for an answer, also on a page the
+    /// user left meanwhile (Back returns to it).
+    fn triggers_waiting(&mut self, id: &str, waits: fn(&Editor) -> bool) -> Option<&mut Editor> {
+        self.admin_pages_mut()
+            .filter_map(|admin| admin.triggers.as_mut())
+            .find(|editor| editor.task_id == id && waits(editor))
     }
 
     /// Opens the editor of a task and reads its triggers from the server.
@@ -273,7 +276,7 @@ impl Bloom {
             triggers: Vec::new(),
             draft: Draft::default(),
         };
-        if let Page::Admin(admin) = &mut self.page {
+        if let Some(admin) = self.admin_data_mut() {
             admin.triggers = Some(editor);
         }
         cx.notify();
@@ -282,9 +285,7 @@ impl Bloom {
             cx,
             move |client| read_triggers(&client, &work_id),
             move |this, result, cx| {
-                if let Some(editor) = this.triggers_editor_mut()
-                    && editor.task_id == id
-                {
+                if let Some(editor) = this.triggers_waiting(&id, |editor| editor.loading) {
                     editor.loading = false;
                     match result {
                         Ok(list) => editor.triggers = list,
@@ -318,7 +319,7 @@ impl Bloom {
     }
 
     pub fn triggers_close(&mut self, cx: &mut Context<Self>) {
-        if let Page::Admin(admin) = &mut self.page {
+        if let Some(admin) = self.admin_data_mut() {
             admin.triggers = None;
         }
         cx.notify();
@@ -334,6 +335,9 @@ impl Bloom {
     /// Changes the list on the server. The list is read again first; a
     /// removal takes out the first trigger equal to the one the user chose.
     fn triggers_apply(&mut self, change: Change, cx: &mut Context<Self>) {
+        if self.session.is_none() {
+            return;
+        }
         let Some(editor) = self.triggers_editor_mut() else {
             return;
         };
@@ -369,9 +373,7 @@ impl Bloom {
                     Ok(_) => this.toast(done, "", cx),
                     Err(err) => this.toast("The server refused the change", format!("{err:#}"), cx),
                 }
-                if let Some(editor) = this.triggers_editor_mut()
-                    && editor.task_id == id
-                {
+                if let Some(editor) = this.triggers_waiting(&id, |editor| editor.busy) {
                     editor.busy = false;
                     if let Ok(list) = result {
                         editor.triggers = list;
@@ -467,67 +469,51 @@ impl Bloom {
 
     /// The form of the time limit.
     fn triggers_ask_limit(&mut self, current: Option<i64>, cx: &mut Context<Self>) {
-        let prompt = Prompt {
+        let ask = Ask {
             title: "Time limit".to_string(),
             message: "The task stops when it runs longer than this. Leave the field empty for no limit.".to_string(),
-            action: "Set".to_string(),
-            fields: vec![Form {
-                label: "Hours".to_string(),
-                placeholder: "No limit".to_string(),
-                value: current.map(|m| hours_text(m)).unwrap_or_default(),
-                masked: false,
-                required: false,
-            }],
-            run: Rc::new(|this, values, cx| {
-                let text = values.into_iter().next().unwrap_or_default();
-                match (text.is_empty(), parse_hours(&text)) {
-                    (true, _) => this.triggers_draft(|d| d.limit_minutes = None, cx),
-                    (false, Some(minutes)) => this.triggers_draft(|d| d.limit_minutes = Some(minutes), cx),
-                    (false, None) => this.toast("This is not a number of hours", "", cx),
-                }
-            }),
+            label: "Hours".to_string(),
+            placeholder: "No limit".to_string(),
+            value: current.map(hours_text).unwrap_or_default(),
+            ..Ask::default()
         };
-        self.ask_prompt(prompt, cx);
+        self.ask_value(ask, cx, |this, text, cx| match (text.is_empty(), parse_hours(text)) {
+            (true, _) => this.triggers_draft(|d| d.limit_minutes = None, cx),
+            (false, Some(minutes)) => this.triggers_draft(|d| d.limit_minutes = Some(minutes), cx),
+            (false, None) => this.toast("This is not a number of hours", "", cx),
+        });
     }
 
     fn triggers_ask_time(&mut self, current: i64, cx: &mut Context<Self>) {
-        let prompt = Prompt {
+        let ask = Ask {
             title: "Time of day".to_string(),
             message: "The time on the server, as hours and minutes: 02:30.".to_string(),
-            action: "Set".to_string(),
-            fields: vec![Form {
-                label: "Time".to_string(),
-                placeholder: "HH:MM".to_string(),
-                value: format!("{:02}:{:02}", current / 60, current % 60),
-                masked: false,
-                required: true,
-            }],
-            run: Rc::new(|this, values, cx| match values.first().and_then(|t| parse_time(t)) {
-                Some(minutes) => this.triggers_draft(|d| d.minutes = minutes, cx),
-                None => this.toast("This is not a time", "Write hours and minutes: 02:30.", cx),
-            }),
+            label: "Time".to_string(),
+            placeholder: "HH:MM".to_string(),
+            value: time_text(current * TICKS_PER_MINUTE),
+            required: true,
+            ..Ask::default()
         };
-        self.ask_prompt(prompt, cx);
+        self.ask_value(ask, cx, |this, text, cx| match parse_time(text) {
+            Some(minutes) => this.triggers_draft(|d| d.minutes = minutes, cx),
+            None => this.toast("This is not a time", "Write hours and minutes: 02:30.", cx),
+        });
     }
 
     fn triggers_ask_interval(&mut self, current: i64, cx: &mut Context<Self>) {
-        let prompt = Prompt {
+        let ask = Ask {
             title: "Interval".to_string(),
             message: "How many hours pass between two runs. A part of an hour is fine: 1.5.".to_string(),
-            action: "Set".to_string(),
-            fields: vec![Form {
-                label: "Hours".to_string(),
-                placeholder: "Hours".to_string(),
-                value: hours_text(current),
-                masked: false,
-                required: true,
-            }],
-            run: Rc::new(|this, values, cx| match values.first().and_then(|t| parse_hours(t)) {
-                Some(minutes) => this.triggers_draft(|d| d.interval_minutes = minutes, cx),
-                None => this.toast("This is not a number of hours", "", cx),
-            }),
+            label: "Hours".to_string(),
+            placeholder: "Hours".to_string(),
+            value: hours_text(current),
+            required: true,
+            ..Ask::default()
         };
-        self.ask_prompt(prompt, cx);
+        self.ask_value(ask, cx, |this, text, cx| match parse_hours(text) {
+            Some(minutes) => this.triggers_draft(|d| d.interval_minutes = minutes, cx),
+            None => this.toast("This is not a number of hours", "", cx),
+        });
     }
 }
 
@@ -546,49 +532,36 @@ fn read_triggers(client: &crate::jellyfin::Client, id: &str) -> Result<Vec<Value
 
 pub fn render(editor: &Editor, cx: &mut Context<Bloom>) -> Div {
     let t = UiTheme::read(cx).clone();
-    let mut page = div().max_w(px(920.)).flex().flex_col().gap(px(18.)).child(
+    let mut page = sub_page(
+        action("triggers.back", LucideIcon::ArrowLeft, "Tasks", false, cx)
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.triggers_close(cx))),
         div()
+            .min_w_0()
             .flex()
-            .items_center()
-            .gap(px(14.))
+            .flex_col()
             .child(
-                action("triggers.back", LucideIcon::ArrowLeft, "Tasks", false, cx)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.triggers_close(cx))),
+                div()
+                    .truncate()
+                    .text_size(px(20.))
+                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                    .text_color(t.colors.foreground)
+                    .child(format!("Triggers of {}", editor.name)),
             )
             .child(
                 div()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(px(20.))
-                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .text_color(t.colors.foreground)
-                            .child(format!("Triggers of {}", editor.name)),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(px(13.))
-                            .text_color(t.colors.muted_foreground)
-                            .child(editor.description.split_whitespace().collect::<Vec<_>>().join(" ")),
-                    ),
+                    .truncate()
+                    .text_size(px(13.))
+                    .text_color(t.colors.muted_foreground)
+                    .child(editor.description.split_whitespace().collect::<Vec<_>>().join(" ")),
             ),
     );
-
-    if editor.loading || editor.error.is_some() {
-        return page.child(
-            div()
-                .py(px(30.))
-                .text_size(px(15.))
-                .text_color(t.colors.muted_foreground)
-                .child(match &editor.error {
-                    Some(error) => format!("Could not read the triggers of this task: {error}"),
-                    None => "Loading…".to_string(),
-                }),
-        );
+    if let Some(note) = load_note(
+        editor.loading,
+        editor.error.as_deref(),
+        "Could not read the triggers of this task",
+        cx,
+    ) {
+        return page.child(note);
     }
 
     // The triggers now.
@@ -626,12 +599,12 @@ pub fn render(editor: &Editor, cx: &mut Context<Bloom>) -> Div {
                             // question first, as for every removal here.
                             let target = target.clone();
                             this.ask_confirm(
-                                super::Confirm {
+                                Confirm {
                                     title: "Remove this trigger?".to_string(),
                                     message: format!("{}. The task no longer runs at this time.", describe(&target)),
                                     action: "Remove".to_string(),
                                     danger: true,
-                                    run: std::rc::Rc::new(move |this, cx| {
+                                    run: Rc::new(move |this, cx| {
                                         this.triggers_apply(Change::Remove(target.clone()), cx)
                                     }),
                                 },
@@ -648,42 +621,28 @@ pub fn render(editor: &Editor, cx: &mut Context<Bloom>) -> Div {
     let draft = editor.draft.clone();
     let mut form = group("Add a trigger", cx);
     let kind = draft.kind;
+    let kinds = Kind::ALL.iter().enumerate().map(|(at, option)| (json!(at), option.label().into())).collect();
+    let kind_at = Kind::ALL.iter().position(|option| *option == kind);
     form = form.child(field(
         "Type",
         "",
-        select("triggers.kind", kind.label(), "Interval", cx).on_click(cx.listener(
-            move |this, event: &ClickEvent, window, cx| {
-                let choices = Kind::ALL
-                    .iter()
-                    .map(|option| {
-                        let option = *option;
-                        Choice::new(option.label(), option == kind, move |this, cx| {
-                            this.triggers_draft(|d| d.kind = option, cx)
-                        })
-                    })
-                    .collect();
-                this.open_choices(choices, event.position(), window, cx);
-            },
-        )),
+        choice_box("triggers.kind", kinds, json!(kind_at), cx, |this, option, cx| {
+            if let Some(option) = option.as_u64().and_then(|at| Kind::ALL.get(at as usize).copied()) {
+                this.triggers_draft(|d| d.kind = option, cx)
+            }
+        }),
         cx,
     ));
     if kind == Kind::Weekly {
-        let day = draft.day;
+        let days = DAYS.iter().enumerate().map(|(at, name)| (json!(at), SharedString::new_static(*name))).collect();
         form = form.child(field(
             "Day",
             "",
-            select("triggers.day", DAYS[day % 7], "Wednesday", cx).on_click(cx.listener(
-                move |this, event: &ClickEvent, window, cx| {
-                    let choices = DAYS
-                        .iter()
-                        .enumerate()
-                        .map(|(at, name)| {
-                            Choice::new(*name, at == day, move |this, cx| this.triggers_draft(|d| d.day = at, cx))
-                        })
-                        .collect();
-                    this.open_choices(choices, event.position(), window, cx);
-                },
-            )),
+            choice_box("triggers.day", days, json!(draft.day % 7), cx, |this, option, cx| {
+                if let Some(at) = option.as_u64() {
+                    this.triggers_draft(|d| d.day = at as usize, cx)
+                }
+            }),
             cx,
         ));
     }
@@ -692,7 +651,7 @@ pub fn render(editor: &Editor, cx: &mut Context<Bloom>) -> Div {
         form = form.child(field(
             "Time",
             "The time of day on the server.",
-            value_button(SharedString::from("triggers.time"), format!("{:02}:{:02}", minutes / 60, minutes % 60), cx)
+            value_button(SharedString::from("triggers.time"), time_text(minutes * TICKS_PER_MINUTE), cx)
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.triggers_ask_time(minutes, cx))),
             cx,
         ));
@@ -794,5 +753,61 @@ mod tests {
         for bad in ["", "daily", "daily 25:00", "weekly 03:00", "weekly funday 03:00", "interval", "interval 0", "startup now", "daily 02:00 limit"] {
             assert!(Draft::parse(bad).is_err(), "{bad:?}");
         }
+    }
+}
+
+/// An answer that comes after the user left the page. See
+/// `app::race_harness`.
+#[cfg(test)]
+mod race_tests {
+    use std::sync::Mutex;
+
+    use gpui_kit::TestAppContext;
+    use serde_json::{Value, json};
+
+    use super::Page;
+    use crate::{
+        admin::{AdminData, Section},
+        app::{Screen, race_harness::{MockServer, app, plain, session}},
+    };
+
+    /// The user adds a trigger, leaves the dashboard before the answer
+    /// comes, and returns with Back: the editor takes changes again.
+    #[gpui_kit::test]
+    fn a_change_answered_on_another_page_unlocks_the_editor(cx: &mut TestAppContext) {
+        let triggers = Mutex::new(json!([]));
+        let server = MockServer::start(move |method, path, body| match (method, path) {
+            ("GET", "/ScheduledTasks/t1") => {
+                (200, json!({ "Triggers": triggers.lock().expect("triggers").clone() }).to_string())
+            }
+            ("POST", "/ScheduledTasks/t1/Triggers") => {
+                *triggers.lock().expect("triggers") = serde_json::from_str(body).unwrap_or(Value::Null);
+                (204, String::new())
+            }
+            _ => plain(method, path),
+        });
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            this.session = Some(session(&server.url, "u1"));
+            this.screen = Screen::Main;
+            let mut admin = AdminData::new(Section::Tasks);
+            admin.loading = false;
+            this.page = Page::Admin(admin);
+            this.triggers_open("t1", "Scan", "", cx);
+        });
+        cx.run_until_parked();
+        bloom.update(cx, |this, cx| {
+            this.triggers_add_text("daily 02:00", cx).expect("add");
+            this.navigate(Page::Downloads, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(server.count("POST", "/ScheduledTasks/t1/Triggers"), 1);
+        bloom.update(cx, |this, cx| this.back(cx));
+        cx.run_until_parked();
+        bloom.read_with(cx, |this, _| {
+            let editor = this.triggers_editor().expect("the editor is open");
+            assert!(!editor.busy, "the editor still waits for the answer");
+            assert_eq!(editor.triggers.len(), 1);
+        });
     }
 }

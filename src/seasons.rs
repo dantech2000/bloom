@@ -14,7 +14,7 @@ use std::collections::HashSet;
 
 use gpui_icons::LucideIcon;
 use gpui_kit::{
-    ClickEvent, Context, Div, InteractiveElement as _, ParentElement as _, SharedString, Stateful,
+    ClickEvent, Context, Div, InteractiveElement as _, IntoElement as _, ParentElement as _, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _, px, rgba,
 };
 use serde_json::{Value, json};
@@ -264,7 +264,9 @@ pub struct SeasonsState {
     pub series_id: String,
     pub data: Option<Data>,
     pub selected: HashSet<i64>,
-    pub sending: bool,
+    /// The series whose request is on its way. One request at a time: its
+    /// answer belongs to that series, whatever the dialog shows by then.
+    pub sending: Option<String>,
     pub error: Option<String>,
 }
 
@@ -297,6 +299,11 @@ impl Bloom {
             cx,
             move |client| client.season_data(&work_id),
             move |this, result, cx| {
+                // An answer for a page the user left: a newer check owns
+                // the place, and its answer is the one to keep.
+                if this.enhanced.seasons.probing.as_ref() != Some(&id) {
+                    return;
+                }
                 this.enhanced.seasons.probing = None;
                 match result {
                     Ok(Some(data)) => {
@@ -371,11 +378,11 @@ impl Bloom {
         let Some(data) = state.data.clone() else { return };
         let mut seasons: Vec<i64> = state.selected.iter().copied().collect();
         seasons.sort_unstable();
-        if seasons.is_empty() || state.sending {
+        if seasons.is_empty() || state.sending.is_some() {
             return;
         }
-        state.sending = true;
         let series_id = state.series_id.clone();
+        state.sending = Some(series_id.clone());
         let title = data.title.clone();
         let tmdb = data.tmdb_id;
         let count = seasons.len();
@@ -383,19 +390,22 @@ impl Bloom {
             cx,
             move |client| client.request_seasons(tmdb, &seasons),
             move |this, result, cx| {
-                this.enhanced.seasons.sending = false;
+                this.enhanced.seasons.sending = None;
+                // The dialog may show another series by now (closed and
+                // opened again): the answer does not close or mark that one.
+                let shown = this.enhanced.seasons.open && this.enhanced.seasons.series_id == series_id;
                 match result {
                     Ok(()) => {
                         this.toast("Requested", format!("{title}: {count} season(s)"), cx);
-                        this.enhanced.seasons.open = false;
+                        if shown {
+                            this.enhanced.seasons.open = false;
+                        }
                         // The page and the dialog show the new status.
                         this.enhanced.seasons.probe = None;
                         this.load_request_more(cx);
                     }
-                    Err(err) => {
-                        this.enhanced.seasons.error = Some(format!("{err:#}"));
-                        let _ = series_id;
-                    }
+                    Err(err) if shown => this.enhanced.seasons.error = Some(format!("{err:#}")),
+                    Err(err) => this.toast("The request failed", format!("{title}: {err:#}"), cx),
                 }
                 cx.notify();
             },
@@ -444,9 +454,9 @@ impl Bloom {
                             cx.notify();
                         }));
                     }
-                    tick.into_any_element_compat()
+                    tick.into_any_element()
                 } else {
-                    div().size(px(26.)).into_any_element_compat()
+                    div().size(px(26.)).into_any_element()
                 })
                 .child(
                     div()
@@ -490,11 +500,13 @@ impl Bloom {
             }
             list = list.child(line);
         }
-        if state.data.is_some() && state.data.as_ref().is_some_and(|d| d.rows.is_empty()) {
+        if state.data.as_ref().is_some_and(|d| d.rows.is_empty()) {
             footer_note = footer_note.or(Some("Seerr lists no seasons for this title.".into()));
         }
         let count = state.selected.len();
-        let can_send = count > 0 && !state.sending && state.data.is_some();
+        // A request for another series is on its way: this one waits.
+        let sending = state.sending.as_deref() == Some(state.series_id.as_str());
+        let can_send = count > 0 && state.sending.is_none() && state.data.is_some();
         let title = state.data.as_ref().map(|d| d.title.clone()).unwrap_or_default();
         let height = (state.data.as_ref().map_or(1, |d| d.rows.len().max(1)) as f32 * 56.).min(392.);
 
@@ -507,6 +519,10 @@ impl Bloom {
                 .items_center()
                 .justify_center()
                 .bg(rgba(0x00000099))
+                // The page behind takes no click while the dialog is open:
+                // a hitbox does not block by itself, and the click that
+                // closes the dialog also pressed the card under the pointer.
+                .occlude()
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_seasons_dialog(cx)))
                 .child(
                     div()
@@ -584,7 +600,7 @@ impl Bloom {
                                             16.,
                                             if can_send { gpui_kit::rgb(0x121212) } else { soft },
                                         ))
-                                        .child(if state.sending {
+                                        .child(if sending {
                                             "Requesting…".to_string()
                                         } else {
                                             format!("Request {count} season{}", if count == 1 { "" } else { "s" })
@@ -643,7 +659,7 @@ impl Bloom {
             "open={} loading={} sending={} selected={selected:?} error={:?} rows={}",
             s.open,
             s.loading,
-            s.sending,
+            s.sending.is_some(),
             s.error,
             s.data
                 .as_ref()
@@ -655,17 +671,6 @@ impl Bloom {
                     .join(","))
                 .unwrap_or_default()
         )
-    }
-}
-
-/// `checkbox` answers a `Stateful<Div>` and the other cell a `Div`; both
-/// become one element type for the row.
-trait IntoAny {
-    fn into_any_element_compat(self) -> gpui_kit::AnyElement;
-}
-impl<T: gpui_kit::IntoElement> IntoAny for T {
-    fn into_any_element_compat(self) -> gpui_kit::AnyElement {
-        self.into_any_element()
     }
 }
 
@@ -760,5 +765,60 @@ mod tests {
             json!({ "mediaType": "tv", "mediaId": 1215, "seasons": [3, 4] })
         );
         assert_eq!(request_body(5, &[]), json!({ "mediaType": "tv", "mediaId": 5, "seasons": [] }));
+    }
+}
+
+/// The answer of a request and the dialog on show (review of 2026-11-10).
+/// See `app::race_harness`.
+#[cfg(test)]
+mod race_tests {
+    use gpui_kit::TestAppContext;
+    use serde_json::json;
+
+    use super::{Data, Row, Status};
+    use crate::app::race_harness::{MockServer, app, plain, session};
+    use crate::enhanced::EnhancedApi as _;
+
+    /// A request for series A is on its way; the user closes the dialog
+    /// and opens it for series B. The answer for A closed B's dialog.
+    #[gpui_kit::test]
+    fn the_answer_of_a_request_leaves_the_dialog_of_another_series_alone(cx: &mut TestAppContext) {
+        let server = MockServer::start(|method, path, _| match (method, path) {
+            ("GET", p) if p.starts_with("/JellyfinEnhanced/public-config") => {
+                (200, json!({"JellyseerrEnabled": true}).to_string())
+            }
+            _ => plain(method, path),
+        });
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            let session = session(&server.url, "u1");
+            this.enhanced.settings = session.client.enhanced_settings().expect("the plugin's settings");
+            this.session = Some(session);
+            assert!(this.request_more_on());
+            let state = &mut this.enhanced.seasons;
+            state.open = true;
+            state.series_id = "a".into();
+            state.data = Some(Data {
+                tmdb_id: 7,
+                title: "A".into(),
+                rows: vec![Row { number: 2, name: "Season 2".into(), year: String::new(), episodes: 8, status: Status::Missing }],
+                partial: true,
+            });
+            state.selected = [2].into_iter().collect();
+            this.send_season_request(cx);
+            assert_eq!(this.enhanced.seasons.sending.as_deref(), Some("a"));
+            this.close_seasons_dialog(cx);
+            this.open_seasons_dialog("b".into(), cx);
+            // One request at a time: B's button waits for A's answer.
+            this.send_season_request(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(server.count("POST", "/JellyfinEnhanced/jellyseerr/request"), 1);
+        bloom.read_with(cx, |this, _| {
+            let state = &this.enhanced.seasons;
+            assert!(state.open, "the answer for series A closed the dialog of series B");
+            assert_eq!(state.series_id, "b");
+            assert!(state.sending.is_none());
+        });
     }
 }

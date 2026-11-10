@@ -2,6 +2,8 @@
 //! What the player and the window do at one moment, and the events
 //! between two such moments.
 
+use std::sync::Arc;
+
 use serde_json::{Value, json};
 
 /// A jump of the position by more than this, against where the clock would
@@ -26,7 +28,8 @@ pub struct ItemInfo {
 pub struct Snapshot {
     /// An item is loaded in the player and the player is on the screen.
     pub active: bool,
-    pub item: Option<ItemInfo>,
+    /// Shared: a look at the player keeps the item of the look before.
+    pub item: Option<Arc<ItemInfo>>,
     pub paused: bool,
     pub buffering: bool,
     pub position: f64,
@@ -156,7 +159,7 @@ mod tests {
     fn film() -> Snapshot {
         Snapshot {
             active: true,
-            item: Some(ItemInfo { id: "m1".into(), kind: "Movie".into(), name: "A Film".into(), ..Default::default() }),
+            item: Some(Arc::new(ItemInfo { id: "m1".into(), kind: "Movie".into(), name: "A Film".into(), ..Default::default() })),
             duration: 6000.,
             rate: 1.,
             ..Default::default()
@@ -254,7 +257,7 @@ mod tests {
         let mut session = 4;
         let before = film();
         let mut next = film();
-        next.item.as_mut().unwrap().id = "m2".into();
+        Arc::make_mut(next.item.as_mut().unwrap()).id = "m2".into();
         let events = between(&before, &next, 0.05, &mut session, false);
         assert_eq!(names(&events), ["playback.stopped", "playback.started"]);
         assert_eq!((&events[0].1["session"], &events[0].1["reason"]), (&json!(4), &json!("replaced")));

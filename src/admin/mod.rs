@@ -308,6 +308,61 @@ impl AdminData {
     }
 }
 
+/// The form of one value (`Bloom::ask_value`).
+#[derive(Default)]
+pub struct Ask {
+    pub title: String,
+    pub message: String,
+    /// The label of the field; the title when empty.
+    pub label: String,
+    pub placeholder: String,
+    /// The text the field starts with.
+    pub value: String,
+    pub masked: bool,
+    /// The form does not submit while the field is empty.
+    pub required: bool,
+}
+
+/// A server object in an editor: as the server gave it, and the copy the
+/// user edits. Nothing goes to the server before a save, and the page
+/// shows the Save bar while the two differ.
+#[derive(Clone, Default)]
+pub struct Draft {
+    pub original: serde_json::Value,
+    pub edited: serde_json::Value,
+    /// A save is on its way.
+    pub saving: bool,
+}
+
+impl Draft {
+    pub fn new(value: serde_json::Value) -> Self {
+        Self { edited: value.clone(), original: value, saving: false }
+    }
+
+    pub fn dirty(&self) -> bool {
+        self.original != self.edited
+    }
+
+    pub fn discard(&mut self) {
+        self.edited = self.original.clone();
+    }
+
+    /// The object to send: the one the server has now, with the edits in
+    /// it (see [`with_changes`]).
+    pub fn body(&self, fresh: &serde_json::Value) -> serde_json::Value {
+        with_changes(fresh, &self.original, &self.edited)
+    }
+
+    /// The server took a save, and holds `server` now. What the user
+    /// changed since the save went out (`sent` is the copy it was made
+    /// from) stays an edit, on top of what the server holds.
+    pub fn saved(&mut self, server: serde_json::Value, sent: &serde_json::Value) {
+        self.edited = with_changes(&server, sent, &self.edited);
+        self.original = server;
+        self.saving = false;
+    }
+}
+
 /// A question the user must answer before an action runs.
 #[derive(Clone)]
 pub struct Confirm {
@@ -334,6 +389,27 @@ impl Bloom {
         }
     }
 
+    pub fn admin_data_mut(&mut self) -> Option<&mut AdminData> {
+        match &mut self.page {
+            Page::Admin(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    /// Every dashboard page the app holds: the one on show, and those Back
+    /// and Forward return to. The answer for an editor looks for it here:
+    /// an editor on a page the user left kept "Saving…" for good when its
+    /// answer looked at the page on show alone.
+    pub(crate) fn admin_pages_mut(&mut self) -> impl Iterator<Item = &mut AdminData> {
+        std::iter::once(&mut self.page)
+            .chain(self.history.iter_mut())
+            .chain(self.forward.iter_mut())
+            .filter_map(|page| match page {
+                Page::Admin(data) => Some(data),
+                _ => None,
+            })
+    }
+
     pub fn open_admin(&mut self, section: Section, cx: &mut Context<Self>) {
         if !self.is_admin() {
             return;
@@ -355,6 +431,11 @@ impl Bloom {
                 data.user_open = None;
                 if data.access.as_ref().is_some_and(|editor| !editor.dirty()) {
                     data.access = None;
+                }
+                if data.plugin_editor.as_ref().is_some_and(|editor| !editor.dirty()) {
+                    data.plugin_editor = None;
+                    data.plugin_open = None;
+                    lazy::forget("plugin.");
                 }
                 self.page_scroll
                     .set_offset(gpui_kit::point(px(0.), px(0.)));
@@ -553,96 +634,73 @@ impl Bloom {
             return;
         };
         // The poll waits while the server is offline; recovery loads the page.
-        if data.loading || crate::connection::is_offline() || self.admin_live.busy {
+        if data.loading || crate::connection::is_offline() || self.admin_live.busy || self.session.is_none() {
             return;
         }
-        // The sections with a live part; each of their loads below ends
-        // the wait when its answer comes.
-        let live = match data.section {
-            Section::Dashboard => data.dashboard.is_some(),
-            Section::Tasks | Section::Libraries => true,
-            _ => false,
-        };
-        if !live || self.session.is_none() {
-            return;
-        }
-        self.admin_live.busy = true;
-        self.admin_live.load += 1;
-        let load = self.admin_live.load;
-        let generation = self.generation;
-        // A load that brings the same data back causes no redraw; see
-        // `AdminData::redraw_due`.
+        // The sections with a live part.
         match data.section {
-            Section::Dashboard if data.dashboard.is_some() => {}
-            // The progress of a running task or library scan.
-            Section::Tasks => {
-                return self.fetch(
-                    cx,
-                    |client| tasks::load(&client),
-                    move |this, result, cx| {
-                        if this.admin_live.load == load {
-                    this.admin_live.busy = false;
-                }
-                        if let (Page::Admin(data), Ok(tasks)) = (&mut this.page, result)
-                            && this.generation == generation
-                        {
-                            let changed = data.tasks.as_ref() != Some(&tasks);
-                            data.tasks = Some(tasks);
-                            if data.redraw_due(changed) {
-                                cx.notify();
-                            }
-                        }
-                    },
-                );
+            Section::Dashboard if data.dashboard.is_some() => {
+                self.live_load(cx, |client| dashboard::refresh(&client), |data, live| {
+                    let Some(dashboard) = &mut data.dashboard else {
+                        return false;
+                    };
+                    let changed = dashboard.live != live;
+                    dashboard.live = live;
+                    changed
+                })
             }
+            // The progress of a running task or library scan.
+            Section::Tasks => self.live_load(cx, |client| tasks::load(&client), |data, tasks| {
+                let changed = data.tasks.as_ref() != Some(&tasks);
+                data.tasks = Some(tasks);
+                changed
+            }),
             Section::Libraries => {
                 let previous = data
                     .libraries
                     .as_ref()
                     .map(|d| d.libraries.clone())
                     .unwrap_or_default();
-                return self.fetch(
+                self.live_load(
                     cx,
                     move |client| libraries::refresh(&client, &previous),
-                    move |this, result, cx| {
-                        if this.admin_live.load == load {
-                    this.admin_live.busy = false;
-                }
-                        if let (Page::Admin(data), Ok(libraries)) = (&mut this.page, result)
-                            && this.generation == generation
-                        {
-                            let changed = data.libraries.as_ref() != Some(&libraries);
-                            data.libraries = Some(libraries);
-                            if data.redraw_due(changed) {
-                                cx.notify();
-                            }
-                        }
+                    |data, libraries| {
+                        let changed = data.libraries.as_ref() != Some(&libraries);
+                        data.libraries = Some(libraries);
+                        changed
                     },
-                );
+                )
             }
-            _ => return,
+            _ => {}
         }
-        self.fetch(
-            cx,
-            |client| dashboard::refresh(&client),
-            move |this, result, cx| {
-                if this.admin_live.load == load {
-                    this.admin_live.busy = false;
+    }
+
+    /// One load of the live part: `work` reads it, and `take` puts it in
+    /// the page and says whether it changed. Its answer ends the wait.
+    fn live_load<T: Send + 'static>(
+        &mut self,
+        cx: &mut Context<Self>,
+        work: impl FnOnce(Client) -> Result<T> + Send + 'static,
+        take: impl FnOnce(&mut AdminData, T) -> bool + 'static,
+    ) {
+        self.admin_live.busy = true;
+        self.admin_live.load += 1;
+        let (load, generation) = (self.admin_live.load, self.generation);
+        self.fetch(cx, work, move |this, result, cx| {
+            if this.admin_live.load == load {
+                this.admin_live.busy = false;
+            }
+            // A load that brings the same data back causes no redraw; see
+            // `AdminData::redraw_due`.
+            if let (Page::Admin(data), Ok(value)) = (&mut this.page, result)
+                && this.generation == generation
+            {
+                let changed = take(data, value);
+                if data.redraw_due(changed) {
+                    cx.notify();
                 }
-                if this.generation != generation {
-                    return;
-                }
-                if let (Page::Admin(data), Ok(live)) = (&mut this.page, result)
-                    && let Some(dashboard) = &mut data.dashboard
-                {
-                    let changed = dashboard.live != live;
-                    dashboard.live = live;
-                    if data.redraw_due(changed) {
-                        cx.notify();
-                    }
-                }
-            },
-        );
+            }
+        });
     }
 
     /// Shows a question; the action runs only when the user agrees.
@@ -651,6 +709,34 @@ impl Bloom {
         self.close_panels();
         self.dialogs.confirm = Some(confirm);
         cx.notify();
+    }
+
+    /// Shows a form with one field; `run` gets its text when the user
+    /// submits. The editors ask for a value this way.
+    pub fn ask_value(
+        &mut self,
+        ask: Ask,
+        cx: &mut Context<Self>,
+        run: impl Fn(&mut Bloom, &str, &mut Context<Bloom>) + 'static,
+    ) {
+        self.ask_prompt(
+            Prompt {
+                message: ask.message,
+                action: "Set".to_string(),
+                fields: vec![Field {
+                    label: if ask.label.is_empty() { ask.title.clone() } else { ask.label },
+                    placeholder: ask.placeholder,
+                    value: ask.value,
+                    masked: ask.masked,
+                    required: ask.required,
+                }],
+                title: ask.title,
+                run: Rc::new(move |this, values, cx| {
+                    run(this, values.first().map(String::as_str).unwrap_or_default(), cx)
+                }),
+            },
+            cx,
+        );
     }
 
     /// Runs a change on the server, tells the result in a toast, and loads
@@ -1267,6 +1353,95 @@ pub fn ago_seconds(seconds: i64) -> String {
     }
 }
 
+/// A value as the text of its field: a text as it is, a list with commas
+/// between its entries, nothing for null.
+pub fn text_of(value: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        Value::Array(items) => items.iter().map(text_of).collect::<Vec<_>>().join(", "),
+        other => other.to_string(),
+    }
+}
+
+/// True or false from a word the user typed.
+pub fn parse_flag(text: &str) -> Option<bool> {
+    match text.trim().to_lowercase().as_str() {
+        "true" | "on" | "yes" | "1" => Some(true),
+        "false" | "off" | "no" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// A number the user typed. "nan" and "inf" parse as numbers; neither is
+/// one for a setting.
+pub fn parse_number(text: &str) -> Option<f64> {
+    text.trim().parse::<f64>().ok().filter(|number| number.is_finite())
+}
+
+/// The entries of a list the user typed, with commas or new lines between
+/// them.
+pub fn list_entries(text: &str) -> impl Iterator<Item = &str> {
+    text.split([',', '\n']).map(str::trim).filter(|entry| !entry.is_empty())
+}
+
+/// A box that shows one of a set of values by its label; a click opens the
+/// menu of the options, and `put` gets the value the user chose.
+pub fn choice_box(
+    id: impl Into<SharedString>,
+    options: Vec<(serde_json::Value, SharedString)>,
+    current: serde_json::Value,
+    cx: &mut Context<Bloom>,
+    put: impl Fn(&mut Bloom, &serde_json::Value, &mut Context<Bloom>) + 'static,
+) -> Stateful<Div> {
+    use crate::settings::{Choice, select};
+    let shown = options
+        .iter()
+        .find(|(option, _)| *option == current)
+        .map_or_else(|| SharedString::from(text_of(&current)), |(_, label)| label.clone());
+    let longest = options
+        .iter()
+        .map(|(_, label)| label.as_ref())
+        .max_by_key(|label| label.chars().count())
+        .unwrap_or_default()
+        .to_string();
+    let put = Rc::new(put);
+    select(id, shown, &longest, cx).on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+        let choices = options
+            .iter()
+            .map(|(option, label)| {
+                let (option, put) = (option.clone(), put.clone());
+                Choice::new(label.to_string(), option == current, move |this, cx| put(this, &option, cx))
+            })
+            .collect();
+        this.open_choices(choices, event.position(), window, cx);
+    }))
+}
+
+/// The top of a page inside a section (the access of a user, the triggers
+/// of a task): the way back and the title beside it. Add the cards.
+pub fn sub_page(back: Stateful<Div>, title: impl IntoElement) -> Div {
+    div()
+        .max_w(px(920.))
+        .flex()
+        .flex_col()
+        .gap(px(18.))
+        .child(div().flex().items_center().gap(px(14.)).child(back).child(title))
+}
+
+/// What such a page shows in place of its cards while it loads, or when
+/// the load failed (`failed` says what could not be read).
+pub fn load_note(loading: bool, error: Option<&str>, failed: &str, cx: &Context<Bloom>) -> Option<Div> {
+    let text = match error {
+        Some(error) => format!("{failed}: {error}"),
+        None if loading => "Loading…".to_string(),
+        None => return None,
+    };
+    let t = UiTheme::read(cx);
+    Some(div().py(px(30.)).text_size(px(15.)).text_color(t.colors.muted_foreground).child(text))
+}
+
 /// The object to send for a save: the object of the server now (`fresh`),
 /// with the places the user changed (where `edited` differs from
 /// `original`) taken from `edited`, and only those. What another client
@@ -1361,6 +1536,47 @@ mod with_changes_tests {
         let edited = json!({ "P": { "A": 3, "B": 2 } });
         assert_eq!(with_changes(&json!({}), &original, &edited), json!({ "P": { "A": 3 } }));
         assert_eq!(with_changes(&json!({ "P": 7 }), &original, &edited), json!({ "P": { "A": 3 } }));
+    }
+}
+
+#[cfg(test)]
+mod draft_tests {
+    use super::{Draft, list_entries, parse_flag, parse_number, text_of};
+    use serde_json::json;
+
+    /// The answer of a save is the new baseline, and an edit made while
+    /// the save was on its way stays an edit.
+    #[test]
+    fn an_edit_after_the_send_stays_when_the_answer_comes() {
+        let mut draft = Draft::new(json!({ "A": 1, "B": 2 }));
+        draft.edited["A"] = json!(5);
+        assert!(draft.dirty());
+        let sent = draft.edited.clone();
+        let body = draft.body(&json!({ "A": 1, "B": 2, "New": true }));
+        assert_eq!(body, json!({ "A": 5, "B": 2, "New": true }));
+        // The user goes on while the save is on its way.
+        draft.edited["B"] = json!(9);
+        draft.saving = true;
+        draft.saved(body.clone(), &sent);
+        assert_eq!(draft.original, body);
+        assert_eq!(draft.edited, json!({ "A": 5, "B": 9, "New": true }));
+        assert!(draft.dirty() && !draft.saving);
+        draft.discard();
+        assert!(!draft.dirty());
+    }
+
+    #[test]
+    fn typed_words_make_values() {
+        assert_eq!(parse_flag(" Yes "), Some(true));
+        assert_eq!(parse_flag("0"), Some(false));
+        assert_eq!(parse_flag("maybe"), None);
+        assert_eq!(parse_number(" 1.5 "), Some(1.5));
+        assert_eq!(parse_number("nan"), None);
+        assert_eq!(parse_number("inf"), None);
+        assert_eq!(list_entries("a,\n b ,").collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(text_of(&json!(["a", 2])), "a, 2");
+        assert_eq!(text_of(&json!(null)), "");
+        assert_eq!(text_of(&json!(1.5)), "1.5");
     }
 }
 

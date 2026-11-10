@@ -10,12 +10,12 @@ use gpui_kit::{
 
 use crate::{
     app::{CardRow, HomeData, Bloom, Page},
-    jellyfin::Client,
+    jellyfin::{Client, Item},
     ui::scroll_area::ScrollArea,
     views::{hero::HERO_ROWS_START, shell::TOPBAR_H},
     views::cards::{
-        CARD_TEXT_H, Cards, empty_state, library_tile, poster_card, section, section_height,
-        skeleton_row, wide_card,
+        CARD_TEXT_H, Cards, empty_state, library_tile, poster_card, section as section_row,
+        section_height, skeleton_row, wide_card,
     },
 };
 
@@ -23,6 +23,16 @@ use crate::{
 const SECTION_GAP: f32 = 18.;
 /// Space under the last home row.
 const ROWS_BOTTOM: f32 = 72.;
+
+/// One row of the home page.
+enum HomeSection<'a> {
+    /// "Recently Added in" a library, with its items.
+    Latest(&'a Item, &'a [Item]),
+    /// The libraries as tiles.
+    Media,
+    Resume,
+    NextUp,
+}
 
 /// The rows under the home hero as their own view, so GPUI can keep them
 /// from one frame to the next while only the hero changes.
@@ -69,6 +79,32 @@ impl Bloom {
         )
     }
 
+    /// The rows of the page in the order of the user's settings, each
+    /// with the height of its cards. The height of the cached rows and the
+    /// rows themselves both come from this list, so they cannot differ.
+    fn home_sections<'a>(&'a self, data: &'a HomeData) -> Vec<(HomeSection<'a>, f32)> {
+        let m = self.metrics();
+        let portrait = m.portrait_h() + CARD_TEXT_H;
+        let wide = m.backdrop_h() + CARD_TEXT_H;
+        let mut sections = Vec::new();
+        for kind in &data.order {
+            match kind.as_str() {
+                "latestmedia" => sections.extend(
+                    data.latest
+                        .iter()
+                        .map(|(library, items)| (HomeSection::Latest(library, items), portrait)),
+                ),
+                "smalllibrarytiles" | "librarybuttons" if !self.views.is_empty() => {
+                    sections.push((HomeSection::Media, m.backdrop_h()))
+                }
+                "resume" if !data.resume.is_empty() => sections.push((HomeSection::Resume, wide)),
+                "nextup" if !data.next_up.is_empty() => sections.push((HomeSection::NextUp, wide)),
+                _ => {}
+            }
+        }
+        sections
+    }
+
     /// Height of the home rows when it is known without a layout pass.
     fn home_rows_height(&self) -> Option<f32> {
         let Page::Home(data) = &self.page else {
@@ -77,29 +113,13 @@ impl Bloom {
         if data.loading || self.session.is_none() {
             return None;
         }
-        let m = self.metrics();
-        let wide = section_height(m.backdrop_h() + CARD_TEXT_H);
-        let mut heights: Vec<f32> = Vec::new();
-        for kind in &data.order {
-            match kind.as_str() {
-                "latestmedia" => heights.extend(
-                    data.latest
-                        .iter()
-                        .map(|_| section_height(m.portrait_h() + CARD_TEXT_H)),
-                ),
-                "smalllibrarytiles" | "librarybuttons" if !self.views.is_empty() => {
-                    heights.push(section_height(m.backdrop_h()))
-                }
-                "resume" if !data.resume.is_empty() => heights.push(wide),
-                "nextup" if !data.next_up.is_empty() => heights.push(wide),
-                _ => {}
-            }
-        }
-        if heights.is_empty() {
+        let sections = self.home_sections(data);
+        if sections.is_empty() {
             return None;
         }
-        let gaps = SECTION_GAP * (heights.len() - 1) as f32;
-        Some(heights.iter().sum::<f32>() + gaps + ROWS_BOTTOM)
+        let heights: f32 = sections.iter().map(|(_, row_h)| section_height(*row_h)).sum();
+        let gaps = SECTION_GAP * (sections.len() - 1) as f32;
+        Some(heights + gaps + ROWS_BOTTOM)
     }
 
     /// The rows under the hero. [`HomeRows`] calls this for its render.
@@ -141,8 +161,19 @@ impl Bloom {
             } else {
                 self.viewport_h * HERO_ROWS_START + TOPBAR_H + 16.
             };
-            for kind in &data.order {
-                self.push_home_section(kind, data, &client, &mut y, &mut sections, cx);
+            // A row outside the window, and 200 points around it, becomes
+            // empty space of its height.
+            let scrolled = -f32::from(self.page_scroll.offset().y);
+            let (view_top, view_bottom) = (scrolled - 200., scrolled + self.viewport_h + 200.);
+            for (section, row_h) in self.home_sections(data) {
+                let height = section_height(row_h);
+                let visible = y + height >= view_top && y <= view_bottom;
+                sections.push(if visible {
+                    self.home_section(section, row_h, data, &client, cx)
+                } else {
+                    div().h(px(height)).flex_shrink_0()
+                });
+                y += height + SECTION_GAP;
             }
             if sections.is_empty() {
                 sections.push(empty_state(
@@ -161,96 +192,61 @@ impl Bloom {
             .children(sections)
     }
 
-    /// Adds the rows of one section kind. `y` is the top of the next row in
-    /// the page; a row outside the window becomes empty space of its height.
-    fn push_home_section(
+    /// One row of the page, with cards `row_h` tall.
+    fn home_section(
         &self,
-        kind: &str,
+        section: HomeSection,
+        row_h: f32,
         data: &HomeData,
         client: &Client,
-        y: &mut f32,
-        sections: &mut Vec<gpui_kit::Div>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> gpui_kit::Div {
         let m = self.metrics();
-        let wide_row = m.backdrop_h() + CARD_TEXT_H;
-        let scrolled = -f32::from(self.page_scroll.offset().y);
-        let (view_top, view_bottom) = (scrolled - 200., scrolled + self.viewport_h + 200.);
-        let mut place = |row_h: f32, build: &mut dyn FnMut() -> gpui_kit::Div| {
-            let height = section_height(row_h);
-            let visible = *y + height >= view_top && *y <= view_bottom;
-            sections.push(if visible {
-                build()
-            } else {
-                div().h(px(height)).flex_shrink_0()
-            });
-            *y += height + SECTION_GAP;
-        };
-        match kind {
-            "latestmedia" => {
-                for (library, items) in &data.latest {
-                    let row_h = m.portrait_h() + CARD_TEXT_H;
-                    place(row_h, &mut || {
-                        section(
-                            self,
-                            SharedString::from(format!("home.latest.{}", library.id)),
-                            format!("Recently Added in {}", library.name),
-                            Some(library.clone()),
-                            row_h,
-                            Cards::new(m.portrait_w, items.len(), |i, cx| {
-                                poster_card(&items[i], client, m.portrait_w, cx)
-                            }),
-                            cx,
-                        )
-                    });
-                }
-            }
-            "smalllibrarytiles" | "librarybuttons" if !self.views.is_empty() => {
-                place(m.backdrop_h(), &mut || {
-                    section(
-                        self,
-                        "home.media",
-                        "My Media",
-                        None,
-                        m.backdrop_h(),
-                        Cards::new(m.backdrop_w, self.views.len(), |i, cx| {
-                            library_tile(&self.views[i], client, m.backdrop_w, cx)
-                        }),
-                        cx,
-                    )
-                });
-            }
-            "resume" if !data.resume.is_empty() => {
-                place(wide_row, &mut || {
-                    section(
-                        self,
-                        "home.resume",
-                        "Continue Watching",
-                        None,
-                        wide_row,
-                        Cards::new(m.backdrop_w, data.resume.len(), |i, cx| {
-                            wide_card(&data.resume[i], client, m.backdrop_w, CardRow::Resume, cx)
-                        }),
-                        cx,
-                    )
-                });
-            }
-            "nextup" if !data.next_up.is_empty() => {
-                place(wide_row, &mut || {
-                    section(
-                        self,
-                        "home.nextup",
-                        "Next Up",
-                        None,
-                        wide_row,
-                        Cards::new(m.backdrop_w, data.next_up.len(), |i, cx| {
-                            wide_card(&data.next_up[i], client, m.backdrop_w, CardRow::NextUp, cx)
-                        }),
-                        cx,
-                    )
-                });
-            }
-            _ => {}
+        match section {
+            HomeSection::Latest(library, items) => section_row(
+                self,
+                SharedString::from(format!("home.latest.{}", library.id)),
+                format!("Recently Added in {}", library.name),
+                Some(library.clone()),
+                row_h,
+                Cards::new(m.portrait_w, items.len(), |i, cx| {
+                    poster_card(&items[i], client, m.portrait_w, cx)
+                }),
+                cx,
+            ),
+            HomeSection::Media => section_row(
+                self,
+                "home.media",
+                "My Media",
+                None,
+                row_h,
+                Cards::new(m.backdrop_w, self.views.len(), |i, cx| {
+                    library_tile(&self.views[i], client, m.backdrop_w, cx)
+                }),
+                cx,
+            ),
+            HomeSection::Resume => section_row(
+                self,
+                "home.resume",
+                "Continue Watching",
+                None,
+                row_h,
+                Cards::new(m.backdrop_w, data.resume.len(), |i, cx| {
+                    wide_card(&data.resume[i], client, m.backdrop_w, CardRow::Resume, cx)
+                }),
+                cx,
+            ),
+            HomeSection::NextUp => section_row(
+                self,
+                "home.nextup",
+                "Next Up",
+                None,
+                row_h,
+                Cards::new(m.backdrop_w, data.next_up.len(), |i, cx| {
+                    wide_card(&data.next_up[i], client, m.backdrop_w, CardRow::NextUp, cx)
+                }),
+                cx,
+            ),
         }
     }
 }

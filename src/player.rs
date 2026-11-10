@@ -23,7 +23,7 @@ use std::{
     ptr,
     sync::{
         Arc, Condvar, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -140,6 +140,11 @@ pub struct PlayerStatus {
     /// Files that were to start shown and did not come: the app burns
     /// the track in instead (`Player::take_failed_subtitles`).
     pub failed_subs: Vec<i64>,
+    /// The load this status is of (`Player::prepare`); 0 at rest. The
+    /// worker writes what is of an item only into the status of that
+    /// item's load: the end of the item before must not end a load that
+    /// was prepared since.
+    pub generation: u64,
 }
 
 /// A subtitle in a file of its own, added to the item once it is loaded.
@@ -232,7 +237,7 @@ enum Cmd {
     /// (`Queued`). They travel in the load, not ahead of it: the worker
     /// applies them only when it accepts the load, so the choice made for
     /// a cancelled load never reaches the item after it.
-    Load { generation: u64, request: PlayRequest, tracks: Vec<Cmd> },
+    Load { generation: u64, request: PlayRequest, tracks: Tracks },
     /// Ends the worker, so mpv is closed before the process exits: at the
     /// quit of the app, and at the end of a test.
     Quit,
@@ -272,6 +277,19 @@ enum Cmd {
     FetchSubtitle(SubtitleFile),
     /// Reads an mpv property on the worker (`dev/jctl mpv <name>`, tests).
     Probe(String, mpsc::Sender<String>),
+}
+
+/// The track choices that go with a load; `Some(None)` turns a kind off.
+#[derive(Default)]
+struct Tracks {
+    audio: Option<Option<i64>>,
+    subtitle: Option<Option<i64>>,
+}
+
+/// Chooses a track of mpv by its id; none turns the kind off.
+fn set_track(mpv: &Mpv, property: &str, id: Option<i64>) {
+    let value = id.map(|i| i.to_string()).unwrap_or_else(|| "no".into());
+    let _ = mpv.set_property(property, value);
 }
 
 /// Settings sent before the first worker exists: the app sends them while
@@ -316,9 +334,8 @@ impl Queued {
     /// The commands for a worker that starts for the load `load_gen`: the
     /// settings, which the worker gets at once, and the track choices of
     /// that load, which go inside its `Cmd::Load`.
-    fn take(&mut self, load_gen: u64) -> (Vec<Cmd>, Vec<Cmd>) {
+    fn take(&mut self, load_gen: u64) -> (Vec<Cmd>, Tracks) {
         let mut cmds = Vec::new();
-        let mut tracks = Vec::new();
         if let Some(v) = self.volume.take() {
             cmds.push(Cmd::SetVolume(v));
         }
@@ -332,16 +349,10 @@ impl Queued {
             cmds.push(Cmd::Follow(on));
         }
         cmds.extend(self.properties.drain(..).map(|(n, v)| Cmd::SetProperty(n, v)));
-        if let Some((generation, id)) = self.audio.take()
-            && generation == load_gen
-        {
-            tracks.push(Cmd::SetAudio(id));
-        }
-        if let Some((generation, id)) = self.subtitle.take()
-            && generation == load_gen
-        {
-            tracks.push(Cmd::SetSubtitle(id));
-        }
+        let of_load = |choice: Option<(u64, Option<i64>)>| {
+            choice.filter(|(generation, _)| *generation == load_gen).map(|(_, id)| id)
+        };
+        let tracks = Tracks { audio: of_load(self.audio.take()), subtitle: of_load(self.subtitle.take()) };
         (cmds, tracks)
     }
 }
@@ -387,14 +398,8 @@ struct Shared {
     /// become one). The UI draws at once on it, not at its next poll: a
     /// wait of some milliseconds here made the times between frames uneven.
     frames: (async_channel::Sender<()>, async_channel::Receiver<()>),
-    /// When mpv asked for the newest frame (see `RenderSignal`).
-    frame_asked_ns: AtomicU64,
     /// When the newest frame was rendered.
     frame_done_ns: AtomicU64,
-    /// When the render thread last reported a swap to mpv, and mpv's target
-    /// time of the frame it asked for (pacing trace).
-    swap_ns: AtomicU64,
-    frame_target: std::sync::atomic::AtomicI64,
     /// The size of the picture mpv shows (`dwidth`, `dheight`), from the
     /// worker to the render thread; 0 before the first frame.
     dwidth: AtomicU32,
@@ -415,8 +420,21 @@ struct Shared {
     colours: Mutex<(u64, Vec<[u8; 3]>)>,
     /// The display link, once the worker has started it (display pacing).
     clock: Mutex<Option<DisplayClock>>,
-    /// mpv's own view of the display sync, for `dev/jctl pacing clock`.
-    sync_info: Mutex<String>,
+    /// What that link writes at each tick, for a read without the `clock`
+    /// lock (each draw and each frame reads it); null while no link is
+    /// there. The state is never freed (`DisplayClock::start`).
+    clock_state: AtomicPtr<pacing::ClockState>,
+    /// The subtitle files on their way (see `fetch_subtitles`).
+    fetching: Mutex<Vec<Fetch>>,
+}
+
+/// A subtitle file on its way: the load it is of, its server index, and
+/// whether it is shown when it comes. A choice of the file while it is on
+/// its way sets `select`; it is not fetched a second time.
+struct Fetch {
+    generation: u64,
+    index: i64,
+    select: bool,
 }
 
 /// What mpv's update callback gets: the flag for the worker, and the
@@ -507,11 +525,34 @@ impl Shared {
         published.seq
     }
 
+    /// What the display link wrote last; none while no link is there.
+    fn clock_state(&self) -> Option<&'static pacing::ClockState> {
+        // SAFETY: null, or the state a `DisplayClock` leaked at its start.
+        unsafe { self.clock_state.load(Ordering::Acquire).as_ref() }
+    }
+
     /// Events nobody reads are dropped when the channel is full.
     fn emit(&self, event: PlayerEvent) {
         let _ = self.events.0.try_send(event);
     }
 }
+
+/// A display link that ticked within this time runs (`Player::ui_seen`).
+const LINK_TICKS_WITHIN_NS: u64 = 100_000_000;
+
+/// The properties of mpv's display sync that `dev/jctl pacing clock` shows,
+/// each with its name in the line.
+const SYNC_INFO: [(&str, &str); 9] = [
+    ("video-sync", "video-sync"),
+    ("active", "display-sync-active"),
+    ("display-fps", "display-fps"),
+    ("estimated", "estimated-display-fps"),
+    ("vsync-ratio", "vsync-ratio"),
+    ("jitter", "vsync-jitter"),
+    ("mistimed", "mistimed-frame-count"),
+    ("delayed", "vo-delayed-frame-count"),
+    ("dropped", "frame-drop-count"),
+];
 
 /// Shared handle owned by the UI. Cheap to clone.
 #[derive(Clone)]
@@ -536,10 +577,7 @@ impl Default for Player {
                 wake: (Mutex::new(false), Condvar::new()),
                 events: async_channel::bounded(256),
                 frames: async_channel::bounded(1),
-                frame_asked_ns: AtomicU64::new(0),
                 frame_done_ns: AtomicU64::new(0),
-                swap_ns: AtomicU64::new(0),
-                frame_target: std::sync::atomic::AtomicI64::new(0),
                 dwidth: AtomicU32::new(0),
                 dheight: AtomicU32::new(0),
                 ui_seen_ns: AtomicU64::new(0),
@@ -549,7 +587,8 @@ impl Default for Player {
                 colours_ns: AtomicU64::new(0),
                 colours: Mutex::new((0, Vec::new())),
                 clock: Mutex::new(None),
-                sync_info: Mutex::new(String::new()),
+                clock_state: AtomicPtr::new(ptr::null_mut()),
+                fetching: Mutex::new(Vec::new()),
             }),
             commands: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(Queued::default())),
@@ -615,33 +654,28 @@ impl Player {
     /// first tick), in nanoseconds of `clock_ns`. For `pacing::due` and
     /// `pacing::frame_phase` with the tick of a [`Published`] frame.
     pub fn clock_time(&self) -> (u64, u64) {
-        let now = clock_ns();
-        let (last_tick, period) = self
-            .shared
-            .clock
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map_or((0, 0), |clock| {
-                let state = clock.state();
-                (state.tick_ns.load(Ordering::Acquire), state.period_ns.load(Ordering::Relaxed))
-            });
-        // Where this draw lands after our tick, for `pacing clock`.
-        if last_tick != 0 {
-            pacing::note_phase(now.saturating_sub(last_tick));
-        }
-        (now, if period == 0 { 16_666_667 } else { period })
+        let period = self.shared.clock_state().map_or(0, |state| state.period_ns.load(Ordering::Relaxed));
+        (clock_ns(), if period == 0 { 16_666_667 } else { period })
     }
 
     /// The display drives the frames (see `pacing.rs`), and the clock runs.
     pub fn display_pacing(&self) -> bool {
-        self.shared.clock.lock().unwrap().is_some()
+        self.shared.clock_state().is_some()
     }
 
     /// The UI draws the frames right now: call it from each draw. The
     /// worker renders no frame for a window that stopped drawing.
     pub fn ui_seen(&self) {
-        self.shared.ui_seen_ns.store(clock_ns(), Ordering::Release);
+        let now = clock_ns();
+        self.shared.ui_seen_ns.store(now, Ordering::Release);
+        // Where this draw lands after our tick, for `pacing clock`. A link
+        // that is held (nothing plays) has no tick to measure from.
+        if let Some(state) = self.shared.clock_state() {
+            let since_tick = now.saturating_sub(state.tick_ns.load(Ordering::Acquire));
+            if since_tick < LINK_TICKS_WITHIN_NS {
+                pacing::note_phase(since_tick);
+            }
+        }
     }
 
     /// The display the window is on; the display link follows it.
@@ -685,7 +719,20 @@ impl Player {
     }
 
     /// The display link and mpv's display sync, for `dev/jctl pacing clock`.
+    /// mpv's part is read through the worker now, when the command asks:
+    /// a read waits for the core, so the worker does none by itself. The
+    /// caller waits for the answers (`probe`); with no worker, or one that
+    /// does not answer the first, the values are `-`.
     pub fn pacing_state(&self) -> String {
+        let mut answers = true;
+        let sync_info: Vec<String> = SYNC_INFO
+            .iter()
+            .map(|(label, name)| {
+                let value = if answers { self.probe(name) } else { None };
+                answers = value.is_some();
+                format!("{label}={}", value.filter(|v| !v.is_empty()).unwrap_or_else(|| "-".into()))
+            })
+            .collect();
         let clock = self
             .shared
             .clock
@@ -693,11 +740,7 @@ impl Player {
             .unwrap()
             .as_ref()
             .map_or_else(|| "no display link".to_string(), DisplayClock::describe);
-        format!(
-            "{clock} | {} | mpv: {}",
-            pacing::report(),
-            self.shared.sync_info.lock().unwrap()
-        )
+        format!("{clock} | {} | mpv: {}", pacing::report(), sync_info.join(" "))
     }
 
     pub fn toggle_pause(&self) {
@@ -806,6 +849,9 @@ impl Player {
         let mut status = self.shared.status.lock().unwrap();
         // The delays are of the item; the worker decides on the load.
         let (sub_delay, audio_delay) = (status.sub_delay, status.audio_delay);
+        // The count moves under the lock of the status, so the status is
+        // always of the newest load.
+        let generation = self.shared.load_gen.fetch_add(1, Ordering::AcqRel) + 1;
         *status = PlayerStatus {
             state: PlayState::Starting,
             title: title.to_string(),
@@ -813,9 +859,10 @@ impl Player {
             paused,
             sub_delay,
             audio_delay,
+            generation,
             ..Default::default()
         };
-        self.shared.load_gen.fetch_add(1, Ordering::AcqRel) + 1
+        generation
     }
 
     /// Loads the item of a prepared load. False, and nothing happens,
@@ -898,10 +945,10 @@ impl Player {
     /// Starts the worker when there is none, for the load `load_gen`: the
     /// settings that waited go to it first. Gives back the track choices
     /// that waited for this load, for its `Cmd::Load`.
-    fn ensure_thread(&self, load_gen: u64) -> Vec<Cmd> {
+    fn ensure_thread(&self, load_gen: u64) -> Tracks {
         let mut slot = self.commands.lock().unwrap();
         if slot.is_some() {
-            return Vec::new();
+            return Tracks::default();
         }
         let (tx, rx) = mpsc::channel();
         let (settings, tracks) = self.queued.lock().unwrap().take(load_gen);
@@ -920,11 +967,23 @@ impl Player {
         thread::Builder::new()
             .name("mpv".into())
             .spawn(move || {
-                if let Err(err) = run(shared.clone(), &rx, worker_tx) {
-                    log::error!("mpv worker failed: {err:#}");
-                    let mut status = shared.status.lock().unwrap();
-                    status.error = Some(format!("{err:#}"));
-                    status.state = PlayState::Ended;
+                let (reports, reporter) = reporter();
+                match run(shared.clone(), &rx, worker_tx, reports) {
+                    // The quit: the core is closed by now, and the stop
+                    // report of the item that played goes out before the
+                    // slot closes, which the quit of the app waits for
+                    // (`shut_down_all`, up to `QUIT_WAIT`).
+                    Ok(()) => {
+                        if let Some(reporter) = reporter {
+                            let _ = reporter.join();
+                        }
+                    }
+                    Err(err) => {
+                        log::error!("mpv worker failed: {err:#}");
+                        let mut status = shared.status.lock().unwrap();
+                        status.error = Some(format!("{err:#}"));
+                        status.state = PlayState::Ended;
+                    }
                 }
                 // The slot closes under its lock, and the loads still in
                 // the channel fail under the same lock: a load that comes
@@ -1070,8 +1129,14 @@ pub(crate) enum ReportKind {
 /// so they have a thread of their own; on the worker they would stop the
 /// video and every deadline for as long as the server takes.
 pub(crate) fn spawn_reporter() -> mpsc::Sender<Report> {
+    reporter().0
+}
+
+/// The reporter with its thread, which ends once every sender is gone and
+/// the reports are sent: the worker waits for it at the quit of the app.
+fn reporter() -> (mpsc::Sender<Report>, Option<thread::JoinHandle<()>>) {
     let (tx, rx) = mpsc::channel::<Report>();
-    let _ = thread::Builder::new().name("playback-reports".into()).spawn(move || {
+    let handle = thread::Builder::new().name("playback-reports".into()).spawn(move || {
         while let Ok(first) = rx.recv() {
             let mut batch = vec![first];
             while let Ok(more) = rx.try_recv() {
@@ -1118,7 +1183,7 @@ pub(crate) fn spawn_reporter() -> mpsc::Sender<Report> {
             }
         }
     });
-    tx
+    (tx, handle.ok())
 }
 
 /// How long a subtitle file may take to come. The server makes a text
@@ -1138,7 +1203,10 @@ const SUBTITLE_LIMIT: u64 = 256 * 1024 * 1024;
 /// first had to make). A load that was replaced or stopped meanwhile gets
 /// no files. An image track that does not start shown is left for the
 /// moment the user chooses it (`Cmd::FetchSubtitle`): a film's ten PGS
-/// tracks are 300 MB, which would go with the video over the link.
+/// tracks are 300 MB, which would go with the video over the link. A file
+/// that is on its way already is not fetched again (two fetches would
+/// write one file, the second over what mpv reads of the first): a choice
+/// of it is kept in its `Fetch` and counts when the file comes.
 fn fetch_subtitles(
     shared: Arc<Shared>,
     tx: mpsc::Sender<Cmd>,
@@ -1146,27 +1214,33 @@ fn fetch_subtitles(
     generation: u64,
     subtitles: Vec<SubtitleFile>,
 ) {
-    let subtitles: Vec<SubtitleFile> = subtitles.into_iter().filter(|sub| sub.select || !sub.graphical).collect();
+    let subtitles = wanted_files(&mut shared.fetching.lock().unwrap(), generation, subtitles);
     for sub in &subtitles {
-        set_pending(&shared, sub.index, true);
+        set_pending(&shared, generation, sub.index, true);
+    }
+    if subtitles.is_empty() {
+        return;
     }
     let _ = thread::Builder::new().name("subtitles".into()).spawn(move || {
         let dir = std::env::temp_dir().join("bloom-subtitles");
+        let live = || shared.load_gen.load(Ordering::Acquire) == generation;
         for sub in subtitles {
-            if shared.load_gen.load(Ordering::Acquire) != generation {
+            if !live() {
                 return;
             }
             // The extension tells mpv the format ahead of the content.
             let path = dir.join(format!("{}-{generation}-{}.{}", std::process::id(), sub.index, subtitle_extension(&sub.url)));
             let fetched = std::fs::create_dir_all(&dir)
                 .map_err(anyhow::Error::from)
-                .and_then(|()| fetch_subtitle(&client, &sub.url, &path));
+                .and_then(|()| fetch_subtitle(&client, &sub.url, &path, &live));
+            // The file may have been chosen while it was on its way.
+            let select = fetch_over(&mut shared.fetching.lock().unwrap(), generation, sub.index).unwrap_or(sub.select);
             if let Err(err) = fetched {
                 log::warn!("subtitle {:?} not fetched: {err:#}", sub.title);
                 let _ = std::fs::remove_file(&path);
-                set_pending(&shared, sub.index, false);
-                if sub.select && shared.load_gen.load(Ordering::Acquire) == generation {
-                    let mut status = shared.status.lock().unwrap();
+                set_pending(&shared, generation, sub.index, false);
+                let mut status = shared.status.lock().unwrap();
+                if select && status.generation == generation {
                     status.failed_subs.push(sub.index);
                     status.tracks_version += 1;
                 }
@@ -1176,11 +1250,15 @@ fn fetch_subtitles(
                 generation,
                 index: sub.index,
                 path,
-                select: sub.select,
+                select,
                 title: sub.title,
                 lang: sub.lang,
             });
-            if sent.is_err() {
+            // No worker is there to add the file, or to remove it later.
+            if let Err(mpsc::SendError(cmd)) = sent {
+                if let Cmd::AddSubtitle { path, .. } = cmd {
+                    let _ = std::fs::remove_file(path);
+                }
                 return;
             }
             // The worker sleeps between rounds.
@@ -1189,10 +1267,43 @@ fn fetch_subtitles(
     });
 }
 
-/// Marks a subtitle file as on its way, or as come: the menu says
-/// "Loading…" meanwhile.
-fn set_pending(shared: &Shared, index: i64, pending: bool) {
+/// The files of a load to fetch now: those that start shown and the text
+/// ones (an image track waits for its choice), less the ones on their way
+/// already, whose `Fetch` takes the choice instead. The list forgets the
+/// loads before this one.
+fn wanted_files(fetching: &mut Vec<Fetch>, generation: u64, subtitles: Vec<SubtitleFile>) -> Vec<SubtitleFile> {
+    fetching.retain(|fetch| fetch.generation == generation);
+    subtitles
+        .into_iter()
+        .filter(|sub| sub.select || !sub.graphical)
+        .filter(|sub| match fetching.iter_mut().find(|fetch| fetch.index == sub.index) {
+            Some(fetch) => {
+                fetch.select |= sub.select;
+                false
+            }
+            None => {
+                fetching.push(Fetch { generation, index: sub.index, select: sub.select });
+                true
+            }
+        })
+        .collect()
+}
+
+/// A fetch is over: whether its file is shown, as asked at the start or
+/// chosen since. None when a later load took the list.
+fn fetch_over(fetching: &mut Vec<Fetch>, generation: u64, index: i64) -> Option<bool> {
+    let at = fetching.iter().position(|fetch| fetch.generation == generation && fetch.index == index)?;
+    Some(fetching.swap_remove(at).select)
+}
+
+/// Marks a subtitle file of the load `generation` as on its way, or as
+/// come: the menu says "Loading…" meanwhile. Nothing for a status that is
+/// of another load by now: the same item loaded again has the same indexes.
+fn set_pending(shared: &Shared, generation: u64, index: i64, pending: bool) {
     let mut status = shared.status.lock().unwrap();
+    if status.generation != generation {
+        return;
+    }
     let was = status.pending_subs.contains(&index);
     match (pending, was) {
         (true, false) => status.pending_subs.push(index),
@@ -1204,8 +1315,11 @@ fn set_pending(shared: &Shared, index: i64, pending: bool) {
 
 /// One subtitle file into `path`, with the token in the header as every
 /// request. The body goes to the file as it comes: an image track is tens
-/// of MB, and the memory of the app need not hold it.
-fn fetch_subtitle(client: &Client, url: &str, path: &std::path::Path) -> Result<()> {
+/// of MB, and the memory of the app need not hold it. It goes in pieces,
+/// and the transfer ends when `live` says the load is over: the rest of a
+/// 60 MB track is of no use to an item that was stopped.
+fn fetch_subtitle(client: &Client, url: &str, path: &std::path::Path, live: &dyn Fn() -> bool) -> Result<()> {
+    use std::io::{Read as _, Write as _};
     let mut response = client
         .agent()
         .get(url)
@@ -1216,8 +1330,19 @@ fn fetch_subtitle(client: &Client, url: &str, path: &std::path::Path) -> Result<
         .call()?;
     let mut reader = response.body_mut().with_config().limit(SUBTITLE_LIMIT).reader();
     let mut file = std::fs::File::create(path)?;
-    std::io::copy(&mut reader, &mut file)?;
-    Ok(())
+    let mut piece = vec![0u8; 64 * 1024];
+    loop {
+        let read = match reader.read(&mut piece) {
+            Ok(0) => return Ok(()),
+            Ok(read) => read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err.into()),
+        };
+        if !live() {
+            return Err(anyhow!("the item is over"));
+        }
+        file.write_all(&piece[..read])?;
+    }
 }
 
 /// The extension of the file written for a subtitle address: the format
@@ -1257,7 +1382,24 @@ struct Pending {
     target: Option<f64>,
     /// When mpv said that playback can go on.
     restarted: Option<Instant>,
+    /// The load an exact seek took the place of, still to be answered.
+    load: Option<u64>,
 }
+
+impl Pending {
+    /// The token of the load that has no answer yet.
+    fn load_token(&self) -> Option<u64> {
+        if self.target.is_none() { Some(self.token) } else { self.load }
+    }
+}
+
+/// While the player gets able to play after mpv restarted playback, the
+/// worker looks at it this often.
+const PENDING_POLL: Duration = Duration::from_millis(10);
+/// The longest sleep of the worker with an item (see the end of `run`).
+const ACTIVE_WAIT: Duration = Duration::from_millis(100);
+/// Time between two progress reports.
+const REPORT_EVERY: Duration = Duration::from_secs(10);
 
 /// State of the worker that is not in the shared status.
 struct Worker {
@@ -1303,6 +1445,39 @@ struct Worker {
 }
 
 impl Worker {
+    fn new(reports: mpsc::Sender<Report>, tx: mpsc::Sender<Cmd>) -> Self {
+        Self {
+            reports,
+            awaiting_start: false,
+            subtitles: Vec::new(),
+            add_subtitles: false,
+            pending: None,
+            scheduled: None,
+            follow: false,
+            last_sample: Instant::now(),
+            user_speed: 1.,
+            sync_speed: 1.,
+            stall_since: None,
+            stalled: false,
+            volume: 100.,
+            muted: false,
+            report_at: None,
+            item_id: None,
+            keep_delays: None,
+            size_changed: false,
+            tx,
+            generation: 0,
+            sub_files: Vec::new(),
+            backdrop: None,
+        }
+    }
+
+    /// The status is of the item of this worker, not of a load that was
+    /// prepared since or of a player at rest (`PlayerStatus::generation`).
+    fn owns(&self, status: &PlayerStatus) -> bool {
+        status.generation == self.generation
+    }
+
     /// Removes the subtitle files of the item: with a new item or at the
     /// end they have no use.
     fn forget_subtitles(&mut self) {
@@ -1327,7 +1502,14 @@ impl Worker {
 
     fn seek_exact(&mut self, mpv: &Mpv, position: f64, token: u64) {
         let _ = mpv.command("seek", &[&format!("{position:.3}"), "absolute+exact"]);
-        self.pending = Some(Pending { token, target: Some(position), restarted: None });
+        self.await_seek(position, token);
+    }
+
+    /// An exact seek is on its way. A load that still waits for its answer
+    /// keeps it: both are answered once the player can play at the target.
+    fn await_seek(&mut self, position: f64, token: u64) {
+        let load = self.pending.take().and_then(|pending| pending.load_token());
+        self.pending = Some(Pending { token, target: Some(position), restarted: None, load });
     }
 }
 
@@ -1340,6 +1522,15 @@ struct Renderer {
     size: (u32, u32),
     src: (u32, u32),
     asked: Option<((u32, u32), Instant)>,
+    /// For the pacing trace: when mpv asked for the frame in work, when
+    /// the swap was last reported to mpv, and mpv's target time of the
+    /// frame.
+    asked_ns: u64,
+    swap_ns: u64,
+    target: i64,
+    /// The frame mpv has now was not drawn, because the window drew
+    /// nothing: it is drawn once the window draws again (`render_loop`).
+    unseen: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -1359,11 +1550,39 @@ unsafe extern "C" fn on_render_update(ctx: *mut c_void) {
     signal.wake();
 }
 
+/// The properties the worker hears the changes of. `dwidth` and `dheight`
+/// are the size of the picture, for the render thread, which must not ask.
+const OBSERVED: [(&str, Format); 12] = [
+    ("time-pos", Format::Double),
+    ("duration", Format::Double),
+    ("pause", Format::Flag),
+    ("track-list", Format::String),
+    ("paused-for-cache", Format::Flag),
+    ("path", Format::String),
+    ("video-params/w", Format::Int64),
+    ("video-params/h", Format::Int64),
+    ("sub-delay", Format::Double),
+    ("audio-delay", Format::Double),
+    ("dwidth", Format::Int64),
+    ("dheight", Format::Int64),
+];
+
+/// What an error in place of an event of mpv says, when it ends the item:
+/// the wrapper gives the error of a file that ended with one as `Raw`.
+/// Any other error is of the event itself (a log line or the text of a
+/// property that is not UTF-8) and says nothing about the playback.
+fn end_error(err: &libmpv2::Error) -> Option<String> {
+    match err {
+        libmpv2::Error::Raw(code) => Some(mpv_error_text(*code)),
+        _ => None,
+    }
+}
+
 /// Makes the next worker fail before it has a core, for a test.
 #[cfg(test)]
 pub(crate) static FAIL_INIT: AtomicBool = AtomicBool::new(false);
 
-fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> Result<()> {
+fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>, reports: mpsc::Sender<Report>) -> Result<()> {
     #[cfg(test)]
     if FAIL_INIT.load(Ordering::Relaxed) {
         return Err(anyhow!("test: the worker fails to start"));
@@ -1491,51 +1710,18 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
     let mut display_fps = 0.;
     let mut sync_checked = Instant::now();
 
-    mpv.observe_property("time-pos", Format::Double, 1)?;
-    mpv.observe_property("duration", Format::Double, 2)?;
-    mpv.observe_property("pause", Format::Flag, 3)?;
-    mpv.observe_property("track-list", Format::String, 4)?;
-    mpv.observe_property("paused-for-cache", Format::Flag, 5)?;
-    mpv.observe_property("path", Format::String, 6)?;
-    mpv.observe_property("video-params/w", Format::Int64, 7)?;
-    mpv.observe_property("video-params/h", Format::Int64, 8)?;
-    mpv.observe_property("sub-delay", Format::Double, 9)?;
-    mpv.observe_property("audio-delay", Format::Double, 10)?;
-    // The size of the picture, for the render thread, which must not ask.
-    mpv.observe_property("dwidth", Format::Int64, 11)?;
-    mpv.observe_property("dheight", Format::Int64, 12)?;
+    for (id, (name, format)) in OBSERVED.iter().enumerate() {
+        mpv.observe_property(name, *format, id as u64 + 1)?;
+    }
 
     let mut session: Option<Session> = None;
     // End-of-file events still to come for files that a new load replaced.
     let mut stale_ends = 0u32;
-    let mut worker = Worker {
-        reports: spawn_reporter(),
-        awaiting_start: false,
-        subtitles: Vec::new(),
-        add_subtitles: false,
-        pending: None,
-        scheduled: None,
-        follow: false,
-        last_sample: Instant::now(),
-        user_speed: 1.,
-        sync_speed: 1.,
-        stall_since: None,
-        stalled: false,
-        volume: 100.,
-        muted: false,
-        report_at: None,
-        item_id: None,
-        keep_delays: None,
-        size_changed: false,
-        tx,
-        generation: 0,
-        sub_files: Vec::new(),
-        backdrop: None,
-    };
+    let mut worker = Worker::new(reports, tx);
 
     loop {
-        // Once a second: the display the window is on, its refresh rate for
-        // mpv, and mpv's view of the sync for `dev/jctl pacing clock`.
+        // Once a second: the display the window is on, and its refresh rate
+        // for mpv.
         if display_pacing && sync_checked.elapsed() >= Duration::from_secs(1) {
             sync_checked = Instant::now();
             let fps = {
@@ -1551,33 +1737,21 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
                 log::info!("display refresh rate {fps:.3} Hz for mpv's display sync");
                 let _ = mpv.set_property("display-fps-override", fps);
             }
-            // Property reads wait for the core: none while a load, a seek
-            // or a scheduled action is on its way, so they stay on time.
-            if session.is_some() && worker.pending.is_none() && worker.scheduled.is_none() {
-                let started = Instant::now();
-                let read = |name: &str| {
-                    mpv.get_property::<String>(name).unwrap_or_else(|_| "-".into())
-                };
-                *shared.sync_info.lock().unwrap() = format!(
-                    "video-sync={} active={} display-fps={} estimated={} vsync-ratio={} jitter={} mistimed={} delayed={} dropped={}",
-                    read("video-sync"),
-                    read("display-sync-active"),
-                    read("display-fps"),
-                    read("estimated-display-fps"),
-                    read("vsync-ratio"),
-                    read("vsync-jitter"),
-                    read("mistimed-frame-count"),
-                    read("vo-delayed-frame-count"),
-                    read("frame-drop-count"),
-                );
-                if started.elapsed() > Duration::from_millis(5) {
-                    log::debug!("sync info took {:?}", started.elapsed());
-                }
-            }
         }
 
-        // Events from mpv.
-        while let Some(event) = mpv.wait_event(0.0) {
+        // Events from mpv. The wrapper gives `None` for an empty queue, and
+        // also for a property that is not there any more, with events
+        // behind it. Each observed property has one change in the queue at
+        // most, so the queue is empty after more of them in a row than
+        // there are properties. Nothing may stay in it: the loop sleeps
+        // until mpv has a new event.
+        let mut empty = 0;
+        while empty <= OBSERVED.len() {
+            let Some(event) = mpv.wait_event(0.0) else {
+                empty += 1;
+                continue;
+            };
+            empty = 0;
             match event {
                 Ok(Event::LogMessage { prefix, level, text, .. }) => {
                     let text = text.trim_end();
@@ -1605,13 +1779,14 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
                 // failed end-file) as `Err`; treat those as a failed load.
                 Err(err) => {
                     log::warn!("mpv event error: {err}");
-                    if session.is_some() {
-                        let message = match err {
-                            libmpv2::Error::Raw(code) => mpv_error_text(code),
-                            other => other.to_string(),
-                        };
-                        shared.status.lock().unwrap().error =
-                            Some(format!("Playback failed: {message}"));
+                    if session.is_some()
+                        && let Some(message) = end_error(&err)
+                    {
+                        let mut status = shared.status.lock().unwrap();
+                        if worker.owns(&status) {
+                            status.error = Some(format!("Playback failed: {message}"));
+                        }
+                        drop(status);
                         finish(&shared, &mut session, &mut worker);
                     }
                 }
@@ -1685,18 +1860,11 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
                     pacing::phase::reset();
                     // The track choices made for this load before a worker
                     // was there; mpv keeps them over the `loadfile` below.
-                    for track in tracks {
-                        match track {
-                            Cmd::SetAudio(id) => {
-                                let value = id.map(|i| i.to_string()).unwrap_or_else(|| "no".into());
-                                let _ = mpv.set_property("aid", value);
-                            }
-                            Cmd::SetSubtitle(id) => {
-                                let value = id.map(|i| i.to_string()).unwrap_or_else(|| "no".into());
-                                let _ = mpv.set_property("sid", value);
-                            }
-                            _ => {}
-                        }
+                    if let Some(id) = tracks.audio {
+                        set_track(&mpv, "aid", id);
+                    }
+                    if let Some(id) = tracks.subtitle {
+                        set_track(&mpv, "sid", id);
                     }
                     let delays = {
                         let status = shared.status.lock().unwrap();
@@ -1712,16 +1880,7 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
                         let _ = worker.reports.send(Report {
                             client: active.client.clone(),
                             kind: ReportKind::Stopped,
-                            progress: Progress {
-                                item_id: active.item_id.clone(),
-                                play_session_id: active.play_session_id.clone(),
-                                position_ticks: (active.position * TICKS_PER_SECOND as f64) as i64,
-                                paused: false,
-                                volume: worker.volume as i64,
-                                muted: worker.muted,
-                                play_method: active.play_method.clone(),
-                                media_source_id: active.media_source_id.clone(),
-                            },
+                            progress: progress_of(&active, false, &worker),
                         });
                     }
                     // A failure here ends the worker; the load is answered
@@ -1767,7 +1926,7 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
                     worker.stalled = false;
                     worker.awaiting_start = true;
                     worker.pending =
-                        Some(Pending { token: req.token, target: None, restarted: None });
+                        Some(Pending { token: req.token, target: None, restarted: None, load: None });
                     let start = if req.start_secs > 0. {
                         format!("start=+{:.3}", req.start_secs)
                     } else {
@@ -1842,14 +2001,8 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
                     let _ = mpv.command("seek", &[&secs.to_string(), "absolute"]);
                     worker.report_soon();
                 }
-                Cmd::SetAudio(id) => {
-                    let value = id.map(|i| i.to_string()).unwrap_or_else(|| "no".into());
-                    let _ = mpv.set_property("aid", value);
-                }
-                Cmd::SetSubtitle(id) => {
-                    let value = id.map(|i| i.to_string()).unwrap_or_else(|| "no".into());
-                    let _ = mpv.set_property("sid", value);
-                }
+                Cmd::SetAudio(id) => set_track(&mpv, "aid", id),
+                Cmd::SetSubtitle(id) => set_track(&mpv, "sid", id),
                 Cmd::SetVolume(volume) => {
                     let _ = mpv.set_property("volume", volume.clamp(0., 100.));
                     worker.volume = volume.clamp(0., 100.);
@@ -1887,22 +2040,23 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
                 Cmd::Stop(generation) => {
                     worker.item_id = None;
                     let _ = mpv.command("stop", &[]);
+                    // A load that was only prepared ends here, unless a
+                    // later one was prepared since the stop: no end of a
+                    // file comes for it. (The end of an item that plays
+                    // is for the status of that item alone, see `finish`.)
+                    let mut status = shared.status.lock().unwrap();
+                    if status.state == PlayState::Starting
+                        && shared.load_gen.load(Ordering::Acquire) == generation
+                    {
+                        status.state = PlayState::Ended;
+                    }
+                    drop(status);
                     if session.is_none() {
-                        // Nothing is loaded, so no end of file will come: a
-                        // load that was only prepared ends here, unless a
-                        // later one was prepared since the stop.
-                        let mut status = shared.status.lock().unwrap();
-                        if status.state == PlayState::Starting
-                            && shared.load_gen.load(Ordering::Acquire) == generation
-                        {
-                            status.state = PlayState::Ended;
-                        }
-                        drop(status);
                         rest(&shared);
                     }
                 }
                 Cmd::AddSubtitle { generation, index, path, select, title, lang } => {
-                    set_pending(&shared, index, false);
+                    set_pending(&shared, generation, index, false);
                     // Of an item that is over, or of a load a later one replaced.
                     if generation != worker.generation || session.is_none() {
                         let _ = std::fs::remove_file(&path);
@@ -1920,8 +2074,10 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
                                 .ok()
                                 .and_then(|json| serde_json::from_str::<Vec<Track>>(&json).ok())
                                 .and_then(|tracks| tracks.iter().filter(|t| t.kind == "sub").map(|t| t.id).max());
-                            if let Some(sid) = sid {
-                                let mut status = shared.status.lock().unwrap();
+                            let mut status = shared.status.lock().unwrap();
+                            if let Some(sid) = sid
+                                && worker.owns(&status)
+                            {
                                 status.external_sids.retain(|(i, _)| *i != index);
                                 status.external_sids.push((index, sid));
                                 status.tracks_version += 1;
@@ -1942,6 +2098,10 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
                     }
                 }
                 Cmd::Quit => {
+                    // The item that plays ends with the app: the server
+                    // hears of the stop (the thread of this worker waits
+                    // for the report, see `ensure_thread`).
+                    finish(&shared, &mut session, &mut worker);
                     worker.forget_subtitles();
                     return Ok(());
                 }
@@ -1978,10 +2138,11 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
             && let Some(restarted) = pending.restarted
             && !mpv.get_property::<bool>("seeking").unwrap_or(false)
         {
-            let position = mpv.get_property::<f64>("time-pos").unwrap_or(f64::MAX);
-            let there = pending
-                .target
-                .is_none_or(|target| (position - target).abs() <= SETTLED_WITHIN_SECS);
+            // No position is no place to write down, and not the target.
+            let position = mpv.get_property::<f64>("time-pos").ok();
+            let there = pending.target.is_none_or(|target| {
+                position.is_some_and(|position| (position - target).abs() <= SETTLED_WITHIN_SECS)
+            });
             let has_data = mpv
                 .get_property::<f64>("demuxer-cache-duration")
                 .is_ok_and(|secs| secs >= READY_CACHE_SECS)
@@ -1993,11 +2154,20 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
                     Some(_) => PlayerEvent::Settled { token },
                     None => PlayerEvent::Loaded { token },
                 };
+                let load = pending.load;
                 worker.pending = None;
                 {
                     let mut status = shared.status.lock().unwrap();
-                    status.position = position;
-                    status.position_at = Some(Instant::now());
+                    if let Some(position) = position
+                        && worker.owns(&status)
+                    {
+                        status.position = position;
+                        status.position_at = Some(Instant::now());
+                    }
+                }
+                // The load a seek took the place of is answered first.
+                if let Some(token) = load {
+                    shared.emit(PlayerEvent::Loaded { token });
                 }
                 shared.emit(event);
             }
@@ -2041,16 +2211,19 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
         // another device may watch (see `Worker::report_soon`).
         let soon = worker.report_at.is_some_and(|at| Instant::now() >= at);
         if let Some(active) = session.as_mut()
-            && (soon || active.last_report.elapsed() >= Duration::from_secs(10))
+            && (soon || active.last_report.elapsed() >= REPORT_EVERY)
         {
             active.last_report = Instant::now();
             worker.report_at = None;
-            let snapshot = shared.status.lock().unwrap().clone();
-            if snapshot.state == PlayState::Playing {
+            let (state, paused) = {
+                let status = shared.status.lock().unwrap();
+                (status.state, status.paused)
+            };
+            if state == PlayState::Playing {
                 let _ = worker.reports.send(Report {
                     client: active.client.clone(),
                     kind: ReportKind::Progress,
-                    progress: progress_of(active, &snapshot, &worker),
+                    progress: progress_of(active, paused, &worker),
                 });
             }
         } else if session.is_none() {
@@ -2058,13 +2231,30 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>) -> 
         }
 
         // Sleep until something happens: a command or an event of mpv wakes
-        // the loop. With an item the round is short, so its timers (the
-        // reports, the samples, the stall) keep their time; an idle core
-        // has none and sleeps. The wait never passes the scheduled action.
+        // the loop. The wait ends at the next thing the loop does by the
+        // clock: the scheduled action, a position measurement, a look at a
+        // player that gets able to play, a copy of the frame. The timers
+        // that count in seconds (the reports, the stall) are looked at
+        // every `ACTIVE_WAIT` with an item; an idle core has none and
+        // sleeps. (Before 2026-11-10 the loop ran every 4 ms with an item,
+        // 250 rounds a second for timers known ahead.)
         let idle = session.is_none() && worker.pending.is_none() && worker.scheduled.is_none();
-        let mut timeout = if idle { IDLE_WAIT } else { Duration::from_millis(4) };
+        let now = Instant::now();
+        let mut timeout = if idle { IDLE_WAIT } else { ACTIVE_WAIT };
+        let mut wake_at = |at: Instant| timeout = timeout.min(at.saturating_duration_since(now));
         if let Some(scheduled) = worker.scheduled {
-            timeout = timeout.min(scheduled.at.saturating_duration_since(Instant::now()));
+            wake_at(scheduled.at);
+        }
+        if session.is_some() {
+            if worker.follow {
+                wake_at(worker.last_sample + SAMPLE_EVERY);
+            }
+            if let Some(last) = worker.backdrop {
+                wake_at(last + BACKDROP_INTERVAL);
+            }
+        }
+        if worker.pending.as_ref().is_some_and(|pending| pending.restarted.is_some()) {
+            wake_at(now + PENDING_POLL);
         }
         let (lock, cvar) = &shared.wake;
         let mut flag = lock.lock().unwrap();
@@ -2198,11 +2388,15 @@ fn render_loop(mpv_handle: usize, signal: &'static RenderSignal, ready: mpsc::Se
         signal.wake();
     });
     match DisplayClock::start(on_tick) {
-        Ok(clock) => *shared.clock.lock().unwrap() = Some(clock),
+        Ok(clock) => {
+            let state: &'static pacing::ClockState = clock.state();
+            shared.clock_state.store(ptr::from_ref(state).cast_mut(), Ordering::Release);
+            *shared.clock.lock().unwrap() = Some(clock);
+        }
         // Without the clock the frames keep the audio timing.
         Err(err) => log::warn!("no display link, audio timing for the frames: {err:#}"),
     }
-    let display_pacing = shared.clock.lock().unwrap().is_some();
+    let display_pacing = shared.clock_state().is_some();
     if display_pacing {
         // The phase loop starts from the model with each worker, and
         // hears of each draw's presented time while this thread lives.
@@ -2218,16 +2412,23 @@ fn render_loop(mpv_handle: usize, signal: &'static RenderSignal, ready: mpsc::Se
         // The display refreshed: mpv hears of it first, so it can hand
         // over the frame for the next refresh at once.
         if signal.swap_due.swap(false, Ordering::AcqRel) {
-            shared.swap_ns.store(clock_ns(), Ordering::Relaxed);
+            renderer.swap_ns = clock_ns();
             unsafe { sys::mpv_render_context_report_swap(renderer.ctx) };
         }
 
         // Video frame. A frame in display sync is rendered at once and the
         // call does not wait; one with audio timing waits in the render
         // call for its time.
-        let redraw = signal.redraw.swap(false, Ordering::AcqRel);
+        //
+        // When the window draws again and the frame mpv has was never
+        // drawn (`Renderer::unseen`), it is drawn now. mpv asks for no
+        // frame while it is paused, so without this the picture of before
+        // the window stopped drawing stayed up after a seek or a pause
+        // that came meanwhile.
+        let watching = || pacing::ui_watching(shared.ui_seen_ns.load(Ordering::Acquire), clock_ns());
+        let redraw = signal.redraw.swap(false, Ordering::AcqRel) || (renderer.unseen && watching());
         if signal.needed.swap(false, Ordering::AcqRel) || redraw {
-            shared.frame_asked_ns.store(signal.asked_ns.load(Ordering::Acquire), Ordering::Release);
+            renderer.asked_ns = signal.asked_ns.load(Ordering::Acquire);
             let flags = unsafe { sys::mpv_render_context_update(renderer.ctx) };
             if flags & (sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME as u64) == 0 {
                 // No new frame: with the size just known, the frame mpv has
@@ -2237,20 +2438,22 @@ fn render_loop(mpv_handle: usize, signal: &'static RenderSignal, ready: mpsc::Se
                 }
             } else {
                 let info = next_frame_info(&renderer);
-                shared.frame_target.store(info.target_time, Ordering::Relaxed);
+                renderer.target = info.target_time;
                 let synced =
                     info.flags & sys::mpv_render_frame_info_flag_MPV_RENDER_FRAME_INFO_BLOCK_VSYNC as u64 != 0;
                 let repeat = info.flags & sys::mpv_render_frame_info_flag_MPV_RENDER_FRAME_INFO_REPEAT as u64 != 0
                     && info.flags & sys::mpv_render_frame_info_flag_MPV_RENDER_FRAME_INFO_REDRAW as u64 == 0;
                 // The same picture again, or nobody draws: mpv counts the
                 // frame as rendered and keeps its timing, the surface stays.
-                let watching = pacing::ui_watching(shared.ui_seen_ns.load(Ordering::Acquire), clock_ns());
-                let skip = display_pacing && (repeat || !watching);
+                let watching = watching();
+                let skip = display_pacing && !pacing::draws(repeat, watching, renderer.unseen);
                 if skip {
-                    if repeat {
+                    if watching {
                         pacing::count_repeat();
                     } else {
                         pacing::count_unseen();
+                        // A repeat of a frame that was drawn changes nothing.
+                        renderer.unseen |= !repeat;
                     }
                 }
                 if let Err(err) = render_frame(&mut renderer, shared, skip, synced) {
@@ -2273,6 +2476,7 @@ fn render_loop(mpv_handle: usize, signal: &'static RenderSignal, ready: mpsc::Se
     if display_pacing {
         gpui_apple::present_trace::set_feedback(None);
     }
+    shared.clock_state.store(ptr::null_mut(), Ordering::Release);
     *shared.clock.lock().unwrap() = None;
     drop(renderer);
 }
@@ -2311,7 +2515,7 @@ fn create_renderer(mpv_handle: *mut sys::mpv_handle, signal: &'static RenderSign
             signal as *const RenderSignal as *mut c_void,
         );
     }
-    Ok(Renderer { ctx, gl, size: (0, 0), src: (0, 0), asked: None })
+    Ok(Renderer { ctx, gl, size: (0, 0), src: (0, 0), asked: None, asked_ns: 0, swap_ns: 0, target: 0, unseen: false })
 }
 
 /// A new size of the video area counts once it has held for this long:
@@ -2362,10 +2566,6 @@ fn next_frame_info(renderer: &Renderer) -> sys::mpv_render_frame_info {
     info
 }
 
-/// Renders the current frame at the size of the UI's video area (see
-/// `frame_size`), then publishes its GPU surface.
-/// With `skip` mpv takes the frame as rendered and nothing is drawn.
-/// `synced` says the frame is in display sync: made for the next refresh.
 /// The bands the colours of the picture are told in, and the least time
 /// between two looks at a frame. Under the time of two frames of a film
 /// (83.3 ms at 24 a second) by a margin, so each second frame is looked at
@@ -2374,22 +2574,22 @@ fn next_frame_info(renderer: &Renderer) -> sys::mpv_render_frame_info {
 pub const COLOUR_BANDS: usize = 14;
 const COLOURS_EVERY_NS: u64 = 75_000_000;
 
+/// Renders the current frame at the size of the UI's video area (see
+/// `frame_size`), then publishes its GPU surface.
+/// With `skip` mpv takes the frame as rendered and nothing is drawn.
+/// `synced` says the frame is in display sync: made for the next refresh.
 #[cfg(target_os = "macos")]
 fn render_frame(renderer: &mut Renderer, shared: &Shared, skip: bool, synced: bool) -> Result<()> {
     // The time of the tick a frame in display sync is made after. A frame
     // with audio timing waits in the render call for its time instead and
     // gets no tick.
-    let (tick, tick_idx, vsync) = if synced {
-        shared.clock.lock().unwrap().as_ref().map_or((0, 0, 0), |clock| {
-            let state = clock.state();
-            (
-                state.tick_ns.load(Ordering::Acquire),
-                state.ticks.load(Ordering::Acquire),
-                state.vsync_ns.load(Ordering::Acquire),
-            )
-        })
-    } else {
-        (0, 0, 0)
+    let (tick, tick_idx, vsync) = match shared.clock_state() {
+        Some(state) if synced => (
+            state.tick_ns.load(Ordering::Acquire),
+            state.ticks.load(Ordering::Acquire),
+            state.vsync_ns.load(Ordering::Acquire),
+        ),
+        _ => (0, 0, 0),
     };
     if skip {
         let mut one: i32 = 1;
@@ -2442,38 +2642,41 @@ fn render_frame(renderer: &mut Renderer, shared: &Shared, skip: bool, synced: bo
     if code < 0 {
         return Err(anyhow!("mpv_render_context_render failed ({code})"));
     }
-    if shared.colours_on.load(Ordering::Relaxed) {
-        let now = clock_ns();
-        if now.saturating_sub(shared.colours_ns.load(Ordering::Relaxed)) >= COLOURS_EVERY_NS {
-            shared.colours_ns.store(now, Ordering::Relaxed);
-            // The first row of the surface is the top of the picture.
-            let bands = renderer.gl.colours(COLOUR_BANDS);
-            let mut colours = shared.colours.lock().unwrap();
-            *colours = (colours.0 + 1, bands);
-        }
-    }
+    renderer.unseen = false;
     let frame = renderer.gl.finish()?;
     let seq = shared.publish(Some(frame), tick, vsync);
     pacing::count_rendered(synced);
     // From mpv's request to the finished frame. mpv asks early and the
     // render call waits for the time of the frame, so this is about the
     // time of one frame. The UI measures its own wait from here.
-    let asked = shared.frame_asked_ns.load(Ordering::Acquire);
+    let asked = renderer.asked_ns;
     let now = clock_ns();
     pacing::trace::rendered(pacing::trace::FrameRec {
         seq,
         tick_idx,
         tick_ns: tick,
         vsync_ns: vsync,
-        swap_ns: shared.swap_ns.load(Ordering::Relaxed),
+        swap_ns: renderer.swap_ns,
         asked_ns: asked,
         done_ns: now,
-        target: shared.frame_target.load(Ordering::Relaxed),
+        target: renderer.target,
         ..Default::default()
     });
     crate::perf::video_frame_rendered(now.saturating_sub(asked) as f64 / 1e6);
     shared.frame_done_ns.store(now, Ordering::Release);
     let _ = shared.frames.0.try_send(());
+    // The colours, after the frame is on its way to the UI: the read
+    // waits for the GPU, and before 2026-11-10 it held the frame back for
+    // that time, twelve times a second.
+    if shared.colours_on.load(Ordering::Relaxed)
+        && now.saturating_sub(shared.colours_ns.load(Ordering::Relaxed)) >= COLOURS_EVERY_NS
+    {
+        shared.colours_ns.store(now, Ordering::Relaxed);
+        // The first row of the surface is the top of the picture.
+        let bands = renderer.gl.colours(COLOUR_BANDS);
+        let mut colours = shared.colours.lock().unwrap();
+        *colours = (colours.0 + 1, bands);
+    }
     Ok(())
 }
 
@@ -2498,17 +2701,23 @@ fn handle_event(
             false
         }
         Event::PropertyChange { name, change, .. } => {
+            // What is of the item goes into the status of the item alone:
+            // while the next load waits for the server, the status is of
+            // that load already, and the item before still plays.
+            let mine = worker.owns(&status);
             match (*name, change) {
                 ("time-pos", PropertyData::Double(v)) => {
-                    status.position = *v;
-                    status.position_at = Some(Instant::now());
+                    if mine {
+                        status.position = *v;
+                        status.position_at = Some(Instant::now());
+                    }
                     if let Some(active) = session.as_mut() {
                         active.position = *v;
                     }
                 }
-                ("duration", PropertyData::Double(v)) => status.duration = *v,
-                ("video-params/w", PropertyData::Int64(v)) => status.video_w = (*v).max(0) as u32,
-                ("video-params/h", PropertyData::Int64(v)) => status.video_h = (*v).max(0) as u32,
+                ("duration", PropertyData::Double(v)) if mine => status.duration = *v,
+                ("video-params/w", PropertyData::Int64(v)) if mine => status.video_w = (*v).max(0) as u32,
+                ("video-params/h", PropertyData::Int64(v)) if mine => status.video_h = (*v).max(0) as u32,
                 ("dwidth", PropertyData::Int64(v)) => {
                     shared.dwidth.store((*v).max(0) as u32, Ordering::Relaxed);
                     worker.size_changed = true;
@@ -2517,16 +2726,20 @@ fn handle_event(
                     shared.dheight.store((*v).max(0) as u32, Ordering::Relaxed);
                     worker.size_changed = true;
                 }
-                ("sub-delay", PropertyData::Double(v)) => status.sub_delay = *v,
-                ("audio-delay", PropertyData::Double(v)) => status.audio_delay = *v,
+                ("sub-delay", PropertyData::Double(v)) if mine => status.sub_delay = *v,
+                ("audio-delay", PropertyData::Double(v)) if mine => status.audio_delay = *v,
                 ("pause", PropertyData::Flag(v)) => {
                     if status.paused != *v {
                         worker.report_soon();
                     }
-                    status.paused = *v;
+                    if mine {
+                        status.paused = *v;
+                    }
                 }
                 ("paused-for-cache", PropertyData::Flag(v)) => {
-                    status.buffering = *v;
+                    if mine {
+                        status.buffering = *v;
+                    }
                     if *v {
                         // Out of data during a load or a seek is no stall.
                         if worker.pending.is_none() && worker.stall_since.is_none() {
@@ -2539,8 +2752,8 @@ fn handle_event(
                         }
                     }
                 }
-                ("path", PropertyData::Str(path)) => status.path = Some(path.to_string()),
-                ("track-list", PropertyData::Str(json)) => {
+                ("path", PropertyData::Str(path)) if mine => status.path = Some(path.to_string()),
+                ("track-list", PropertyData::Str(json)) if mine => {
                     let tracks: Vec<Track> = serde_json::from_str(json).unwrap_or_default();
                     let tracks: Vec<Track> =
                         tracks.into_iter().filter(|t| t.kind != "video").collect();
@@ -2554,7 +2767,7 @@ fn handle_event(
             false
         }
         Event::FileLoaded | Event::PlaybackRestart => {
-            if session.is_some() {
+            if session.is_some() && worker.owns(&status) {
                 status.state = PlayState::Playing;
             }
             if matches!(event, Event::FileLoaded) {
@@ -2568,10 +2781,12 @@ fn handle_event(
             false
         }
         Event::EndFile(reason) => {
-            if *reason == mpv_end_file_reason::Error {
-                status.error = Some("mpv could not play this stream".to_string());
+            if worker.owns(&status) {
+                if *reason == mpv_end_file_reason::Error {
+                    status.error = Some("mpv could not play this stream".to_string());
+                }
+                status.reached_end = *reason == mpv_end_file_reason::Eof;
             }
-            status.reached_end = *reason == mpv_end_file_reason::Eof;
             // Only the active session's end is meaningful (stop+load emits one too).
             session.is_some()
         }
@@ -2591,14 +2806,14 @@ fn mpv_error_text(code: i32) -> String {
     }
 }
 
-fn progress_of(session: &Session, status: &PlayerStatus, worker: &Worker) -> Progress {
+fn progress_of(session: &Session, paused: bool, worker: &Worker) -> Progress {
     Progress {
         item_id: session.item_id.clone(),
         play_session_id: session.play_session_id.clone(),
         // The position of this item: the status can be of the load that
         // replaces it, or cleared by the app that closed the player.
         position_ticks: (session.position * TICKS_PER_SECOND as f64) as i64,
-        paused: status.paused,
+        paused,
         volume: worker.volume as i64,
         muted: worker.muted,
         play_method: session.play_method.clone(),
@@ -2606,14 +2821,23 @@ fn progress_of(session: &Session, status: &PlayerStatus, worker: &Worker) -> Pro
     }
 }
 
-/// Reports the stop to Jellyfin and marks the session ended.
+/// Reports the stop to Jellyfin and marks the session ended. The status
+/// is marked when it is of this item alone: while the next load waits for
+/// the server the status is of that load (`Player::prepare`), and the end
+/// of the item before, by itself or by a stop, must not end it. On
+/// 2026-11-10 the review found that it did: the app then took the load
+/// for an item that ended, and went on in the queue or closed the player.
 fn finish(shared: &Shared, session: &mut Option<Session>, worker: &mut Worker) {
     let Some(active) = session.take() else { return };
-    let snapshot = shared.status.lock().unwrap().clone();
+    let (mine, paused, reached_end) = {
+        let status = shared.status.lock().unwrap();
+        let mine = worker.owns(&status);
+        (mine, status.paused, mine && status.reached_end && status.error.is_none())
+    };
     let _ = worker.reports.send(Report {
         client: active.client.clone(),
         kind: ReportKind::Stopped,
-        progress: progress_of(&active, &snapshot, worker),
+        progress: progress_of(&active, paused, worker),
     });
     worker.scheduled = None;
     worker.item_id = None;
@@ -2621,17 +2845,15 @@ fn finish(shared: &Shared, session: &mut Option<Session>, worker: &mut Worker) {
     worker.stalled = false;
     worker.forget_subtitles();
     // A load that ended before the item could play has failed.
-    if let Some(pending) = worker.pending.take()
-        && pending.target.is_none()
-    {
-        shared.emit(PlayerEvent::LoadFailed { token: pending.token });
-    } else if snapshot.reached_end && snapshot.error.is_none() {
+    if let Some(token) = worker.pending.take().and_then(|pending| pending.load_token()) {
+        shared.emit(PlayerEvent::LoadFailed { token });
+    } else if reached_end {
         shared.emit(PlayerEvent::Ended);
     }
     let mut status = shared.status.lock().unwrap();
     // The app closed the player and took the end already
     // (`acknowledge_end`): the status stays at rest.
-    if status.state != PlayState::Idle {
+    if mine && worker.owns(&status) && status.state != PlayState::Idle {
         status.state = PlayState::Ended;
     }
     drop(status);
@@ -3862,5 +4084,267 @@ mod tests {
             assert_eq!(status.state, PlayState::Ended, "round {round}: {status:?}");
             assert_eq!(failed, 1, "round {round}: LoadFailed {} times for the load of a worker that failed to start: {status:?}", failed);
         }
+    }
+
+    // ----- the review of 2026-11-10 ------------------------------------------
+
+    /// A worker with no core, for what it does with its state alone, and
+    /// the reports it sends.
+    fn worker_of(generation: u64) -> (Worker, mpsc::Receiver<Report>) {
+        let (reports, sent) = mpsc::channel();
+        let (tx, _) = mpsc::channel();
+        let mut worker = Worker::new(reports, tx);
+        worker.generation = generation;
+        (worker, sent)
+    }
+
+    fn session_of(item: &str) -> Session {
+        Session {
+            client: Client::new("http://127.0.0.1:9", "test-device").with_session("token", "user"),
+            item_id: item.into(),
+            play_session_id: "session".into(),
+            play_method: String::new(),
+            media_source_id: String::new(),
+            last_report: Instant::now(),
+            position: 0.,
+        }
+    }
+
+    fn events_of(player: &Player) -> Vec<PlayerEvent> {
+        let events = player.events();
+        std::iter::from_fn(|| events.try_recv().ok()).collect()
+    }
+
+    /// The next load is prepared and waits for the server while the item
+    /// before still plays. What that item does then (its position, its
+    /// end) is not of the prepared load: the status stays `Starting`.
+    /// Before, its end marked the prepared load `Ended` with
+    /// `reached_end`, and the app went on in the queue or closed the
+    /// player and cancelled the load.
+    #[test]
+    fn the_end_of_the_item_before_does_not_end_a_prepared_load() {
+        let player = Player::default();
+        let shared = &player.shared;
+        let first = player.prepare("First", 0., false);
+        let (mut worker, reports) = worker_of(first);
+        let mut session = Some(session_of("first"));
+        assert!(!handle_event(&Event::PlaybackRestart, shared, &mut session, &mut worker));
+        assert_eq!(player.status().state, PlayState::Playing);
+
+        player.prepare("Second", 30., false);
+        let moved = Event::PropertyChange { name: "time-pos", change: PropertyData::Double(99.), reply_userdata: 1 };
+        assert!(!handle_event(&moved, shared, &mut session, &mut worker));
+        assert!(!handle_event(&Event::PlaybackRestart, shared, &mut session, &mut worker));
+        assert!(handle_event(&Event::EndFile(mpv_end_file_reason::Eof), shared, &mut session, &mut worker));
+        finish(shared, &mut session, &mut worker);
+        let status = player.status();
+        assert_eq!(
+            (status.state, status.title.as_str(), status.position, status.reached_end),
+            (PlayState::Starting, "Second", 30., false),
+            "the end of the first item reached the status of the second: {status:?}"
+        );
+        assert_eq!(events_of(&player), vec![], "an end was told for a load that has not played");
+        // The server still hears of the stop, at the place of the first item.
+        let report = reports.try_recv().expect("no stop report");
+        assert!(report.kind == ReportKind::Stopped && report.progress.item_id == "first");
+        assert_eq!(report.progress.position_ticks, 99 * TICKS_PER_SECOND);
+
+        // The end of the item the status is of ends it, as before.
+        let third = player.prepare("Third", 0., false);
+        let (mut worker, _reports) = worker_of(third);
+        let mut session = Some(session_of("third"));
+        handle_event(&Event::PlaybackRestart, shared, &mut session, &mut worker);
+        assert!(handle_event(&Event::EndFile(mpv_end_file_reason::Eof), shared, &mut session, &mut worker));
+        finish(shared, &mut session, &mut worker);
+        let status = player.status();
+        assert!(status.state == PlayState::Ended && status.reached_end, "{status:?}");
+        assert_eq!(events_of(&player), vec![PlayerEvent::Ended]);
+    }
+
+    /// An exact seek that comes while a load still waits for its answer
+    /// does not take the answer away: the load fails with the item, and
+    /// is not left with no answer.
+    #[test]
+    fn a_seek_over_a_pending_load_keeps_the_answer_of_the_load() {
+        let player = Player::default();
+        let generation = player.prepare("Item", 0., false);
+        let (mut worker, _reports) = worker_of(generation);
+        let mut session = Some(session_of("item"));
+        worker.pending = Some(Pending { token: 7, target: None, restarted: None, load: None });
+        worker.await_seek(12., 8);
+        let pending = worker.pending.as_ref().unwrap();
+        assert_eq!((pending.token, pending.target, pending.load_token()), (8, Some(12.), Some(7)));
+        // A second seek keeps it as well.
+        worker.await_seek(15., 9);
+        assert_eq!(worker.pending.as_ref().unwrap().load_token(), Some(7));
+        finish(&player.shared, &mut session, &mut worker);
+        assert_eq!(events_of(&player), vec![PlayerEvent::LoadFailed { token: 7 }]);
+        // A seek of an item that plays has no load to answer.
+        worker.await_seek(3., 10);
+        assert_eq!(worker.pending.as_ref().unwrap().load_token(), None);
+    }
+
+    /// Only the error of a file that ended ends the item. The wrapper
+    /// gives an error also for a log line of mpv that is not UTF-8, and
+    /// that ended the playback with "Playback failed".
+    #[test]
+    fn an_event_that_cannot_be_read_does_not_end_the_item() {
+        assert_eq!(end_error(&libmpv2::Error::InvalidUtf8), None);
+        assert_eq!(end_error(&libmpv2::Error::Null), None);
+        assert!(end_error(&libmpv2::Error::Raw(sys::mpv_error_MPV_ERROR_LOADING_FAILED)).is_some());
+    }
+
+    /// A subtitle file is fetched once: a choice of it while it is on its
+    /// way marks it to be shown and starts no second fetch (which wrote
+    /// the same file again, under mpv). The "Loading…" mark is of one
+    /// load: the file of the load before does not clear the mark of the
+    /// same index in the load that replaced it.
+    #[test]
+    fn a_subtitle_file_on_its_way_is_not_fetched_again() {
+        let file = |index: i64, select: bool, graphical: bool| SubtitleFile {
+            index,
+            url: String::new(),
+            title: String::new(),
+            lang: String::new(),
+            select,
+            graphical,
+        };
+        let indexes = |files: Vec<SubtitleFile>| files.iter().map(|f| f.index).collect::<Vec<_>>();
+        let mut fetching = Vec::new();
+        // At the start: the text file, and no image track that is not shown.
+        assert_eq!(indexes(wanted_files(&mut fetching, 1, vec![file(2, false, false), file(3, false, true)])), vec![2]);
+        // The text file is chosen while on its way, twice; the image track once.
+        assert_eq!(indexes(wanted_files(&mut fetching, 1, vec![file(2, true, false)])), Vec::<i64>::new());
+        assert_eq!(indexes(wanted_files(&mut fetching, 1, vec![file(2, true, false)])), Vec::<i64>::new());
+        assert_eq!(indexes(wanted_files(&mut fetching, 1, vec![file(3, true, true)])), vec![3]);
+        assert_eq!(fetch_over(&mut fetching, 1, 2), Some(true), "the choice made on the way was lost");
+        // Once it is over it can be fetched again (it failed, and is chosen again).
+        assert_eq!(indexes(wanted_files(&mut fetching, 1, vec![file(2, true, false)])), vec![2]);
+        // The next load starts with a clean list, and the fetch of the old one finds nothing.
+        assert_eq!(indexes(wanted_files(&mut fetching, 2, vec![file(3, false, false)])), vec![3]);
+        assert_eq!(fetch_over(&mut fetching, 1, 3), None);
+        assert_eq!(fetch_over(&mut fetching, 2, 3), Some(false));
+
+        let player = Player::default();
+        let old = player.prepare("Item", 0., false);
+        let new = player.prepare("Item again", 0., false);
+        set_pending(&player.shared, new, 2, true);
+        set_pending(&player.shared, old, 2, false);
+        assert_eq!(player.status().pending_subs, vec![2], "the file of the load before cleared the mark");
+        set_pending(&player.shared, new, 2, false);
+        assert!(player.status().pending_subs.is_empty());
+    }
+
+    /// The quit of the app with an item in the player: the server hears
+    /// of the stop before the worker is gone. Before, the worker ended
+    /// with no report, and the server kept the session as playing.
+    #[test]
+    fn a_quit_reports_the_stop_of_the_item() {
+        use std::io::{Read, Write};
+        let Some(_one) = real_player_turn() else { return };
+        if crate::jellyfin::no_report() {
+            eprintln!("\nSKIPPED (BLOOM_NO_REPORT is set): a_quit_reports_the_stop_of_the_item");
+            return;
+        }
+        let Some(media) = silent_clip("bloom-quit-report-test.mp4") else { return };
+        // A server that takes every report and keeps its first line.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        {
+            let seen = seen.clone();
+            thread::spawn(move || {
+                for mut socket in listener.incoming().flatten() {
+                    let _ = socket.set_read_timeout(Some(Duration::from_secs(3)));
+                    let mut buffer = [0u8; 4096];
+                    let n = socket.read(&mut buffer).unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buffer[..n]);
+                    seen.lock().unwrap().push(head.lines().next().unwrap_or_default().to_string());
+                    let _ = socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                }
+            });
+        }
+        let player = Player::default();
+        let closer = Closer(player.clone());
+        player.set_target_size(320, 240);
+        player.set_muted(true);
+        let mut request = request(&media.display().to_string(), "Quit", 101);
+        request.client = Client::new(&format!("http://127.0.0.1:{port}"), "device-1").with_session("token", "user");
+        player.play(request);
+        expect(&player, "loaded", |e| *e == PlayerEvent::Loaded { token: 101 });
+        // The quit: the worker is gone when this returns.
+        drop(closer);
+        assert!(player.commands.lock().unwrap().is_none(), "the worker did not end");
+        let seen = seen.lock().unwrap().clone();
+        assert!(seen.iter().any(|line| line.starts_with("POST /Sessions/Playing/Stopped")), "no stop report at the quit: {seen:?}");
+        assert_eq!(player.status().state, PlayState::Ended);
+    }
+
+    /// The same file chosen twice while it comes, at a server that takes
+    /// its time: one request, one track, and the track is shown.
+    #[test]
+    fn a_file_chosen_twice_while_it_comes_is_one_track() {
+        let Some(_one) = real_player_turn() else { return };
+        let Some(clip) = silent_clip("bloom-test-chosen-twice.mp4") else { return };
+        const DELAY: Duration = Duration::from_secs(2);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(AtomicU32::new(0));
+        {
+            let requests = requests.clone();
+            thread::spawn(move || {
+                for mut stream in listener.incoming().flatten() {
+                    requests.fetch_add(1, Ordering::Relaxed);
+                    thread::spawn(move || {
+                        let mut request = [0u8; 4096];
+                        let _ = std::io::Read::read(&mut stream, &mut request);
+                        thread::sleep(DELAY);
+                        let body = "1\n00:00:00,000 --> 00:00:30,000\ntwice\n";
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = std::io::Write::write_all(&mut stream, format!("{head}{body}").as_bytes());
+                    });
+                }
+            });
+        }
+        let file = |select: bool| SubtitleFile {
+            index: 2,
+            url: format!("http://127.0.0.1:{port}/Subtitles/2/0/Stream.srt"),
+            title: "twice".into(),
+            lang: "eng".into(),
+            select,
+            graphical: false,
+        };
+        let player = Player::default();
+        let _closer = Closer(player.clone());
+        let mut request = request(&clip.to_string_lossy(), "chosen twice", 1);
+        request.subtitles = vec![file(false)];
+        player.play(request);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !player.status().pending_subs.contains(&2) {
+            assert!(Instant::now() < deadline, "the file was never on its way: {:?}", player.status());
+            thread::sleep(Duration::from_millis(20));
+        }
+        player.fetch_subtitle_file(file(true));
+        player.fetch_subtitle_file(file(true));
+        let deadline = Instant::now() + DELAY + Duration::from_secs(10);
+        let of_file = |status: &PlayerStatus| {
+            status.tracks.iter().filter(|t| t.kind == "sub" && t.title.as_deref() == Some("twice")).cloned().collect::<Vec<_>>()
+        };
+        while of_file(&player.status()).is_empty() {
+            assert!(Instant::now() < deadline, "the subtitle never came: {:?}", player.status());
+            thread::sleep(Duration::from_millis(50));
+        }
+        // A second fetch would come within its own delay.
+        thread::sleep(DELAY + Duration::from_millis(500));
+        let status = player.status();
+        let tracks = of_file(&status);
+        assert_eq!(requests.load(Ordering::Relaxed), 1, "the file was asked for more than once");
+        assert_eq!(tracks.len(), 1, "{tracks:?}");
+        assert!(tracks[0].selected, "the choice made while the file came was lost: {tracks:?}");
+        assert!(status.pending_subs.is_empty(), "{status:?}");
+        player.stop();
     }
 }

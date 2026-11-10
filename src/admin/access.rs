@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! What one user may do: the library access and the rights of the policy of
 //! the user. The editor is a page inside the Users section. It keeps two
-//! copies of the policy, as the server gave it and as the user edits it, and
-//! shows the Save bar while the two differ (as the configuration pages do).
+//! copies of the policy, as the server gave it and as the user edits it (a
+//! [`Draft`]), and shows the Save bar while the two differ (as the
+//! configuration pages do).
 //! A save reads the policy from the server again, changes only the keys the
 //! user edited, and sends the whole object back.
 
@@ -17,14 +18,16 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use super::{
-    ButtonKind, Confirm, Field as Form, Prompt, badge, button,
-    config::value_button,
+    Ask, ButtonKind, Confirm, Draft, badge, button, choice_box,
+    config::{bar_room, bar_shell, unsaved_text, value_button},
+    load_note, sub_page,
     users::{User, action, avatar},
+    with_changes,
 };
 use crate::{
     app::{Bloom, Page},
-    settings::{Choice, checkbox, field, group, select},
-    ui::{glass::glass, theme::UiTheme},
+    settings::{checkbox, field, group},
+    ui::theme::UiTheme,
     views::cards::icon,
 };
 
@@ -155,14 +158,11 @@ pub struct Editor {
     /// The signed-in account.
     pub me: bool,
     pub loading: bool,
-    pub saving: bool,
     pub error: Option<String>,
     /// Libraries of the server: id and name.
     pub folders: Vec<(String, String)>,
-    /// The policy as the server gave it.
-    pub original: Value,
-    /// The policy with the edits of the user.
-    pub edited: Value,
+    /// The policy as the server gave it, and with the edits of the user.
+    pub draft: Draft,
 }
 
 /// A folder id without dashes and in lower case, so two spellings compare.
@@ -204,31 +204,37 @@ pub fn changed_keys(original: &Value, edited: &Value) -> Vec<String> {
 }
 
 /// The policy to send: the policy of the server now, with the keys the user
-/// edited (and only those) taken from `edited`. A key in `locked` never
-/// changes. A key the app does not know stays as the server has it.
+/// edited (and only those) taken from `edited` (`with_changes`). A key in
+/// `locked` never changes. A key the app does not know stays as the server
+/// has it.
 pub fn merge_policy(fresh: &Value, original: &Value, edited: &Value, locked: &[&str]) -> Value {
-    let mut policy = fresh.clone();
-    if let Some(object) = policy.as_object_mut() {
-        for key in changed_keys(original, edited) {
-            if locked.contains(&key.as_str()) {
-                continue;
-            }
-            match edited.get(&key) {
-                Some(value) => object.insert(key, value.clone()),
-                None => object.remove(&key),
+    let mut edited = edited.clone();
+    if let Some(object) = edited.as_object_mut() {
+        for key in locked {
+            match original.get(*key) {
+                Some(value) => object.insert(key.to_string(), value.clone()),
+                None => object.remove(*key),
             };
         }
     }
-    policy
+    with_changes(fresh, original, &edited)
 }
 
 impl Editor {
     pub fn changes(&self) -> Vec<String> {
-        changed_keys(&self.original, &self.edited)
+        changed_keys(&self.draft.original, &self.draft.edited)
     }
 
+    /// True when a key differs; the page asks at each frame, so this makes
+    /// no list of the keys.
     pub fn dirty(&self) -> bool {
-        !self.changes().is_empty()
+        let (original, edited) = (&self.draft.original, &self.draft.edited);
+        original
+            .as_object()
+            .into_iter()
+            .chain(edited.as_object())
+            .flat_map(|object| object.keys())
+            .any(|key| !same(key, original, edited))
     }
 
     /// Edits shown to the user: the two library keys count as one.
@@ -239,7 +245,7 @@ impl Editor {
     }
 
     fn flag(&self, key: &str) -> bool {
-        self.edited.get(key).and_then(Value::as_bool).unwrap_or(false)
+        self.draft.edited.get(key).and_then(Value::as_bool).unwrap_or(false)
     }
 
     /// Keys the user cannot change here, with the reason.
@@ -270,8 +276,7 @@ fn number_text(row: &Row, raw: i64) -> String {
     let Kind::Number { unit, scale, .. } = row.kind else {
         return raw.to_string();
     };
-    let value = raw as f64 / scale;
-    let typed = if value.fract() == 0. { format!("{value:.0}") } else { value.to_string() };
+    let typed = typed_number(raw, scale);
     match (row.key, raw) {
         ("RemoteClientBitrateLimit" | "MaxActiveSessions", 0) => "No limit".to_string(),
         ("LoginAttemptsBeforeLockout", -1) => "Never".to_string(),
@@ -280,18 +285,17 @@ fn number_text(row: &Row, raw: i64) -> String {
     }
 }
 
+/// A number of the policy as the form shows it, in the unit of the page.
+fn typed_number(raw: i64, scale: f64) -> String {
+    (raw as f64 / scale).to_string()
+}
+
 /// The number a text stands for, in the units of the policy.
 fn parse_number(row: &Row, text: &str) -> Result<i64> {
     let Kind::Number { scale, min, .. } = row.kind else {
         bail!("{} is not a number", row.key);
     };
-    // "nan" and "inf" parse as numbers; neither is one for a setting.
-    let value: f64 = text
-        .trim()
-        .parse()
-        .ok()
-        .filter(|value: &f64| value.is_finite())
-        .ok_or_else(|| anyhow::anyhow!("{text:?} is not a number"))?;
+    let value = super::parse_number(text).ok_or_else(|| anyhow::anyhow!("{text:?} is not a number"))?;
     let raw = (value * scale).round() as i64;
     if raw < min {
         bail!("the lowest value is {}", min as f64 / scale);
@@ -300,26 +304,24 @@ fn parse_number(row: &Row, text: &str) -> Result<i64> {
 }
 
 fn parse_flag(text: &str) -> Result<bool> {
-    match text.trim().to_lowercase().as_str() {
-        "true" | "on" | "yes" | "1" => Ok(true),
-        "false" | "off" | "no" | "0" => Ok(false),
-        other => bail!("{other:?} is not true or false"),
-    }
+    super::parse_flag(text).ok_or_else(|| anyhow::anyhow!("{:?} is not true or false", text.trim()))
 }
 
 impl Bloom {
     fn access(&self) -> Option<&Editor> {
-        match &self.page {
-            Page::Admin(admin) => admin.access.as_ref(),
-            _ => None,
-        }
+        self.admin_data()?.access.as_ref()
     }
 
     fn access_mut(&mut self) -> Option<&mut Editor> {
-        match &mut self.page {
-            Page::Admin(admin) => admin.access.as_mut(),
-            _ => None,
-        }
+        self.admin_data_mut()?.access.as_mut()
+    }
+
+    /// The editor of a user that waits for an answer, also on a page the
+    /// user left meanwhile (Back returns to it).
+    fn access_waiting(&mut self, id: &str, waits: fn(&Editor) -> bool) -> Option<&mut Editor> {
+        self.admin_pages_mut()
+            .filter_map(|admin| admin.access.as_mut())
+            .find(|editor| editor.user_id == id && waits(editor))
     }
 
     /// Opens the editor of a user and reads the policy from the server.
@@ -333,11 +335,9 @@ impl Bloom {
             image: user.image_url(&session.client),
             me: user.id == session.user_id,
             loading: true,
-            saving: false,
             error: None,
             folders: Vec::new(),
-            original: Value::Null,
-            edited: Value::Null,
+            draft: Draft::default(),
         };
         let id = user.id.clone();
         if let Page::Admin(admin) = &mut self.page {
@@ -374,14 +374,11 @@ impl Bloom {
                 }
             },
             move |this, result, cx| {
-                if let Some(editor) = this.access_mut()
-                    && editor.user_id == id
-                {
+                if let Some(editor) = this.access_waiting(&id, |editor| editor.loading) {
                     editor.loading = false;
                     match result {
                         Ok((policy, folders)) => {
-                            editor.original = policy.clone();
-                            editor.edited = policy;
+                            editor.draft = Draft::new(policy);
                             editor.folders = folders;
                         }
                         Err(err) => editor.error = Some(format!("{err:#}")),
@@ -395,20 +392,11 @@ impl Bloom {
     /// Opens the editor of the user with this name, from the Users page. For
     /// the debug channel.
     pub fn access_open_named(&mut self, name: &str, cx: &mut Context<Self>) -> bool {
-        let Page::Admin(admin) = &self.page else {
-            return false;
-        };
-        let user = admin
-            .users
-            .as_ref()
-            .and_then(|data| data.users.iter().find(|user| user.name == name).cloned());
-        match user {
-            Some(user) => {
-                self.access_open(&user, cx);
-                true
-            }
-            None => false,
+        let user = super::users::user_named(self, name);
+        if let Some(user) = &user {
+            self.access_open(user, cx);
         }
+        user.is_some()
     }
 
     /// Leaves the editor. Edits that are not saved need a yes first.
@@ -430,7 +418,7 @@ impl Bloom {
     }
 
     fn access_leave(&mut self, cx: &mut Context<Self>) {
-        if let Page::Admin(admin) = &mut self.page {
+        if let Some(admin) = self.admin_data_mut() {
             admin.access = None;
         }
         cx.notify();
@@ -438,14 +426,14 @@ impl Bloom {
 
     pub fn access_discard(&mut self, cx: &mut Context<Self>) {
         if let Some(editor) = self.access_mut() {
-            editor.edited = editor.original.clone();
+            editor.draft.discard();
         }
         cx.notify();
     }
 
     fn access_put(&mut self, key: &str, value: Value, cx: &mut Context<Self>) {
         if let Some(editor) = self.access_mut()
-            && let Some(object) = editor.edited.as_object_mut()
+            && let Some(object) = editor.draft.edited.as_object_mut()
         {
             object.insert(key.to_string(), value);
         }
@@ -511,6 +499,7 @@ impl Bloom {
             return;
         };
         let mut chosen: Vec<String> = editor
+            .draft
             .edited
             .get(FOLDERS)
             .and_then(Value::as_array)
@@ -577,44 +566,42 @@ impl Bloom {
 
     /// The form of a number key.
     fn access_ask_number(&mut self, row: &'static Row, current: String, cx: &mut Context<Self>) {
-        let prompt = Prompt {
+        let ask = Ask {
             title: row.label.to_string(),
             message: row.help.to_string(),
-            action: "Set".to_string(),
-            fields: vec![Form {
-                label: match row.kind {
-                    Kind::Number { unit, .. } if !unit.is_empty() => format!("Value in {unit}"),
-                    _ => "Value".to_string(),
-                },
-                placeholder: "A number".to_string(),
-                value: current,
-                masked: false,
-                required: true,
-            }],
-            run: Rc::new(move |this, values, cx| {
-                let text = values.into_iter().next().unwrap_or_default();
-                if let Err(err) = this.access_set(row.key, &text, cx) {
-                    this.toast("This value does not fit", format!("{err:#}"), cx);
-                }
-            }),
+            label: match row.kind {
+                Kind::Number { unit, .. } if !unit.is_empty() => format!("Value in {unit}"),
+                _ => "Value".to_string(),
+            },
+            placeholder: "A number".to_string(),
+            value: current,
+            required: true,
+            ..Ask::default()
         };
-        self.ask_prompt(prompt, cx);
+        self.ask_value(ask, cx, move |this, text, cx| {
+            if let Err(err) = this.access_set(row.key, text, cx) {
+                this.toast("This value does not fit", format!("{err:#}"), cx);
+            }
+        });
     }
 
     /// Sends the edits. The policy is read again first, so a change that
     /// somebody else made to a key the user did not edit stays.
     pub fn access_save(&mut self, cx: &mut Context<Self>) {
+        if self.session.is_none() {
+            return;
+        }
         let Some(editor) = self.access_mut() else {
             return;
         };
-        if editor.saving || editor.loading || !editor.dirty() {
+        if editor.draft.saving || editor.loading || !editor.dirty() {
             return;
         }
-        editor.saving = true;
-        let (id, original, edited) = (editor.user_id.clone(), editor.original.clone(), editor.edited.clone());
+        editor.draft.saving = true;
+        let (id, sent) = (editor.user_id.clone(), editor.draft.clone());
         let locked = editor.locked_keys();
         cx.notify();
-        let work_id = id.clone();
+        let (work_id, edits) = (id.clone(), sent.edited.clone());
         self.fetch(
             cx,
             move |client| -> Result<Value> {
@@ -627,7 +614,7 @@ impl Bloom {
                         bail!("the policy of the server has no {key}");
                     }
                 }
-                let policy = merge_policy(&fresh, &original, &edited, &locked);
+                let policy = merge_policy(&fresh, &sent.original, &sent.edited, &locked);
                 client.post(&format!("{path}/Policy"), &policy)?;
                 let user: Value = client.get(&path, &[])?;
                 Ok(user.get("Policy").cloned().unwrap_or(Value::Null))
@@ -637,13 +624,12 @@ impl Bloom {
                     Ok(_) => this.toast("Access saved", "", cx),
                     Err(err) => this.toast("The server refused the change", format!("{err:#}"), cx),
                 }
-                if let Some(editor) = this.access_mut()
-                    && editor.user_id == id
-                {
-                    editor.saving = false;
-                    if let Ok(policy) = result {
-                        editor.original = policy.clone();
-                        editor.edited = policy;
+                if let Some(editor) = this.access_waiting(&id, |editor| editor.draft.saving) {
+                    match result {
+                        // What the user changed while the save was on its
+                        // way stays an edit (`Draft::saved`).
+                        Ok(policy) => editor.draft.saved(policy, &edits),
+                        Err(_) => editor.draft.saving = false,
                     }
                 }
                 // The Users page behind shows the new badges.
@@ -664,7 +650,7 @@ impl Bloom {
             .changes()
             .into_iter()
             .map(|key| {
-                let value = editor.edited.get(&key).cloned().unwrap_or(Value::Null);
+                let value = editor.draft.edited.get(&key).cloned().unwrap_or(Value::Null);
                 let shown = match (key.as_str(), &value) {
                     (FOLDERS, Value::Array(items)) => format!(
                         "[{}]",
@@ -680,7 +666,7 @@ impl Bloom {
             editor.name,
             editor.me,
             editor.loading,
-            editor.saving,
+            editor.draft.saving,
             editor.error,
             if editor.dirty() { "yes" } else { "no" },
             editor.change_count(),
@@ -737,38 +723,15 @@ impl Bloom {
         if !editor.dirty() || !matches!(&self.page, Page::Admin(admin) if admin.section == super::Section::Users) {
             return None;
         }
-        let t = UiTheme::read(cx).clone();
-        let text = match (editor.saving, editor.change_count()) {
-            (true, _) => "Saving…".to_string(),
-            (_, 1) => "1 change is not saved.".to_string(),
-            (_, n) => format!("{n} changes are not saved."),
-        };
-        let (left, right, bottom) = self.admin_bar_edges();
-        Some(
-            div()
-                .absolute()
-                .left(px(left))
-                .right(px(right))
-                .bottom(px(bottom))
-                .h(px(64.))
-                .rounded(px(24.))
-                .border_1()
-                .border_color(rgba(0xf5f5f733))
-                .child(glass(px(24.), crate::ui::glass::POPUP_TINT))
-                .px(px(20.))
-                .flex()
-                .items_center()
-                .gap(px(10.))
-                .child(div().flex_1().text_size(px(15.)).text_color(t.colors.foreground).child(text))
-                .child(
-                    button("access.discard", "Discard", ButtonKind::Plain, cx)
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.access_discard(cx))),
-                )
-                .child(
-                    button("access.save", "Save", ButtonKind::Primary, cx)
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.access_save(cx))),
-                ),
-        )
+        Some(bar_shell(
+            self.admin_bar_edges(),
+            unsaved_text(editor.change_count(), editor.draft.saving),
+            button("access.discard", "Discard", ButtonKind::Plain, cx)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.access_discard(cx))),
+            button("access.save", "Save", ButtonKind::Primary, cx)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.access_save(cx))),
+            cx,
+        ))
     }
 }
 
@@ -781,21 +744,14 @@ fn lockable(control: Stateful<Div>, locked: bool) -> Stateful<Div> {
 
 pub fn render(editor: &Editor, cx: &mut Context<Bloom>) -> Div {
     let t = UiTheme::read(cx).clone();
-    let mut page = div().max_w(px(920.)).flex().flex_col().gap(px(18.));
-
-    let mut badges = div().flex().gap(px(6.));
-    if editor.me {
-        badges = badges.child(badge("You", rgba(0xffffff2e)));
-    }
-    page = page.child(
+    let mut page = sub_page(
+        action("access.back", LucideIcon::ArrowLeft, "Users", false, cx)
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.access_close(cx))),
         div()
+            .min_w_0()
             .flex()
             .items_center()
             .gap(px(14.))
-            .child(
-                action("access.back", LucideIcon::ArrowLeft, "Users", false, cx)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.access_close(cx))),
-            )
             .child(avatar(&editor.name, editor.image.clone(), 40.))
             .child(
                 div()
@@ -806,20 +762,15 @@ pub fn render(editor: &Editor, cx: &mut Context<Bloom>) -> Div {
                     .text_color(t.colors.foreground)
                     .child(format!("Access of {}", editor.name)),
             )
-            .child(badges),
+            .children(editor.me.then(|| badge("You", rgba(0xffffff2e)))),
     );
-
-    if editor.loading || editor.error.is_some() {
-        return page.child(
-            div()
-                .py(px(30.))
-                .text_size(px(15.))
-                .text_color(t.colors.muted_foreground)
-                .child(match &editor.error {
-                    Some(error) => format!("Could not read the policy of this user: {error}"),
-                    None => "Loading…".to_string(),
-                }),
-        );
+    if let Some(note) = load_note(
+        editor.loading,
+        editor.error.as_deref(),
+        "Could not read the policy of this user",
+        cx,
+    ) {
+        return page.child(note);
     }
 
     // Account, then libraries, then the rest.
@@ -828,49 +779,29 @@ pub fn render(editor: &Editor, cx: &mut Context<Bloom>) -> Div {
     for (title, list) in REST {
         page = page.child(rows_card(title, list, editor, cx));
     }
-    page.child(div().h(px(if editor.dirty() { 72. } else { 0. })))
+    page.child(bar_room(editor.dirty()))
 }
 
 fn rows_card(title: &'static str, list: &'static [Row], editor: &Editor, cx: &mut Context<Bloom>) -> Div {
     let mut card = group(title, cx);
     for row in list {
         let id = SharedString::from(format!("access.{}", row.key));
-        let value = editor.edited.get(row.key).cloned().unwrap_or(Value::Null);
+        let value = editor.draft.edited.get(row.key).unwrap_or(&Value::Null);
         let locked = editor.locked(row.key);
         let key = row.key;
         let control: Stateful<Div> = match row.kind {
             Kind::Flag => lockable(checkbox(id, value.as_bool().unwrap_or(false), cx), locked.is_some())
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.access_toggle(key, cx))),
             Kind::Choice(options) => {
-                let current = value.as_str().unwrap_or("").to_string();
-                let shown = options
-                    .iter()
-                    .find(|(option, _)| *option == current)
-                    .map_or_else(|| current.clone(), |(_, label)| label.to_string());
-                let longest = options.iter().map(|(_, label)| *label).max_by_key(|l| l.len()).unwrap_or_default();
-                select(id, shown, longest, cx).on_click(cx.listener(
-                    move |this, event: &ClickEvent, window, cx| {
-                        let choices = options
-                            .iter()
-                            .map(|(option, label)| {
-                                let option = *option;
-                                Choice::new(*label, option == current, move |this, cx| {
-                                    this.access_put(key, json!(option), cx)
-                                })
-                            })
-                            .collect();
-                        this.open_choices(choices, event.position(), window, cx);
-                    },
-                ))
+                let options = options.iter().map(|(option, label)| (json!(option), SharedString::new_static(*label))).collect();
+                choice_box(id, options, json!(value.as_str().unwrap_or("")), cx, move |this, option, cx| {
+                    this.access_put(key, option.clone(), cx)
+                })
             }
             Kind::Number { scale, .. } => {
                 let raw = value.as_i64().unwrap_or(0);
-                let typed = {
-                    let n = raw as f64 / scale;
-                    if n.fract() == 0. { format!("{n:.0}") } else { n.to_string() }
-                };
                 value_button(id, number_text(row, raw), cx).on_click(cx.listener(
-                    move |this, _: &ClickEvent, _, cx| this.access_ask_number(row, typed.clone(), cx),
+                    move |this, _: &ClickEvent, _, cx| this.access_ask_number(row, typed_number(raw, scale), cx),
                 ))
             }
         };
@@ -892,7 +823,7 @@ fn libraries_card(editor: &Editor, cx: &mut Context<Bloom>) -> Div {
     if all {
         return card;
     }
-    let chosen = ids(editor.edited.get(FOLDERS).unwrap_or(&Value::Null));
+    let chosen = ids(editor.draft.edited.get(FOLDERS).unwrap_or(&Value::Null));
     for (n, (id, name)) in editor.folders.iter().enumerate() {
         let on = chosen.contains(&plain_id(id));
         let id = id.clone();
@@ -1007,5 +938,105 @@ mod tests {
         keys.sort();
         keys.dedup();
         assert_eq!(keys.len(), count);
+    }
+}
+
+/// Answers that come while the user does something else. See
+/// `app::race_harness`.
+#[cfg(test)]
+mod race_tests {
+    use std::sync::Mutex;
+
+    use gpui_kit::{Entity, TestAppContext, VisualTestContext};
+    use serde_json::{Value, json};
+
+    use super::{Bloom, Page};
+    use crate::{
+        admin::{AdminData, Section, users::User},
+        app::{Screen, race_harness::{MockServer, app, plain, session}},
+    };
+
+    /// A server with the user u9. A POST of the policy changes what the
+    /// next GET answers.
+    fn server() -> MockServer {
+        let policy = Mutex::new(json!({
+            "IsHidden": false,
+            "EnableContentDeletion": false,
+            "AuthenticationProviderId": "Default",
+            "PasswordResetProviderId": "Reset",
+        }));
+        MockServer::start(move |method, path, body| match (method, path) {
+            ("GET", "/Users/u9") => {
+                let policy = policy.lock().expect("policy").clone();
+                (200, json!({ "Id": "u9", "Name": "jellyui-test-nine", "Policy": policy }).to_string())
+            }
+            ("POST", "/Users/u9/Policy") => {
+                *policy.lock().expect("policy") = serde_json::from_str(body).unwrap_or(Value::Null);
+                (204, String::new())
+            }
+            _ => plain(method, path),
+        })
+    }
+
+    /// The Users section with the access editor of u9 open and loaded.
+    fn editor_open<'a>(server: &MockServer, cx: &'a mut TestAppContext) -> (Entity<Bloom>, &'a mut VisualTestContext) {
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            this.session = Some(session(&server.url, "u1"));
+            this.screen = Screen::Main;
+            let mut admin = AdminData::new(Section::Users);
+            admin.loading = false;
+            this.page = Page::Admin(admin);
+            let user: User = serde_json::from_value(json!({ "Id": "u9", "Name": "jellyui-test-nine" })).expect("user");
+            this.access_open(&user, cx);
+        });
+        cx.run_until_parked();
+        (bloom, cx)
+    }
+
+    /// A right changed while the save is on its way stays an edit: the
+    /// answer of the save put the policy of the server over it.
+    #[gpui_kit::test]
+    fn an_edit_during_the_save_survives_the_answer(cx: &mut TestAppContext) {
+        let server = server();
+        let (bloom, cx) = editor_open(&server, cx);
+        bloom.update(cx, |this, cx| {
+            this.access_set("IsHidden", "true", cx).expect("set");
+            this.access_save(cx);
+            // The user goes on while the save is on its way.
+            this.access_set("EnableContentDeletion", "true", cx).expect("set");
+        });
+        cx.run_until_parked();
+        assert_eq!(server.count("POST", "/Users/u9/Policy"), 1);
+        bloom.read_with(cx, |this, _| {
+            let editor = this.access().expect("the editor is open");
+            assert_eq!(editor.draft.original["IsHidden"], json!(true), "the baseline is not what the server holds");
+            assert_eq!(editor.draft.original["EnableContentDeletion"], json!(false));
+            assert_eq!(editor.draft.edited["EnableContentDeletion"], json!(true), "the edit after the save went out is gone");
+            assert!(editor.dirty() && !editor.draft.saving);
+        });
+    }
+
+    /// The user leaves the dashboard before the answer of the save comes,
+    /// and returns with Back: the editor is not left at "Saving…".
+    #[gpui_kit::test]
+    fn a_save_answered_on_another_page_unlocks_the_editor(cx: &mut TestAppContext) {
+        let server = server();
+        let (bloom, cx) = editor_open(&server, cx);
+        bloom.update(cx, |this, cx| {
+            this.access_set("IsHidden", "true", cx).expect("set");
+            this.access_save(cx);
+            this.navigate(Page::Downloads, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(server.count("POST", "/Users/u9/Policy"), 1);
+        bloom.update(cx, |this, cx| this.back(cx));
+        cx.run_until_parked();
+        bloom.read_with(cx, |this, _| {
+            let editor = this.access().expect("the editor is open");
+            assert!(!editor.draft.saving, "the editor still says it saves");
+            assert_eq!(editor.draft.original["IsHidden"], json!(true));
+            assert!(!editor.dirty());
+        });
     }
 }

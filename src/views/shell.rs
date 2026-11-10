@@ -13,6 +13,7 @@ use gpui_kit::{
 use crate::ui::motion::{Enter, enter};
 use crate::{
     app::{Bloom, Page, Panel},
+    icons::{Filled, filled},
     jellyfin::ItemKind,
     ui::{
         button::{Button, ButtonSize, ButtonVariant},
@@ -21,7 +22,7 @@ use crate::{
         theme::UiTheme,
         tip::tip,
     },
-    views::cards::icon,
+    views::{cards::icon, parts::initial},
 };
 
 /// Icon of a top bar tab.
@@ -157,6 +158,18 @@ pub fn safe_insets() -> (f32, f32, f32, f32) {
     }
 }
 
+/// The glyph of a library, by the kind of its content.
+fn library_glyph(view: &crate::jellyfin::Item) -> LucideIcon {
+    match view.collection_type.as_deref() {
+        Some("movies") => LucideIcon::Clapperboard,
+        Some("tvshows") => LucideIcon::Tv,
+        Some("music") => LucideIcon::Music,
+        Some("homevideos") | Some("photos") => LucideIcon::Image,
+        Some("boxsets") => LucideIcon::GalleryVerticalEnd,
+        _ => LucideIcon::Folder,
+    }
+}
+
 /// Height of the tab bar of a compact window, and the room the page
 /// keeps under it: the bar floats 10 px over the bottom inset.
 pub const TABBAR_H: f32 = 62.;
@@ -200,10 +213,11 @@ impl Bloom {
             Page::Playlist(d) => format!("page.playlist.{}", d.list.id),
             Page::Downloads => "page.downloads".to_string(),
         });
+        let compact = compact(window);
         let page = enter(
             div().size_full().child(page),
             page_key,
-            if !compact(window) {
+            if !compact {
                 Enter::Lift
             } else if self.nav_back {
                 Enter::Fade
@@ -216,7 +230,6 @@ impl Bloom {
         // pages start below it.
         let overlay = matches!(self.page, Page::Home(_) | Page::Detail(_));
         let scrolled = f32::from(self.page_scroll.offset().y) < -8.;
-        let compact = compact(window);
         VIEWPORT_W.store(
             f32::from(window.viewport_size().width).to_bits(),
             std::sync::atomic::Ordering::Relaxed,
@@ -267,7 +280,10 @@ impl Bloom {
                             .top_0()
                             .left_0()
                             .right_0()
-                            .when(overlay && !scrolled, |el| {
+                            // A shade keeps the bar readable over the artwork.
+                            // A phone: the bar turns to glass instead once
+                            // the page scrolls under it, as the bars of iOS do.
+                            .when(overlay && !(scrolled && compact), |el| {
                                 el.bg(linear_gradient(
                                     180.,
                                     linear_color_stop(gpui_kit::black().alpha(0.55), 0.0),
@@ -275,15 +291,7 @@ impl Bloom {
                                 ))
                             })
                             // Content scrolls under the bar; fade it out there.
-                            .when(overlay && scrolled && !compact, |el| {
-                                el.pb(px(28.)).bg(linear_gradient(
-                                    180.,
-                                    linear_color_stop(gpui_kit::black().alpha(0.55), 0.0),
-                                    linear_color_stop(gpui_kit::black().alpha(0.0), 1.0),
-                                ))
-                            })
-                            // A phone: the bar turns to glass once the page
-                            // scrolls under it, as the bars of iOS do.
+                            .when(overlay && scrolled && !compact, |el| el.pb(px(28.)))
                             .when(overlay && scrolled && compact, |el| {
                                 el.child(glass(px(0.), crate::ui::glass::POPUP_TINT))
                             })
@@ -322,8 +330,7 @@ impl Bloom {
     /// home, the libraries and search, as the tab bar of an iPhone app.
     /// With two libraries or fewer, favourites has a place too.
     fn render_tabbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = UiTheme::read(cx).clone();
-        let fg = t.colors.foreground;
+        let fg = UiTheme::read(cx).colors.foreground;
         // A page that is no library and has no library behind it lights no
         // tab but its own (search), as the tab bars of iOS do.
         let active = match &self.page {
@@ -376,28 +383,20 @@ impl Bloom {
                 item("tab.home".into(), "Home".into(), LucideIcon::House, is_home)
                     .on_click(cx.listener(|this, _, _, cx| this.open_home(cx))),
             );
-        let libraries: Vec<_> = self.views.iter().take(3).collect();
-        for view in &libraries {
-            let glyph = match view.collection_type.as_deref() {
-                Some("movies") => LucideIcon::Clapperboard,
-                Some("tvshows") => LucideIcon::Tv,
-                Some("music") => LucideIcon::Music,
-                Some("homevideos") | Some("photos") => LucideIcon::Image,
-                Some("boxsets") => LucideIcon::GalleryVerticalEnd,
-                _ => LucideIcon::Folder,
-            };
-            let target = (*view).clone();
+        let libraries = self.views.len().min(3);
+        for view in &self.views[..libraries] {
+            let target = view.id.clone();
             bar = bar.child(
                 item(
                     SharedString::from(format!("tab.lib.{}", view.id)),
                     view.name.clone(),
-                    glyph,
+                    library_glyph(view),
                     active.as_deref() == Some(view.id.as_str()),
                 )
-                .on_click(cx.listener(move |this, _, _, cx| this.open_library(target.clone(), cx))),
+                .on_click(cx.listener(move |this, _, _, cx| this.open_library_tab(&target, cx))),
             );
         }
-        if libraries.len() <= 2 {
+        if libraries <= 2 {
             bar = bar.child(
                 item(
                     "tab.favorites".into(),
@@ -409,15 +408,27 @@ impl Bloom {
             );
         }
         bar.child(
-            item("tab.search".into(), "Search".into(), LucideIcon::Search, is_search).on_click(
-                cx.listener(|this, _, window, cx| {
-                    let query = this.search_input.read(cx).value().to_string();
-                    this.open_search(query, cx);
-                    let focus = this.search_input.read(cx).focus_handle(cx);
-                    window.focus(&focus, cx);
-                }),
-            ),
+            item("tab.search".into(), "Search".into(), LucideIcon::Search, is_search)
+                .on_click(cx.listener(|this, _, window, cx| this.focus_search(window, cx))),
         )
+    }
+
+    /// Opens the search page with the text of its field, and puts the
+    /// keys into the field.
+    fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.search_input.read(cx).value().to_string();
+        self.open_search(query, cx);
+        let focus = self.search_input.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+    }
+
+    /// Opens the library of a tab. The tab keeps the id alone: a tab is
+    /// built again at each frame, and a copy of the library for each is
+    /// work that only a click needs.
+    fn open_library_tab(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(view) = self.views.iter().find(|view| view.id == id).cloned() {
+            self.open_library(view, cx);
+        }
     }
 
     /// A scroll over the page: a two-finger swipe between pages goes back
@@ -507,12 +518,7 @@ impl Bloom {
             // Escape closes an open panel first; the page stays.
             "escape" if self.panel_is(Panel::SyncPlay) || self.panel_is(Panel::Cast) => self.close_popups(None, window, cx),
             "escape" | "backspace" if !self.history.is_empty() => self.back(cx),
-            "/" => {
-                let query = self.search_input.read(cx).value().to_string();
-                self.open_search(query, cx);
-                let focus = self.search_input.read(cx).focus_handle(cx);
-                window.focus(&focus, cx);
-            }
+            "/" => self.focus_search(window, cx),
             "h" if modifiers.shift => self.open_home(cx),
             "r" if !modifiers.modified() => self.open_random(cx),
             "left" if on_hero => self.step_hero(false),
@@ -748,8 +754,8 @@ impl Bloom {
     }
 
     fn render_topbar(&self, scrolled: bool, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = UiTheme::read(cx).clone();
-        let fg = t.colors.foreground;
+        let colors = UiTheme::read(cx).colors;
+        let fg = colors.foreground;
         let active = self.active_tab();
         let is_home = matches!(self.page, Page::Home(_)) && self.history.is_empty();
         let server = self
@@ -762,11 +768,7 @@ impl Bloom {
         // the buttons at the right: the tabs show their glyph alone there.
         let icon_only = self.viewport_w < 900.;
         let tab = move |id: SharedString, label: String, glyph: Glyph, selected: bool| {
-            let color = if selected {
-                t.colors.primary_foreground
-            } else {
-                fg
-            };
+            let color = if selected { colors.primary_foreground } else { fg };
             let logo = matches!(glyph, Glyph::Logo);
             div()
                 .id(id)
@@ -782,7 +784,7 @@ impl Bloom {
                 .text_size(px(13.))
                 .font_weight(gpui_kit::FontWeight::MEDIUM)
                 .text_color(color)
-                .when(selected, |el| el.bg(t.colors.primary))
+                .when(selected, |el| el.bg(colors.primary))
                 .when(!selected, |el| el.hover(|s| s.bg(fg.opacity(0.08))))
                 .child(match glyph {
                     Glyph::Lucide(glyph) => icon(glyph, 16., color),
@@ -820,23 +822,15 @@ impl Bloom {
             .on_click(cx.listener(|this, _, _, cx| this.open_favorites(cx))),
         );
         for view in &self.views {
-            let glyph = match view.collection_type.as_deref() {
-                Some("movies") => LucideIcon::Clapperboard,
-                Some("tvshows") => LucideIcon::Tv,
-                Some("music") => LucideIcon::Music,
-                Some("homevideos") | Some("photos") => LucideIcon::Image,
-                Some("boxsets") => LucideIcon::GalleryVerticalEnd,
-                _ => LucideIcon::Folder,
-            };
-            let target = view.clone();
+            let target = view.id.clone();
             tabs = tabs.child(
                 tab(
                     SharedString::from(format!("nav.lib.{}", view.id)),
                     view.name.clone(),
-                    Glyph::Lucide(glyph),
+                    Glyph::Lucide(library_glyph(view)),
                     active.as_deref() == Some(view.id.as_str()),
                 )
-                .on_click(cx.listener(move |this, _, _, cx| this.open_library(target.clone(), cx))),
+                .on_click(cx.listener(move |this, _, _, cx| this.open_library_tab(&target, cx))),
             );
         }
 
@@ -853,25 +847,23 @@ impl Bloom {
             );
         }
 
-        let round = |id: &'static str, label: &'static str, glyph: LucideIcon| {
+        let round = |id: &'static str, label: &'static str, glyph: gpui_kit::Svg| {
             Button::new(id)
                 .variant(ButtonVariant::Ghost)
                 .size(ButtonSize::Icon)
                 .aria_label(label)
-                .child(icon(glyph, 18., fg))
+                .child(glyph)
         };
+        // A state the button stands for (a device plays, a group is
+        // joined) lights it.
+        let lit = gpui_kit::rgba(0xf5f5f733);
 
         let (name, image) = match &self.session {
             Some(s) => (s.user_name.clone(), s.user_image.clone()),
             None => (String::new(), None),
         };
-        let initial: String = name
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_default();
         let avatar = crate::ui::avatar::Avatar::new("profile.avatar")
-            .fallback(initial)
+            .fallback(initial(&name))
             .aria_label(name)
             .when_some(
                 image.and_then(|url| crate::images::image(&url, cx)),
@@ -879,7 +871,6 @@ impl Bloom {
             );
 
         if compact {
-            let avatar = avatar;
             return div()
                 .relative()
                 .h(px(TOPBAR_H + top_inset()))
@@ -890,7 +881,7 @@ impl Bloom {
                 .items_center()
                 .gap(px(4.))
                 .when(!is_home, |el| {
-                    el.child(round("top.back", "Back", LucideIcon::ArrowLeft).on_click(
+                    el.child(round("top.back", "Back", icon(LucideIcon::ArrowLeft, 18., fg)).on_click(
                         cx.listener(|this, _, _, cx| {
                             if this.admin_back_to_list(cx) || this.settings_back_to_list(cx) {
                                 // The page went back to its list of sections.
@@ -917,7 +908,6 @@ impl Bloom {
                 .children(self.render_downloads_chip(cx))
                 .child(
                     Menu::new(&self.profile_menu, "Account")
-                        .trigger_style_with(|button| button)
                         .trigger(div().id("top.account").child(avatar)),
                 )
                 .into_any_element();
@@ -939,7 +929,7 @@ impl Bloom {
                     .items_center()
                     .when(!is_home, |el| {
                         el.child(
-                            round("top.back", "Back", LucideIcon::ArrowLeft)
+                            round("top.back", "Back", icon(LucideIcon::ArrowLeft, 18., fg))
                                 .tooltip(tip("Back (Esc)"))
                                 .on_click(cx.listener(
                                 |this, _, _, cx| {
@@ -973,12 +963,8 @@ impl Bloom {
                     .when(self.session.is_some(), |el| {
                         let casting = self.cast.active();
                         el.child(
-                            Button::new("top.cast")
-                                .variant(ButtonVariant::Ghost)
-                                .size(ButtonSize::Icon)
-                                .aria_label("Play on")
-                                .child(crate::icons::filled(crate::icons::Filled::Cast, 22., fg))
-                                .when(casting, |el| el.bg(gpui_kit::rgba(0xf5f5f733)))
+                            round("top.cast", "Play on", filled(Filled::Cast, 22., fg))
+                                .when(casting, |el| el.bg(lit))
                                 .tooltip(tip(if casting { "Play on: another device plays" } else { "Play on" }))
                                 .on_click(cx.listener(|this, _, window, cx| this.toggle_cast_panel(window, cx))),
                         )
@@ -986,12 +972,8 @@ impl Bloom {
                     .when(self.sync.allowed() && self.sync.session.is_some(), |el| {
                         let in_group = self.sync.in_group();
                         el.child(
-                            Button::new("top.syncplay")
-                                .variant(ButtonVariant::Ghost)
-                                .size(ButtonSize::Icon)
-                                .aria_label("SyncPlay")
-                                .child(crate::icons::filled(crate::icons::Filled::Groups, 22., fg))
-                                .when(in_group, |el| el.bg(gpui_kit::rgba(0xf5f5f733)))
+                            round("top.syncplay", "SyncPlay", filled(Filled::Groups, 22., fg))
+                                .when(in_group, |el| el.bg(lit))
                                 .tooltip(tip(if in_group {
                                     "SyncPlay: in a group"
                                 } else {
@@ -1001,26 +983,18 @@ impl Bloom {
                         )
                     })
                     .child(
-                        round("top.random", "Random item", LucideIcon::Dices)
+                        round("top.random", "Random item", icon(LucideIcon::Dices, 18., fg))
                             .tooltip(tip("Random item (R)"))
                             .on_click(cx.listener(|this, _, _, cx| this.open_random(cx))),
                     )
                     .child(
-                        round("top.search", "Search", LucideIcon::Search)
+                        round("top.search", "Search", icon(LucideIcon::Search, 18., fg))
                             .tooltip(tip("Search (/)"))
-                            .on_click(cx.listener(
-                            |this, _, window, cx| {
-                                let query = this.search_input.read(cx).value().to_string();
-                                this.open_search(query, cx);
-                                let focus = this.search_input.read(cx).focus_handle(cx);
-                                window.focus(&focus, cx);
-                            },
-                        )),
+                            .on_click(cx.listener(|this, _, window, cx| this.focus_search(window, cx))),
                     )
                     .child(
                         Menu::new(&self.profile_menu, "Account")
                             // The avatar is the whole button; no frame around it.
-                            .trigger_style_with(|button| button)
                             .trigger(div().id("top.account").tooltip(tip("Account")).child(avatar)),
                     ),
             )
@@ -1045,6 +1019,18 @@ impl Bloom {
             .map(|s| s.server_name.clone())
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "The server".to_string())
+    }
+
+    /// The texts of the offline state: why the server does not answer, in
+    /// plain words, and when the app tries again.
+    fn offline_texts(&self) -> (String, String) {
+        let core = &self.connection.core;
+        let reason = core.why.map(crate::connection::plain_words).unwrap_or_default();
+        let next = match core.retry_in(std::time::Instant::now()) {
+            Some(secs) if secs > 0 => format!("Trying again in {secs} s."),
+            _ => "Trying again now…".to_string(),
+        };
+        (reason, next)
     }
 
     /// True when the page has nothing to show because the server does not
@@ -1077,10 +1063,9 @@ impl Bloom {
     /// The offline state as a page: the server, the reason in plain words,
     /// the next try, Retry, and Open Downloads when there are downloads.
     fn render_offline_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        use crate::connection::{State, plain_words};
+        use crate::connection::State;
         use crate::settings::raised;
-        let t = UiTheme::read(cx).clone();
-        let fg = t.colors.foreground;
+        let fg = UiTheme::read(cx).colors.foreground;
         let core = &self.connection.core;
         let server = self.offline_server();
         let checking = core.state == State::Checking;
@@ -1089,13 +1074,10 @@ impl Bloom {
         } else {
             format!("{server} is offline")
         };
-        let mut hint = core.why.map(plain_words).unwrap_or_default();
+        let (mut hint, next) = self.offline_texts();
         if !checking {
             hint.push(' ');
-            hint.push_str(&match core.retry_in(std::time::Instant::now()) {
-                Some(secs) if secs > 0 => format!("Trying again in {secs} s."),
-                _ => "Trying again now…".to_string(),
-            });
+            hint.push_str(&next);
         }
         let mut actions = div().flex().items_center().gap(px(10.));
         if !checking {
@@ -1156,18 +1138,12 @@ impl Bloom {
     /// dot (a state), the server, Retry, and Downloads when there are
     /// downloads. The reason and the next try are in its tooltip.
     pub fn render_offline_chip(&self, cx: &mut Context<Self>) -> Option<gpui_kit::Stateful<gpui_kit::Div>> {
-        use crate::connection::plain_words;
-        let core = &self.connection.core;
-        if !core.is_offline() {
+        if !self.connection.core.is_offline() {
             return None;
         }
         let fg = UiTheme::read(cx).colors.foreground;
         let server = self.offline_server();
-        let next = match core.retry_in(std::time::Instant::now()) {
-            Some(secs) if secs > 0 => format!("Trying again in {secs} s."),
-            _ => "Trying again now…".to_string(),
-        };
-        let reason = core.why.map(plain_words).unwrap_or_default();
+        let (reason, next) = self.offline_texts();
         let action = |id: &'static str, label: &'static str| {
             div()
                 .id(id)

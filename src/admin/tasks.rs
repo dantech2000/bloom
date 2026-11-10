@@ -109,6 +109,10 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The green of a task that works now: a colour is a state, and "running"
+/// is the live one (blue before, which is no state of the dashboard).
+const RUNNING: u32 = 0x7ee787;
+
 /// Colour of the dot for the result of a run.
 fn result_color(status: &str) -> Rgba {
     match status {
@@ -147,7 +151,7 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
             data.groups.len()
         ));
     if running > 0 {
-        summary = summary.child(badge(format!("{running} running"), rgb(0x1565c0)));
+        summary = summary.child(badge(format!("{running} running"), rgb(RUNNING)));
     }
     if failed > 0 {
         summary = summary.child(badge(format!("{failed} failed"), rgb(0xc62828)));
@@ -192,13 +196,19 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
             let content_w = this.admin_content_w();
             let compact = this.compact_w();
             let show_schedule = content_w >= SCHEDULE_MIN_W;
-            shown[range.clone()]
+            // The data is read again here: a task that is gone is left out.
+            let Some((_, list)) = data.groups.get(group) else {
+                return Vec::new();
+            };
+            shown
+                .get(range.clone())
+                .unwrap_or_default()
                 .iter()
                 .zip(range)
-                .map(|(&i, index)| {
-                    let task = &data.groups[group].1[i];
+                .filter_map(|(&i, index)| {
+                    let task = list.get(i)?;
                     let lines = text_lines(task, compact, show_schedule, content_w);
-                    row(task, index, show_schedule, row_h, lines, cx).into_any_element()
+                    Some(row(task, index, show_schedule, row_h, lines, cx).into_any_element())
                 })
                 .collect()
         });
@@ -258,7 +268,8 @@ fn row(
     (name_lines, description_lines): (usize, usize),
     cx: &mut Context<Bloom>,
 ) -> Div {
-    let t = UiTheme::read(cx).clone();
+    // The colours alone: a row is built for every frame of a scroll.
+    let colors = UiTheme::read(cx).colors;
     let busy = task.state != "Idle";
     let progress = (task.current_progress_percentage.unwrap_or(0.) as f32 / 100.)
         .clamp(0., 1.);
@@ -274,7 +285,7 @@ fn row(
                     .flex()
                     .justify_between()
                     .text_size(px(13.))
-                    .text_color(rgb(0x64b5f6))
+                    .text_color(rgb(RUNNING))
                     .child(if task.state == "Cancelling" {
                         "Stopping…"
                     } else {
@@ -293,7 +304,7 @@ fn row(
                             .h_full()
                             .rounded_full()
                             .w(gpui_kit::relative(progress))
-                            .bg(rgb(0x42a5f5)),
+                            .bg(rgb(RUNNING)),
                     ),
             )
     } else {
@@ -308,7 +319,7 @@ fn row(
                         .items_center()
                         .gap(px(8.))
                         .text_size(px(14.))
-                        .text_color(t.colors.foreground.opacity(0.9))
+                        .text_color(colors.foreground.opacity(0.9))
                         .child(
                             div()
                                 .size(px(8.))
@@ -327,7 +338,7 @@ fn row(
                         .pl(px(16.))
                         .truncate()
                         .text_size(px(12.))
-                        .text_color(t.colors.muted_foreground)
+                        .text_color(colors.muted_foreground)
                         .child(
                             match run.error_message.as_deref().filter(|m| !m.is_empty())
                             {
@@ -340,43 +351,28 @@ fn row(
                 ),
             None => div()
                 .text_size(px(14.))
-                .text_color(t.colors.muted_foreground)
+                .text_color(colors.muted_foreground)
                 .child("Never run"),
         }
     };
 
     let schedule = super::triggers::schedule(&task.triggers);
 
+    // Stop for a task that runs, Run for one that does not.
     let id = task.id.clone();
-    let action = if busy {
-        button(
-            SharedString::from(format!("admin.tasks.stop.{}", task.id)),
-            "Stop",
-            ButtonKind::Danger,
-            cx,
-        )
-        .child(icon(LucideIcon::Square, 13., rgb(0xffffff)))
-        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-            let id = id.clone();
-            this.admin_action("Task stopped", cx, move |client| {
-                client.call("DELETE", &format!("/ScheduledTasks/Running/{id}"), &[])
-            })
-        }))
+    let (verb, label, kind, glyph, ink, method, done) = if busy {
+        ("stop", "Stop", ButtonKind::Danger, LucideIcon::Square, rgb(0xffffff), "DELETE", "Task stopped")
     } else {
-        button(
-            SharedString::from(format!("admin.tasks.run.{}", task.id)),
-            "Run",
-            ButtonKind::Plain,
-            cx,
-        )
-        .child(icon(LucideIcon::Play, 13., t.colors.foreground))
+        ("run", "Run", ButtonKind::Plain, LucideIcon::Play, colors.foreground, "POST", "Task started")
+    };
+    let action = button(SharedString::from(format!("admin.tasks.{verb}.{}", task.id)), label, kind, cx)
+        .child(icon(glyph, 13., ink))
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
             let id = id.clone();
-            this.admin_action("Task started", cx, move |client| {
-                client.call("POST", &format!("/ScheduledTasks/Running/{id}"), &[])
+            this.admin_action(done, cx, move |client| {
+                client.call(method, &format!("/ScheduledTasks/Running/{id}"), &[])
             })
-        }))
-    };
+        }));
 
     // A phone: the state goes under the name, and the row grows with it.
     let compact = crate::views::shell::compact_now();
@@ -404,7 +400,7 @@ fn row(
                             .text_size(px(15.))
                             .line_height(px(NAME_LINE_H))
                             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .text_color(t.colors.foreground)
+                            .text_color(colors.foreground)
                             .child(task.name.clone()),
                     )
                     .child({
@@ -416,7 +412,7 @@ fn row(
                             .text_ellipsis()
                             .text_size(px(13.))
                             .line_height(px(DESCRIPTION_LINE_H))
-                            .text_color(t.colors.muted_foreground)
+                            .text_color(colors.muted_foreground)
                             .when(!compact && description.len() > 110, |el| {
                                 el.tooltip(crate::ui::tip::tip(description.clone()))
                             })
@@ -434,8 +430,8 @@ fn row(
                         .items_center()
                         .gap(px(8.))
                         .text_size(px(13.))
-                        .text_color(t.colors.foreground.opacity(0.7))
-                        .child(icon(LucideIcon::Clock, 14., t.colors.muted_foreground))
+                        .text_color(colors.foreground.opacity(0.7))
+                        .child(icon(LucideIcon::Clock, 14., colors.muted_foreground))
                         .child(div().min_w_0().truncate().child(schedule)),
                 )
             })

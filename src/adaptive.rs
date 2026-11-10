@@ -60,6 +60,8 @@ const WINDOW: Duration = Duration::from_secs(60);
 /// A pause for data shorter than this is a hiccup, not a stall.
 const MIN_STALL: Duration = Duration::from_secs(1);
 /// Stalls in the window, or time stalled in it, that step the quality down.
+/// The step is decided when playback goes on, so a stall counts once, at
+/// its end, with its whole length.
 const STALLS_DOWN: usize = 2;
 const STALLED_DOWN: Duration = Duration::from_secs(8);
 /// In a group a reload makes everyone wait, so it takes more.
@@ -139,7 +141,6 @@ pub fn decide(
     let fits_direct = usable >= file;
     let wanted = if fits_direct { Choice::Direct } else { best_rung(&rungs, usable) };
     match previous {
-        Some(Choice::Direct) if fits_direct => (Choice::Direct, "the link carries the file"),
         Some(Choice::Rung(held)) => {
             let with_room = (usable as f64 / UP_MARGIN) as u64;
             if with_room >= file {
@@ -263,16 +264,8 @@ impl Stepper {
         Self { stalls: Vec::new(), last_change: None }
     }
 
+    /// A stall that began at `at` and ended after `length`.
     pub fn stall(&mut self, at: Instant, length: Duration) {
-        self.stalls.push((at, length));
-    }
-
-    /// The stall that began at `at` ended, with its whole length. A long
-    /// one was counted early, at the length it had then (`STALLED_DOWN`):
-    /// that entry takes the whole length, so a stall of twenty seconds
-    /// counts as one.
-    pub fn stall_ended(&mut self, at: Instant, length: Duration) {
-        self.stalls.retain(|(began, _)| *began != at);
         self.stalls.push((at, length));
     }
 
@@ -336,13 +329,30 @@ impl Stepper {
 
 // ----- the state --------------------------------------------------------------------
 
+/// Where the speed of the link comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    /// A test download of this run.
+    Measured,
+    /// The config, from an earlier run.
+    Kept,
+}
+
+impl Source {
+    fn name(self) -> &'static str {
+        match self {
+            Source::Measured => "measured",
+            Source::Kept => "kept",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Link {
     bps: u64,
     at: Instant,
     bytes: u64,
-    /// "measured", "kept" (from the config), "fake" (the debug channel).
-    from: &'static str,
+    from: Source,
 }
 
 struct Adaptive {
@@ -359,8 +369,8 @@ struct Adaptive {
     /// newer than it says otherwise.
     stepped: Option<(u64, Instant)>,
     stepper: Stepper,
-    /// The pause for data that runs now, and whether it counted already.
-    buffering_since: Option<(Instant, bool)>,
+    /// When the pause for data that runs now began.
+    buffering_since: Option<Instant>,
     last_stall_end: Option<Instant>,
     /// For the sleep check: `Instant` stands still while the Mac sleeps.
     clock: Option<(Instant, SystemTime)>,
@@ -406,6 +416,12 @@ impl Adaptive {
 
 static STATE: Mutex<Adaptive> = Mutex::new(Adaptive::new());
 
+/// True when the wall clock went on by more than the clock of the process
+/// did between two polls: the machine slept in between.
+fn slept(wall_passed: Duration, mono_passed: Duration) -> bool {
+    wall_passed.saturating_sub(mono_passed) > SLEEP_GAP
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -415,14 +431,14 @@ fn unix_now() -> u64 {
 /// Takes the switch and the last measurement from the config.
 pub fn install(config: &crate::config::Config) {
     let mut state = STATE.lock().unwrap();
-    state.enabled = config.adaptive_quality.unwrap_or(crate::adaptive::DEFAULT_ON);
+    state.enabled = config.adaptive_quality.unwrap_or(DEFAULT_ON);
     if let (Some(bps), Some(wall)) = (config.link_bps, config.link_measured_at) {
         let age = unix_now().saturating_sub(wall);
         if age <= KEPT_FOR {
             let at = Instant::now()
                 .checked_sub(Duration::from_secs(age))
                 .unwrap_or_else(Instant::now);
-            state.link = Some(Link { bps, at, bytes: 0, from: "kept" });
+            state.link = Some(Link { bps, at, bytes: 0, from: Source::Kept });
         }
     }
 }
@@ -455,13 +471,16 @@ pub fn auto_cap(file: Option<u64>, codec: Option<&str>) -> Option<u64> {
     choice.cap()
 }
 
+/// What Auto chose for the item that loaded last: the file as it is with
+/// the switch off, or before a first load.
+pub fn auto_choice() -> Choice {
+    let state = STATE.lock().unwrap();
+    state.choice.filter(|_| state.enabled).unwrap_or(Choice::Direct)
+}
+
 /// "Original" or the rung, for the Auto entry of the Quality menu.
 pub fn auto_label() -> String {
-    let state = STATE.lock().unwrap();
-    match state.choice {
-        Some(choice) if state.enabled => choice.label(),
-        _ => "Original".to_string(),
-    }
+    auto_choice().label()
 }
 
 /// "48.2 Mbps · 2 min ago", for the Playback info card.
@@ -480,7 +499,7 @@ pub fn link_line() -> String {
             } else {
                 format!("{} h ago", age / 3600)
             };
-            let from = if link.from == "kept" { " · from the last run" } else { "" };
+            let from = if link.from == Source::Kept { " · from the last run" } else { "" };
             format!("{} · {when}{from}", bitrate_label(link.bps))
         }
         None if state.measuring => "measuring".to_string(),
@@ -488,8 +507,8 @@ pub fn link_line() -> String {
     }
 }
 
-/// One line for the debug channel.
-pub fn describe() -> String {
+/// One line for the debug channel. `in_group` chooses the hold-off shown.
+pub fn describe(in_group: bool) -> String {
     let mut state = STATE.lock().unwrap();
     let now = Instant::now();
     let link = match state.link {
@@ -498,7 +517,7 @@ pub fn describe() -> String {
             link.bps / 1000,
             link.at.elapsed().as_secs(),
             link.bytes,
-            link.from
+            link.from.name()
         ),
         None => "link=none link_age=- link_bytes=0 link_from=none".to_string(),
     };
@@ -509,7 +528,6 @@ pub fn describe() -> String {
         (_, None, Some(Choice::Rung(b))) => format!("rung {}", b / 1000),
         (_, None, None) => "none".to_string(),
     };
-    let in_group = false;
     let hold = state.stepper.hold_off_left(now, in_group).as_secs();
     let (count, stalled) = (state.stepper.count(now), state.stepper.stalled(now).as_secs());
     format!(
@@ -542,7 +560,7 @@ impl Bloom {
 
     /// Settings > Playback: "Lower the quality on a slow connection".
     pub fn toggle_adaptive_quality(&mut self, cx: &mut Context<Self>) {
-        let on = !self.config.adaptive_quality.unwrap_or(crate::adaptive::DEFAULT_ON);
+        let on = !self.config.adaptive_quality.unwrap_or(DEFAULT_ON);
         self.config.adaptive_quality = Some(on);
         self.save_config(cx);
         STATE.lock().unwrap().enabled = on;
@@ -589,7 +607,7 @@ impl Bloom {
                             bps: m.bps,
                             at: Instant::now(),
                             bytes: m.bytes,
-                            from: "measured",
+                            from: Source::Measured,
                         });
                         drop(state);
                         this.config.link_bps = Some(m.bps);
@@ -608,42 +626,45 @@ impl Bloom {
     /// it up, and a measurement runs when the link is free. Called with
     /// every poll of the player.
     pub fn adaptive_tick(&mut self, cx: &mut Context<Self>) {
+        // A reload that waited for a load runs first (`stream`).
+        self.stream_poll();
         let now = Instant::now();
         let status = &self.player_status;
         let playing = self.player_open && status.state == PlayState::Playing;
         let in_group = self.sync.in_group();
         let manual = stream::max_bitrate().is_some();
         let mut state = STATE.lock().unwrap();
-
-        // After a sleep the network is often another one.
-        match state.clock {
-            Some((mono, wall)) => {
-                let wall_passed = SystemTime::now()
-                    .duration_since(wall)
-                    .unwrap_or(Duration::ZERO);
-                if wall_passed.saturating_sub(mono.elapsed()) > SLEEP_GAP {
-                    log::info!("link: the machine slept; a measurement is due");
-                    state.wanted = Some("the machine slept");
-                    state.stepper.clear();
-                    state.buffering_since = None;
-                    state.clock = Some((now, SystemTime::now()));
-                }
-            }
-            None => state.clock = Some((now, SystemTime::now())),
+        // With the switch off nothing reads the stalls or a measurement.
+        if !state.enabled {
+            state.stepper.clear();
+            state.buffering_since = None;
+            state.wanted = None;
+            state.clock = None;
+            state.was_open = self.player_open;
+            return;
         }
 
-        // A pause for data counts at its end, or at once when it lasts.
-        match (playing && status.buffering, state.buffering_since) {
-            (true, None) => state.buffering_since = Some((now, false)),
-            (true, Some((since, false))) if now.duration_since(since) >= STALLED_DOWN => {
-                state.on_stall(since, now.duration_since(since));
-                state.buffering_since = Some((since, true));
+        // After a sleep the network is often another one. The wall clock
+        // went on while the Mac slept and `Instant` did not: the two are
+        // compared from one poll to the next, so a clock that is set a
+        // little now and then does not add up to a sleep.
+        let wall = SystemTime::now();
+        if let Some((mono, before)) = state.clock.replace((now, wall)) {
+            let wall_passed = wall.duration_since(before).unwrap_or(Duration::ZERO);
+            if slept(wall_passed, now.duration_since(mono)) {
+                log::info!("link: the machine slept; a measurement is due");
+                state.wanted = Some("the machine slept");
+                state.stepper.clear();
+                state.buffering_since = None;
             }
-            (false, Some((since, counted))) => {
+        }
+
+        // A pause for data counts at its end, with its whole length.
+        match (playing && status.buffering, state.buffering_since) {
+            (true, None) => state.buffering_since = Some(now),
+            (false, Some(since)) => {
                 let length = now.duration_since(since);
-                if counted {
-                    state.stepper.stall_ended(since, length);
-                } else if length >= MIN_STALL {
+                if length >= MIN_STALL {
                     state.on_stall(since, length);
                 }
                 state.buffering_since = None;
@@ -659,13 +680,13 @@ impl Bloom {
             state.item = item.to_string();
             state.stepper.clear();
         }
-        if manual || !state.enabled {
+        if manual {
             state.stepper.clear();
         }
 
         let mut reload: Option<String> = None;
-        if playing && !self.scrubbing && !manual && state.enabled && !status.buffering {
-            let resolved = stream::current();
+        if playing && !self.scrubbing && !manual && !status.buffering {
+            let resolved = self.playing.as_ref().and_then(|item| stream::current_of(&item.id));
             let playing_bps = resolved
                 .as_ref()
                 .and_then(|r| r.target.as_ref().map(|t| t.bitrate).or(r.source_bitrate));
@@ -726,7 +747,7 @@ impl Bloom {
             self.toast("Quality", text, cx);
             self.rebuild_track_menus(cx);
         }
-        if due && !self.session.is_none() {
+        if due {
             self.adaptive_measure(why, cx);
         }
     }
@@ -765,7 +786,7 @@ impl Bloom {
                     }
                 }
                 self.adaptive_tick(cx);
-                describe()
+                describe(self.sync.in_group())
             }
             // The switch of Settings > Playback, as the checkbox sets it.
             "adaptive" => {
@@ -774,7 +795,7 @@ impl Bloom {
                     "off" => false,
                     _ => return "error: usage: quality adaptive <on|off>".into(),
                 };
-                if self.config.adaptive_quality.unwrap_or(crate::adaptive::DEFAULT_ON) != on {
+                if self.config.adaptive_quality.unwrap_or(DEFAULT_ON) != on {
                     self.toggle_adaptive_quality(cx);
                 }
                 format!("adaptive={on}")
@@ -806,19 +827,29 @@ impl Bloom {
 mod tests {
     use super::*;
 
-    /// A stall is counted early, while it lasts, and at its end it takes
-    /// its whole length: twenty seconds in one stall are two steps, and a
-    /// stall longer than the window still counts when playback goes on.
+    /// A stall longer than the window still counts when playback goes on,
+    /// with its whole length: twenty seconds in one stall are two steps.
     #[test]
     fn a_long_stall_counts_whole_and_after_its_end() {
         let mut stepper = Stepper::new();
         let began = Instant::now();
-        stepper.stall(began, STALLED_DOWN);
-        stepper.stall_ended(began, Duration::from_secs(90));
+        stepper.stall(began, Duration::from_secs(90));
         let end = began + Duration::from_secs(90);
-        assert_eq!(stepper.count(end), 1, "the stall was counted twice, or dropped as old");
+        assert_eq!(stepper.count(end), 1, "the stall was dropped as old");
         assert_eq!(stepper.stalled(end), Duration::from_secs(90));
         assert_eq!(stepper.step(end, false), 2);
+    }
+
+    /// A sleep is the wall clock ahead of the process clock between two
+    /// polls; a clock set by a second is none.
+    #[test]
+    fn a_sleep_is_a_gap_between_two_polls() {
+        let poll = Duration::from_millis(250);
+        assert!(!slept(poll, poll));
+        assert!(!slept(poll + Duration::from_secs(1), poll), "a clock set by a second");
+        assert!(slept(Duration::from_secs(600), poll));
+        // The wall clock set back is no sleep.
+        assert!(!slept(Duration::ZERO, poll));
     }
 
     const M: u64 = 1_000_000;
@@ -988,7 +1019,7 @@ mod tests {
             *state = Adaptive::new();
             state.enabled = true;
             state.fake = None;
-            state.link = Some(Link { bps: 50 * M, at: Instant::now(), bytes: 0, from: "measured" });
+            state.link = Some(Link { bps: 50 * M, at: Instant::now(), bytes: 0, from: Source::Measured });
         }
         assert_eq!(auto_cap(file, Some("h264")), None);
         assert_eq!(auto_label(), "Original");
@@ -1002,7 +1033,7 @@ mod tests {
             bps: 50 * M,
             at: stepped_at + Duration::from_secs(60),
             bytes: 0,
-            from: "measured",
+            from: Source::Measured,
         });
         assert_eq!(auto_cap(file, Some("h264")), None);
         assert!(STATE.lock().unwrap().stepped.is_none());

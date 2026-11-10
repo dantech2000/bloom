@@ -17,7 +17,7 @@ use super::{
     drift::{Correction, Drift},
     protocol::{
         Command, CommandKind, GroupInfo, GroupState, GroupUpdate, PlayQueue, PlayerReport,
-        Request, ServerMessage, TICKS_PER_MS, format_time, same_id,
+        RepeatMode, Request, ServerMessage, ShuffleMode, TICKS_PER_MS, format_time, same_id,
     },
 };
 
@@ -41,6 +41,13 @@ const BUFFERING_EVERY_MS: f64 = 5000.;
 const CONFIRM_MS: f64 = 2000.;
 /// The group gets this long to name the next item after an item ended.
 const ADVANCE_MS: f64 = 10_000.;
+/// A seek of the player gets this long for its answer. The player gives
+/// none for a place it cannot reach (past the end of the item), and an
+/// event of it can be lost.
+const SEEK_WAIT_MS: f64 = 10_000.;
+/// A start that waits for its time counts as lost when the player is still
+/// paused this long after it.
+const START_WAIT_MS: f64 = 3000.;
 /// Seeks of the server to one position before this member steps aside.
 const SEEK_LOOP: u32 = 3;
 /// A seek of the user ends this far before the end of the item at the
@@ -111,6 +118,9 @@ pub enum Intent {
     Remove { playlist_item_ids: Vec<String> },
     Move { playlist_item_id: String, new_index: usize },
     Jump { playlist_item_id: String },
+    /// The repeat mode and the order of the queue, by the names the server
+    /// has for them (`RepeatMode::name`, `ShuffleMode::name`): the debug
+    /// channel gives a text. A name that is none does nothing.
     Repeat(String),
     Shuffle(String),
     /// Stop to follow the group, but stay a member.
@@ -170,6 +180,37 @@ pub enum Notice {
     Denied(String),
     /// This member stepped aside: the group does not wait for it any more.
     SteppedAside(&'static str),
+}
+
+/// What the player is in the middle of, as the app may ask ([`Core::phase`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhaseKind {
+    Idle,
+    Loading,
+    Parked,
+    /// A seek to a place where the player stays paused.
+    Seeking,
+    /// A seek ahead of a group that plays, and the start after it.
+    CatchingUp,
+    Starting,
+    Playing,
+    Advancing,
+}
+
+impl PhaseKind {
+    /// Short text for the debug channel.
+    pub fn name(self) -> &'static str {
+        match self {
+            PhaseKind::Idle => "idle",
+            PhaseKind::Loading => "loading",
+            PhaseKind::Parked => "parked",
+            PhaseKind::Seeking => "seeking",
+            PhaseKind::CatchingUp => "catching-up",
+            PhaseKind::Starting => "starting",
+            PhaseKind::Playing => "playing",
+            PhaseKind::Advancing => "advancing",
+        }
+    }
 }
 
 /// What the player is in the middle of.
@@ -329,6 +370,13 @@ impl Core {
         self.next_token
     }
 
+    /// The group waits for a new `Ready` of this member.
+    fn expect_ready(&mut self) {
+        self.owes_ready = true;
+        self.ready_sent = None;
+        self.ready_position = None;
+    }
+
     pub fn handle(
         &mut self,
         input: Input,
@@ -339,7 +387,7 @@ impl Core {
         let mut out = Vec::new();
         match input {
             Input::Server(ServerMessage::Group { group_id, update }) => {
-                self.on_group(&group_id, update, now, clock, view, &mut out)
+                self.on_group(&group_id, update, now, clock, &mut out)
             }
             Input::Server(ServerMessage::Command(command)) => {
                 self.on_command(command, now, clock, view, &mut out)
@@ -414,7 +462,6 @@ impl Core {
         update: GroupUpdate,
         now: f64,
         clock: &ServerClock,
-        view: &PlayerView,
         out: &mut Vec<Action>,
     ) {
         match update {
@@ -422,8 +469,6 @@ impl Core {
                 let same = self.group.as_ref().is_some_and(|g| same_id(&g.group_id, &info.group_id));
                 if !same {
                     self.leave(out);
-                    self.loaded = None;
-                    self.phase = Phase::Idle;
                 }
                 // A join of the group this member is in already (after a
                 // lost socket, or to follow again) brings the queue again,
@@ -466,7 +511,7 @@ impl Core {
                 }
                 out.push(Action::Notice(Notice::State(state, reason)));
             }
-            GroupUpdate::Queue(queue) => self.on_queue(queue, now, clock, view, out),
+            GroupUpdate::Queue(queue) => self.on_queue(queue, now, clock, out),
         }
     }
 
@@ -475,7 +520,6 @@ impl Core {
         queue: PlayQueue,
         now: f64,
         clock: &ServerClock,
-        view: &PlayerView,
         out: &mut Vec<Action>,
     ) {
         if self.queue.as_ref().is_some_and(|old| queue.last_update <= old.last_update) {
@@ -490,8 +534,15 @@ impl Core {
             } else {
                 0.
             };
-        // A command older than the queue is about the item before.
-        if self.command.as_ref().is_some_and(|c| c.emitted_at < queue.last_update) {
+        // A command older than the queue is about the item before, when
+        // the queue starts again or names another item. An edit of the
+        // queue around the item that plays (an item added, moved or taken
+        // out, the repeat mode) brings no new command: the old one stands.
+        let goes_on = !restart
+            && current.as_ref().zip(self.command.as_ref()).is_some_and(|(item, command)| {
+                same_id(&item.playlist_item_id, &command.playlist_item_id)
+            });
+        if !goes_on && self.command.as_ref().is_some_and(|c| c.emitted_at < queue.last_update) {
             self.command = None;
         }
         self.queue = Some(queue);
@@ -528,9 +579,7 @@ impl Core {
         let position = self.group_position(now, clock).unwrap_or(position);
         out.push(Action::CancelScheduled);
         self.drift.reset();
-        self.owes_ready = true;
-        self.ready_sent = None;
-        self.ready_position = None;
+        self.expect_ready();
         self.provisional_pause = None;
         if loaded {
             // The group starts the item again: go to its place and report.
@@ -546,7 +595,6 @@ impl Core {
                 position,
             });
         }
-        let _ = view;
     }
 
     fn on_command(
@@ -611,14 +659,14 @@ impl Core {
             self.step_aside("The player cannot reach the position of the group.", out);
             return;
         }
-        if duplicate && self.consistent(now, clock, view) {
+        if duplicate && self.consistent(now, view) {
             return;
         }
         self.apply(now, clock, view, out);
     }
 
     /// True when the player already does what the last command says.
-    fn consistent(&self, now: f64, clock: &ServerClock, view: &PlayerView) -> bool {
+    fn consistent(&self, now: f64, view: &PlayerView) -> bool {
         let Some(command) = &self.command else { return true };
         match command.command {
             CommandKind::Unpause => matches!(
@@ -626,7 +674,6 @@ impl Core {
                 Phase::Playing { .. } | Phase::Starting { .. } | Phase::Seeking { start: Some(_), .. }
             ),
             CommandKind::Pause | CommandKind::Seek => {
-                let _ = clock;
                 view.paused
                     && (view.position_at(now) - command.position_ms()).abs() <= AT_POSITION_MS
                     && !matches!(self.phase, Phase::Seeking { .. })
@@ -666,9 +713,7 @@ impl Core {
             }
             CommandKind::Seek => {
                 let token = self.token();
-                self.owes_ready = true;
-                self.ready_sent = None;
-        self.ready_position = None;
+                self.expect_ready();
                 self.phase = Phase::Seeking { token, asked: now, start: None };
                 out.push(Action::SeekPaused { position: command.position_ms(), token });
             }
@@ -731,7 +776,7 @@ impl Core {
                     .command
                     .as_ref()
                     .is_some_and(|c| same_id(&c.playlist_item_id, &playlist_item_id));
-                if waiting && !self.consistent(now, clock, view) {
+                if waiting && !self.consistent(now, view) {
                     self.apply(now, clock, view, out);
                 }
             }
@@ -785,9 +830,7 @@ impl Core {
                 if in_step && self.following && !recent {
                     if let Some(report) = self.report(now, clock, view) {
                         self.buffering_sent = Some(now);
-                        self.owes_ready = true;
-                        self.ready_sent = None;
-        self.ready_position = None;
+                        self.expect_ready();
                         out.push(Action::Send(Request::Buffering(report)));
                     }
                 }
@@ -843,6 +886,14 @@ impl Core {
         }
         let Phase::Playing { since } = self.phase else { return };
         if !self.following || !self.group_plays() || self.stalled || view.paused {
+            return;
+        }
+        // Without a measurement of the clock (the machine slept and the
+        // clock starts again) the place of the group is not known: a
+        // difference to it would be the difference of the two clocks.
+        if !clock.ready() {
+            self.drift.reset();
+            self.drift_ms = None;
             return;
         }
         // A correction runs its time; then the measurements start again.
@@ -946,8 +997,16 @@ impl Core {
             Intent::Jump { playlist_item_id } => {
                 send(out, Request::SetPlaylistItem { playlist_item_id })
             }
-            Intent::Repeat(mode) => send(out, Request::SetRepeatMode(mode)),
-            Intent::Shuffle(mode) => send(out, Request::SetShuffleMode(mode)),
+            Intent::Repeat(mode) => {
+                if let Some(mode) = RepeatMode::parse(&mode) {
+                    send(out, Request::SetRepeatMode(mode));
+                }
+            }
+            Intent::Shuffle(mode) => {
+                if let Some(mode) = ShuffleMode::parse(&mode) {
+                    send(out, Request::SetShuffleMode(mode));
+                }
+            }
             Intent::StopFollowing => {
                 if self.following {
                     self.following = false;
@@ -1004,6 +1063,31 @@ impl Core {
             self.phase = Phase::Idle;
             out.push(Action::Stop);
         }
+        // A seek with no answer: go on as if it was done, from the place
+        // the player is at. A `Ready` then says that place, and the server
+        // seeks again when it is not the place of the group; a catch-up
+        // starts again, with more lead.
+        if let Phase::Seeking { token, asked, .. } = self.phase
+            && now - asked > SEEK_WAIT_MS
+            && self.following
+        {
+            self.on_player(PlayerEvent::Settled { token }, now, clock, view, out);
+        }
+        // A start whose time is long past with the player still paused:
+        // the player lost it. A pause of the user explains itself.
+        if let Phase::Starting { at } = self.phase
+            && now - at > START_WAIT_MS
+            && view.paused
+            && self.following
+            && self.provisional_pause.is_none()
+            && clock.ready()
+        {
+            if self.group_plays() {
+                self.apply(now, clock, view, out);
+            } else {
+                self.phase = Phase::Parked;
+            }
+        }
     }
 
     /// The server took the `Ready`: a command or a state after it shows the
@@ -1013,19 +1097,24 @@ impl Core {
         self.owes_ready = false;
     }
 
+    /// What the player is in the middle of.
+    pub fn phase(&self) -> PhaseKind {
+        match self.phase {
+            Phase::Idle => PhaseKind::Idle,
+            Phase::Loading { .. } => PhaseKind::Loading,
+            Phase::Parked => PhaseKind::Parked,
+            Phase::Seeking { start: None, .. } => PhaseKind::Seeking,
+            Phase::Seeking { start: Some(_), .. } => PhaseKind::CatchingUp,
+            Phase::Starting { .. } => PhaseKind::Starting,
+            Phase::Playing { .. } => PhaseKind::Playing,
+            Phase::Advancing { .. } => PhaseKind::Advancing,
+        }
+    }
+
     /// Short text of what the player is in the middle of, for the debug
     /// channel.
     pub fn phase_name(&self) -> &'static str {
-        match self.phase {
-            Phase::Idle => "idle",
-            Phase::Loading { .. } => "loading",
-            Phase::Parked => "parked",
-            Phase::Seeking { start: None, .. } => "seeking",
-            Phase::Seeking { start: Some(_), .. } => "catching-up",
-            Phase::Starting { .. } => "starting",
-            Phase::Playing { .. } => "playing",
-            Phase::Advancing { .. } => "advancing",
-        }
+        self.phase().name()
     }
 
     /// Playlist item the player has loaded.
@@ -1131,8 +1220,8 @@ mod tests {
                 playing_item_index: index,
                 start_position_ticks: (position * TICKS_PER_MS) as i64,
                 is_playing: playing,
-                shuffle_mode: "Sorted".into(),
-                repeat_mode: "RepeatNone".into(),
+                shuffle_mode: ShuffleMode::Sorted,
+                repeat_mode: RepeatMode::RepeatNone,
             };
             self.group(GroupUpdate::Queue(queue))
         }
@@ -1560,7 +1649,7 @@ mod tests {
     #[test]
     fn a_repeat_mode_keeps_the_end_of_the_last_item_going() {
         let mut rig = Rig::playing_with(&["p1"], 0.);
-        rig.core.queue.as_mut().unwrap().repeat_mode = "RepeatAll".into();
+        rig.core.queue.as_mut().unwrap().repeat_mode = RepeatMode::RepeatAll;
         let out = rig.player(PlayerEvent::Ended);
         assert_eq!(sent(&out), [&Request::NextItem { playlist_item_id: "p1".into() }]);
         assert!(!out.contains(&Action::Stop));
@@ -1735,6 +1824,100 @@ mod tests {
         let mut rig = Rig::playing(0.);
         let out = rig.command(CommandKind::Stop, "00000000000000000000000000000000", 0., 0.);
         assert!(out.contains(&Action::Stop));
+    }
+
+    /// Another member adds an item while the group plays (the server
+    /// sends the queue with a new time and no command). The group still
+    /// plays: the pause button asks for a pause, and the drift is
+    /// measured. Before, the queue update threw the command away.
+    #[test]
+    fn an_edit_of_the_queue_keeps_the_command_of_the_item_that_plays() {
+        let mut rig = Rig::playing(0.);
+        rig.pass(2_000.);
+        rig.player(PlayerEvent::Position);
+        for reason in ["Queue", "MoveItem", "RepeatMode"] {
+            rig.pass(100.);
+            let out = rig.queue(reason, &["p1", "p2", "p3"], 0, 0., true);
+            assert_eq!(out, vec![Action::Notice(Notice::Queue)], "{reason}");
+            assert!(rig.core.group_plays(), "the group stopped to play at {reason}");
+        }
+        assert_eq!(sent(&rig.user(Intent::TogglePause)), [&Request::Pause]);
+        // The measurements go on.
+        let mut rig = Rig::playing(0.);
+        rig.pass(2_000.);
+        rig.queue("Queue", &["p1", "p2", "p3"], 0, 0., true);
+        rig.view.position -= 300.;
+        rig.pass(100.);
+        rig.player(PlayerEvent::Position);
+        assert!((rig.core.drift_ms.expect("no measurement") - 300.).abs() < 1e-6);
+        // The next item is another matter: its command has not come yet.
+        rig.pass(100.);
+        rig.queue("NextItem", &["p1", "p2", "p3"], 1, 0., false);
+        assert!(!rig.core.group_plays());
+    }
+
+    /// The clock starts again (the machine slept): until its first
+    /// measurement the difference to the group is not known, and nothing
+    /// is corrected by the difference of the two clocks.
+    #[test]
+    fn no_correction_while_the_clock_has_no_measurement() {
+        let mut rig = Rig::playing(0.);
+        rig.pass(2_000.);
+        let measured = std::mem::take(&mut rig.clock);
+        for _ in 0..10 {
+            rig.pass(100.);
+            let out = rig.player(PlayerEvent::Position);
+            assert!(out.is_empty(), "a correction by the offset of the clocks: {out:?}");
+        }
+        assert_eq!(rig.core.drift_ms, None);
+        rig.clock = measured;
+        rig.pass(100.);
+        rig.player(PlayerEvent::Position);
+        assert!(rig.core.drift_ms.unwrap().abs() < 1e-6);
+    }
+
+    /// The player gives no answer to a seek (a place past the end, a lost
+    /// event). The member does not wait for ever: it says where it is.
+    #[test]
+    fn a_seek_with_no_answer_is_given_up_and_reported() {
+        let mut rig = Rig::playing(5_000.);
+        let out = rig.command(CommandKind::Seek, "p1", 600_000., 0.);
+        assert!(seek_of(&out).is_some());
+        rig.pass(9_000.);
+        assert!(rig.feed(Input::Tick).is_empty());
+        assert_eq!(rig.core.phase(), PhaseKind::Seeking);
+        rig.pass(1_500.);
+        let out = rig.feed(Input::Tick);
+        assert!(matches!(sent(&out)[..], [Request::Ready(_)]), "{out:?}");
+        assert_eq!(rig.core.phase(), PhaseKind::Parked);
+        // A catch-up with no answer starts again.
+        let mut rig = Rig::parked(0.);
+        let out = rig.command(CommandKind::Unpause, "p1", 10_000., -1_000.);
+        let (_, first) = seek_of(&out).unwrap();
+        rig.pass(10_500.);
+        let out = rig.feed(Input::Tick);
+        let (_, second) = seek_of(&out).expect("a second catch-up");
+        assert!(second != first);
+        assert_eq!(rig.core.phase(), PhaseKind::CatchingUp);
+    }
+
+    /// A start that the player lost (it is still paused long after its
+    /// time) is made again; a start that is still ahead is left alone.
+    #[test]
+    fn a_start_that_did_not_happen_is_made_again() {
+        let mut rig = Rig::parked(5_000.);
+        rig.command(CommandKind::Unpause, "p1", 5_000., 800.);
+        rig.pass(2_000.);
+        assert!(rig.feed(Input::Tick).is_empty());
+        rig.pass(2_000.);
+        let out = rig.feed(Input::Tick);
+        // The group is 3.2 s on: a seek ahead of it, and a start.
+        let (position, _) = seek_of(&out).expect("a catch-up");
+        assert!((position - (5_000. + 3_200. + 500.)).abs() < 1e-6, "{position}");
+        // The player that did start is in step and is left alone.
+        let mut rig = Rig::playing(5_000.);
+        rig.pass(5_000.);
+        assert!(rig.feed(Input::Tick).is_empty());
     }
 
     #[test]

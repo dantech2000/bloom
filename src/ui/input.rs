@@ -30,7 +30,6 @@ pub enum KeyboardKind {
     #[default]
     Default,
     Url,
-    Email,
     Numbers,
 }
 
@@ -48,7 +47,6 @@ pub enum ReturnKey {
 pub enum Content {
     #[default]
     None,
-    Username,
     Password,
     Url,
     OneTimeCode,
@@ -138,7 +136,6 @@ fn apply_keyboard(keyboard: Keyboard) {
             keyboard: match keyboard.kind {
                 KeyboardKind::Default => ios::KeyboardType::Default,
                 KeyboardKind::Url => ios::KeyboardType::URL,
-                KeyboardKind::Email => ios::KeyboardType::EmailAddress,
                 KeyboardKind::Numbers => ios::KeyboardType::NumberPad,
             },
             return_key: match keyboard.return_key {
@@ -150,7 +147,6 @@ fn apply_keyboard(keyboard: Keyboard) {
             },
             content: match keyboard.content {
                 Content::None => ios::TextContent::None,
-                Content::Username => ios::TextContent::Username,
                 Content::Password => ios::TextContent::Password,
                 Content::Url => ios::TextContent::Url,
                 Content::OneTimeCode => ios::TextContent::OneTimeCode,
@@ -178,9 +174,7 @@ pub struct Input {
     style: gpui_kit::StyleRefinement,
     label: Option<SharedString>,
     disabled: bool,
-    read_only: bool,
     invalid: bool,
-    bordered: bool,
     keyboard: Keyboard,
 }
 impl Input {
@@ -191,9 +185,7 @@ impl Input {
             style: Default::default(),
             label: None,
             disabled: false,
-            read_only: false,
             invalid: false,
-            bordered: true,
             keyboard: Keyboard::text(),
         }
     }
@@ -212,19 +204,9 @@ impl Input {
         self.disabled = value;
         self
     }
-    /// Prevents user changes while preserving focus and reading.
-    pub fn read_only(mut self, value: bool) -> Self {
-        self.read_only = value;
-        self
-    }
     /// Applies validation error colors and an invalid accessibility description.
     pub fn invalid(mut self, value: bool) -> Self {
         self.invalid = value;
-        self
-    }
-    /// Controls the Nova input border and background.
-    pub fn bordered(mut self, value: bool) -> Self {
-        self.bordered = value;
         self
     }
 }
@@ -235,11 +217,9 @@ impl Styled for Input {
 }
 impl RenderOnce for Input {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let theme = UiTheme::read(cx).clone();
-        let colors = theme.colors;
+        let colors = UiTheme::read(cx).colors;
         self.state.update(cx, |state, cx| {
             state.set_disabled(self.disabled, cx);
-            state.set_readonly(self.read_only, cx);
             state.set_editor_style(InputEditorStyle {
                 foreground: colors.foreground.into(),
                 muted_foreground: colors.muted_foreground.into(),
@@ -250,6 +230,12 @@ impl RenderOnce for Input {
                 ..Default::default()
             });
         });
+        // A phone: a long press on the field opens the system's edit
+        // menu (Cut, Copy, Paste, Select All); the Mac has the context
+        // menu and the keys.
+        let edit_menu = (cfg!(target_os = "ios") && !self.disabled)
+            .then(|| edit_menu_overlay(self.state.clone(), self.keyboard, window, cx));
+        let theme = UiTheme::read(cx);
         let state = self.state.read(cx);
         let focus = state.focus_handle(cx);
         let focused = focus.is_focused(window) && !self.disabled;
@@ -267,7 +253,6 @@ impl RenderOnce for Input {
             .when_some(self.label, |root, label| root.accessibility_label(label))
             .aria_value(value)
             .aria_placeholder(placeholder)
-            .when(self.read_only, |root| root.aria_description("Read only"))
             .when(self.invalid, |root| root.aria_description("Invalid value"))
             .when(!self.disabled, |root| {
                 root.on_a11y_action(AccessibleAction::Focus, move |_, window, cx| {
@@ -279,7 +264,7 @@ impl RenderOnce for Input {
                     click_state.update(cx, |state, cx| state.focus(window, cx));
                 })
             })
-            .when(!self.disabled && !self.read_only, |root| {
+            .when(!self.disabled, |root| {
                 root.on_a11y_action(AccessibleAction::SetValue, move |data, window, cx| {
                     if let Some(gpui_kit::accesskit::ActionData::Value(value)) = data {
                         action_state.update(cx, |state, cx| {
@@ -299,20 +284,14 @@ impl RenderOnce for Input {
             .text_size(theme.text(14.))
             .line_height(theme.text(20.))
             .text_color(colors.foreground)
-            .when(self.bordered, |root| {
-                root.rounded(theme.radius.lg)
-                    .border_1()
-                    .border_color(if self.invalid {
-                        colors.destructive
-                    } else {
-                        colors.input
-                    })
-                    .bg(match theme.mode {
-                        ThemeMode::Light => colors.background.opacity(0.),
-                        ThemeMode::Dark => colors.input.opacity(0.3),
-                    })
+            .rounded(theme.radius.lg)
+            .border_1()
+            .border_color(if self.invalid { colors.destructive } else { colors.input })
+            .bg(match theme.mode {
+                ThemeMode::Light => colors.background.opacity(0.),
+                ThemeMode::Dark => colors.input.opacity(0.3),
             })
-            .when(focused && self.bordered, |root| {
+            .when(focused, |root| {
                 root.border_color(if self.invalid {
                     colors.destructive
                 } else {
@@ -320,18 +299,7 @@ impl RenderOnce for Input {
                 })
             })
             .when(self.disabled, |root| root.opacity(0.5).cursor_not_allowed())
-            // A phone: a long press on the field opens the system's edit
-            // menu (Cut, Copy, Paste, Select All); the Mac has the context
-            // menu and the keys.
-            .when(cfg!(target_os = "ios") && !self.disabled, |root| {
-                root.relative().child(edit_menu_overlay(
-                    self.state.clone(),
-                    self.keyboard,
-                    self.read_only,
-                    window,
-                    cx,
-                ))
-            })
+            .when_some(edit_menu, |root, overlay| root.relative().child(overlay))
             .child(self.state);
         super::theme::apply_style(root, &self.style)
     }
@@ -343,7 +311,6 @@ impl RenderOnce for Input {
 fn edit_menu_overlay(
     state: Entity<InputState>,
     keyboard: Keyboard,
-    read_only: bool,
     window: &mut Window,
     cx: &mut App,
 ) -> gpui_kit::Canvas<()> {
@@ -371,9 +338,9 @@ fn edit_menu_overlay(
             // A password is never copied out of its field.
             let menu = EditMenu {
                 bounds,
-                cut: selection && !keyboard.secure && !read_only,
+                cut: selection && !keyboard.secure,
                 copy: selection && !keyboard.secure,
-                paste: clipboard && !read_only,
+                paste: clipboard,
                 select_all: !empty,
             };
             present_edit_menu(menu, state.clone(), async_window.clone());
@@ -396,7 +363,9 @@ fn clipboard_has_text(cx: &App) -> bool {
     }
 }
 
-/// The edit menu of a field: where it points, and what it offers.
+/// The edit menu of a field: where it points, and what it offers. Only
+/// the iOS build reads it.
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
 struct EditMenu {
     bounds: gpui_kit::Bounds<gpui_kit::Pixels>,
     cut: bool,

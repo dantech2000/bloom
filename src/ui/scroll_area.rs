@@ -1,11 +1,10 @@
-//! Native scrolling with Nova-styled GPUI Kit scrollbars.
+//! Native vertical scrolling with Nova-styled GPUI Kit scrollbars.
 
 use super::theme::UiTheme;
 use gpui_kit::base::{Scrollbar, ScrollbarHandle, ScrollbarMode};
 use gpui_kit::{
-    AnyElement, App, Axis, ElementId, InteractiveElement as _, IntoElement, ParentElement,
-    RenderOnce, Role, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled, Window,
-    div, prelude::FluentBuilder as _, px,
+    AnyElement, App, ElementId, InteractiveElement as _, IntoElement, ParentElement, RenderOnce,
+    Role, ScrollHandle, StatefulInteractiveElement as _, Styled, Window, div, px,
 };
 
 /// Overlay on a relative container holding a list or scroll viewport.
@@ -37,8 +36,6 @@ pub fn scroll_area_scrollbar_for<H: ScrollbarHandle + Clone>(
 pub struct ScrollArea {
     id: ElementId,
     style: gpui_kit::StyleRefinement,
-    label: Option<SharedString>,
-    axis: Axis,
     handle: Option<ScrollHandle>,
     children: Vec<AnyElement>,
 }
@@ -48,25 +45,13 @@ impl ScrollArea {
         Self {
             id: id.into(),
             style: Default::default(),
-            label: None,
-            axis: Axis::Vertical,
             handle: None,
             children: vec![],
         }
     }
-    /// Sets the accessible name of the control.
-    pub fn aria_label(mut self, value: impl Into<SharedString>) -> Self {
-        self.label = Some(value.into());
-        self
-    }
     /// Uses a caller-owned scroll handle in place of the internal one.
     pub fn track(mut self, handle: &ScrollHandle) -> Self {
         self.handle = Some(handle.clone());
-        self
-    }
-    /// Selects horizontal or vertical layout and keyboard navigation.
-    pub fn axis(mut self, axis: Axis) -> Self {
-        self.axis = axis;
         self
     }
 }
@@ -82,7 +67,6 @@ impl Styled for ScrollArea {
 }
 impl RenderOnce for ScrollArea {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let t = UiTheme::read(cx).clone();
         let handle = self.handle.clone().unwrap_or_else(|| {
             window
                 .use_keyed_state((self.id.clone(), "scroll"), cx, |_, _| ScrollHandle::new())
@@ -90,7 +74,6 @@ impl RenderOnce for ScrollArea {
                 .clone()
         });
         let keyboard = handle.clone();
-        let axis = self.axis;
         let viewport = div()
             .id("viewport")
             .role(Role::ScrollView)
@@ -99,38 +82,18 @@ impl RenderOnce for ScrollArea {
             // A gesture along the other axis does not move this area.
             .restrict_scroll_to_axis()
             .track_scroll(&handle)
-            .when(axis == Axis::Vertical, |viewport| {
-                viewport.overflow_y_scroll()
-            })
-            .when(axis == Axis::Horizontal, |viewport| {
-                viewport.overflow_x_scroll()
-            })
-            .when_some(self.label, |viewport, label| viewport.aria_label(label))
+            .overflow_y_scroll()
             .on_key_down(move |event, window, cx| {
                 if event.keystroke.modifiers.modified() {
                     return;
                 }
                 let mut offset = keyboard.offset();
-                let max = if axis == Axis::Vertical {
-                    keyboard.max_offset().y
-                } else {
-                    keyboard.max_offset().x
-                };
-                let page = if axis == Axis::Vertical {
-                    keyboard.bounds().size.height
-                } else {
-                    keyboard.bounds().size.width
-                };
-                let value = if axis == Axis::Vertical {
-                    &mut offset.y
-                } else {
-                    &mut offset.x
-                };
+                let max = keyboard.max_offset().y;
+                let page = keyboard.bounds().size.height;
+                let value = &mut offset.y;
                 *value = match event.keystroke.key.as_str() {
-                    "up" if axis == Axis::Vertical => *value + px(32.),
-                    "down" if axis == Axis::Vertical => *value - px(32.),
-                    "left" if axis == Axis::Horizontal => *value + px(32.),
-                    "right" if axis == Axis::Horizontal => *value - px(32.),
+                    "up" => *value + px(32.),
+                    "down" => *value - px(32.),
                     "pageup" => *value + page,
                     "pagedown" => *value - page,
                     "home" => px(0.),
@@ -143,13 +106,14 @@ impl RenderOnce for ScrollArea {
                 cx.stop_propagation();
             })
             .child(div().flex().flex_col().min_w_full().children(self.children));
-        let scrollbar = scroll_area_scrollbar_for("scrollbar", &handle, cx).axis(axis);
+        let scrollbar = scroll_area_scrollbar_for("scrollbar", &handle, cx);
+        let t = UiTheme::read(cx);
         let root = div()
             .id(self.id)
             .relative()
             .min_h_0()
             .min_w_0()
-            .font_family(t.fonts.body)
+            .font_family(t.fonts.body.clone())
             .text_color(t.colors.foreground)
             .child(viewport)
             .child(scrollbar);

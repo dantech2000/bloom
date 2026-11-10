@@ -15,7 +15,6 @@ use gpui_kit::{
 use super::theme::{ThemeMode, UiRadius, UiTheme};
 
 type ButtonClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
-type ButtonStyleHandler = Rc<dyn Fn(BaseButton) -> BaseButton>;
 
 /// The pinned shadcn Button visual variant.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -23,38 +22,20 @@ pub enum ButtonVariant {
     /// Primary action.
     #[default]
     Default,
-    /// Bordered action.
-    Outline,
-    /// Secondary action.
-    Secondary,
     /// Low-emphasis action.
     Ghost,
-    /// Destructive action.
-    Destructive,
-    /// Link-styled action.
-    Link,
 }
 
 /// The pinned shadcn Button size.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ButtonSize {
-    /// 24px-high extra-small button.
-    Xs,
-    /// 28px-high small button.
-    Sm,
     /// 32px-high default button.
     #[default]
     Default,
-    /// 36px-high large button.
-    Lg,
-    /// 24px square icon button.
-    IconXs,
     /// 28px square icon button.
     IconSm,
     /// 32px square icon button.
     Icon,
-    /// 36px square icon button.
-    IconLg,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -72,14 +53,9 @@ impl ButtonSize {
         let radius = f32::from(radii.lg);
         let radius_md = f32::from(radii.md);
         match self {
-            Self::Xs => ButtonMetrics::new(24.0, 8.0, 4.0, radius_md.min(10.0), 12.0, false),
-            Self::Sm => ButtonMetrics::new(28.0, 10.0, 4.0, radius_md.min(12.0), 12.8, false),
             Self::Default => ButtonMetrics::new(32.0, 10.0, 6.0, radius, 14.0, false),
-            Self::Lg => ButtonMetrics::new(36.0, 10.0, 6.0, radius, 14.0, false),
-            Self::IconXs => ButtonMetrics::new(24.0, 0.0, 0.0, radius_md.min(10.0), 14.0, true),
             Self::IconSm => ButtonMetrics::new(28.0, 0.0, 0.0, radius_md.min(12.0), 14.0, true),
             Self::Icon => ButtonMetrics::new(32.0, 0.0, 0.0, radius, 14.0, true),
-            Self::IconLg => ButtonMetrics::new(36.0, 0.0, 0.0, radius, 14.0, true),
         }
     }
 }
@@ -111,10 +87,8 @@ pub struct Button {
     id: ElementId,
     variant: ButtonVariant,
     size: ButtonSize,
-    disabled: bool,
     aria_label: Option<SharedString>,
     on_click: Option<ButtonClickHandler>,
-    style_with: Option<ButtonStyleHandler>,
     tooltip: Option<Rc<dyn Fn(&mut Window, &mut App) -> gpui_kit::AnyView>>,
     children: Vec<AnyElement>,
 }
@@ -127,10 +101,8 @@ impl Button {
             id: id.into(),
             variant: ButtonVariant::default(),
             size: ButtonSize::default(),
-            disabled: false,
             aria_label: None,
             on_click: None,
-            style_with: None,
             tooltip: None,
             children: Vec::new(),
         }
@@ -148,23 +120,9 @@ impl Button {
         self
     }
 
-    /// Prevents activation and removes the Button from tab order.
-    pub fn disabled(mut self, disabled: bool) -> Self {
-        self.disabled = disabled;
-        self
-    }
-
-    /// Sets the accessible name for icon or custom content. Use `label` for plain text.
+    /// Sets the accessible name for icon or custom content.
     pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
         self.aria_label = Some(label.into());
-        self
-    }
-
-    /// Adds visible text and uses it as the accessible name unless one was supplied.
-    pub fn label(mut self, label: impl Into<SharedString>) -> Self {
-        let label = label.into();
-        self.aria_label.get_or_insert_with(|| label.clone());
-        self.children.push(label.into_any_element());
         self
     }
 
@@ -186,12 +144,6 @@ impl Button {
         self
     }
 
-    /// Replaces the visual styling while retaining button interaction.
-    /// Include a visible keyboard focus treatment in custom styles.
-    pub fn style_with(mut self, handler: impl Fn(BaseButton) -> BaseButton + 'static) -> Self {
-        self.style_with = Some(Rc::new(handler));
-        self
-    }
 }
 
 impl ParentElement for Button {
@@ -202,14 +154,7 @@ impl ParentElement for Button {
 
 impl RenderOnce for Button {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let theme = UiTheme::read(cx).clone();
-        let variant = self.variant;
-        let size = self.size;
-        let root = BaseButton::new(self.id).disabled(self.disabled);
-        let root = match self.style_with {
-            Some(style) => style(root),
-            None => style_button(root, self.disabled, variant, size, &theme),
-        };
+        let root = style_button(BaseButton::new(self.id), self.variant, self.size, UiTheme::read(cx));
         let mut root = super::theme::apply_style(root, &self.style).children(self.children);
 
         if let Some(label) = self.aria_label {
@@ -228,21 +173,17 @@ impl RenderOnce for Button {
     }
 }
 
-pub(super) fn style_button<
+fn style_button<
     T: Styled + gpui_kit::InteractiveElement + gpui_kit::prelude::FluentBuilder,
 >(
     base: T,
-    disabled: bool,
     variant: ButtonVariant,
     size: ButtonSize,
     theme: &UiTheme,
 ) -> T {
     let colors = theme.colors;
     let metrics = size.metrics(theme.radius);
-    let focus_border = match variant {
-        ButtonVariant::Destructive => colors.destructive.opacity(0.40),
-        _ => colors.ring,
-    };
+    let focus_border = colors.ring;
 
     let base = base
         .flex()
@@ -270,37 +211,7 @@ pub(super) fn style_button<
         ButtonVariant::Default => base
             .bg(colors.primary)
             .text_color(colors.primary_foreground)
-            .when(!disabled, |base| {
-                base.hover(move |style| style.bg(colors.primary.opacity(0.80)))
-            }),
-        ButtonVariant::Outline => {
-            let background = match theme.mode {
-                ThemeMode::Light => colors.background,
-                ThemeMode::Dark => colors.input.opacity(0.30),
-            };
-            let border = match theme.mode {
-                ThemeMode::Light => colors.border,
-                ThemeMode::Dark => colors.input,
-            };
-            let hover = match theme.mode {
-                ThemeMode::Light => colors.muted,
-                ThemeMode::Dark => colors.input.opacity(0.50),
-            };
-            base.bg(background)
-                .text_color(colors.foreground)
-                .border_color(border)
-                .when(!disabled, |base| {
-                    base.hover(move |style| style.bg(hover).text_color(colors.foreground))
-                })
-        }
-        ButtonVariant::Secondary => {
-            let hover = colors
-                .secondary
-                .blend(colors.secondary_foreground.opacity(0.08));
-            base.bg(colors.secondary)
-                .text_color(colors.secondary_foreground)
-                .when(!disabled, |base| base.hover(move |style| style.bg(hover)))
-        }
+            .hover(move |style| style.bg(colors.primary.opacity(0.80))),
         ButtonVariant::Ghost => {
             let hover = match theme.mode {
                 ThemeMode::Light => colors.muted,
@@ -308,33 +219,11 @@ pub(super) fn style_button<
             };
             base.bg(colors.background.opacity(0.0))
                 .text_color(colors.foreground)
-                .when(!disabled, |base| {
-                    base.hover(move |style| style.bg(hover).text_color(colors.foreground))
-                })
+                .hover(move |style| style.bg(hover).text_color(colors.foreground))
         }
-        ButtonVariant::Destructive => {
-            let background_alpha = match theme.mode {
-                ThemeMode::Light => 0.10,
-                ThemeMode::Dark => 0.20,
-            };
-            let hover_alpha = match theme.mode {
-                ThemeMode::Light => 0.20,
-                ThemeMode::Dark => 0.30,
-            };
-            base.bg(colors.destructive.opacity(background_alpha))
-                .text_color(colors.destructive)
-                .when(!disabled, |base| {
-                    base.hover(move |style| style.bg(colors.destructive.opacity(hover_alpha)))
-                })
-        }
-        ButtonVariant::Link => base
-            .bg(colors.background.opacity(0.0))
-            .text_color(colors.primary)
-            .when(!disabled, |base| base.hover(|style| style.underline())),
     };
 
-    base.when(!disabled, |base| base.cursor_pointer())
-        .when(disabled, |base| base.opacity(0.50).cursor_not_allowed())
+    base.cursor_pointer()
 }
 
 impl gpui_kit::Styled for Button {
@@ -348,33 +237,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_variants_expose_clickable_and_disabled_cursors() {
+    fn all_variants_show_the_clickable_cursor() {
         for theme in [UiTheme::neutral_light(), UiTheme::neutral_dark()] {
-            for variant in [
-                ButtonVariant::Default,
-                ButtonVariant::Outline,
-                ButtonVariant::Secondary,
-                ButtonVariant::Ghost,
-                ButtonVariant::Destructive,
-                ButtonVariant::Link,
-            ] {
-                for disabled in [false, true] {
-                    let mut button = style_button(
-                        gpui_kit::div(),
-                        disabled,
-                        variant,
-                        ButtonSize::Default,
-                        &theme,
-                    );
-                    assert_eq!(
-                        button.style().mouse_cursor,
-                        Some(if disabled {
-                            gpui_kit::CursorStyle::OperationNotAllowed
-                        } else {
-                            gpui_kit::CursorStyle::PointingHand
-                        })
-                    );
-                }
+            for variant in [ButtonVariant::Default, ButtonVariant::Ghost] {
+                let mut button = style_button(gpui_kit::div(), variant, ButtonSize::Default, &theme);
+                assert_eq!(button.style().mouse_cursor, Some(gpui_kit::CursorStyle::PointingHand));
             }
         }
     }
@@ -382,14 +249,9 @@ mod tests {
     #[test]
     fn nova_sizes_are_exact() {
         let sizes = [
-            (ButtonSize::Xs, 24.0, 8.0, 4.0, 8.0),
-            (ButtonSize::Sm, 28.0, 10.0, 4.0, 8.0),
             (ButtonSize::Default, 32.0, 10.0, 6.0, 10.0),
-            (ButtonSize::Lg, 36.0, 10.0, 6.0, 10.0),
-            (ButtonSize::IconXs, 24.0, 0.0, 0.0, 8.0),
             (ButtonSize::IconSm, 28.0, 0.0, 0.0, 8.0),
             (ButtonSize::Icon, 32.0, 0.0, 0.0, 10.0),
-            (ButtonSize::IconLg, 36.0, 0.0, 0.0, 10.0),
         ];
 
         for (size, height, padding, gap, radius) in sizes {

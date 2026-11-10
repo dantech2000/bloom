@@ -256,6 +256,14 @@ pub(crate) fn ask_new(app: &mut Bloom, cx: &mut Context<Bloom>) {
     app.ask_prompt(prompt, cx);
 }
 
+/// The key of `name` that was not among the keys before.
+fn new_key(before: &[String], after: &[Key], name: &str) -> Option<String> {
+    after
+        .iter()
+        .find(|k| k.app_name == name && !before.contains(&k.access_token))
+        .map(|k| k.access_token.clone())
+}
+
 /// Makes the key on the server, then shows it once.
 fn create(app: &mut Bloom, name: String, cx: &mut Context<Bloom>) {
     let shown = name.clone();
@@ -263,7 +271,7 @@ fn create(app: &mut Bloom, name: String, cx: &mut Context<Bloom>) {
     // asked: after a switch of the server it is not this server's key.
     app.fetch_in_session(
         cx,
-        move |client| -> Result<Option<String>> {
+        move |client| -> Result<(Option<String>, Data)> {
             // The server does not answer with the key, so the new one is the
             // key that was not there before.
             let before: Vec<String> = load(&client)?
@@ -272,28 +280,40 @@ fn create(app: &mut Bloom, name: String, cx: &mut Context<Bloom>) {
                 .map(|k| k.access_token)
                 .collect();
             client.call("POST", "/Auth/Keys", &[("app", name.clone())])?;
-            Ok(load(&client)?
-                .keys
-                .into_iter()
-                .find(|k| k.app_name == name && !before.contains(&k.access_token))
-                .map(|k| k.access_token))
+            let after = load(&client)?;
+            Ok((new_key(&before, &after.keys, &name), after))
         },
         move |this, result, cx| {
             match result {
-                Ok(Some(value)) if matches!(this.page, crate::app::Page::Admin(_)) => {
-                    this.dialogs.secret = Some(Secret {
-                        title: format!("API key for {shown}"),
-                        message: "Copy the key now and keep it in a safe place.".to_string(),
-                        value,
-                    });
+                Ok((key, keys)) => {
+                    // The list read after the change is the page's list
+                    // now: no third request for it.
+                    let on_page = match &mut this.page {
+                        crate::app::Page::Admin(data) => {
+                            data.api_keys = Some(keys);
+                            true
+                        }
+                        _ => false,
+                    };
+                    match key.filter(|_| on_page) {
+                        Some(value) => {
+                            this.dialogs.secret = Some(Secret {
+                                title: format!("API key for {shown}"),
+                                message: "Copy the key now and keep it in a safe place.".to_string(),
+                                value,
+                            });
+                        }
+                        // The user left the dashboard: the key exists, and
+                        // the list of the keys has it.
+                        None => this.toast("API key created", "", cx),
+                    }
                 }
-                // The user left the dashboard: the key exists, and the
-                // list of the keys has it.
-                Ok(_) => this.toast("API key created", "", cx),
-                Err(err) => this.toast("The server refused the change", format!("{err:#}"), cx),
-            }
-            if matches!(this.page, crate::app::Page::Admin(_)) {
-                this.load_page(cx);
+                Err(err) => {
+                    this.toast("The server refused the change", format!("{err:#}"), cx);
+                    if matches!(this.page, crate::app::Page::Admin(_)) {
+                        this.load_page(cx);
+                    }
+                }
             }
             cx.notify();
         },

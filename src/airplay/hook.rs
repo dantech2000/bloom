@@ -17,12 +17,14 @@ impl Bloom {
             self.close_player_view(cx);
         }
         self.playing = Some(item.clone());
+        // The limit the user set for the player holds for the receiver too.
+        let options = StreamOptions { max_bitrate: self.config.max_bitrate, ..StreamOptions::new() };
         Some(self.airplay.send(SendRequest {
             client,
             item_id: item.id.clone(),
             title: item.display_title(),
             start_secs,
-            options: StreamOptions::new(),
+            options,
         }))
     }
 
@@ -30,8 +32,13 @@ impl Bloom {
     pub fn debug_airplay(&mut self, rest: &str, window: &mut Window, cx: &mut Context<Self>) -> String {
         let (verb, arg) = rest.split_once(' ').unwrap_or((rest, ""));
         match verb {
-            // Names from the Bonjour browse; listens only.
+            // Names from the Bonjour browse; listens only. "routes off"
+            // ends the browse and the route detection, as a closed panel does.
             "routes" => {
+                if arg == "off" {
+                    self.airplay.stop_routes();
+                    return "routes off".into();
+                }
                 let names = self.airplay.routes();
                 self.airplay.detect_routes();
                 let status = self.airplay.status();
@@ -140,7 +147,7 @@ impl Bloom {
                 let age = s.position_at.map(|at| at.elapsed().as_millis()).unwrap_or(0);
                 format!(
                     "state={} item={} position={:.2} ({age} ms ago) duration={:.2} external={} route={} \
-                     picker={} error={} session={} volume={:.2} muted={}",
+                     picker={} browse={} error={} session={} volume={:.2} muted={}",
                     s.state.name(),
                     s.item_id.as_deref().unwrap_or("-"),
                     s.position,
@@ -148,6 +155,7 @@ impl Bloom {
                     s.external,
                     s.route.as_deref().unwrap_or("-"),
                     picker::shown(),
+                    self.airplay.browsing(),
                     s.error.as_deref().unwrap_or("-"),
                     s.play_session_id.as_deref().map(|id| &id[..id.len().min(8)]).unwrap_or("-"),
                     s.volume,
@@ -166,10 +174,10 @@ impl Bloom {
                     .unwrap_or_else(|| "-".into());
                 format!("load={load} control={control} poll=250 ms")
             }
-            _ => "error: airplay routes|picker [x y w h|off]|send <item id> [seconds]|file <path>|play|pause|seek <s>|stop|\
+            _ => "error: airplay routes [off]|picker [x y w h|off]|send <item id> [seconds]|file <path>|play|pause|seek <s>|stop|\
                   disconnect|volume <0..1>|mute [off]|state|latency. \
                   Act on the receiver once a route is picked: send, play, pause, seek, volume, mute (and the \
-                  picker's menu picks the route). Safe anywhere: routes, state, latency, stop, disconnect."
+                  picker's menu picks the route). Safe anywhere: routes, routes off, state, latency, stop, disconnect."
                 .into(),
         }
     }

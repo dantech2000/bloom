@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The JSON of the cast namespaces: what the sender says, and what the
-//! device answers. A request carries a `requestId`; the answer repeats it.
+//! device answers. A request carries a `requestId` and the answer repeats
+//! it; the connection numbers a request when it sends it, so the messages
+//! here have none.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -38,29 +40,31 @@ pub fn pong() -> Value {
 
 // ----- receiver --------------------------------------------------------------
 
-pub fn get_status(id: u64) -> Value {
-    json!({ "type": "GET_STATUS", "requestId": id })
+/// The status of the device on the receiver namespace, and of the item
+/// on the media namespace of an app.
+pub fn get_status() -> Value {
+    json!({ "type": "GET_STATUS" })
 }
 
-pub fn launch(id: u64, app_id: &str) -> Value {
-    json!({ "type": "LAUNCH", "requestId": id, "appId": app_id })
+pub fn launch(app_id: &str) -> Value {
+    json!({ "type": "LAUNCH", "appId": app_id })
 }
 
-pub fn stop_app(id: u64, session_id: &str) -> Value {
-    json!({ "type": "STOP", "requestId": id, "sessionId": session_id })
+pub fn stop_app(session_id: &str) -> Value {
+    json!({ "type": "STOP", "sessionId": session_id })
 }
 
 /// `level` from 0 to 1.
-pub fn set_volume(id: u64, level: f64) -> Value {
-    json!({ "type": "SET_VOLUME", "requestId": id, "volume": { "level": level.clamp(0., 1.) } })
+pub fn set_volume(level: f64) -> Value {
+    json!({ "type": "SET_VOLUME", "volume": { "level": level.clamp(0., 1.) } })
 }
 
-pub fn set_muted(id: u64, muted: bool) -> Value {
-    json!({ "type": "SET_VOLUME", "requestId": id, "volume": { "muted": muted } })
+pub fn set_muted(muted: bool) -> Value {
+    json!({ "type": "SET_VOLUME", "volume": { "muted": muted } })
 }
 
-pub fn app_availability(id: u64, app_ids: &[String]) -> Value {
-    json!({ "type": "GET_APP_AVAILABILITY", "requestId": id, "appId": app_ids })
+pub fn app_availability(app_ids: &[String]) -> Value {
+    json!({ "type": "GET_APP_AVAILABILITY", "appId": app_ids })
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -99,11 +103,27 @@ pub struct Volume {
     pub muted: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase", default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ReceiverStatus {
     pub applications: Vec<App>,
     pub volume: Option<Volume>,
+}
+
+/// The entries of a list that read as `T`. One that does not is left out
+/// with a word in the log, so one odd field of one entry does not cost the
+/// whole status.
+fn entries<T: serde::de::DeserializeOwned>(list: &Value, what: &str) -> Vec<T> {
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| match T::deserialize(entry) {
+            Ok(entry) => Some(entry),
+            Err(err) => {
+                log::debug!("cast: {what} not read: {err}");
+                None
+            }
+        })
+        .collect()
 }
 
 impl ReceiverStatus {
@@ -112,7 +132,11 @@ impl ReceiverStatus {
         if payload["type"] != "RECEIVER_STATUS" {
             return None;
         }
-        serde_json::from_value(payload["status"].clone()).ok()
+        let status = &payload["status"];
+        let volume = Option::<Volume>::deserialize(&status["volume"])
+            .inspect_err(|err| log::debug!("cast: the volume of the receiver status not read: {err}"))
+            .unwrap_or_default();
+        Some(Self { applications: entries(&status["applications"], "an app of the receiver status"), volume })
     }
 
     /// The app that runs, if one does and it is not the idle screen.
@@ -134,37 +158,13 @@ pub struct LoadMedia {
     pub start_secs: f64,
     /// Length in seconds, when known; a transcoded stream has none.
     pub duration: Option<f64>,
-    pub tracks: Vec<Track>,
-    pub active_tracks: Vec<i64>,
-    /// `BUFFERED` for a file, `LIVE` for a stream with no end.
-    pub live: bool,
 }
 
-/// A side-loaded subtitle: a WebVTT URL.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Track {
-    pub id: i64,
-    pub url: String,
-    pub language: String,
-    pub name: String,
-}
-
-pub fn load(id: u64, media: &LoadMedia) -> Value {
-    let tracks: Vec<Value> = media
-        .tracks
-        .iter()
-        .map(|track| {
-            json!({
-                "trackId": track.id, "type": "TEXT", "subtype": "SUBTITLES",
-                "trackContentId": track.url, "trackContentType": "text/vtt",
-                "language": track.language, "name": track.name,
-            })
-        })
-        .collect();
+pub fn load(media: &LoadMedia) -> Value {
     let mut item = json!({
         "contentId": media.url,
         "contentType": media.content_type,
-        "streamType": if media.live { "LIVE" } else { "BUFFERED" },
+        "streamType": "BUFFERED",
         "metadata": {
             "metadataType": 0,
             "title": media.title,
@@ -175,47 +175,36 @@ pub fn load(id: u64, media: &LoadMedia) -> Value {
     if let Some(duration) = media.duration {
         item["duration"] = json!(duration);
     }
-    if !tracks.is_empty() {
-        item["tracks"] = Value::Array(tracks);
-    }
-    let mut message = json!({
-        "type": "LOAD", "requestId": id, "media": item,
+    json!({
+        "type": "LOAD", "media": item,
         "autoplay": true, "currentTime": media.start_secs,
-    });
-    if !media.active_tracks.is_empty() {
-        message["activeTrackIds"] = json!(media.active_tracks);
-    }
-    message
+    })
 }
 
-pub fn media_status(id: u64) -> Value {
-    json!({ "type": "GET_STATUS", "requestId": id })
+pub fn play(media_session_id: i64) -> Value {
+    json!({ "type": "PLAY", "mediaSessionId": media_session_id })
 }
 
-pub fn play(id: u64, media_session_id: i64) -> Value {
-    json!({ "type": "PLAY", "requestId": id, "mediaSessionId": media_session_id })
+pub fn pause(media_session_id: i64) -> Value {
+    json!({ "type": "PAUSE", "mediaSessionId": media_session_id })
 }
 
-pub fn pause(id: u64, media_session_id: i64) -> Value {
-    json!({ "type": "PAUSE", "requestId": id, "mediaSessionId": media_session_id })
-}
-
-pub fn media_stop(id: u64, media_session_id: i64) -> Value {
-    json!({ "type": "STOP", "requestId": id, "mediaSessionId": media_session_id })
+pub fn media_stop(media_session_id: i64) -> Value {
+    json!({ "type": "STOP", "mediaSessionId": media_session_id })
 }
 
 /// Without `resumeState` the receiver keeps its state: a seek while paused
 /// stays paused, as a seek in the player does.
-pub fn seek(id: u64, media_session_id: i64, secs: f64) -> Value {
+pub fn seek(media_session_id: i64, secs: f64) -> Value {
     json!({
-        "type": "SEEK", "requestId": id, "mediaSessionId": media_session_id,
+        "type": "SEEK", "mediaSessionId": media_session_id,
         "currentTime": secs.max(0.),
     })
 }
 
-pub fn edit_tracks(id: u64, media_session_id: i64, active: &[i64]) -> Value {
+pub fn edit_tracks(media_session_id: i64, active: &[i64]) -> Value {
     json!({
-        "type": "EDIT_TRACKS_INFO", "requestId": id, "mediaSessionId": media_session_id,
+        "type": "EDIT_TRACKS_INFO", "mediaSessionId": media_session_id,
         "activeTrackIds": active,
     })
 }
@@ -224,7 +213,6 @@ pub fn edit_tracks(id: u64, media_session_id: i64, active: &[i64]) -> Value {
 #[serde(rename_all = "camelCase", default)]
 pub struct MediaItem {
     pub content_id: String,
-    pub content_type: String,
     pub duration: Option<f64>,
 }
 
@@ -235,12 +223,9 @@ pub struct MediaStatus {
     /// IDLE, BUFFERING, PLAYING, PAUSED.
     pub player_state: String,
     pub current_time: f64,
-    pub playback_rate: f64,
     pub idle_reason: Option<String>,
     pub media: Option<MediaItem>,
-    pub volume: Option<Volume>,
     pub active_track_ids: Vec<i64>,
-    pub supported_media_commands: u64,
 }
 
 impl MediaStatus {
@@ -250,7 +235,7 @@ impl MediaStatus {
         if payload["type"] != "MEDIA_STATUS" {
             return None;
         }
-        serde_json::from_value(payload["status"].clone()).ok()
+        Some(entries(&payload["status"], "an entry of the media status"))
     }
 }
 
@@ -277,27 +262,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn requests_carry_their_id_and_the_fields_of_the_spec() {
-        assert_eq!(get_status(7), json!({"type": "GET_STATUS", "requestId": 7}));
-        assert_eq!(launch(8, "F007D354"), json!({"type": "LAUNCH", "requestId": 8, "appId": "F007D354"}));
-        assert_eq!(stop_app(9, "s1"), json!({"type": "STOP", "requestId": 9, "sessionId": "s1"}));
-        assert_eq!(set_volume(10, 1.5), json!({"type": "SET_VOLUME", "requestId": 10, "volume": {"level": 1.0}}));
-        assert_eq!(set_muted(11, true), json!({"type": "SET_VOLUME", "requestId": 11, "volume": {"muted": true}}));
+    fn requests_carry_the_fields_of_the_spec() {
+        assert_eq!(get_status(), json!({"type": "GET_STATUS"}));
+        assert_eq!(launch("F007D354"), json!({"type": "LAUNCH", "appId": "F007D354"}));
+        assert_eq!(stop_app("s1"), json!({"type": "STOP", "sessionId": "s1"}));
+        assert_eq!(set_volume(1.5), json!({"type": "SET_VOLUME", "volume": {"level": 1.0}}));
+        assert_eq!(set_muted(true), json!({"type": "SET_VOLUME", "volume": {"muted": true}}));
         assert_eq!(
-            app_availability(12, &["A".into(), "B".into()]),
-            json!({"type": "GET_APP_AVAILABILITY", "requestId": 12, "appId": ["A", "B"]})
+            app_availability(&["A".into(), "B".into()]),
+            json!({"type": "GET_APP_AVAILABILITY", "appId": ["A", "B"]})
         );
-        assert_eq!(seek(13, 4, -2.), json!({"type": "SEEK", "requestId": 13, "mediaSessionId": 4, "currentTime": 0.0}));
-        assert_eq!(pause(14, 4)["type"], "PAUSE");
-        assert_eq!(play(15, 4)["mediaSessionId"], 4);
-        assert_eq!(media_stop(16, 4)["type"], "STOP");
-        assert_eq!(edit_tracks(17, 4, &[2])["activeTrackIds"], json!([2]));
+        assert_eq!(seek(4, -2.), json!({"type": "SEEK", "mediaSessionId": 4, "currentTime": 0.0}));
+        assert_eq!(pause(4)["type"], "PAUSE");
+        assert_eq!(play(4)["mediaSessionId"], 4);
+        assert_eq!(media_stop(4)["type"], "STOP");
+        assert_eq!(edit_tracks(4, &[2])["activeTrackIds"], json!([2]));
         assert_eq!(connect()["type"], "CONNECT");
         assert_eq!(ping(), json!({"type": "PING"}));
     }
 
     #[test]
-    fn load_names_the_stream_and_its_tracks() {
+    fn load_names_the_stream() {
         let media = LoadMedia {
             url: "https://s/v.m3u8".into(),
             content_type: "application/x-mpegURL".into(),
@@ -306,28 +291,47 @@ mod tests {
             image_url: Some("https://s/i.jpg".into()),
             start_secs: 42.5,
             duration: Some(600.),
-            tracks: vec![Track { id: 1, url: "https://s/en.vtt".into(), language: "en".into(), name: "English".into() }],
-            active_tracks: vec![1],
-            live: false,
         };
-        let message = load(3, &media);
+        let message = load(&media);
         assert_eq!(message["type"], "LOAD");
-        assert_eq!(message["requestId"], 3);
         assert_eq!(message["autoplay"], true);
         assert_eq!(message["currentTime"], 42.5);
-        assert_eq!(message["activeTrackIds"], json!([1]));
         let item = &message["media"];
         assert_eq!(item["contentId"], "https://s/v.m3u8");
         assert_eq!(item["streamType"], "BUFFERED");
         assert_eq!(item["duration"], 600.0);
         assert_eq!(item["metadata"]["title"], "Film");
         assert_eq!(item["metadata"]["images"][0]["url"], "https://s/i.jpg");
-        assert_eq!(item["tracks"][0]["trackContentType"], "text/vtt");
-        assert_eq!(item["tracks"][0]["trackId"], 1);
-        let bare = load(4, &LoadMedia { live: true, ..Default::default() });
-        assert_eq!(bare["media"]["streamType"], "LIVE");
-        assert!(bare["media"].get("tracks").is_none());
-        assert!(bare.get("activeTrackIds").is_none());
+        let bare = load(&LoadMedia::default());
+        assert!(bare["media"].get("duration").is_none());
+        assert_eq!(bare["media"]["metadata"]["images"], json!([]));
+    }
+
+    /// One entry with a field of a kind the app does not expect (a null
+    /// where a text goes) is left out; the rest of the status still reads.
+    /// Before, the whole status was dropped without a word.
+    #[test]
+    fn one_odd_entry_does_not_cost_the_status() {
+        let payload = json!({
+            "type": "RECEIVER_STATUS",
+            "status": {
+                "applications": [
+                    {"appId": "ODD", "statusText": null, "transportId": "t0"},
+                    {"appId": "F007D354", "sessionId": "s-1", "transportId": "web-7"},
+                ],
+                "volume": {"level": 0.5, "muted": true},
+            },
+        });
+        let status = ReceiverStatus::parse(&payload).expect("the status reads");
+        assert_eq!(status.running().map(|app| app.transport_id.as_str()), Some("web-7"));
+        assert_eq!(status.volume, Some(Volume { level: 0.5, muted: true }));
+        let media = json!({"type": "MEDIA_STATUS", "status": [
+            {"mediaSessionId": "odd"},
+            {"mediaSessionId": 3, "playerState": "PLAYING"},
+        ]});
+        let entries = MediaStatus::parse(&media).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].media_session_id, 3);
     }
 
     #[test]

@@ -114,10 +114,10 @@ impl Bloom {
                 if !this.connection.probes.is_current(id) {
                     return;
                 }
-                let event = match result {
-                    Ok(Ok(())) => Event::ProbeOk,
-                    Ok(Err(why)) => Event::ProbeFailed(why),
-                    Err(_) => Event::ProbeFailed(Why::Connect),
+                // The work has no error of its own: the probe's is the answer.
+                let event = match result.unwrap_or(Err(Why::Connect)) {
+                    Ok(()) => Event::ProbeOk,
+                    Err(why) => Event::ProbeFailed(why),
                 };
                 let was = this.connection.core.state;
                 let action = this.connection.core.handle(event, Instant::now());

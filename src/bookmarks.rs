@@ -12,6 +12,7 @@
 //! is not lost. The app keeps the file as it got it, so keys it does not know
 //! stay.
 
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use gpui_icons::LucideIcon;
 use gpui_kit::{
@@ -270,6 +271,17 @@ pub struct BookmarkState {
     /// for each change of it: the seek bar of the player asks for them at
     /// each of its frames.
     all: Vec<Bookmark>,
+    /// Counts the changes of `all` and of `targets`: what was matched for
+    /// an item holds for one count.
+    rev: u64,
+    /// Who the bookmarks of an item are for, as the server has the item
+    /// (an episode with the TMDB id of its series), by item id. `None`
+    /// while the server is asked; see [`Bloom::learn_bookmark_target`].
+    targets: RefCell<HashMap<String, Option<Target>>>,
+    /// The bookmarks of the item asked for last, and the count they are
+    /// of. The seek bar of the player asks at each of its frames: it gets
+    /// this list, with no match and no copy of the entries.
+    matched: RefCell<Option<(String, u64, Rc<[Bookmark]>)>>,
     /// The label field of the panel.
     pub input: Option<Entity<InputState>>,
     _subscription: Option<Subscription>,
@@ -284,6 +296,31 @@ impl BookmarkState {
     fn edit(&mut self, change: impl FnOnce(&mut Option<Value>)) {
         change(&mut self.file);
         self.all = self.file.as_ref().map(parse).unwrap_or_default();
+        self.rev += 1;
+    }
+
+    /// The bookmarks of an item, by time: by the target the server gave
+    /// for it when there is one, else by what the item itself says.
+    fn of(&self, item: &Item) -> Rc<[Bookmark]> {
+        if let Some((id, rev, list)) = &*self.matched.borrow()
+            && *id == item.id
+            && *rev == self.rev
+        {
+            return list.clone();
+        }
+        let list: Rc<[Bookmark]> = match self.targets.borrow().get(&item.id) {
+            Some(Some(target)) => for_item(&self.all, target),
+            _ => for_item(&self.all, &Target::of(item, None)),
+        }
+        .into();
+        *self.matched.borrow_mut() = Some((item.id.clone(), self.rev, list.clone()));
+        list
+    }
+
+    /// Keeps the target of an item.
+    fn learn(&mut self, item_id: String, target: Target) {
+        self.targets.get_mut().insert(item_id, Some(target));
+        self.rev += 1;
     }
 }
 
@@ -333,9 +370,39 @@ impl Bloom {
     }
 
     /// The bookmarks of an item, by time.
-    pub fn bookmarks_of(&self, item: &Item) -> Vec<Bookmark> {
-        let series = None;
-        for_item(self.enhanced.bookmarks.all(), &Target::of(item, series))
+    pub fn bookmarks_of(&self, item: &Item) -> Rc<[Bookmark]> {
+        self.enhanced.bookmarks.of(item)
+    }
+
+    /// Asks the server who the bookmarks of an item are for, once for
+    /// each item, when no bookmark has its item id. The plugin then
+    /// matches by the ids at other sites, and for an episode that is the
+    /// TMDB id of its series with the season and the episode number: the
+    /// item of a page or of the player does not have the series' ids, so
+    /// an episode whose file was replaced (a new item id) showed none of
+    /// its bookmarks here while the web client showed them. A place that
+    /// shows the bookmarks of an item calls this when it draws.
+    fn learn_bookmark_target(&self, item: &Item, cx: &mut Context<Self>) {
+        let state = &self.enhanced.bookmarks;
+        if state.all.is_empty()
+            || state.all.iter().any(|b| b.item_id == item.id)
+            || state.targets.borrow().contains_key(&item.id)
+        {
+            return;
+        }
+        state.targets.borrow_mut().insert(item.id.clone(), None);
+        let (id, asked) = (item.id.clone(), item.id.clone());
+        self.fetch_in_session(
+            cx,
+            move |client| client.bookmark_target(&asked),
+            move |this, result, cx| match result {
+                Ok(target) => {
+                    this.enhanced.bookmarks.learn(id, target);
+                    cx.notify();
+                }
+                Err(err) => log::warn!("bookmarks: the ids of {id} did not come: {err:#}"),
+            },
+        );
     }
 
     /// Adds a bookmark at `secs` of the item. The plugin builds the entry; the
@@ -346,17 +413,20 @@ impl Bloom {
         }
         let secs = (secs.max(0.) * 10.).round() / 10.;
         let id = item_id.clone();
-        self.fetch(
+        // The answer is for the session that asked: another profile may
+        // be open by then, with a file of its own.
+        self.fetch_in_session(
             cx,
             move |client| {
                 let target = client.bookmark_target(&id)?;
                 let body = add_body(&target, secs, &label);
                 let key = client.bookmark_add(&body)?;
-                Ok((key, body))
+                Ok((key, body, target))
             },
             move |this, result, cx| match result {
-                Ok((key, body)) => {
+                Ok((key, body, target)) => {
                     let now = jiff::Timestamp::now().to_string();
+                    this.enhanced.bookmarks.learn(item_id, target);
                     this.enhanced.bookmarks.edit(|file| {
                         insert(file.get_or_insert_with(|| json!({})), &key, &body, &now);
                     });
@@ -370,7 +440,7 @@ impl Bloom {
 
     pub fn remove_bookmark(&mut self, id: String, cx: &mut Context<Self>) {
         let key = id.clone();
-        self.fetch(
+        self.fetch_in_session(
             cx,
             move |client| client.bookmark_remove(&key),
             move |this, result, cx| match result {
@@ -385,11 +455,6 @@ impl Bloom {
                 Err(err) => this.toast("Could not remove the bookmark", format!("{err:#}"), cx),
             },
         );
-    }
-
-    /// Jumps to a bookmark in the player.
-    pub fn jump_to_bookmark(&mut self, secs: f64, cx: &mut Context<Self>) {
-        self.request_seek_to(secs, cx);
     }
 
     /// The label field, made on the first use.
@@ -468,6 +533,10 @@ impl Bloom {
         if !self.bookmarks_on() {
             return None;
         }
+        // The marks of the seek bar are drawn with this button.
+        if let Some(item) = &self.playing {
+            self.learn_bookmark_target(item, cx);
+        }
         let open = self.panel_is(Panel::Bookmarks);
         Some(
             div()
@@ -498,7 +567,7 @@ impl Bloom {
             return Vec::new();
         }
         self.bookmarks_of(item)
-            .into_iter()
+            .iter()
             .filter(|b| b.timestamp >= 0. && b.timestamp <= duration)
             .map(|b| {
                 // A white diamond above the track; the chapter marks are
@@ -525,6 +594,7 @@ impl Bloom {
         let t = UiTheme::read(cx).clone();
         let soft = rgba(0xf5f5f7b3);
         let item = self.playing.clone()?;
+        self.learn_bookmark_target(&item, cx);
         let list = self.bookmarks_of(&item);
         let input = self.enhanced.bookmarks.input.clone();
         let position = self.player_status.position;
@@ -533,58 +603,11 @@ impl Bloom {
             cx.stop_propagation();
         }
         let mut rows = div().flex().flex_col().gap(px(2.));
-        for b in &list {
-            let (jump, remove, at) = (b.timestamp, b.id.clone(), b.timestamp);
-            rows = rows.child(
-                div()
-                    .id(SharedString::from(format!("bookmark.row.{}", b.id)))
-                    .min_h(px(44.))
-                    .px(px(12.))
-                    .py(px(6.))
-                    .rounded(px(12.))
-                    .flex()
-                    .items_center()
-                    .gap(px(12.))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgba(0xffffff1f)))
-                    .child(
-                        div()
-                            .w(px(58.))
-                            .flex_shrink_0()
-                            .text_size(px(15.))
-                            .font_weight(gpui_kit::FontWeight::MEDIUM)
-                            .text_color(t.colors.foreground)
-                            .child(format_duration(at as i64)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(14.))
-                            .text_color(if b.label.is_empty() { soft } else { t.colors.foreground })
-                            .child(if b.label.is_empty() { "No label".to_string() } else { b.label.clone() }),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("bookmark.delete.{}", b.id)))
-                            .size(px(28.))
-                            .rounded(px(8.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .hover(|s| s.bg(rgba(0xffffff29)))
-                            .tooltip(tip("Delete the bookmark"))
-                            .child(icon(LucideIcon::Trash2, 15., soft))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.remove_bookmark(remove.clone(), cx)
-                            })),
-                    )
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.jump_to_bookmark(jump, cx)
-                    })),
-            );
+        for b in list.iter() {
+            let jump = b.timestamp;
+            rows = rows.child(self.bookmark_row(b, false, cx).on_click(cx.listener(
+                move |this, _: &ClickEvent, _, cx| this.request_seek_to(jump, cx),
+            )));
         }
         let height = (list.len() as f32 * 46.).min(230.);
         Some(
@@ -665,6 +688,66 @@ impl Bloom {
         )
     }
 
+    /// One bookmark as a row: its time, its label, and the button that
+    /// deletes it. The panel of the player and the detail page show the
+    /// same row; the one of the detail page (`detail`) has an icon first
+    /// and ids of its own. The caller adds what a click on the row does.
+    fn bookmark_row(&self, b: &Bookmark, detail: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+        let t = UiTheme::read(cx).clone();
+        let soft = rgba(0xf5f5f7b3);
+        let (row_id, delete_id) = match detail {
+            true => (format!("detail.bookmark.{}", b.id), format!("detail.bookmark.delete.{}", b.id)),
+            false => (format!("bookmark.row.{}", b.id), format!("bookmark.delete.{}", b.id)),
+        };
+        let remove = b.id.clone();
+        div()
+            .id(SharedString::from(row_id))
+            .min_h(px(44.))
+            .px(px(12.))
+            .py(px(6.))
+            .rounded(px(12.))
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgba(0xffffff1f)))
+            .when(detail, |el| el.child(icon(LucideIcon::Bookmark, 16., soft)))
+            .child(
+                div()
+                    .w(px(58.))
+                    .flex_shrink_0()
+                    .text_size(px(15.))
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                    .text_color(t.colors.foreground)
+                    .child(format_duration(b.timestamp as i64)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(14.))
+                    .text_color(if b.label.is_empty() { soft } else { t.colors.foreground })
+                    .child(if b.label.is_empty() { "No label".to_string() } else { b.label.clone() }),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(delete_id))
+                    .size(px(28.))
+                    .rounded(px(8.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover(|s| s.bg(rgba(0xffffff29)))
+                    .tooltip(tip("Delete the bookmark"))
+                    .child(icon(LucideIcon::Trash2, 15., soft))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.remove_bookmark(remove.clone(), cx)
+                    })),
+            )
+    }
+
     // ----- detail page -----------------------------------------------------------
 
     /// The "Bookmarks" list of a detail page, when the item has some.
@@ -672,71 +755,23 @@ impl Bloom {
         if !self.bookmarks_on() || !item.is_playable() {
             return None;
         }
+        self.learn_bookmark_target(item, cx);
         let list = self.bookmarks_of(item);
         if list.is_empty() {
             return None;
         }
         let t = UiTheme::read(cx).clone();
-        let soft = rgba(0xf5f5f7b3);
         let mut rows = div().flex().flex_col().gap(px(2.)).w(px(520.).min(px(self.viewport_w - left - right)));
-        for b in list {
-            let (item, at, remove) = (item.clone(), b.timestamp, b.id.clone());
-            rows = rows.child(
-                div()
-                    .id(SharedString::from(format!("detail.bookmark.{}", b.id)))
-                    .min_h(px(44.))
-                    .px(px(12.))
-                    .py(px(6.))
-                    .rounded(px(12.))
-                    .flex()
-                    .items_center()
-                    .gap(px(12.))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgba(0xffffff1f)))
-                    .tooltip(tip("Play from this time"))
-                    .child(icon(LucideIcon::Bookmark, 16., soft))
-                    .child(
-                        div()
-                            .w(px(58.))
-                            .flex_shrink_0()
-                            .text_size(px(15.))
-                            .font_weight(gpui_kit::FontWeight::MEDIUM)
-                            .text_color(t.colors.foreground)
-                            .child(format_duration(at as i64)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(14.))
-                            .text_color(if b.label.is_empty() { soft } else { t.colors.foreground })
-                            .child(if b.label.is_empty() { "No label".to_string() } else { b.label.clone() }),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("detail.bookmark.delete.{}", b.id)))
-                            .size(px(28.))
-                            .rounded(px(8.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .hover(|s| s.bg(rgba(0xffffff29)))
-                            .tooltip(tip("Delete the bookmark"))
-                            .child(icon(LucideIcon::Trash2, 15., soft))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.remove_bookmark(remove.clone(), cx)
-                            })),
-                    )
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        // Starts the item at the time of the bookmark.
-                        let mut start = item.clone();
-                        start.user_data.playback_position_ticks =
-                            (at * crate::jellyfin::TICKS_PER_SECOND as f64) as i64;
-                        this.play(&start, true, window, cx);
-                    })),
-            );
+        for b in list.iter() {
+            let (item, at) = (item.clone(), b.timestamp);
+            rows = rows.child(self.bookmark_row(b, true, cx).tooltip(tip("Play from this time")).on_click(cx.listener(
+                move |this, _: &ClickEvent, window, cx| {
+                    // Starts the item at the time of the bookmark.
+                    let mut start = item.clone();
+                    start.user_data.playback_position_ticks = (at * crate::jellyfin::TICKS_PER_SECOND as f64) as i64;
+                    this.play(&start, true, window, cx);
+                },
+            )));
         }
         Some(
             div()
@@ -813,7 +848,7 @@ impl Bloom {
         };
         match rest.trim().parse::<usize>().ok().and_then(|n| self.bookmarks_of(&item).get(n.wrapping_sub(1)).cloned()) {
             Some(b) => {
-                self.jump_to_bookmark(b.timestamp, cx);
+                self.request_seek_to(b.timestamp, cx);
                 format!("jumped to {}s", b.timestamp)
             }
             None => "error: je bookmark-jump <place>".into(),
@@ -915,6 +950,34 @@ mod tests {
         let now = time(&|| state.all().len());
         println!("the bookmarks of a file of 100, for one frame: {before:?} before, {now:?} now");
         // The times are printed, not asserted: a loaded machine can turn them.
+    }
+
+    /// An episode whose file was replaced has a new item id, and the
+    /// item of the player has no ids of its series: its bookmarks show
+    /// once the server said who they are for (the TMDB id of the series,
+    /// the season and the episode). Before, they did not show. The list
+    /// of an item is made once for each change, not at each frame.
+    #[test]
+    fn an_episode_with_a_new_id_gets_its_bookmarks_by_the_target_of_the_server() {
+        let mut state = BookmarkState::default();
+        state.edit(|kept| *kept = Some(file()));
+        let episode = Item {
+            id: "new-id".into(),
+            kind: ItemKind::Episode,
+            parent_index_number: Some(1),
+            index_number: Some(1),
+            ..Default::default()
+        };
+        assert!(state.of(&episode).is_empty());
+        let target = Target { item_id: "new-id".into(), tmdb_id: "77".into(), media_type: "tv".into(), season: Some(1), episode: Some(1), ..Default::default() };
+        state.learn("new-id".into(), target);
+        let list = state.of(&episode);
+        assert_eq!(list.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(), ["Bm_3"]);
+        assert!(Rc::ptr_eq(&list, &state.of(&episode)), "the list was made again with no change");
+        state.edit(|kept| {
+            remove(kept.as_mut().unwrap(), "Bm_3");
+        });
+        assert!(state.of(&episode).is_empty());
     }
 
     #[test]

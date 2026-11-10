@@ -144,35 +144,41 @@ impl Inbox {
         Ok(n > 0)
     }
 
-    /// The next whole message, when one is in.
+    /// Takes bytes that were read elsewhere.
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    /// The next whole message, when one is in. A frame that is not a cast
+    /// message is skipped with a word in the log: its length is known, so
+    /// the frames after it still read. An error is a length no frame has;
+    /// after that the stream cannot be read on.
     pub fn next(&mut self) -> Result<Option<CastMessage>> {
-        if self.bytes.len() < 4 {
-            return Ok(None);
+        loop {
+            if self.bytes.len() < 4 {
+                return Ok(None);
+            }
+            let len = u32::from_be_bytes([self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3]]) as usize;
+            if len > MAX_FRAME {
+                bail!("cast frame of {len} bytes");
+            }
+            if self.bytes.len() < 4 + len {
+                return Ok(None);
+            }
+            let message = CastMessage::decode(&self.bytes[4..4 + len]);
+            self.bytes.drain(..4 + len);
+            match message {
+                Ok(message) => return Ok(Some(message)),
+                Err(err) => log::debug!("cast: a frame of {len} bytes skipped: {err:#}"),
+            }
         }
-        let len = u32::from_be_bytes([self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3]]) as usize;
-        if len > MAX_FRAME {
-            bail!("cast frame of {len} bytes");
-        }
-        if self.bytes.len() < 4 + len {
-            return Ok(None);
-        }
-        let message = CastMessage::decode(&self.bytes[4..4 + len])?;
-        self.bytes.drain(..4 + len);
-        Ok(Some(message))
     }
 }
 
-fn put_varint(out: &mut Vec<u8>, field: u32, mut value: u64) {
+/// A varint field: its key, then the value.
+fn put_varint(out: &mut Vec<u8>, field: u32, value: u64) {
     push_varint(out, u64::from(field << 3));
-    loop {
-        let byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value == 0 {
-            out.push(byte);
-            return;
-        }
-        out.push(byte | 0x80);
-    }
+    push_varint(out, value);
 }
 
 fn push_varint(out: &mut Vec<u8>, mut value: u64) {
@@ -297,6 +303,20 @@ mod tests {
         assert_eq!(inbox.next().unwrap().unwrap().text_payload(), r#"{"type":"PING"}"#);
         assert!(inbox.next().unwrap().is_none());
         assert!(!inbox.fill(&mut &b""[..]).unwrap(), "a closed socket");
+    }
+
+    /// A frame that does not decode (a string that is not UTF-8) is left
+    /// out, and the frame after it comes: the connection goes on.
+    #[test]
+    fn a_bad_frame_is_skipped_and_the_next_one_reads() {
+        let bad_body = [0x12, 0x02, 0xff, 0xfe];
+        let mut bytes = vec![0, 0, 0, bad_body.len() as u8];
+        bytes.extend_from_slice(&bad_body);
+        bytes.extend(ping_frame());
+        let mut inbox = Inbox::default();
+        inbox.push(&bytes);
+        assert_eq!(inbox.next().unwrap().unwrap().text_payload(), r#"{"type":"PING"}"#);
+        assert!(inbox.next().unwrap().is_none());
     }
 
     #[test]

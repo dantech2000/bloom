@@ -11,7 +11,7 @@ use gpui_kit::{
     base::input::{InputEvent, InputState},
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::{
     app::{Bloom, Page},
@@ -86,74 +86,6 @@ pub fn is_test_name(name: &str) -> bool {
     name.starts_with(TEST_PREFIX) && name.len() > TEST_PREFIX.len()
 }
 
-/// A request without a body: method, path and query.
-#[derive(Debug, PartialEq)]
-pub struct Req {
-    pub method: &'static str,
-    pub path: String,
-    pub query: Vec<(&'static str, String)>,
-}
-
-fn ids_param(ids: &[String]) -> String {
-    ids.join(",")
-}
-
-pub fn add_to_playlist_req(list: &str, ids: &[String], user: &str) -> Req {
-    Req {
-        method: "POST",
-        path: format!("/Playlists/{list}/Items"),
-        query: vec![("ids", ids_param(ids)), ("userId", user.to_string())],
-    }
-}
-
-pub fn remove_from_playlist_req(list: &str, entry_ids: &[String]) -> Req {
-    Req {
-        method: "DELETE",
-        path: format!("/Playlists/{list}/Items"),
-        query: vec![("entryIds", ids_param(entry_ids))],
-    }
-}
-
-pub fn move_in_playlist_req(list: &str, entry_id: &str, new_index: usize) -> Req {
-    Req {
-        method: "POST",
-        path: format!("/Playlists/{list}/Items/{entry_id}/Move/{new_index}"),
-        query: Vec::new(),
-    }
-}
-
-pub fn create_collection_req(name: &str, ids: &[String]) -> Req {
-    Req {
-        method: "POST",
-        path: "/Collections".to_string(),
-        query: vec![("name", name.to_string()), ("ids", ids_param(ids))],
-    }
-}
-
-pub fn add_to_collection_req(list: &str, ids: &[String]) -> Req {
-    Req {
-        method: "POST",
-        path: format!("/Collections/{list}/Items"),
-        query: vec![("ids", ids_param(ids))],
-    }
-}
-
-pub fn remove_from_collection_req(list: &str, ids: &[String]) -> Req {
-    Req {
-        method: "DELETE",
-        path: format!("/Collections/{list}/Items"),
-        query: vec![("ids", ids_param(ids))],
-    }
-}
-
-pub fn create_playlist_body(name: &str, ids: &[String], user: &str) -> Value {
-    json!({ "Name": name, "Ids": ids, "UserId": user, "MediaType": "Video" })
-}
-
-pub fn rename_playlist_body(name: &str) -> Value {
-    json!({ "Name": name })
-}
-
 // ----- Calls to the server ------------------------------------------------
 
 /// An entry of a playlist: the item, and the id of its place in the list
@@ -217,13 +149,10 @@ pub(crate) impl Client {
         Ok(entries.items)
     }
 
-    fn run(&self, req: Req) -> Result<()> {
-        self.call(req.method, &req.path, &req.query)
-    }
-
     fn create_playlist(&self, name: &str, ids: &[String]) -> Result<String> {
         let user = self.user()?.to_string();
-        let mut body = self.post("/Playlists", &create_playlist_body(name, ids, &user))?;
+        let playlist = json!({ "Name": name, "Ids": ids, "UserId": user, "MediaType": "Video" });
+        let mut body = self.post("/Playlists", &playlist)?;
         let created: Created = body.read_json()?;
         ensure!(!created.id.is_empty(), "the server sent no id for the playlist");
         Ok(created.id)
@@ -231,35 +160,35 @@ pub(crate) impl Client {
 
     fn add_to_playlist(&self, list: &str, ids: &[String]) -> Result<()> {
         let user = self.user()?.to_string();
-        self.run(add_to_playlist_req(list, ids, &user))
+        self.call("POST", &format!("/Playlists/{list}/Items"), &[("ids", ids.join(",")), ("userId", user)])
     }
 
     fn remove_from_playlist(&self, list: &str, entry_ids: &[String]) -> Result<()> {
-        self.run(remove_from_playlist_req(list, entry_ids))
+        self.call("DELETE", &format!("/Playlists/{list}/Items"), &[("entryIds", entry_ids.join(","))])
     }
 
     fn move_in_playlist(&self, list: &str, entry_id: &str, new_index: usize) -> Result<()> {
-        self.run(move_in_playlist_req(list, entry_id, new_index))
+        self.call("POST", &format!("/Playlists/{list}/Items/{entry_id}/Move/{new_index}"), &[])
     }
 
     fn rename_playlist(&self, list: &str, name: &str) -> Result<()> {
-        self.post(&format!("/Playlists/{list}"), &rename_playlist_body(name))?;
+        self.post(&format!("/Playlists/{list}"), &json!({ "Name": name }))?;
         Ok(())
     }
 
     fn create_collection(&self, name: &str, ids: &[String]) -> Result<String> {
-        let req = create_collection_req(name, ids);
-        let created: Created = self.send(req.method, &req.path, &req.query)?;
+        let created: Created =
+            self.send("POST", "/Collections", &[("name", name.to_string()), ("ids", ids.join(","))])?;
         ensure!(!created.id.is_empty(), "the server sent no id for the collection");
         Ok(created.id)
     }
 
     fn add_to_collection(&self, list: &str, ids: &[String]) -> Result<()> {
-        self.run(add_to_collection_req(list, ids))
+        self.call("POST", &format!("/Collections/{list}/Items"), &[("ids", ids.join(","))])
     }
 
     fn remove_from_collection(&self, list: &str, ids: &[String]) -> Result<()> {
-        self.run(remove_from_collection_req(list, ids))
+        self.call("DELETE", &format!("/Collections/{list}/Items"), &[("ids", ids.join(","))])
     }
 
     /// Deletes a playlist or a collection, and nothing else. The server
@@ -363,9 +292,11 @@ pub struct PlaylistData {
 }
 
 impl Bloom {
-    /// Loads the playlists and the collection right of the user.
+    /// Loads the playlists and the collection right of the user. The
+    /// answer is for the session that asked: another profile may be open
+    /// by then, with playlists and rights of its own.
     pub fn load_lists(&mut self, cx: &mut Context<Self>) {
-        self.fetch(
+        self.fetch_in_session(
             cx,
             |client| Ok((client.playlists()?, client.can_collect().unwrap_or(false))),
             |this, result, cx| {
@@ -656,7 +587,7 @@ impl Bloom {
             // once): it loads again and shows what the server has.
             Err(err) => {
                 this.toast(failed, format!("{err:#}"), cx);
-                if matches!(this.page, crate::app::Page::Playlist(_)) {
+                if matches!(this.page, Page::Playlist(_)) {
                     this.load_page(cx);
                 }
             }
@@ -664,10 +595,10 @@ impl Bloom {
     }
 
     /// A playlist or collection appeared, changed or went away: the lists
-    /// of the navigation, the title index and the page load again.
+    /// of the navigation and the page load again. The title index does
+    /// not: it holds movies and series, and no list is in it.
     pub fn after_list_change(&mut self, cx: &mut Context<Self>) {
         self.load_lists(cx);
-        self.reload_catalog(cx);
         if matches!(self.page, Page::Library(_) | Page::Playlist(_)) {
             self.load_page(cx);
         }
@@ -768,28 +699,38 @@ impl Bloom {
         }
         let ok = format!("Deleted {}", list.name);
         let id = list.id.clone();
-        // The page of the list is gone with it: go back and load again.
-        let on_list_page = match &self.page {
-            Page::Playlist(data) => data.list.id == list.id,
-            Page::Library(data) => data.view.id == list.id,
-            _ => false,
-        };
+        let on_list_page = self.on_page_of_list(&list.id);
         self.list_change(
             ok,
             "Could not delete",
             move |client| client.delete_list(&id),
             move |this, cx| {
                 if on_list_page {
-                    if this.history.is_empty() {
-                        this.open_home(cx);
-                    } else {
-                        this.back(cx);
-                        this.load_page(cx);
-                    }
+                    this.leave_deleted_list(cx);
                 }
             },
             cx,
         );
+    }
+
+    /// True when the page is the one of this playlist or collection.
+    fn on_page_of_list(&self, id: &str) -> bool {
+        match &self.page {
+            Page::Playlist(data) => data.list.id == id,
+            Page::Library(data) => data.view.id == id,
+            _ => false,
+        }
+    }
+
+    /// The page of a list is gone with the list: the page before it
+    /// shows, loaded again, or the home when there is none.
+    fn leave_deleted_list(&mut self, cx: &mut Context<Self>) {
+        if self.history.is_empty() {
+            self.open_home(cx);
+        } else {
+            self.back(cx);
+            self.load_page(cx);
+        }
     }
 
     pub fn remove_from_collection(&mut self, collection: Item, item: Item, cx: &mut Context<Self>) {
@@ -834,15 +775,24 @@ impl Bloom {
             return;
         }
         let (id, entry_id) = (data.list.id.clone(), entry.entry_id.clone());
-        // The page shows the new order at once; the server answer confirms it.
+        // The page shows the new order at once, and it is the order the
+        // server has when it took the move: no notice and no load then.
+        // A load after each step put the order of the step before back
+        // on the page for a moment when two steps came close together.
+        // A move the server refused loads the page, to show what it has.
         reorder(&mut data.entries, place, to);
         cx.notify();
-        self.list_change(
-            "Moved".into(),
-            "Could not move the entry",
-            move |client| client.move_in_playlist(&id, &entry_id, to),
-            |_, _| {},
+        self.fetch_in_session(
             cx,
+            move |client| client.move_in_playlist(&id, &entry_id, to),
+            |this, result, cx| {
+                if let Err(err) = result {
+                    this.toast("Could not move the entry", format!("{err:#}"), cx);
+                    if matches!(this.page, Page::Playlist(_)) {
+                        this.load_page(cx);
+                    }
+                }
+            },
         );
     }
 
@@ -1009,14 +959,8 @@ impl Bloom {
             "delete" => {
                 let list = guard(client, args.first().ok_or_else(|| anyhow!("a list id is missing"))?)?;
                 client.delete_list(&list.id)?;
-                // A page of the deleted list goes back.
-                let gone = match &self.page {
-                    Page::Playlist(d) => d.list.id == list.id,
-                    Page::Library(d) => d.view.id == list.id,
-                    _ => false,
-                };
-                if gone {
-                    self.back(cx);
+                if self.on_page_of_list(&list.id) {
+                    self.leave_deleted_list(cx);
                 }
                 self.after_list_change(cx);
                 Ok("deleted".into())
@@ -1180,10 +1124,6 @@ impl Bloom {
 mod tests {
     use super::*;
 
-    fn ids(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
-    }
-
     #[test]
     fn only_a_playlist_or_a_collection_is_deletable() {
         assert!(is_deletable_kind(&ItemKind::Playlist));
@@ -1219,40 +1159,6 @@ mod tests {
         assert_eq!(list, ['d', 'b', 'c', 'a']);
         reorder(&mut list, 1, 9);
         assert_eq!(list, ['d', 'b', 'c', 'a']);
-    }
-
-    #[test]
-    fn requests() {
-        assert_eq!(
-            add_to_playlist_req("p", &ids(&["a", "b"]), "u"),
-            Req {
-                method: "POST",
-                path: "/Playlists/p/Items".into(),
-                query: vec![("ids", "a,b".into()), ("userId", "u".into())],
-            }
-        );
-        assert_eq!(
-            remove_from_playlist_req("p", &ids(&["e1"])),
-            Req {
-                method: "DELETE",
-                path: "/Playlists/p/Items".into(),
-                query: vec![("entryIds", "e1".into())],
-            }
-        );
-        assert_eq!(move_in_playlist_req("p", "e1", 2).path, "/Playlists/p/Items/e1/Move/2");
-        assert_eq!(create_collection_req("n", &ids(&["a"])).path, "/Collections");
-        assert_eq!(add_to_collection_req("c", &ids(&["a", "b"])).query, vec![("ids", "a,b".to_string())]);
-        assert_eq!(remove_from_collection_req("c", &ids(&["a"])).method, "DELETE");
-    }
-
-    #[test]
-    fn bodies() {
-        let body = create_playlist_body("n", &ids(&["a"]), "u");
-        assert_eq!(body["Name"], "n");
-        assert_eq!(body["Ids"][0], "a");
-        assert_eq!(body["UserId"], "u");
-        assert_eq!(body["MediaType"], "Video");
-        assert_eq!(rename_playlist_body("x"), json!({ "Name": "x" }));
     }
 
     #[test]

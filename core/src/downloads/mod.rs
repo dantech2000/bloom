@@ -8,6 +8,8 @@ use std::{path::PathBuf, sync::OnceLock};
 pub mod engine;
 pub mod offline;
 mod stall;
+#[cfg(test)]
+mod test_http;
 
 /// The engine of this process, from the time the app opens it
 /// (`src/downloads`).

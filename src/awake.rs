@@ -2,15 +2,16 @@
 //! Keeps the display awake while a video plays. mpv draws through the
 //! render API, so the system sees no video and the app must say so itself.
 //!
-//! The assertion is `IOPMAssertionCreateWithName` with
-//! `PreventUserIdleDisplaySleep`, not `NSProcessInfo beginActivityWithOptions:`:
-//! it is one C call with a name that `pmset -g assertions` lists under the
-//! pid of the app, it has no activity object to keep, and it does not touch
-//! App Nap or the "user initiated" state of the process.
+//! The display is kept awake by `IOPMAssertionCreateWithName` with
+//! `PreventUserIdleDisplaySleep`: one C call with a name that
+//! `pmset -g assertions` lists under the pid of the app. With it goes an
+//! activity of `NSProcessInfo` (`begin_activity`), which keeps App Nap from
+//! slowing the timers of the app while the window is behind others.
 //!
 //! One owner ([`Awake`]) holds the one assertion. The decision is the pure
 //! function [`wanted`]; the app feeds it the facts of the player at every
-//! change of the status (see `start_player_poll` in `src/app.rs`).
+//! change of the status (`macos_player_changed` in `src/nowplaying.rs`,
+//! which the poll of the player in `src/app.rs` calls).
 
 #![cfg_attr(not(target_os = "macos"), allow(unused_imports))]
 

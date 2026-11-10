@@ -321,18 +321,12 @@ fn clock_is_12_hour() -> bool {
 }
 
 fn uses_12_hour(locale: Id) -> bool {
-    {
-        let template = send!(Id, class(c"NSString"), c"stringWithUTF8String:", c"j".as_ptr() => *const std::ffi::c_char);
-        let pattern = send!(
-            Id, class(c"NSDateFormatter"), c"dateFormatFromTemplate:options:locale:",
-            template => Id, 0usize => usize, locale => Id
-        );
-        if pattern.is_null() {
-            return true;
-        }
-        let utf8 = send!(*const std::ffi::c_char, pattern, c"UTF8String");
-        !utf8.is_null() && unsafe { CStr::from_ptr(utf8) }.to_string_lossy().contains('a')
-    }
+    let pattern = send!(
+        Id, class(c"NSDateFormatter"), c"dateFormatFromTemplate:options:locale:",
+        ns_string(c"j") => Id, 0usize => usize, locale => Id
+    );
+    // No pattern for the locale: the 12-hour clock, as before.
+    pattern.is_null() || string_of(pattern).contains('a')
 }
 
 fn format_clock(time: jiff::civil::Time, twelve_hour: bool) -> String {
@@ -403,7 +397,7 @@ mod tests {
         assert_eq!(clock_is_12_hour(), clock_is_12_hour());
         // The same call for fixed locales, to see both answers.
         let locale = |name: &CStr| {
-            let name = send!(Id, class(c"NSString"), c"stringWithUTF8String:", name.as_ptr() => *const std::ffi::c_char);
+            let name = ns_string(name);
             let locale = send!(Id, class(c"NSLocale"), c"alloc");
             send!(Id, locale, c"initWithLocaleIdentifier:", name => Id)
         };

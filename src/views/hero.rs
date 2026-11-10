@@ -155,6 +155,11 @@ impl Bloom {
             .unwrap_or_else(|| self.hero.since.elapsed())
     }
 
+    /// Time of the slide's own that has passed (`slide_shown`).
+    fn hero_shown(&self) -> Duration {
+        slide_shown(self.hero_elapsed(), self.hero.video.phase == Phase::Loading)
+    }
+
     /// Forgets the slides: they are those of one user on one server, and
     /// the next session loads its own.
     pub fn clear_hero(&mut self) {
@@ -265,8 +270,9 @@ impl Bloom {
         video.progress = 0.;
         log::debug!("hero trailer: slide {index} loads {url}");
         video.player.play(url, video.load, video.muted);
-        // The slide timer starts only if the trailer is not up in time.
-        self.hero.since = Instant::now() + TRAILER_GRACE;
+        // The slide starts again with its trailer. Its own time runs only
+        // if the trailer is not up in time (`slide_shown`).
+        self.hero.since = Instant::now();
     }
 
     /// One step of the slideshow: starts and follows the trailer, advances
@@ -274,9 +280,10 @@ impl Bloom {
     fn tick_hero(&mut self, cx: &mut Context<Self>) {
         if !self.hero_visible() {
             // Hold the slide while it is hidden; its trailer starts again later.
+            let shown = self.hero_shown().min(HERO_SLIDE);
             self.hero.video.stop();
             if self.hero.paused.is_none() {
-                self.hero.since = Instant::now() - self.hero_elapsed().min(HERO_SLIDE);
+                self.hero.since = Instant::now() - shown;
             }
             return;
         }
@@ -287,8 +294,11 @@ impl Bloom {
         }
         self.hero.video.held = hold;
         if hold {
+            // The time that has passed stays as it is, the part of the
+            // trailer's grace too.
             if self.hero.paused.is_none() {
-                self.hero.since = Instant::now() - self.hero_elapsed().min(HERO_SLIDE);
+                let elapsed = self.hero_elapsed().min(HERO_SLIDE + TRAILER_GRACE);
+                self.hero.since = Instant::now() - elapsed;
             }
             return;
         }
@@ -341,7 +351,7 @@ impl Bloom {
             Phase::None => {}
         }
 
-        if self.hero.since.elapsed() >= HERO_SLIDE {
+        if self.hero_shown() >= HERO_SLIDE {
             self.step_hero(true);
             cx.notify();
         } else if self.hero.video.last_redraw.elapsed() >= Duration::from_millis(150) {
@@ -412,7 +422,8 @@ impl Bloom {
     pub fn render_hero(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let item = self.hero.slides.get(self.hero.index)?;
         let client = self.session.as_ref()?.client.clone();
-        let t = UiTheme::read(cx).clone();
+        let colors = UiTheme::read(cx).colors;
+        let compact = self.compact_w();
         let (vw, vh) = (self.viewport_w, self.viewport_h);
         let height = self.hero_height();
         let left = vw * 0.04;
@@ -584,20 +595,15 @@ impl Bloom {
                     .items_center()
                     .gap(px(6.))
                     .cursor_pointer()
-                    .bg(t.colors.primary)
-                    .text_color(t.colors.primary_foreground)
+                    .bg(colors.primary)
+                    .text_color(colors.primary_foreground)
                     .text_size(px(18.))
                     .font_weight(gpui_kit::FontWeight::BOLD)
                     .hover(|s| s.opacity(0.8))
-                    .child(filled(Filled::Play, 24., t.colors.primary_foreground))
+                    .child(filled(Filled::Play, 24., colors.primary_foreground))
                     .child("Play")
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        if play_target.is_series() {
-                            this.play_series(&play_target, window, cx);
-                        } else {
-                            let resume = play_target.resume_secs() > 0;
-                            this.play(&play_target, resume, window, cx);
-                        }
+                        this.play_item(&play_target, window, cx)
                     })),
             )
             .child(
@@ -621,7 +627,7 @@ impl Bloom {
         let fraction = if playing {
             video.progress
         } else {
-            (self.hero_elapsed().as_secs_f32() / HERO_SLIDE.as_secs_f32()).clamp(0., 1.)
+            (self.hero_shown().as_secs_f32() / HERO_SLIDE.as_secs_f32()).clamp(0., 1.)
         };
         let fill = if index % 2 == 0 {
             div().h_full().w(relative(fraction))
@@ -680,7 +686,24 @@ impl Bloom {
         let paused = self.hero.paused.is_some();
         // The small controls at the top right: a 32-point glyph on a
         // 44-point target on a phone.
-        let small_control = if self.compact_w() { 44. } else { 32. };
+        let small_control = if compact { 44. } else { 32. };
+        let corner = |id: &'static str, label: &'static str, right: f32, glyph: gpui_kit::Svg| {
+            div()
+                .id(id)
+                .role(gpui_kit::Role::Button)
+                .aria_label(label)
+                .absolute()
+                .top(px(crate::views::shell::TOPBAR_H + crate::views::shell::top_inset()))
+                .right(px(vw * 0.028 + right))
+                .size(px(small_control))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .opacity(0.3)
+                .hover(|s| s.opacity(0.9))
+                .child(glyph)
+        };
         Some(
             div()
                 .id(SharedString::from("hero"))
@@ -690,7 +713,7 @@ impl Bloom {
                 .h(px(height))
                 .flex_shrink_0()
                 .overflow_hidden()
-                .bg(t.colors.background)
+                .bg(colors.background)
                 .children(previous)
                 .children(backdrop)
                 .child(div().absolute().inset_0().bg(rgba(0x00000033)))
@@ -727,8 +750,8 @@ impl Bloom {
                         .h(px(height * 0.34))
                         .bg(linear_gradient(
                             180.,
-                            linear_color_stop(t.colors.background.opacity(0.), 0.0),
-                            linear_color_stop(t.colors.background, 0.82),
+                            linear_color_stop(colors.background.opacity(0.), 0.0),
+                            linear_color_stop(colors.background, 0.82),
                         )),
                 )
                 .child(
@@ -736,7 +759,7 @@ impl Bloom {
                         .absolute()
                         .left(px(left))
                         .top(px(vh * 0.15))
-                        .w(relative(if self.compact_w() { 0.85 } else { 0.4 }))
+                        .w(relative(if compact { 0.85 } else { 0.4 }))
                         .h(px(vh * 0.315))
                         .child(title),
                 )
@@ -756,7 +779,7 @@ impl Bloom {
                         .font_weight(gpui_kit::FontWeight::MEDIUM)
                         .text_color(rgba(0xffffff80))
                         // A phone: one line, cut where the room ends.
-                        .when(self.compact_w(), |el| el.max_w(px(vw - left * 2.)).truncate())
+                        .when(compact, |el| el.max_w(px(vw - left * 2.)).truncate())
                         .child(genres),
                 )
                 .child(
@@ -764,12 +787,12 @@ impl Bloom {
                         .absolute()
                         .left(px(left))
                         .top(px(vh * 0.53))
-                        .max_w(px(if self.compact_w() { vw - left * 2. } else { (vw * 0.6).min(840.) }))
+                        .max_w(px(if compact { vw - left * 2. } else { (vw * 0.6).min(840.) }))
                         .text_size(px(16.))
                         .line_height(relative(1.4))
                         .font_weight(gpui_kit::FontWeight::MEDIUM)
                         .text_color(white)
-                        .line_clamp(if self.compact_w() { 3 } else { 2 })
+                        .line_clamp(if compact { 3 } else { 2 })
                         // The cut ends in an ellipsis, not mid-word.
                         .text_ellipsis()
                         .child(item.overview.clone().unwrap_or_default()),
@@ -792,73 +815,80 @@ impl Bloom {
                 .child(arrow("hero.next", LucideIcon::ChevronRight, true).right(px(20.)))
                 .when(playing, |el| {
                     el.child(
-                        div()
-                            .id("hero.mute").tooltip(tip(if video.muted {
-                                "Unmute the trailer (M)"
-                            } else {
-                                "Mute the trailer (M)"
-                            }))
-                            .role(gpui_kit::Role::Button)
-                            .aria_label(if video.muted { "Unmute the trailer" } else { "Mute the trailer" })
-                            .absolute()
-                            .top(px(crate::views::shell::TOPBAR_H + crate::views::shell::top_inset()))
-                            .right(px(vw * 0.028 + 60.))
-                            .size(px(small_control))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .opacity(0.3)
-                            .hover(|s| s.opacity(0.9))
-                            .child(icon(
-                                if video.muted {
-                                    LucideIcon::VolumeX
-                                } else {
-                                    LucideIcon::Volume2
-                                },
+                        corner(
+                            "hero.mute",
+                            if video.muted { "Unmute the trailer" } else { "Mute the trailer" },
+                            60.,
+                            icon(
+                                if video.muted { LucideIcon::VolumeX } else { LucideIcon::Volume2 },
                                 22.,
                                 white,
-                            ))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.toggle_hero_mute();
-                                cx.notify();
-                            })),
+                            ),
+                        )
+                        .tooltip(tip(if video.muted {
+                            "Unmute the trailer (M)"
+                        } else {
+                            "Mute the trailer (M)"
+                        }))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.toggle_hero_mute();
+                            cx.notify();
+                        })),
                     )
                 })
                 .child(
-                    div()
-                        .id("hero.pause").tooltip(tip(if paused {
-                            "Resume the slideshow (Space)"
-                        } else {
-                            "Pause the slideshow (Space)"
-                        }))
-                        .role(gpui_kit::Role::Button)
-                        .aria_label(if paused { "Resume the slideshow" } else { "Pause the slideshow" })
-                        .absolute()
-                        .top(px(crate::views::shell::TOPBAR_H + crate::views::shell::top_inset()))
-                        .right(px(vw * 0.028 + 18.))
-                        .size(px(small_control))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .opacity(0.3)
-                        .hover(|s| s.opacity(0.9))
-                        .child(filled(
-                            if paused { Filled::Play } else { Filled::Pause },
-                            24.,
-                            white,
-                        ))
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.toggle_hero_pause();
-                            cx.notify();
-                        })),
+                    corner(
+                        "hero.pause",
+                        if paused { "Resume the slideshow" } else { "Pause the slideshow" },
+                        18.,
+                        filled(if paused { Filled::Play } else { Filled::Pause }, 24., white),
+                    )
+                    .tooltip(tip(if paused {
+                        "Resume the slideshow (Space)"
+                    } else {
+                        "Pause the slideshow (Space)"
+                    }))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.toggle_hero_pause();
+                        cx.notify();
+                    })),
                 ),
         )
+    }
+}
+
+/// The time of a slide's own out of the time since it came on screen. A
+/// slide with a trailer waits `TRAILER_GRACE` for the first frame; while
+/// the trailer loads, that wait is not time of the slide, so the slide
+/// lasts its whole length when no frame comes. The wait is part of the
+/// time that has passed, so a pause or a window that goes behind another
+/// keeps what is left of it. (Before 2026-11-10 the start of the slide was
+/// set ahead by the wait, and a hold lost it.)
+fn slide_shown(elapsed: Duration, trailer_loads: bool) -> Duration {
+    if trailer_loads {
+        elapsed.saturating_sub(TRAILER_GRACE)
+    } else {
+        elapsed
     }
 }
 
 /// A hero item is usable only with a backdrop to show.
 pub fn usable(item: &Item) -> bool {
     !item.backdrop_image_tags.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_wait_for_a_trailer_is_not_time_of_the_slide() {
+        let two = Duration::from_secs(2);
+        // Two seconds into the wait: nothing of the slide has passed, and
+        // a hold that keeps the two seconds keeps the three that are left.
+        assert_eq!(slide_shown(two, true), Duration::ZERO);
+        assert_eq!(slide_shown(TRAILER_GRACE + two, true), two);
+        // No trailer: the slide's time is the time on screen.
+        assert_eq!(slide_shown(two, false), two);
+    }
 }

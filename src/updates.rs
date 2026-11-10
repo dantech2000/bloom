@@ -493,7 +493,7 @@ impl Bloom {
                 set_automatic(rest == "auto on");
                 describe()
             }
-            _ => "error: updates [state | check | background | restart | auto on|off]".into(),
+            _ => "error: updates [state | check | background | restart | auto on|off | channel on|off]".into(),
         }
     }
 }

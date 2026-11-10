@@ -4,7 +4,7 @@
 //! colours follow the Jellyfin web client with the Abyss theme.
 
 use gpui_icons::{LucideIcon, lucide};
-use std::time::Duration;
+use std::{collections::HashMap, rc::Rc, time::Duration};
 
 use gpui_kit::{
     App, Bounds, ClickEvent, Context, DispatchPhase, Div, ElementId, InteractiveElement as _,
@@ -105,17 +105,17 @@ pub fn artwork(
     placeholder: LucideIcon,
     cx: &mut Context<Bloom>,
 ) -> Div {
-    let t = UiTheme::read(cx).clone();
+    let colors = UiTheme::read(cx).colors;
     div()
         .relative()
         .w(px(w))
         .h(px(h))
         .rounded(radius)
-        .bg(t.colors.muted)
+        .bg(colors.muted)
         .flex()
         .items_center()
         .justify_center()
-        .child(icon(placeholder, 36., t.colors.muted_foreground))
+        .child(icon(placeholder, 36., colors.muted_foreground))
         .when_some(url, |el, url| {
             el.child(
                 crate::images::remote_with(url, radius, ObjectFit::Cover)
@@ -129,30 +129,64 @@ pub fn artwork(
 }
 
 /// Rounded bar across the bottom of a card image.
-fn progress_bar(progress: Option<f32>) -> Option<Div> {
-    let value = progress?;
-    Some(
-        div()
-            .absolute()
-            .bottom(px(7.))
-            .left(px(12.))
-            .right(px(12.))
-            .h(px(7.))
-            .rounded_full()
-            .overflow_hidden()
-            .bg(rgba(0x00000059))
-            .child(
-                div()
-                    .h_full()
-                    .rounded_full()
-                    .w(gpui_kit::relative(value))
-                    .bg(rgba(0xf5f5f7f2)),
-            ),
-    )
+pub fn progress_bar(progress: Option<f32>) -> Option<Div> {
+    Some(progress_bar_sized(progress?, 12., 7., 7., 0x00000059))
+}
+
+/// The bar of [`progress_bar`] with its own sizes: `side` from the left
+/// and right edges, `bottom` from the bottom, `h` tall, over `track`.
+pub fn progress_bar_sized(value: f32, side: f32, bottom: f32, h: f32, track: u32) -> Div {
+    div()
+        .absolute()
+        .bottom(px(bottom))
+        .left(px(side))
+        .right(px(side))
+        .h(px(h))
+        .rounded_full()
+        .overflow_hidden()
+        .bg(rgba(track))
+        .child(
+            div()
+                .h_full()
+                .rounded_full()
+                .w(gpui_kit::relative(value))
+                .bg(rgba(0xf5f5f7f2)),
+        )
+}
+
+/// The faint light edge the web theme draws inside each image. With
+/// `hover` the image dims under the pointer and the edge lights.
+pub fn image_edge(hover: bool) -> Div {
+    div()
+        .absolute()
+        .inset_0()
+        .rounded(px(CARD_RADIUS))
+        .border_1()
+        .border_color(rgba(0xc8c8c81f))
+        .when(hover, |el| {
+            el.hover(|s| s.bg(rgba(0x00000066)).border_color(rgba(0xf5f5f733)))
+        })
+}
+
+/// The still of an episode: its own picture, or else the wide image.
+pub fn still_url(item: &Item, client: &Client, width: u32) -> Option<String> {
+    item.image_tags
+        .primary
+        .as_deref()
+        .map(|tag| client.image_url(&item.id, "Primary", Some(tag), width))
+        .or_else(|| item.wide_url(client, width))
+}
+
+/// "3. Name" for an episode with a number, the name alone without one.
+pub fn numbered_name(item: &Item) -> String {
+    match item.index_number {
+        Some(n) => format!("{n}. {}", item.name),
+        None => item.name.clone(),
+    }
 }
 
 /// Watched check or unplayed count at the top right of a card image.
-fn indicator(item: &Item) -> Option<Div> {
+pub fn indicator(item: &Item) -> Option<Div> {
     let chip = || {
         div()
             .absolute()
@@ -191,8 +225,21 @@ fn indicator(item: &Item) -> Option<Div> {
 }
 
 /// The two text lines under a card image.
-fn card_text(title: String, subtitle: Option<String>, cx: &Context<Bloom>) -> Div {
-    let t = UiTheme::read(cx);
+fn card_text(title: String, subtitle: Option<String>, cx: &App) -> Div {
+    card_text_with(title, subtitle.map(|s| card_second_line(cx).truncate().child(s)), cx)
+}
+
+/// The second, quiet line under a card image, without its content.
+pub fn card_second_line(cx: &App) -> Div {
+    div()
+        .text_size(px(15.))
+        .line_height(px(21.))
+        .text_color(UiTheme::read(cx).colors.muted_foreground)
+}
+
+/// The text under a card image: the title, and a second line the caller
+/// made from [`card_second_line`].
+pub fn card_text_with(title: String, second: Option<Div>, cx: &App) -> Div {
     div()
         .mt(px(4.))
         .h(px(CARD_TEXT_H - 4.))
@@ -205,25 +252,30 @@ fn card_text(title: String, subtitle: Option<String>, cx: &Context<Bloom>) -> Di
                 .text_size(px(17.))
                 .line_height(px(24.))
                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                .text_color(t.colors.foreground)
+                .text_color(UiTheme::read(cx).colors.foreground)
                 .truncate()
                 .child(title),
         )
-        .when_some(subtitle, |el, s| {
-            el.child(
-                div()
-                    .text_size(px(15.))
-                    .line_height(px(21.))
-                    .text_color(t.colors.muted_foreground)
-                    .truncate()
-                    .child(s),
-            )
-        })
+        .children(second)
+}
+
+/// The frame of a card: the width of its image, set as least and most
+/// width too, which spares a layout pass (`Bloom::render_settings`).
+pub fn card_frame(id: impl Into<ElementId>, w: f32) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w(px(w))
+        .min_w(px(w))
+        .max_w(px(w))
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .cursor_pointer()
 }
 
 /// Dark layer with the play button and the watched, favourite and more
 /// actions. It shows while the pointer is over the card.
-fn hover_overlay(item: &Item, row: CardRow, cx: &mut Context<Bloom>) -> Div {
+fn hover_overlay(item: &Rc<Item>, row: CardRow, cx: &mut Context<Bloom>) -> Div {
     let dim = rgba(0xffffffc2);
     let small = |id: &'static str, glyph: Svg| {
         div()
@@ -238,6 +290,7 @@ fn hover_overlay(item: &Item, row: CardRow, cx: &mut Context<Bloom>) -> Div {
     };
     let played = item.user_data.played;
     let favorite = item.user_data.is_favorite;
+    // The listeners share the card's copy of the item.
     let (play_target, played_target, favorite_target, menu_target) =
         (item.clone(), item.clone(), item.clone(), item.clone());
 
@@ -250,7 +303,8 @@ fn hover_overlay(item: &Item, row: CardRow, cx: &mut Context<Bloom>) -> Div {
         .border_color(rgba(0xf5f5f733))
         .flex()
         .items_center()
-        .justify_center();    if item.is_playable() || item.is_series() {
+        .justify_center();
+    if item.is_playable() || item.is_series() {
         overlay = overlay.child(
             div()
                 .id(SharedString::from(format!("card.play.{}", item.id))).tooltip(tip("Play"))
@@ -263,12 +317,7 @@ fn hover_overlay(item: &Item, row: CardRow, cx: &mut Context<Bloom>) -> Div {
                 .child(filled(Filled::Play, 40., dim))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     cx.stop_propagation();
-                    if play_target.is_series() {
-                        this.play_series(&play_target, window, cx);
-                    } else {
-                        let resume = play_target.resume_secs() > 0;
-                        this.play(&play_target, resume, window, cx);
-                    }
+                    this.play_item(&play_target, window, cx);
                 })),
         );
     }
@@ -354,48 +403,46 @@ fn card(
     let hovered = cx
         .try_global::<HoveredCard>()
         .is_some_and(|h| h.0.as_ref() == Some(&key));
+    // One copy of the item for all the listeners of the card: a card is
+    // built again at each frame, and an item is forty fields.
+    let item = &Rc::new(item.clone());
     let target = item.clone();
     let menu_target = item.clone();
     // A finger: a long press on the card opens its menu, as the right
     // button does; the hover layer with "More" never shows on a touch
     // screen. The press is claimed (`prevent_default`), or GPUI takes the
-    // release for a tap and opens the item under the menu.
-    let press_target = item.clone();
-    let press: std::rc::Rc<dyn Fn(&LongPressEvent, &mut Window, &mut App)> =
-        std::rc::Rc::new(cx.listener(move |this, event: &LongPressEvent, window, cx| {
-            this.open_card_menu(&press_target, row, event.start_position, window, cx);
-        }));
-    let long_press = canvas(
-        |_, _, _| {},
-        move |bounds: Bounds<Pixels>, _, window, _| {
-            let press = press.clone();
-            window.on_mouse_event(move |event: &LongPressEvent, phase, window, cx| {
-                if phase == DispatchPhase::Bubble
-                    && event.phase == TouchPhase::Started
-                    && bounds.contains(&event.start_position)
-                {
-                    window.prevent_default();
-                    press(event, window, cx);
-                }
-            });
-        },
-    )
-    .absolute()
-    .inset_0();
-    div()
-        .id(ElementId::from(key.clone()))
+    // release for a tap and opens the item under the menu. Only the
+    // touch platform sends a long press, so the Mac builds no listener
+    // for each card of each frame.
+    let long_press = cfg!(not(target_os = "macos")).then(|| {
+        let press_target = item.clone();
+        let press: Rc<dyn Fn(&LongPressEvent, &mut Window, &mut App)> =
+            Rc::new(cx.listener(move |this, event: &LongPressEvent, window, cx| {
+                this.open_card_menu(&press_target, row, event.start_position, window, cx);
+            }));
+        canvas(
+            |_, _, _| {},
+            move |bounds: Bounds<Pixels>, _, window, _| {
+                let press = press.clone();
+                window.on_mouse_event(move |event: &LongPressEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Bubble
+                        && event.phase == TouchPhase::Started
+                        && bounds.contains(&event.start_position)
+                    {
+                        window.prevent_default();
+                        press(event, window, cx);
+                    }
+                });
+            },
+        )
+        .absolute()
+        .inset_0()
+    });
+    card_frame(ElementId::from(key.clone()), w)
         .relative()
         // For assistive tech and the tests that tap by label.
         .role(gpui_kit::Role::Button)
         .aria_label(title.clone())
-        .w(px(w))
-        // A set least and most width spares a layout pass (`Bloom::render_settings`).
-        .min_w(px(w))
-        .max_w(px(w))
-        .flex_shrink_0()
-        .flex()
-        .flex_col()
-        .cursor_pointer()
         .on_hover(cx.listener(move |_, inside: &bool, _, cx| {
             let current = cx.try_global::<HoveredCard>().and_then(|h| h.0.clone());
             if *inside {
@@ -407,22 +454,14 @@ fn card(
         }))
         .child(
             artwork(url, w, h, px(CARD_RADIUS), placeholder, cx)
-                // The web theme draws a faint light edge inside each image.
-                .child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .rounded(px(CARD_RADIUS))
-                        .border_1()
-                        .border_color(rgba(0xc8c8c81f)),
-                )
+                .child(image_edge(false))
                 .children(progress_bar(item.progress()))
                 .children(indicator(item))
                 .when(hovered, |el| el.child(hover_overlay(item, row, cx))),
         )
         .child(card_text(title, subtitle, cx))
-        .child(long_press)
-        .on_click(cx.listener(move |this, _, _, cx| this.open_item(target.clone(), cx)))
+        .children(long_press)
+        .on_click(cx.listener(move |this, _, _, cx| this.open_item((*target).clone(), cx)))
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -447,16 +486,7 @@ pub fn poster_card(
         _ => None,
     };
     let url = series_poster.or_else(|| item.poster_url(client, width));
-    let (title, subtitle) = match item.kind {
-        ItemKind::Episode => (
-            item.series_name
-                .clone()
-                .unwrap_or_else(|| item.name.clone()),
-            Some(episode_line(item)),
-        ),
-        ItemKind::Season => (item.name.clone(), None),
-        _ => (item.name.clone(), item.year_label()),
-    };
+    let (title, subtitle) = card_titles(item);
     let placeholder = match item.kind {
         ItemKind::Series | ItemKind::Season | ItemKind::Episode => LucideIcon::Tv,
         ItemKind::BoxSet => LucideIcon::GalleryVerticalEnd,
@@ -484,7 +514,7 @@ pub fn poster_card(
 
 /// Quality tags at the top left of a poster, as Jellyfin Enhanced shows them.
 fn quality_tags(item: &Item) -> Option<Div> {
-    let labels = crate::quality::labels(item);
+    let labels = crate::quality_tags::labels(item);
     if labels.is_empty() {
         return None;
     }
@@ -497,7 +527,7 @@ fn quality_tags(item: &Item) -> Option<Div> {
             .flex_col()
             .items_start()
             .gap(px(4.))
-            .children(labels.into_iter().map(crate::quality::pill)),
+            .children(labels.into_iter().map(crate::quality_tags::pill)),
     )
 }
 
@@ -514,15 +544,7 @@ pub fn wide_card(
     let url = item
         .wide_url(client, width)
         .or_else(|| item.poster_url(client, width));
-    let (title, subtitle) = match item.kind {
-        ItemKind::Episode => (
-            item.series_name
-                .clone()
-                .unwrap_or_else(|| item.name.clone()),
-            Some(episode_line(item)),
-        ),
-        _ => (item.name.clone(), item.year_label()),
-    };
+    let (title, subtitle) = card_titles(item);
     card(
         "wide",
         item,
@@ -546,12 +568,7 @@ pub fn episode_card(
 ) -> Stateful<Div> {
     let h = (w * 9. / 16.).round();
     let width = image_px(w);
-    let url = item
-        .image_tags
-        .primary
-        .as_deref()
-        .map(|tag| client.image_url(&item.id, "Primary", Some(tag), width))
-        .or_else(|| item.wide_url(client, width));
+    let url = still_url(item, client, width);
     card(
         "episode",
         item,
@@ -580,26 +597,24 @@ pub fn library_tile(
         .as_deref()
         .map(|tag| client.image_url(&view.id, "Primary", Some(tag), image_px(w)));
     let target = view.clone();
-    div()
-        .id(card_id("tile", view))
-        .w(px(w))
-        // A set least and most width spares a layout pass (`Bloom::render_settings`).
-        .min_w(px(w))
-        .max_w(px(w))
-        .flex_shrink_0()
-        .cursor_pointer()
-        .child(
-            artwork(url, w, h, px(CARD_RADIUS), LucideIcon::Folder, cx).child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .rounded(px(CARD_RADIUS))
-                    .border_1()
-                    .border_color(rgba(0xc8c8c81f))
-                    .hover(|s| s.bg(rgba(0x00000066)).border_color(rgba(0xf5f5f733))),
-            ),
-        )
+    card_frame(card_id("tile", view), w)
+        .child(artwork(url, w, h, px(CARD_RADIUS), LucideIcon::Folder, cx).child(image_edge(true)))
         .on_click(cx.listener(move |this, _, _, cx| this.open_library(target.clone(), cx)))
+}
+
+/// The two lines under a card: an episode has its series over its own
+/// line, a season its name alone, anything else its name over its year.
+fn card_titles(item: &Item) -> (String, Option<String>) {
+    match item.kind {
+        ItemKind::Episode => (
+            item.series_name
+                .clone()
+                .unwrap_or_else(|| item.name.clone()),
+            Some(episode_line(item)),
+        ),
+        ItemKind::Season => (item.name.clone(), None),
+        _ => (item.name.clone(), item.year_label()),
+    }
 }
 
 /// "S2:E5 - Name" as the web client prints it.
@@ -610,12 +625,50 @@ fn episode_line(item: &Item) -> String {
     }
 }
 
+/// The glide that owns each row, by the id of the row. A click on an arrow
+/// while the row still glides starts a second glide; without an owner the
+/// two wrote their own offsets to the row in turn, and the row shook.
+#[derive(Default)]
+struct RowGlides(HashMap<SharedString, u64>);
+
+impl gpui_kit::Global for RowGlides {}
+
+/// Steps of a glide, and the time between two.
+const GLIDE_STEP: Duration = Duration::from_millis(8);
+const GLIDE_STEPS: u32 = 34;
+
+impl RowGlides {
+    /// Starts a glide of a row and returns its number; the glide before
+    /// it, when one runs, owns the row no more.
+    fn start(&mut self, row: &SharedString) -> u64 {
+        let number = self.0.entry(row.clone()).or_default();
+        *number += 1;
+        *number
+    }
+
+    /// Where the glide `number` of a row puts it at a step, between `from`
+    /// and `to`; `None` when a later glide took the row.
+    fn offset(&self, row: &SharedString, number: u64, from: f32, to: f32, step: u32) -> Option<f32> {
+        if self.0.get(row) != Some(&number) {
+            return None;
+        }
+        // Ease out: fast at the start, slow into the end position.
+        let t = step as f32 / GLIDE_STEPS as f32;
+        let eased = 1. - (1. - t).powi(3);
+        Some(from + (to - from) * eased)
+    }
+}
+
 /// Moves a row by nearly one view width, the way the web arrows do. The row
 /// glides there in about a quarter of a second, or jumps under Reduce
 /// Motion.
-fn page_row(handle: &ScrollHandle, direction: f32, window: &mut Window, cx: &mut App) {
-    const STEP: Duration = Duration::from_millis(8);
-    const STEPS: u32 = 34;
+fn page_row(
+    row: &SharedString,
+    handle: &ScrollHandle,
+    direction: f32,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let view = handle.bounds().size.width;
     let max = handle.max_offset().x;
     let from = handle.offset().x;
@@ -623,6 +676,7 @@ fn page_row(handle: &ScrollHandle, direction: f32, window: &mut Window, cx: &mut
     if to == from {
         return;
     }
+    let number = cx.default_global::<RowGlides>().start(row);
     if UiTheme::read(cx).motion.reduced || cx.reduce_motion() {
         let mut offset = handle.offset();
         offset.x = to;
@@ -630,21 +684,24 @@ fn page_row(handle: &ScrollHandle, direction: f32, window: &mut Window, cx: &mut
         window.refresh();
         return;
     }
-    let handle = handle.clone();
+    let (row, handle) = (row.clone(), handle.clone());
+    let (from, to) = (f32::from(from), f32::from(to));
     window
         .spawn(cx, async move |cx| {
-            for step in 1..=STEPS {
-                cx.background_executor().timer(STEP).await;
-                // Ease out: fast at the start, slow into the end position.
-                let t = step as f32 / STEPS as f32;
-                let eased = 1. - (1. - t).powi(3);
-                let moved = cx.update(|window, _| {
+            for step in 1..=GLIDE_STEPS {
+                cx.background_executor().timer(GLIDE_STEP).await;
+                let moved = cx.update(|window, cx| {
+                    let Some(x) = cx.default_global::<RowGlides>().offset(&row, number, from, to, step)
+                    else {
+                        return false;
+                    };
                     let mut offset = handle.offset();
-                    offset.x = from + (to - from) * eased;
+                    offset.x = px(x);
                     handle.set_offset(offset);
                     window.refresh();
+                    true
                 });
-                if moved.is_err() {
+                if !matches!(moved, Ok(true)) {
                     break;
                 }
             }
@@ -712,20 +769,20 @@ pub fn section_padded(
     right: f32,
     cx: &mut Context<Bloom>,
 ) -> Div {
-    let t = UiTheme::read(cx).clone();
     let id: SharedString = id.into();
     let handle = this.row_scroll(&id);
-    let fg = t.colors.foreground;
+    let fg = UiTheme::read(cx).colors.foreground;
 
     // Build the cards in view and one more at each side; empty space of the
     // same width stands in for the rest, so the row scrolls as before.
-    let gap = this.metrics().gap;
+    let m = this.metrics();
+    let gap = m.gap;
     let stride = cards.width + gap;
     let scrolled = -f32::from(handle.offset().x);
     // A row that starts inside the page (the rows of the detail page, at
     // the right of the poster) is cut off at its start: a card that scrolls
     // past it goes out of view there, and not across the poster column.
-    let clip = if left > this.metrics().side + 1. { left } else { 0. };
+    let clip = if left > m.side + 1. { left } else { 0. };
     let left = left - clip;
     let first = (((scrolled - left) / stride).floor() - 1.).max(0.) as usize;
     let last = ((((scrolled + this.viewport_w - clip - left) / stride).ceil() + 1.).max(0.)
@@ -754,7 +811,7 @@ pub fn section_padded(
         });
 
     let arrow = |name: &'static str, glyph: LucideIcon, direction: f32| {
-        let handle = handle.clone();
+        let (row, handle) = (id.clone(), handle.clone());
         div()
             .id(SharedString::from(format!("{id}.{name}")))
             .role(gpui_kit::Role::Button)
@@ -767,13 +824,21 @@ pub fn section_padded(
             .cursor_pointer()
             .hover(|s| s.bg(rgba(0x00000066)))
             .child(icon(glyph, 22., fg))
-                .tooltip(tip(if direction < 0. { "Previous" } else { "Next" }))
-            .on_click(move |_, window, cx| page_row(&handle, direction, window, cx))
+            .tooltip(tip(if direction < 0. { "Previous" } else { "Next" }))
+            .on_click(move |_, window, cx| page_row(&row, &handle, direction, window, cx))
     };
 
     // A phone pans the row with a finger: no arrows there, and the heading
     // has the whole width (they cut "Recently Added in Movies" short).
     let compact = this.compact_w();
+    // The arrows are made before the row takes the id.
+    let arrows = (!compact).then(|| {
+        div()
+            .flex()
+            .gap(px(8.))
+            .child(arrow("prev", LucideIcon::ChevronLeft, -1.))
+            .child(arrow("next", LucideIcon::ChevronRight, 1.))
+    });
     div()
         .flex()
         .flex_col()
@@ -787,15 +852,7 @@ pub fn section_padded(
                 .items_center()
                 .justify_between()
                 .child(heading)
-                .when(!compact, |el| {
-                    el.child(
-                        div()
-                            .flex()
-                            .gap(px(8.))
-                            .child(arrow("prev", LucideIcon::ChevronLeft, -1.))
-                            .child(arrow("next", LucideIcon::ChevronRight, 1.)),
-                    )
-                }),
+                .children(arrows),
         )
         .child(
             div()
@@ -932,4 +989,47 @@ pub fn empty_state(title: &str, hint: &str, cx: &Context<Bloom>) -> Div {
 /// the window (2 on a Mac, 3 on a phone), so a poster is sharp on both.
 fn image_px(w: f32) -> u32 {
     (w * crate::views::shell::scale_now().max(2.)).round() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two clicks on an arrow inside a quarter of a second ran two glides
+    /// at once, and each wrote its own offsets to the row.
+    #[test]
+    fn a_second_glide_of_a_row_ends_the_first() {
+        let row = SharedString::from("home.resume");
+        let other = SharedString::from("home.nextup");
+        let mut glides = RowGlides::default();
+        let first = glides.start(&row);
+        assert_eq!(glides.offset(&row, first, 0., -900., GLIDE_STEPS), Some(-900.));
+        let second = glides.start(&row);
+        assert_eq!(glides.offset(&row, first, 0., -900., 10), None, "a later glide took the row");
+        assert!(glides.offset(&row, second, -300., -1200., 10).is_some());
+        // Another row has its own glide.
+        let third = glides.start(&other);
+        assert!(glides.offset(&other, third, 0., -900., 1).is_some());
+        assert!(glides.offset(&row, second, -300., -1200., 11).is_some());
+    }
+
+    #[test]
+    fn the_titles_of_a_card() {
+        let episode = Item {
+            kind: "Episode".into(),
+            name: "Pilot".into(),
+            series_name: Some("The Show".into()),
+            parent_index_number: Some(1),
+            index_number: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(
+            card_titles(&episode),
+            ("The Show".to_string(), Some("S1:E2 - Pilot".to_string()))
+        );
+        assert_eq!(numbered_name(&episode), "2. Pilot");
+        let season = Item { kind: "Season".into(), name: "Season 1".into(), ..Default::default() };
+        assert_eq!(card_titles(&season), ("Season 1".to_string(), None));
+        assert_eq!(numbered_name(&season), "Season 1");
+    }
 }

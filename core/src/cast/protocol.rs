@@ -108,6 +108,14 @@ pub fn controllable(sessions: Vec<SessionInfo>, own_device_id: &str) -> Vec<Sess
     sessions
 }
 
+/// The items a list of ids names, in the order of the ids: a query by ids
+/// answers in an order of its own. An id with no item is left out.
+pub fn in_order(items: Vec<Item>, ids: &[String]) -> Vec<Item> {
+    ids.iter()
+        .filter_map(|id| items.iter().find(|item| item.id == *id).cloned())
+        .collect()
+}
+
 // ----- what this app sends, as a controller ------------------------------
 
 /// How items go to a session: now, after the item that plays, or at the
@@ -367,17 +375,6 @@ pub fn plan(command: &RemoteCommand, local: Local) -> Action {
     }
 }
 
-/// The track of mpv for a stream index of the item. mpv numbers the
-/// tracks of a kind from 1 in file order; the server numbers every
-/// stream of the source in one list. Subtitles the server keeps in files
-/// of their own are not in mpv's list, so they get none.
-pub fn mpv_track(item: &Item, kind: &str, stream_index: i64) -> Option<i64> {
-    item.streams(kind)
-        .iter()
-        .position(|stream| stream.index == stream_index)
-        .map(|place| place as i64 + 1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +416,14 @@ mod tests {
         ];
         let ids: Vec<String> = controllable(list, "me").into_iter().map(|s| s.id).collect();
         assert_eq!(ids, vec!["4", "2"]);
+    }
+
+    #[test]
+    fn puts_items_in_the_order_of_their_ids() {
+        let item = |id: &str| -> Item { serde_json::from_value(json!({ "Id": id, "Name": id, "Type": "Episode" })).unwrap() };
+        let ids: Vec<String> = ["b", "gone", "a", "b"].map(String::from).to_vec();
+        let ordered = in_order(vec![item("a"), item("b")], &ids);
+        assert_eq!(ordered.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["b", "a", "b"]);
     }
 
     #[test]
@@ -572,25 +577,5 @@ mod tests {
         );
         assert_eq!(plan(&RemoteCommand::ToggleFullscreen, closed), Action::ToggleFullscreen);
         assert_eq!(plan(&RemoteCommand::Other("GoHome".into()), playing), Action::Nothing);
-    }
-
-    #[test]
-    fn finds_the_mpv_track_of_a_stream() {
-        let item: Item = serde_json::from_value(json!({
-            "Id": "i", "Name": "Film", "Type": "Movie",
-            "MediaSources": [{ "MediaStreams": [
-                { "Type": "Video", "Index": 0 },
-                { "Type": "Audio", "Index": 1 },
-                { "Type": "Audio", "Index": 2 },
-                { "Type": "Subtitle", "Index": 3 },
-                { "Type": "Subtitle", "Index": 4 }
-            ]}]
-        }))
-        .unwrap();
-        assert_eq!(mpv_track(&item, "Audio", 1), Some(1));
-        assert_eq!(mpv_track(&item, "Audio", 2), Some(2));
-        assert_eq!(mpv_track(&item, "Subtitle", 4), Some(2));
-        assert_eq!(mpv_track(&item, "Subtitle", 1), None);
-        assert_eq!(mpv_track(&item, "Audio", 9), None);
     }
 }

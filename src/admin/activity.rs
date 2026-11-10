@@ -276,7 +276,9 @@ pub fn render(_app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                 return Vec::new();
             };
             let show_kind = content_width(this) >= 760.;
-            data.entries[start + range.start..start + range.end]
+            data.entries
+                .get(start + range.start..start + range.end)
+                .unwrap_or_default()
                 .iter()
                 .map(|entry| row(entry, data, show_kind, cx).into_any_element())
                 .collect()
@@ -286,7 +288,8 @@ pub fn render(_app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
 
 /// One entry of the timeline.
 fn row(entry: &Entry, data: &Data, show_kind: bool, cx: &mut Context<Bloom>) -> Div {
-    let t = UiTheme::read(cx).clone();
+    // The colours alone: a row is built for every frame of a scroll.
+    let colors = UiTheme::read(cx).colors;
     let (glyph, color) = entry.look();
     let user = entry
         .user_id
@@ -314,7 +317,7 @@ fn row(entry: &Entry, data: &Data, show_kind: bool, cx: &mut Context<Bloom>) -> 
                 .w(px(72.))
                 .flex_shrink_0()
                 .text_size(px(13.))
-                .text_color(t.colors.foreground.opacity(0.55))
+                .text_color(colors.foreground.opacity(0.55))
                 .child(time),
         )
         .child(icon_disc(glyph, tint(color), 32.))
@@ -329,14 +332,14 @@ fn row(entry: &Entry, data: &Data, show_kind: bool, cx: &mut Context<Bloom>) -> 
                     div()
                         .truncate()
                         .text_size(px(15.))
-                        .text_color(t.colors.foreground)
+                        .text_color(colors.foreground)
                         .child(entry.name.clone()),
                 )
                 .child(
                     div()
                         .truncate()
                         .text_size(px(13.))
-                        .text_color(t.colors.foreground.opacity(0.55))
+                        .text_color(colors.foreground.opacity(0.55))
                         .child(match overview {
                             Some(text) => format!("{text} · {}", ago(&entry.date)),
                             None => ago(&entry.date),

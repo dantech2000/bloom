@@ -6,23 +6,23 @@
 
 use gpui_icons::LucideIcon;
 use gpui_kit::{
-    AnyElement, App, AvailableSpace, Bounds, ClickEvent, Context, Div, Element, ElementId,
-    GlobalElementId, InspectorElementId, InteractiveElement as _, IntoElement, LayoutId,
-    ObjectFit, ParentElement as _, Pixels, SharedString, Stateful,
-    StatefulInteractiveElement as _, Style, Styled, WeakEntity, Window, div, linear_color_stop,
-    linear_gradient, point, prelude::FluentBuilder as _, px, relative, rgb, rgba, size,
+    ClickEvent, Context, Div, InteractiveElement as _, IntoElement, ObjectFit,
+    ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _, Styled, div,
+    linear_color_stop, linear_gradient, prelude::FluentBuilder as _, px, relative, rgb, rgba,
 };
 
 use crate::{
     app::{DetailData, Bloom, Page},
     icons::{Filled, filled},
-    jellyfin::{Client, Item, ItemKind, Person, format_runtime},
+    jellyfin::{Client, Item, ItemKind, MediaStream, Person, format_runtime},
     ui::{glass::glass, menu::Menu, scroll_area::ScrollArea, theme::UiTheme},
     views::{
         cards::{
-            CARD_GAP, CARD_RADIUS, CARD_TEXT_H, Cards, artwork, card_id, episode_card, icon,
-            poster_card, section_padded,
+            CARD_GAP, CARD_RADIUS, CARD_TEXT_H, Cards, artwork, card_frame, card_id,
+            episode_card, icon, indicator, numbered_name, poster_card, progress_bar,
+            section_padded, still_url,
         },
+        parts::{icon_button, icon_menu, last_part},
         shell::TOPBAR_H,
     },
 };
@@ -37,6 +37,13 @@ struct Layout {
     poster_w: f32,
     /// Height of the backdrop band above the title ribbon.
     band_h: f32,
+    /// A phone: one column, no poster.
+    compact: bool,
+    /// Left edge and width of the logo in the band.
+    logo: (f32, f32),
+    /// Width of an episode card and of a season card.
+    episode_w: f32,
+    season_w: f32,
 }
 
 impl Bloom {
@@ -50,6 +57,10 @@ impl Bloom {
                 side: 16.,
                 poster_w: 0.,
                 band_h: (TOPBAR_H + vh * 0.38).round(),
+                compact: true,
+                logo: (16., vw * 0.6),
+                episode_w: (vw * 0.56).round(),
+                season_w: (vw * 0.28).round(),
             };
         }
         // The web narrows the poster column on very wide windows.
@@ -63,6 +74,10 @@ impl Bloom {
             side: (vw * 0.033).round(),
             poster_w: (vw * poster).round(),
             band_h: (TOPBAR_H + vh * 0.38).round(),
+            compact: false,
+            logo: (vw * 0.325, vw * 0.25),
+            episode_w: (vw * 0.173).round(),
+            season_w: (vw * 0.09).round(),
         }
     }
 
@@ -73,7 +88,7 @@ impl Bloom {
         let Some(client) = self.session.as_ref().map(|s| s.client.clone()) else {
             return div();
         };
-        let t = UiTheme::read(cx).clone();
+        let colors = UiTheme::read(cx).colors;
         let item = &data.item;
         let l = self.detail_layout();
         let (vw, vh) = (self.viewport_w, self.viewport_h);
@@ -107,11 +122,8 @@ impl Bloom {
                             .top(relative(0.15))
                             .bg(linear_gradient(
                                 180.,
-                                linear_color_stop(t.colors.background.opacity(0.0), 0.),
-                                linear_color_stop(
-                                    t.colors.background.opacity(0.92),
-                                    0.8 / 0.85,
-                                ),
+                                linear_color_stop(colors.background.opacity(0.0), 0.),
+                                linear_color_stop(colors.background.opacity(0.92), 0.8 / 0.85),
                             )),
                     )
             });
@@ -125,9 +137,9 @@ impl Bloom {
                 el.child(
                     crate::images::remote_logo(url)
                         .absolute()
-                        .left(px(if self.compact_w() { l.side } else { vw * 0.325 }))
+                        .left(px(l.logo.0))
                         .top(px(TOPBAR_H + vh * 0.20))
-                        .w(px(if self.compact_w() { vw * 0.6 } else { vw * 0.25 }))
+                        .w(px(l.logo.1))
                         .h(px(vh * 0.16)),
                 )
             });
@@ -141,13 +153,13 @@ impl Bloom {
             .bg(rgba(0x00000033))
             .flex()
             // A phone: the actions on a row of their own under the name.
-            .when(self.compact_w(), |el| el.flex_wrap().gap(px(12.)))
+            .when(l.compact, |el| el.flex_wrap())
             .items_center()
-            .when(!self.compact_w(), |el| el.gap(px(24.)))
+            .gap(px(if l.compact { 12. } else { 24. }))
             .child(
                 div()
-                    .when(!self.compact_w(), |el| el.flex_1().min_w_0())
-                    .when(self.compact_w(), |el| el.w_full())
+                    .when(!l.compact, |el| el.flex_1().min_w_0())
+                    .when(l.compact, |el| el.w_full())
                     .flex()
                     .flex_col()
                     .gap(px(8.))
@@ -169,7 +181,7 @@ impl Bloom {
                 div()
                     .mt(px(6.))
                     .text_size(px(17.))
-                    .text_color(t.colors.foreground)
+                    .text_color(colors.foreground)
                     .child(tagline.clone()),
             );
         }
@@ -179,7 +191,7 @@ impl Bloom {
                     .mt(px(8.))
                     .text_size(px(15.))
                     .line_height(relative(1.35))
-                    .text_color(t.colors.foreground.opacity(0.82))
+                    .text_color(colors.foreground.opacity(0.82))
                     .child(text),
             );
         }
@@ -189,7 +201,7 @@ impl Bloom {
 
         let mut rows: Vec<Div> = Vec::new();
         if let Some(next) = &data.next_up {
-            let w = (vw * if self.compact_w() { 0.56 } else { 0.173 }).round();
+            let w = l.episode_w;
             rows.push(plain_section(
                 "Next Up",
                 l.content_left,
@@ -199,7 +211,7 @@ impl Bloom {
             ));
         }
         if !data.seasons.is_empty() {
-            let w = (vw * if self.compact_w() { 0.28 } else { 0.09 }).round();
+            let w = l.season_w;
             let cards = data
                 .seasons
                 .iter()
@@ -215,7 +227,7 @@ impl Bloom {
         }
         if item.kind == ItemKind::Episode && data.episodes.len() > 1 {
             // The other episodes of the season, with this one marked.
-            let w = (vw * if self.compact_w() { 0.56 } else { 0.173 }).round();
+            let w = l.episode_w;
             let current = item.id.clone();
             let cards = Cards::new(w, data.episodes.len(), |i, cx| {
                 let episode = &data.episodes[i];
@@ -253,10 +265,28 @@ impl Bloom {
                 div()
                     .pl(px(l.content_left - 12.))
                     .pr(px(l.side))
-                    .child(EpisodeRows {
-                        app: cx.weak_entity(),
-                        count: data.episodes.len(),
-                    }),
+                    // Only the rows in view are built (`admin::rows`): a
+                    // season of 150 episodes then costs as much per frame
+                    // as one of 8.
+                    .child(crate::admin::rows::rows(
+                        cx,
+                        data.episodes.len(),
+                        EPISODE_ROW_H + EPISODE_ROW_GAP,
+                        |this, range, cx| {
+                            let (Page::Detail(data), Some(session)) = (&this.page, &this.session)
+                            else {
+                                return Vec::new();
+                            };
+                            let episodes = &data.episodes;
+                            episodes[range.start.min(episodes.len())..range.end.min(episodes.len())]
+                                .iter()
+                                .map(|ep| {
+                                    episode_row(ep, &session.client, this.viewport_w, cx)
+                                        .into_any_element()
+                                })
+                                .collect()
+                        },
+                    )),
             );
         }
         rows.extend(self.bookmarks_detail_section(item, l.content_left, l.side, cx));
@@ -283,12 +313,12 @@ impl Bloom {
 
         // The poster keeps its place while the page scrolls under it. A
         // phone has no room beside the text for it.
-        let poster = (!self.compact_w()).then(|| div()
+        let poster = (!l.compact).then(|| div()
             .absolute()
             .left(px(l.side))
             .top(px(vh * 0.15))
             .rounded(px(24.))
-            .shadow(t.shadows.lg.clone())
+            .shadow(UiTheme::read(cx).shadows.lg.clone())
             .child(artwork(
                 item.poster_url(&client, (l.poster_w * 2.) as u32),
                 l.poster_w,
@@ -322,13 +352,13 @@ impl Bloom {
 
     /// Title lines: the series is a link on season and episode pages.
     fn render_name(&self, item: &Item, cx: &mut Context<Self>) -> Div {
-        let t = UiTheme::read(cx).clone();
+        let fg = UiTheme::read(cx).colors.foreground;
         let heading = |text: String| {
             div()
                 .text_size(px(27.))
                 .line_height(px(34.))
                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                .text_color(t.colors.foreground)
+                .text_color(fg)
                 .truncate()
                 .child(text)
         };
@@ -343,9 +373,10 @@ impl Bloom {
         let target_name = series.clone();
         // On an episode page the season is a link too.
         let season = item.season_name.clone().filter(|_| item.kind == ItemKind::Episode);
-        let second = match (&item.kind, item.index_number) {
-            (ItemKind::Episode, Some(n)) => format!("{n}. {}", item.name),
-            _ => item.name.clone(),
+        let second = if item.kind == ItemKind::Episode {
+            numbered_name(item)
+        } else {
+            item.name.clone()
         };
         let season_link = season.zip(item.season_id.clone()).map(|(name, id)| {
             let target = Item {
@@ -360,8 +391,8 @@ impl Bloom {
                 .id("detail.season-link")
                 .flex_shrink_0()
                 .cursor_pointer()
-                .hover(|s| s.underline().text_color(t.colors.foreground))
-                .tooltip(crate::ui::tip::tip("Open the season"))
+                .hover(|s| s.underline().text_color(fg))
+                .tooltip(tip("Open the season"))
                 .child(format!("{name} ›"))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.open_item(target.clone(), cx)
@@ -375,7 +406,7 @@ impl Bloom {
                     .id("detail.series-link")
                     .cursor_pointer()
                     .hover(|s| s.underline())
-                    .tooltip(crate::ui::tip::tip("Open the show"))
+                    .tooltip(tip("Open the show"))
                     .child(heading(series))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         if let Some(id) = &series_id {
@@ -397,7 +428,7 @@ impl Bloom {
                     .items_center()
                     .gap(px(8.))
                     .text_size(px(17.))
-                    .text_color(t.colors.foreground.opacity(0.82))
+                    .text_color(fg.opacity(0.82))
                     .children(season_link)
                     .child(div().min_w_0().truncate().child(second)),
             )
@@ -407,18 +438,7 @@ impl Bloom {
     fn render_actions(&self, item: &Item, cx: &mut Context<Self>) -> Div {
         let fg = rgba(0xffffffde);
         let round = |id: &'static str, glyph: gpui_kit::Svg| {
-            div()
-                .id(id)
-                .role(gpui_kit::Role::Button)
-                .aria_label(id.rsplit('.').next().unwrap_or(id))
-                .size(px(46.))
-                .rounded(px(CARD_RADIUS))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(|s| s.bg(rgba(0x00000066)))
-                .child(glyph)
+            icon_button(id, last_part(id), glyph, 46., ACTION_HOVER)
         };
         let mut row = div().flex_shrink_0().flex().items_center().gap(px(8.));
 
@@ -497,20 +517,14 @@ impl Bloom {
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_favorite(cx))),
         )
         .child(
-            Menu::new(&self.more_menu, "More")
-                .trigger_style_with(|button| button)
-                .trigger(
-                    div()
-                        .id("detail.more")
-                        .tooltip(tip("More"))
-                        .size(px(46.))
-                        .rounded(px(CARD_RADIUS))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .hover(|s| s.bg(rgba(0x00000066)))
-                        .child(filled(Filled::More, 25., fg)),
-                ),
+            icon_menu(
+                &self.more_menu,
+                "detail.more",
+                "More",
+                filled(Filled::More, 25., fg),
+                46.,
+                ACTION_HOVER,
+            ),
         )
     }
 
@@ -522,11 +536,24 @@ impl Bloom {
         item.media_sources.first()?;
         let label = t.colors.foreground;
         let value = t.colors.foreground.opacity(0.7);
-        let title = |kind: &str, n: usize| {
-            item.streams(kind)
+        // The name of the track at a place among the tracks of its kind,
+        // and the length of the longest name, which sizes the box.
+        let title = |streams: &[&MediaStream], n: usize| {
+            streams
                 .get(n)
                 .and_then(|s| s.display_title.clone())
                 .unwrap_or_else(|| format!("Track {}", n + 1))
+        };
+        let longest = |streams: &[&MediaStream]| {
+            streams
+                .iter()
+                .enumerate()
+                .map(|(n, s)| match &s.display_title {
+                    Some(title) => title.chars().count(),
+                    None => format!("Track {}", n + 1).len(),
+                })
+                .max()
+                .unwrap_or(0)
         };
         // A phone: a box wider than the room left beside the label goes
         // under it, the whole width (it ran off the page, 2026-10-23).
@@ -546,7 +573,6 @@ impl Bloom {
                       longest: usize| {
             let width = (longest as f32 * 7.4 + 64.).clamp(170., 545.);
             Menu::new(state, name)
-                .trigger_style_with(|button| button)
                 .trigger(
                     div()
                         .when(!compact, |el| el.w(px(width)))
@@ -580,20 +606,16 @@ impl Bloom {
                 .or_else(|| audio.iter().position(|s| s.is_default))
                 .unwrap_or(0);
             rows = rows.child(if audio.len() > 1 {
-                let longest = (0..audio.len())
-                    .map(|n| title("Audio", n).chars().count())
-                    .max()
-                    .unwrap_or(0);
                 row("Audio").child(select(
                     &self.detail_audio_menu,
                     "Audio",
-                    title("Audio", current),
-                    longest,
+                    title(&audio, current),
+                    longest(&audio),
                 ))
             } else {
                 row("Audio")
                     .h(px(34.))
-                    .child(div().text_color(value).child(title("Audio", current)))
+                    .child(div().text_color(value).child(title(&audio, current)))
             });
         }
         let subtitles = item.streams("Subtitle");
@@ -602,18 +624,14 @@ impl Bloom {
                 .subtitle
                 .unwrap_or_else(|| subtitles.iter().position(|s| s.is_default));
             let text = match current {
-                Some(n) => title("Subtitle", n),
+                Some(n) => title(&subtitles, n),
                 None => "Off".to_string(),
             };
-            let longest = (0..subtitles.len())
-                .map(|n| title("Subtitle", n).chars().count())
-                .max()
-                .unwrap_or(0);
             rows = rows.child(row("Subtitles").child(select(
                 &self.detail_subtitle_menu,
                 "Subtitles",
                 text,
-                longest,
+                longest(&subtitles),
             )));
         }
         Some(rows)
@@ -660,6 +678,9 @@ impl Bloom {
         rows
     }
 }
+
+/// The fill under the pointer of an action of the title ribbon.
+const ACTION_HOVER: u32 = 0x00000066;
 
 /// Height to width ratio of the detail poster.
 fn poster_ratio(item: &Item) -> f32 {
@@ -890,8 +911,8 @@ fn plain_section(
 }
 
 /// Cast in credit order. The crew roles of one person join into one card.
-fn merged_people(people: &[Person], guests: bool) -> Vec<(Person, String)> {
-    let mut out: Vec<(Person, String)> = Vec::new();
+fn merged_people(people: &[Person], guests: bool) -> Vec<(&Person, String)> {
+    let mut out: Vec<(&Person, String)> = Vec::new();
     for person in people {
         if (person.kind == "GuestStar") != guests {
             continue;
@@ -911,7 +932,7 @@ fn merged_people(people: &[Person], guests: bool) -> Vec<(Person, String)> {
                 roles.push_str(&role);
             }
             Some(_) => {}
-            None => out.push((person.clone(), role)),
+            None => out.push((person, role)),
         }
     }
     out
@@ -925,21 +946,12 @@ fn person_card(
     h: f32,
     cx: &mut Context<Bloom>,
 ) -> Stateful<Div> {
-    let t = UiTheme::read(cx).clone();
+    let colors = UiTheme::read(cx).colors;
     let url = person
         .primary_image_tag
         .as_deref()
         .map(|tag| client.image_url(&person.id, "Primary", Some(tag), (w * 2.) as u32));
-    div()
-        .id(SharedString::from(format!("person.{}.{role}", person.id)))
-        .w(px(w))
-        // A set least and most width spares a layout pass (`Bloom::render_settings`).
-        .min_w(px(w))
-        .max_w(px(w))
-        .flex_shrink_0()
-        .flex()
-        .flex_col()
-        .cursor_pointer()
+    card_frame(SharedString::from(format!("person.{}.{role}", person.id)), w)
         .on_click(cx.listener({
             let (id, name) = (person.id.clone(), person.name.clone());
             move |this, _: &ClickEvent, _, cx| this.open_person(&id, &name, cx)
@@ -954,14 +966,14 @@ fn person_card(
                     div()
                         .text_size(px(15.))
                         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                        .text_color(t.colors.foreground)
+                        .text_color(colors.foreground)
                         .truncate()
                         .child(person.name.clone()),
                 )
                 .child(
                     div()
                         .text_size(px(13.))
-                        .text_color(t.colors.muted_foreground)
+                        .text_color(colors.muted_foreground)
                         .truncate()
                         .child(role.to_string()),
                 ),
@@ -974,115 +986,9 @@ const EPISODE_ROW_H: f32 = 166.;
 /// Space between two episode rows.
 const EPISODE_ROW_GAP: f32 = 2.;
 
-/// The episode rows of a season, built on demand: only the rows inside the
-/// window (and one more at each side) are built and laid out for a frame.
-/// Every row is `EPISODE_ROW_H` tall, so the element knows its height and
-/// the place of each row without building the rest; a season of 150
-/// episodes then costs as much per frame as one of 8.
-struct EpisodeRows {
-    app: WeakEntity<Bloom>,
-    count: usize,
-}
-
-impl IntoElement for EpisodeRows {
-    type Element = Self;
-
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
-impl Element for EpisodeRows {
-    type RequestLayoutState = ();
-    type PrepaintState = Vec<AnyElement>;
-
-    fn id(&self) -> Option<ElementId> {
-        Some("detail.episodes".into())
-    }
-
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, ()) {
-        let stride = EPISODE_ROW_H + EPISODE_ROW_GAP;
-        let mut style = Style::default();
-        style.size.width = relative(1.).into();
-        style.size.height = px(stride * self.count as f32 - EPISODE_ROW_GAP).into();
-        style.flex_shrink = 0.;
-        (window.request_layout(style, None, cx), ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _: &mut (),
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Vec<AnyElement> {
-        let stride = EPISODE_ROW_H + EPISODE_ROW_GAP;
-        // `bounds` is in window coordinates, so the page scroll is in it.
-        let top = f32::from(bounds.origin.y);
-        let view_h = f32::from(window.viewport_size().height);
-        let first = ((-top / stride).floor() - 1.).max(0.) as usize;
-        let last = ((((view_h - top) / stride).ceil() + 1.).max(0.) as usize).min(self.count);
-        let first = first.min(last);
-        let mut rows: Vec<AnyElement> = self
-            .app
-            .update(cx, |this, cx| {
-                let Page::Detail(data) = &this.page else {
-                    return Vec::new();
-                };
-                let Some(client) = this.session.as_ref().map(|s| s.client.clone()) else {
-                    return Vec::new();
-                };
-                data.episodes
-                    .iter()
-                    .take(last)
-                    .skip(first)
-                    .map(|ep| episode_row(ep, &client, this.viewport_w, cx).into_any_element())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let space = size(
-            AvailableSpace::Definite(bounds.size.width),
-            AvailableSpace::Definite(px(EPISODE_ROW_H)),
-        );
-        for (i, row) in rows.iter_mut().enumerate() {
-            row.layout_as_root(space, window, cx);
-            let y = bounds.origin.y + px(stride * (first + i) as f32);
-            row.prepaint_at(point(bounds.origin.x, y), window, cx);
-        }
-        rows
-    }
-
-    fn paint(
-        &mut self,
-        _: Option<&GlobalElementId>,
-        _: Option<&InspectorElementId>,
-        _: Bounds<Pixels>,
-        _: &mut (),
-        rows: &mut Vec<AnyElement>,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        for row in rows {
-            row.paint(window, cx);
-        }
-    }
-}
-
 /// One episode of a season: still, number and name, details, overview.
 fn episode_row(ep: &Item, client: &Client, vw: f32, cx: &mut Context<Bloom>) -> Stateful<Div> {
-    let t = UiTheme::read(cx).clone();
+    let colors = UiTheme::read(cx).colors;
     // A phone: a wide still, as the episode's picture is, with the text
     // beside it; the Mac's column is taller than wide.
     let (w, h) = if vw < crate::views::shell::COMPACT_W {
@@ -1091,16 +997,8 @@ fn episode_row(ep: &Item, client: &Client, vw: f32, cx: &mut Context<Bloom>) -> 
     } else {
         ((vw * 0.195).round(), 160.)
     };
-    let still = ep
-        .image_tags
-        .primary
-        .as_deref()
-        .map(|tag| client.image_url(&ep.id, "Primary", Some(tag), 500))
-        .or_else(|| ep.wide_url(client, 500));
-    let name = match ep.index_number {
-        Some(n) => format!("{n}. {}", ep.name),
-        None => ep.name.clone(),
-    };
+    let still = still_url(ep, client, 500);
+    let name = numbered_name(ep);
     let mut details: Vec<String> = Vec::new();
     if let Some(secs) = ep.runtime_secs() {
         details.push(format_runtime(secs));
@@ -1110,7 +1008,6 @@ fn episode_row(ep: &Item, client: &Client, vw: f32, cx: &mut Context<Bloom>) -> 
     }
     let (open, play) = (ep.clone(), ep.clone());
     let resume = ep.resume_secs() > 0;
-    let played = ep.user_data.played;
     div()
         .id(card_id("episode", ep))
         .w_full()
@@ -1127,41 +1024,8 @@ fn episode_row(ep: &Item, client: &Client, vw: f32, cx: &mut Context<Bloom>) -> 
         .child(
             artwork(still, w, h, px(CARD_RADIUS), LucideIcon::Tv, cx)
                 .flex_shrink_0()
-                .when_some(ep.progress(), |el, value| {
-                    el.child(
-                        div()
-                            .absolute()
-                            .bottom(px(7.))
-                            .left(px(12.))
-                            .right(px(12.))
-                            .h(px(7.))
-                            .rounded_full()
-                            .overflow_hidden()
-                            .bg(rgba(0x00000059))
-                            .child(
-                                div()
-                                    .h_full()
-                                    .rounded_full()
-                                    .w(relative(value))
-                                    .bg(rgba(0xf5f5f7f2)),
-                            ),
-                    )
-                })
-                .when(played, |el| {
-                    el.child(
-                        div()
-                            .absolute()
-                            .top(px(5.))
-                            .right(px(5.))
-                            .size(px(26.))
-                            .rounded(px(10.))
-                            .bg(rgb(0xf5f5f7))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(icon(LucideIcon::Check, 16., rgb(0x121212))),
-                    )
-                })
+                .children(progress_bar(ep.progress()))
+                .children(indicator(ep))
                 .child(
                     div()
                         .id(card_id("episode.play", ep)).tooltip(tip("Play"))
@@ -1199,7 +1063,7 @@ fn episode_row(ep: &Item, client: &Client, vw: f32, cx: &mut Context<Bloom>) -> 
                     div()
                         .text_size(px(16.))
                         .font_weight(gpui_kit::FontWeight::MEDIUM)
-                        .text_color(t.colors.foreground)
+                        .text_color(colors.foreground)
                         .truncate()
                         .child(name),
                 )
@@ -1207,7 +1071,7 @@ fn episode_row(ep: &Item, client: &Client, vw: f32, cx: &mut Context<Bloom>) -> 
                     el.child(
                         div()
                             .text_size(px(14.))
-                            .text_color(t.colors.muted_foreground)
+                            .text_color(colors.muted_foreground)
                             .child(details.join("   ")),
                     )
                 })
@@ -1216,7 +1080,7 @@ fn episode_row(ep: &Item, client: &Client, vw: f32, cx: &mut Context<Bloom>) -> 
                         div()
                             .text_size(px(14.))
                             .line_height(relative(1.35))
-                            .text_color(t.colors.muted_foreground)
+                            .text_color(colors.muted_foreground)
                             .line_clamp(4)
                             .child(text),
                     )

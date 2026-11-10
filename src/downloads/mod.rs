@@ -14,13 +14,14 @@ pub use bloom_core::downloads::{dir, engine, offline};
 use bloom_core::downloads::ENGINE;
 
 use std::{
+    cell::RefCell,
     path::PathBuf,
     time::{Duration, Instant},
 };
 
 use gpui_kit::{Context, Task, Window};
 
-pub use engine::{Engine, Entry, EntryState, format_bytes};
+pub use engine::{Engine, Entry, EntryState, Key, format_bytes};
 
 use crate::{
     app::{Bloom, Page},
@@ -54,7 +55,7 @@ fn folder() -> PathBuf {
 /// there is one; the file of another server with the same item id does not
 /// count. Cheap; it reads the index in memory and asks the disk once.
 pub fn local_path(server_id: Option<&str>, item_id: &str) -> Option<PathBuf> {
-    ENGINE.get()?.local_path_of(server_id, item_id)
+    ENGINE.get()?.local_path(Key::of(server_id, item_id))
 }
 
 /// The source the player loads for an item: its local file when the item
@@ -65,7 +66,7 @@ pub fn local_source(player: &Player, server_id: Option<&str>, item_id: &str) -> 
     let subtitles: Vec<String> = path
         .as_ref()
         .and_then(|p| p.parent())
-        .and_then(|folder| ENGINE.get()?.meta(item_id).map(|meta| (folder.to_path_buf(), meta)))
+        .and_then(|folder| ENGINE.get()?.meta(Key::of(server_id, item_id)).map(|meta| (folder.to_path_buf(), meta)))
         .map(|(folder, meta)| {
             meta["Subtitles"]
                 .as_array()
@@ -92,7 +93,7 @@ pub fn local_source(player: &Player, server_id: Option<&str>, item_id: &str) -> 
 /// the caller then asks the server.
 pub fn stored_segments(server_id: Option<&str>, item_id: &str) -> Option<Vec<crate::jellyfin::MediaSegment>> {
     local_path(server_id, item_id)?;
-    segments_of_meta(&ENGINE.get()?.meta(item_id)?)
+    segments_of_meta(&ENGINE.get()?.meta(Key::of(server_id, item_id))?)
 }
 
 /// The `Segments` array of a `meta.json`: the `Items` of `/MediaSegments`.
@@ -102,7 +103,7 @@ fn segments_of_meta(meta: &serde_json::Value) -> Option<Vec<crate::jellyfin::Med
     (!segments.is_empty()).then_some(segments)
 }
 
-/// Downloads as the app holds them: the offline mode and the poll that
+/// Downloads as the app holds them: the offline mode and the task that
 /// redraws for progress.
 #[derive(Default)]
 pub struct DownloadsState {
@@ -113,7 +114,8 @@ pub struct DownloadsState {
     /// answered.
     pub allowed: Option<bool>,
     poll: Option<Task<()>>,
-    version_seen: u64,
+    /// What the Downloads page lists; see [`ui::Listing`].
+    listing: RefCell<ui::Listing>,
     /// What the notice "in the queue" counts: the items queued since the
     /// notice came up, and when the last one came.
     queued_notice: Option<(Instant, usize)>,
@@ -142,7 +144,8 @@ fn queued_text(count: usize, title: Option<&str>) -> String {
     }
 }
 
-/// Progress reaches the UI this often at most.
+/// Progress reaches the UI this often at most: the wait after a frame
+/// that a change of the engine made.
 const POLL_EVERY: Duration = Duration::from_millis(250);
 
 /// The word when another instance holds the download folder.
@@ -214,19 +217,17 @@ impl Bloom {
         if self.downloads.poll.is_some() {
             return;
         }
+        // The engine says when its state changed: one message for all
+        // the changes since the last one taken. With nothing under way
+        // none comes, and the app sleeps; a timer that asked four times
+        // a second woke it for the whole life of the window.
+        let changes = engine().changes();
         self.downloads.poll = Some(cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(POLL_EVERY).await;
-                let alive = this.update(cx, |this, cx| {
-                    let version = engine().version();
-                    if version != this.downloads.version_seen {
-                        this.downloads.version_seen = version;
-                        cx.notify();
-                    }
-                });
-                if alive.is_err() {
+            while changes.recv().await.is_ok() {
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
                     break;
                 }
+                cx.background_executor().timer(POLL_EVERY).await;
             }
         }));
     }
@@ -236,7 +237,7 @@ impl Bloom {
     pub fn downloads_allowed(&self) -> bool {
         match self.downloads.allowed {
             Some(allowed) => allowed,
-            None => !engine().entries().is_empty(),
+            None => engine().summary().entries > 0,
         }
     }
 
@@ -254,7 +255,7 @@ impl Bloom {
             self.toast("Downloads", NOT_OWNER_TEXT, cx);
             return;
         }
-        let fresh = engine.entry(&item.id).is_none();
+        let fresh = engine.state_of(&item.id).is_none();
         if let Err(err) = engine.add(item) {
             log::warn!("download refused: {err:#}");
             self.toast("Downloads", "The server sent an item that cannot be saved safely.", cx);
@@ -291,18 +292,11 @@ impl Bloom {
             self.toast("Downloads", NOT_OWNER_TEXT, cx);
             return;
         }
-        let mut added = 0;
-        for episode in episodes.iter().filter(|e| e.is_playable()) {
-            let state = engine.entry(&episode.id).map(|e| e.state);
-            if state.is_none() || matches!(state, Some(EntryState::Paused | EntryState::Failed)) {
-                match engine.add(episode) {
-                    Ok(()) => added += 1,
-                    Err(err) => log::warn!("download refused: {err:#}"),
-                }
-            }
-        }
-        if added > 0 {
-            self.note_queued(added, None, cx);
+        // One step for the season: the index is written once.
+        match engine.add_many(episodes.iter().filter(|e| e.is_playable())) {
+            Ok(0) => {}
+            Ok(added) => self.note_queued(added, None, cx),
+            Err(err) => log::warn!("download refused: {err:#}"),
         }
         cx.notify();
     }
@@ -439,8 +433,8 @@ impl Bloom {
         if self.download_of_another_server(server_id, item_id, cx) {
             return;
         }
-        let item = engine().item_of(server_id, item_id).or_else(|| {
-            engine().entry_of(server_id, item_id).map(|e| Item {
+        let item = engine().item(Key::of(server_id, item_id)).or_else(|| {
+            engine().entry(Key::of(server_id, item_id)).map(|e| Item {
                 id: e.item_id.clone(),
                 name: e.name.clone(),
                 kind: e.kind.as_str().into(),
@@ -462,7 +456,7 @@ impl Bloom {
         if self.download_of_another_server(server_id, item_id, cx) {
             return;
         }
-        let Some(mut item) = engine().item_of(server_id, item_id) else {
+        let Some(mut item) = engine().item(Key::of(server_id, item_id)) else {
             self.toast("Downloads", "The item is not downloaded.", cx);
             return;
         };
@@ -573,16 +567,16 @@ impl Bloom {
             }
         }
         cx.notify();
-        let entries = engine.entries();
+        let all = engine.summary();
         format!(
             "downloads offline={} allowed={:?} owner={} entries={} active={} done={} used={} free={} dir={} source={} segments=[{}]",
             self.downloads.offline,
             self.downloads.allowed,
             engine.owns_storage(),
-            entries.len(),
-            entries.iter().filter(|e| e.is_active()).count(),
-            entries.iter().filter(|e| e.state == EntryState::Done).count(),
-            format_bytes(engine.used_bytes()),
+            all.entries,
+            all.active,
+            all.done,
+            format_bytes(all.used),
             engine.free_bytes().map_or("?".to_string(), format_bytes),
             engine.dir().display(),
             self.downloads_source_label(),

@@ -16,19 +16,17 @@
 //!   does not launch.
 
 pub mod debug;
-pub mod jellyfin;
-pub use bloom_core::chromecast::{mdns, messages, proto};
-/// The fake device of the tests; the app runs it as well when
-/// `BLOOM_CHROMECAST_MOCK` is set, so the panel can be driven against it.
-#[cfg_attr(not(test), allow(dead_code))]
-pub mod mock;
-pub mod session;
+/// The engine is in `bloom-core`, where its tests run without the app.
+pub use bloom_core::chromecast::{jellyfin, mdns, messages, mock, session};
 
 /// What the app keeps: the search, the one connection, and the last events
 /// for the debug channel.
 #[derive(Default)]
 pub struct State {
     pub discovery: Option<mdns::Discovery>,
+    /// The debug channel asked for the search: it stays with the panel
+    /// closed (`Bloom::stop_cast_search`).
+    pub keep_search: bool,
     pub session: Option<session::Session>,
     /// The last events, one line each, newest last.
     pub events: Vec<String>,
@@ -50,6 +48,7 @@ impl State {
                 format!("message {namespace} {}", payload["type"].as_str().unwrap_or(""))
             }
             session::Event::Error(text) => format!("error {text}"),
+            session::Event::Ended { load } => format!("ended load={load}"),
             session::Event::Closed => "closed".into(),
         };
         self.events.push(line);

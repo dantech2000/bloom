@@ -40,29 +40,6 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &FocusPrevious, cx| advance_focus(true, cx));
     // Later scoped bindings take precedence over window-wide defaults.
     gpui_kit::base::init(cx);
-    #[cfg(target_family = "wasm")]
-    {
-        // Browser previews also accept macOS editing shortcuts.
-        use gpui_kit::KeyBinding;
-        use gpui_kit::base::input::{
-            Copy, Cut, MoveEnd, MoveHome, MoveToNextWord, MoveToPreviousWord, Paste, Redo,
-            SelectAll, SelectToNextWordEnd, SelectToPreviousWordStart, Undo,
-        };
-        cx.bind_keys([
-            KeyBinding::new("cmd-a", SelectAll, Some("Input")),
-            KeyBinding::new("cmd-c", Copy, Some("Input")),
-            KeyBinding::new("cmd-v", Paste, Some("Input")),
-            KeyBinding::new("cmd-x", Cut, Some("Input")),
-            KeyBinding::new("cmd-left", MoveHome, Some("Input")),
-            KeyBinding::new("cmd-right", MoveEnd, Some("Input")),
-            KeyBinding::new("cmd-z", Undo, Some("Input")),
-            KeyBinding::new("cmd-shift-z", Redo, Some("Input")),
-            KeyBinding::new("alt-left", MoveToPreviousWord, Some("Input")),
-            KeyBinding::new("alt-right", MoveToNextWord, Some("Input")),
-            KeyBinding::new("alt-shift-left", SelectToPreviousWordStart, Some("Input")),
-            KeyBinding::new("alt-shift-right", SelectToNextWordEnd, Some("Input")),
-        ]);
-    }
 }
 
 fn advance_focus(reverse: bool, cx: &mut App) {
@@ -129,16 +106,6 @@ pub struct UiColors {
     pub input: Rgba,
     /// Focus ring.
     pub ring: Rgba,
-    /// First chart color.
-    pub chart_1: Rgba,
-    /// Second chart color.
-    pub chart_2: Rgba,
-    /// Third chart color.
-    pub chart_3: Rgba,
-    /// Fourth chart color.
-    pub chart_4: Rgba,
-    /// Fifth chart color.
-    pub chart_5: Rgba,
     /// Sidebar background.
     pub sidebar: Rgba,
     /// Sidebar foreground.
@@ -155,8 +122,6 @@ pub struct UiColors {
     pub sidebar_border: Rgba,
     /// Sidebar focus border color.
     pub sidebar_ring: Rgba,
-    /// Scrim behind modal surfaces.
-    pub overlay: Rgba,
 }
 
 /// Theme font family names. Applications own font loading.
@@ -217,8 +182,6 @@ pub struct UiMotion {
     pub normal: Duration,
     /// Application preference; true removes movement without removing state feedback.
     pub reduced: bool,
-    /// Shared easing for reversible state transitions.
-    pub easing: UiEasing,
 }
 impl Default for UiMotion {
     fn default() -> Self {
@@ -226,28 +189,6 @@ impl Default for UiMotion {
             fast: Duration::from_millis(150),
             normal: Duration::from_millis(200),
             reduced: false,
-            easing: UiEasing::EaseInOut,
-        }
-    }
-}
-
-/// Curves supported by the shared native transition helper.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum UiEasing {
-    /// Constant-speed motion, as used by shadcn sidebar layout transitions.
-    Linear,
-    /// Fast response followed by a smooth stop.
-    EaseOut,
-    /// Smooth acceleration and deceleration for changes within a layout.
-    #[default]
-    EaseInOut,
-}
-impl UiEasing {
-    fn sample(self, progress: f32) -> f32 {
-        match self {
-            Self::Linear => progress,
-            Self::EaseOut => gpui_kit::ease_out_quint()(progress),
-            Self::EaseInOut => gpui_kit::ease_in_out(progress),
         }
     }
 }
@@ -275,7 +216,7 @@ pub fn transition_value(
         id.into(),
         target,
         gpui_kit::base::motion::Transition::new(duration)
-            .ease(move |progress| motion.easing.sample(progress)),
+            .ease(gpui_kit::ease_in_out),
         window,
         cx,
     )
@@ -297,7 +238,7 @@ pub(crate) fn presence(
     gpui_kit::base::motion::Presence::new(id.into(), present)
         .transition(
             gpui_kit::base::motion::Transition::new(duration)
-                .ease(move |progress| motion.easing.sample(progress)),
+                .ease(gpui_kit::ease_in_out),
         )
         .sample(window, cx)
 }
@@ -375,20 +316,6 @@ impl UiTheme {
         cx.global::<Self>()
     }
 
-    /// Selects the pinned palette, preserving non-color tokens or initializing defaults.
-    pub fn switch(cx: &mut App, mode: ThemeMode) {
-        let mut theme = cx
-            .try_global::<Self>()
-            .cloned()
-            .unwrap_or_else(Self::neutral_light);
-        theme.mode = mode;
-        theme.colors = match mode {
-            ThemeMode::Light => neutral_light_colors(),
-            ThemeMode::Dark => neutral_dark_colors(),
-        };
-        Self::set(cx, theme);
-    }
-
     /// Returns a multiple of the configured spacing unit (2 means 8px by default).
     pub fn space(&self, units: f32) -> Pixels {
         self.spacing.unit * units
@@ -460,11 +387,6 @@ fn neutral_light_colors() -> UiColors {
         border: neutral(0.922),
         input: neutral(0.922),
         ring: neutral(0.708),
-        chart_1: neutral(0.87),
-        chart_2: neutral(0.556),
-        chart_3: neutral(0.439),
-        chart_4: neutral(0.371),
-        chart_5: neutral(0.269),
         sidebar: neutral(0.985),
         sidebar_foreground: neutral(0.145),
         sidebar_primary: neutral(0.205),
@@ -473,7 +395,6 @@ fn neutral_light_colors() -> UiColors {
         sidebar_accent_foreground: neutral(0.205),
         sidebar_border: neutral(0.922),
         sidebar_ring: neutral(0.708),
-        overlay: black().alpha(0.10).into(),
     }
 }
 
@@ -497,11 +418,6 @@ fn neutral_dark_colors() -> UiColors {
         border: neutral_alpha(1.0, 0.10),
         input: neutral_alpha(1.0, 0.15),
         ring: neutral(0.556),
-        chart_1: neutral(0.87),
-        chart_2: neutral(0.556),
-        chart_3: neutral(0.439),
-        chart_4: neutral(0.371),
-        chart_5: neutral(0.269),
         sidebar: neutral(0.205),
         sidebar_foreground: neutral(0.985),
         sidebar_primary: srgb(0x14, 0x47, 0xe6),
@@ -510,7 +426,6 @@ fn neutral_dark_colors() -> UiColors {
         sidebar_accent_foreground: neutral(0.985),
         sidebar_border: neutral_alpha(1.0, 0.10),
         sidebar_ring: neutral(0.556),
-        overlay: black().alpha(0.10).into(),
     }
 }
 
@@ -608,31 +523,6 @@ pub(crate) fn apply_style<T: Styled>(mut element: T, style: &gpui_kit::StyleRefi
     element
 }
 
-#[derive(gpui_kit::IntoElement)]
-pub(crate) struct DisclosureIcon {
-    icon: gpui_kit::Svg,
-    open: bool,
-}
-pub(crate) fn disclosure_icon(icon: gpui_kit::Svg, open: bool) -> DisclosureIcon {
-    DisclosureIcon { icon, open }
-}
-impl gpui_kit::RenderOnce for DisclosureIcon {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl gpui_kit::IntoElement {
-        let duration = UiTheme::read(cx).motion.fast;
-        let value = transition_value(
-            "disclosure-rotation",
-            if self.open { 1. } else { 0. },
-            duration,
-            window,
-            cx,
-        );
-        self.icon
-            .with_transformation(gpui_kit::Transformation::rotate(gpui_kit::radians(
-                value * std::f32::consts::PI,
-            )))
-    }
-}
-
 #[cfg(test)]
 mod motion_tests {
     use super::*;
@@ -689,88 +579,5 @@ mod motion_tests {
                 .unwrap(),
             1.
         );
-    }
-}
-
-/// Shared focus traversal for the tab, radio and toggle collections.
-pub(crate) struct RovingFocus {
-    pub handles: Vec<Option<gpui_kit::FocusHandle>>,
-    active: gpui_kit::Entity<Option<gpui_kit::FocusHandle>>,
-}
-impl RovingFocus {
-    pub fn new(
-        id: gpui_kit::ElementId,
-        items: &[(gpui_kit::ElementId, bool)],
-        selected: Option<usize>,
-        window: &mut gpui_kit::Window,
-        cx: &mut App,
-    ) -> Self {
-        let active =
-            window.use_keyed_state((id, "active"), cx, |_, _| None::<gpui_kit::FocusHandle>);
-        let mut handles: Vec<_> = items
-            .iter()
-            .map(|(id, disabled)| {
-                let handle = window
-                    .use_keyed_state((id.clone(), "focus"), cx, |_, cx| cx.focus_handle())
-                    .read(cx)
-                    .clone();
-                handle.clone().tab_stop(false);
-                (!disabled).then_some(handle)
-            })
-            .collect();
-        let index = handles
-            .iter()
-            .position(|h| h.as_ref().is_some_and(|h| h.is_focused(window)))
-            .or(selected.filter(|&i| handles.get(i).is_some_and(Option::is_some)))
-            .or_else(|| {
-                handles
-                    .iter()
-                    .position(|h| h.is_some() && h.as_ref() == active.read(cx).as_ref())
-            })
-            .or_else(|| handles.iter().position(Option::is_some));
-        if let Some(index) = index {
-            let handle = handles[index].as_ref().unwrap().clone().tab_stop(true);
-            handles[index] = Some(handle.clone());
-            active.update(cx, |value, _| *value = Some(handle));
-        }
-        Self { handles, active }
-    }
-    pub fn key(
-        &self,
-        event: &gpui_kit::KeyDownEvent,
-        axis: Option<gpui_kit::Axis>,
-        window: &mut gpui_kit::Window,
-        cx: &mut App,
-    ) -> Option<usize> {
-        if event.keystroke.modifiers.modified() {
-            return None;
-        }
-        let enabled: Vec<_> = self
-            .handles
-            .iter()
-            .enumerate()
-            .filter_map(|(i, h)| h.as_ref().map(|h| (i, h)))
-            .collect();
-        let current = enabled.iter().position(|(_, h)| h.is_focused(window))?;
-        let next = match event.keystroke.key.as_str() {
-            "home" => 0,
-            "end" => enabled.len() - 1,
-            "left" if axis != Some(gpui_kit::Axis::Vertical) => {
-                (current + enabled.len() - 1) % enabled.len()
-            }
-            "right" if axis != Some(gpui_kit::Axis::Vertical) => (current + 1) % enabled.len(),
-            "up" if axis != Some(gpui_kit::Axis::Horizontal) => {
-                (current + enabled.len() - 1) % enabled.len()
-            }
-            "down" if axis != Some(gpui_kit::Axis::Horizontal) => (current + 1) % enabled.len(),
-            _ => return None,
-        };
-        enabled[current].1.clone().tab_stop(false);
-        let handle = enabled[next].1.clone().tab_stop(true);
-        handle.focus(window, cx);
-        self.active.update(cx, |value, _| *value = Some(handle));
-        window.refresh();
-        cx.stop_propagation();
-        Some(enabled[next].0)
     }
 }

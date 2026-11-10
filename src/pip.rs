@@ -69,14 +69,30 @@ fn set_frame(window: Id, frame: Frame) {
     send!((), window, c"setFrame:display:animate:", rect => Rect, true => bool, true => bool);
 }
 
+/// The close, minimise and zoom buttons of the window, those it has.
+fn buttons(window: Id) -> Vec<Id> {
+    (0..3_usize)
+        .map(|kind| send!(Id, window, c"standardWindowButton:", kind => usize))
+        .filter(|button| !button.is_null())
+        .collect()
+}
+
 /// Shows or hides the close, minimise and zoom buttons.
 fn set_buttons_hidden(window: Id, hidden: bool) {
-    for kind in 0..3_usize {
-        let button = send!(Id, window, c"standardWindowButton:", kind => usize);
-        if !button.is_null() {
-            send!((), button, c"setHidden:", hidden => bool);
-        }
+    for button in buttons(window) {
+        send!((), button, c"setHidden:", hidden => bool);
     }
+}
+
+/// Runs `work` with the window after the current event (see
+/// `macos::after_event`). The window is kept until then: it can close
+/// before the work runs.
+fn after_event_with(window: Id, work: impl FnOnce(Id) + 'static) {
+    let kept = send!(Id, window, c"retain");
+    crate::macos::after_event(move || {
+        work(kept);
+        send!((), kept, c"release");
+    });
 }
 
 /// Shows or hides the close, minimise and zoom buttons of the window. The
@@ -89,14 +105,10 @@ pub fn set_window_buttons_hidden(window: &Window, hidden: bool) {
         return;
     };
     let alpha: f64 = if hidden { 0. } else { 1. };
-    let buttons: Vec<Id> = (0..3_usize)
-        .map(|kind| send!(Id, window, c"standardWindowButton:", kind => usize))
-        .filter(|button| !button.is_null())
-        .collect();
-    for button in &buttons {
-        send!((), *button, c"setAlphaValue:", alpha => f64);
+    for button in buttons(window) {
+        send!((), button, c"setAlphaValue:", alpha => f64);
     }
-    crate::macos::after_event(move || place_buttons(window, &buttons));
+    after_event_with(window, |window| place_buttons(window, &buttons(window)));
 }
 
 /// Puts the window buttons at [`TRAFFIC_LIGHTS`].
@@ -174,7 +186,7 @@ pub fn enter(window: &Window, saved: Option<Frame>) -> Option<Frame> {
     set_buttons_hidden(ns, true);
     // The caller is inside a gpui update, where gpui cannot take the news
     // of the new size; the resize waits until the update is over.
-    crate::macos::after_event(move || {
+    after_event_with(ns, move |ns| {
         send!((), ns, c"setContentMinSize:", min => Size);
         set_frame(ns, target);
     });
@@ -193,7 +205,7 @@ pub fn leave(window: &Window, normal: Frame) {
         width: NORMAL_MIN_SIZE.0,
         height: NORMAL_MIN_SIZE.1,
     };
-    crate::macos::after_event(move || {
+    after_event_with(ns, move |ns| {
         set_frame(ns, normal);
         send!((), ns, c"setContentMinSize:", min => Size);
     });

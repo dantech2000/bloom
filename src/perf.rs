@@ -12,6 +12,7 @@
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use std::{
+    collections::VecDeque,
     sync::{
         Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -34,8 +35,6 @@ static DRAWS: AtomicU64 = AtomicU64::new(0);
 /// grow when other programs load the machine, so limits are checked on it.
 static DRAW_CPU_NS: AtomicU64 = AtomicU64::new(0);
 static DRAW_CPU_MAX_NS: AtomicU64 = AtomicU64::new(0);
-/// CPU time of the UI thread at its latest render.
-static MAIN_CPU_NS: AtomicU64 = AtomicU64::new(0);
 /// Named counters, such as cards built.
 static CARDS: AtomicU64 = AtomicU64::new(0);
 
@@ -100,7 +99,6 @@ pub fn record_render(build: Duration) {
     }
     BUILD_NS.fetch_add(build.as_nanos() as u64, Ordering::Relaxed);
     BUILD_MAX_NS.fetch_max(build.as_nanos() as u64, Ordering::Relaxed);
-    MAIN_CPU_NS.store(cpu_ns(CLOCK_THREAD_CPUTIME_ID), Ordering::Relaxed);
 }
 
 /// CPU time the calling thread has used. Take it at the start of a render
@@ -128,28 +126,40 @@ pub fn record_draw(started: Instant, started_cpu: u64) {
 /// the last 4000. A draw request is not the frame on the glass: the
 /// `jumps` of `pacing_report` are a secondary figure, the ruler is
 /// `pacing::trace` (the time the display showed each frame).
-static VIDEO_GAPS: Mutex<(Option<Instant>, Vec<u32>)> = Mutex::new((None, Vec::new()));
+static VIDEO_GAPS: Mutex<(Option<Instant>, VecDeque<u32>)> = Mutex::new((None, VecDeque::new()));
 
 /// Waits from "mpv has a frame" to "the UI is told to draw it", in
 /// microseconds; the last 4000. This is measured also when the window is
 /// hidden and draws nothing.
-static VIDEO_WAITS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static VIDEO_WAITS: Mutex<VecDeque<u32>> = Mutex::new(VecDeque::new());
 
 /// Times from "mpv has a frame" to "the frame is rendered", in
 /// microseconds; the last 4000.
-static VIDEO_RENDERS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static VIDEO_RENDERS: Mutex<VecDeque<u32>> = Mutex::new(VecDeque::new());
+
+/// How many values each of the three lists keeps.
+const KEPT: usize = 4000;
+
+/// Adds a value to a list and drops the oldest one of a full list.
+fn keep(list: &mut VecDeque<u32>, value: u32) {
+    if list.len() >= KEPT {
+        list.pop_front();
+    }
+    list.push_back(value);
+}
+
+/// Milliseconds as the microseconds the lists hold.
+fn micros(ms: f64) -> u32 {
+    (ms * 1000.).clamp(0., 4e9) as u32
+}
 
 /// Records the render time of one frame, on the thread of the player.
 pub fn video_frame_rendered(ms: f64) {
-    let mut list = VIDEO_RENDERS.lock().unwrap();
-    if list.len() >= 4000 {
-        list.remove(0);
-    }
-    list.push((ms * 1000.).clamp(0., 4e9) as u32);
+    keep(&mut VIDEO_RENDERS.lock().unwrap(), micros(ms));
 }
 
-fn quantiles(name: &str, list: &Mutex<Vec<u32>>) -> String {
-    let mut list = std::mem::take(&mut *list.lock().unwrap());
+fn quantiles(name: &str, list: &Mutex<VecDeque<u32>>) -> String {
+    let mut list = Vec::from(std::mem::take(&mut *list.lock().unwrap()));
     if list.is_empty() {
         return format!("{name}: no frames");
     }
@@ -168,11 +178,7 @@ fn quantiles(name: &str, list: &Mutex<Vec<u32>>) -> String {
 
 /// Records the wait of one frame.
 pub fn video_frame_noticed(wait_ms: f64) {
-    let mut waits = VIDEO_WAITS.lock().unwrap();
-    if waits.len() >= 4000 {
-        waits.remove(0);
-    }
-    waits.push((wait_ms * 1000.).clamp(0., 4e9) as u32);
+    keep(&mut VIDEO_WAITS.lock().unwrap(), micros(wait_ms));
 }
 
 fn waits_report() -> String {
@@ -190,10 +196,7 @@ pub fn video_frame_shown() {
     let mut gaps = VIDEO_GAPS.lock().unwrap();
     if let Some(last) = gaps.0.replace(now) {
         let gap = now.duration_since(last).as_micros().min(u32::MAX as u128) as u32;
-        if gaps.1.len() >= 4000 {
-            gaps.1.remove(0);
-        }
-        gaps.1.push(gap);
+        keep(&mut gaps.1, gap);
     }
 }
 

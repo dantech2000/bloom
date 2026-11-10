@@ -16,7 +16,7 @@ use gpui_kit::{
 
 use super::{ButtonKind, button};
 use crate::{
-    app::{Bloom, Page},
+    app::Bloom,
     ui::{
         glass::glass,
         input::Input,
@@ -37,18 +37,21 @@ pub struct Dialogs {
     pub inputs: [gpui_kit::Entity<crate::ui::input::InputState>; 3],
     /// Value shown once, such as a new API key.
     pub secret: Option<Secret>,
+    /// A form went away with no window at hand (`forget`): its fields
+    /// still hold their text, and the next render clears them.
+    stale_text: bool,
 }
 
 impl Dialogs {
     pub fn new(inputs: [gpui_kit::Entity<crate::ui::input::InputState>; 3]) -> Self {
-        Self { confirm: None, prompt: None, prompt_fresh: false, inputs, secret: None }
+        Self { confirm: None, prompt: None, prompt_fresh: false, inputs, secret: None, stale_text: false }
     }
 
-    /// Drops what is open, with no action. The text of the fields stays;
-    /// `Bloom::close_admin_dialog` clears it.
+    /// Drops what is open, with no action. The text of the fields goes in
+    /// the next render, which has the window (`Bloom::prepare_admin_prompt`).
     pub fn forget(&mut self) {
         self.confirm = None;
-        self.prompt = None;
+        self.stale_text |= self.prompt.take().is_some();
         self.prompt_fresh = false;
         self.secret = None;
     }
@@ -91,6 +94,12 @@ pub struct Secret {
 impl Bloom {
     /// Shows a form; the action runs when the user submits it.
     pub fn ask_prompt(&mut self, prompt: Prompt, cx: &mut Context<Self>) {
+        // The app has one plain field and two masked ones (`admin_input`).
+        debug_assert!(
+            prompt.fields.iter().filter(|f| !f.masked).count() <= 1
+                && prompt.fields.iter().filter(|f| f.masked).count() <= 2,
+            "a prompt holds one plain field and two masked ones at most"
+        );
         self.close_panels();
         self.dialogs.prompt = Some(prompt);
         // The fields are cleared and focused in the next render, which has
@@ -99,13 +108,13 @@ impl Bloom {
         cx.notify();
     }
 
-    /// True while a dialog of the dashboard is open.
+    /// True while a dialog is open, on any page: the downloads ask a
+    /// question too, and a page change drops what is open.
     pub fn admin_dialog_open(&self) -> bool {
-        matches!(self.page, Page::Admin(_) | Page::Settings(_))
-            && (self.dialogs.confirm.is_some()
-                || self.dialogs.prompt.is_some()
-                || self.dialogs.secret.is_some()
-                || self.text_editor_open())
+        self.dialogs.confirm.is_some()
+            || self.dialogs.prompt.is_some()
+            || self.dialogs.secret.is_some()
+            || self.text_editor_open()
     }
 
     /// Drops a question, a form or a shown secret that is still open when
@@ -119,9 +128,7 @@ impl Bloom {
 
     /// Closes the open dialog without an action.
     pub fn close_admin_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.dialogs.confirm = None;
-        self.dialogs.prompt = None;
-        self.dialogs.secret = None;
+        self.dialogs.forget();
         self.close_text_editor();
         self.clear_admin_inputs(window, cx);
         window.focus(&self.app_focus, cx);
@@ -130,6 +137,7 @@ impl Bloom {
 
     /// A password must not stay in a field that is out of view.
     fn clear_admin_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dialogs.stale_text = false;
         for input in &self.dialogs.inputs {
             input.update(cx, |input, cx| input.set_value("", window, cx));
         }
@@ -153,6 +161,10 @@ impl Bloom {
     /// text and placeholders, and the focus in the first one. The root render calls
     /// this.
     pub fn prepare_admin_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A form that a page change dropped: its password goes now.
+        if self.dialogs.stale_text {
+            self.clear_admin_inputs(window, cx);
+        }
         if !std::mem::take(&mut self.dialogs.prompt_fresh) {
             return;
         }
@@ -377,4 +389,76 @@ fn dialog(id: &'static str, title: &str, message: &str, cx: &Context<Bloom>) -> 
                 .text_color(t.colors.foreground.opacity(0.8))
                 .child(message.to_string()),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::TestAppContext;
+
+    use super::{Field, Prompt};
+    use crate::app::{
+        Page,
+        race_harness::{MockServer, app, plain, session},
+    };
+
+    fn password_prompt() -> Prompt {
+        Prompt {
+            title: String::new(),
+            message: String::new(),
+            action: String::new(),
+            fields: vec![Field {
+                label: "Password".to_string(),
+                placeholder: String::new(),
+                value: String::new(),
+                masked: true,
+                required: true,
+            }],
+            run: std::rc::Rc::new(|_, _, _| {}),
+        }
+    }
+
+    /// A form that goes away with a page change leaves no password in its
+    /// field: the next render clears it. Before, the text stayed in the
+    /// field until another form opened.
+    #[gpui_kit::test]
+    fn a_dropped_form_leaves_no_password(cx: &mut TestAppContext) {
+        let server = MockServer::start(|method, path, _| plain(method, path));
+        let (bloom, cx) = app(cx);
+        bloom.update_in(cx, |this, window, cx| {
+            this.session = Some(session(&server.url, "u1"));
+            this.ask_prompt(password_prompt(), cx);
+            this.prepare_admin_prompt(window, cx);
+            this.dialogs.inputs[1].update(cx, |input, cx| input.set_value("secret", window, cx));
+            // The page changes under the form.
+            this.forget_admin_dialogs();
+            assert!(this.dialogs.prompt.is_none());
+            this.prepare_admin_prompt(window, cx);
+            assert_eq!(this.dialogs.inputs[1].read(cx).value().to_string(), "");
+        });
+        cx.run_until_parked();
+    }
+
+    /// A question on the downloads page counts as an open dialog, so
+    /// Escape closes it and its keys are not shortcuts of the page. Before,
+    /// only the dashboard and the settings counted.
+    #[gpui_kit::test]
+    fn a_question_on_the_downloads_page_is_an_open_dialog(cx: &mut TestAppContext) {
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            this.page = Page::Downloads;
+            assert!(!this.admin_dialog_open());
+            this.ask_confirm(
+                crate::admin::Confirm {
+                    title: String::new(),
+                    message: String::new(),
+                    action: String::new(),
+                    danger: false,
+                    run: std::rc::Rc::new(|_, _| {}),
+                },
+                cx,
+            );
+            assert!(this.admin_dialog_open());
+        });
+        cx.run_until_parked();
+    }
 }

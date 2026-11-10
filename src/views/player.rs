@@ -20,8 +20,11 @@ use crate::{
     jellyfin::format_duration,
     player::PlayState,
     queue::PreviewFrame,
-    ui::{glass::glass, menu::Menu, slider::Slider, theme::UiTheme, tip::tip},
-    views::cards::icon,
+    ui::{glass::glass, slider::Slider, theme::UiTheme, tip::tip},
+    views::{
+        cards::icon,
+        parts::{icon_button, icon_menu, last_part},
+    },
 };
 
 /// Space between the control panel and the window edges.
@@ -31,50 +34,56 @@ const PREVIEW_W: f32 = 240.;
 /// Width of the preview when the item has no preview images: time and
 /// chapter name only.
 const PREVIEW_TEXT_W: f32 = 160.;
+/// The fill of a control of the bar under the pointer.
+const CONTROL_HOVER: u32 = 0xffffff1f;
+
+/// Sizes and places of the player's chrome for one window, chosen once
+/// per render as `cards::Metrics` is. A phone has fewer controls, each a
+/// finger wide, inside the safe area (in landscape the notch is at a
+/// side); the Mac and an iPad have the bar of the web player.
+#[derive(Clone, Copy)]
+struct PlayerMetrics {
+    /// A phone: the bar is the tab bar's glass, the transport sits in its
+    /// middle, and a panel takes the corner of the skip button.
+    phone: bool,
+    /// The controls a phone drops: rating, "Ends at", favourite, mute,
+    /// the volume slider and the bookmarks.
+    extras: bool,
+    /// Size of a control of the bar: 44 points for a thumb, 40 under a
+    /// pointer.
+    control: f32,
+    /// The bar's distance from the left, right and bottom edges.
+    panel: (f32, f32, f32),
+    /// The bar's padding at its sides.
+    panel_pad: f32,
+    /// Height of the shade behind the header.
+    header_h: f32,
+    /// The header's distance from the top, left and right edges.
+    header: (f32, f32, f32),
+    /// Where a panel sits over the bar: from the right, from the bottom.
+    corner: (f32, f32),
+}
 
 impl Bloom {
     pub fn render_player(&self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         if self.pip.is_some() {
             return self.render_pip(window, cx);
         }
-        let t = UiTheme::read(cx).clone();
+        let fade = UiTheme::read(cx).motion.normal;
         let s = &self.player_status;
         let white = rgb(0xffffff);
         let soft = rgba(0xffffffb3);
         let starting = s.state == PlayState::Starting;
         let fullscreen = window.is_fullscreen();
-        // A phone: fewer controls, each a finger wide, inside the safe
-        // area (in landscape the notch is at a side).
-        let phone = self.phone();
-        let (top_in, left_in, bottom_in, right_in) = crate::views::shell::safe_insets();
+        let m = self.player_metrics(fullscreen);
         // A popup from the bar on a phone opens above the bar, where the
         // episode picker sits (`ui::menu`, `touch_bottom`).
-        let menu_bottom = phone.then(|| self.viewport_h - self.panel_corner().1);
+        let menu_bottom = m.phone.then(|| self.viewport_h - m.corner.1);
         for menu in [&self.subtitle_menu, &self.settings_menu] {
             if menu.read(cx).touch_bottom != menu_bottom {
                 menu.update(cx, |menu, _| menu.touch_bottom = menu_bottom);
             }
         }
-        let (panel_left, panel_right, panel_bottom) = if phone {
-            (12. + left_in, 12. + right_in, 8. + bottom_in)
-        } else {
-            (PANEL_MARGIN, PANEL_MARGIN, PANEL_MARGIN)
-        };
-
-        let player = self.player.clone();
-        let scale = window.scale_factor();
-        // Reports the video area to the renderer so frames are sized to fit.
-        let measure = canvas(
-            move |bounds, _, _| {
-                player.set_target_size(
-                    (f32::from(bounds.size.width) * scale) as u32,
-                    (f32::from(bounds.size.height) * scale) as u32,
-                );
-            },
-            |_, _, _, _| {},
-        )
-        .absolute()
-        .size_full();
 
         let video = div()
             .id("player.surface")
@@ -83,7 +92,7 @@ impl Bloom {
             .flex()
             .items_center()
             .justify_center()
-            .child(measure)
+            .child(self.video_measure(window))
             // A click on the video closes the episode list when it is open;
             // otherwise it pauses or resumes. On a phone a tap shows the
             // controls, or hides them, as the players of iOS do; the pause
@@ -139,64 +148,21 @@ impl Bloom {
                 },
             );
 
-        // Hitboxes don't block by default, so overlay clicks would reach the
-        // video and toggle pause too. Swallow them here, keeping keyboard
-        // focus on the player.
-        fn swallow(
-            this: &mut Bloom,
-            _: &MouseDownEvent,
-            window: &mut Window,
-            cx: &mut Context<Bloom>,
-        ) {
-            window.focus(&this.player_focus, cx);
-            cx.stop_propagation();
-        }
-
-        // A control of the bar: 44 points on a phone, the size a thumb
-        // needs; 40 under a pointer.
-        let control = if phone { 44. } else { 40. };
         let button = |id: &'static str, glyph: Svg| {
-            div()
-                .id(id)
-                // For assistive tech and the tests that tap by label.
-                .role(gpui_kit::Role::Button)
-                .aria_label(id.rsplit('.').next().unwrap_or(id))
-                .size(px(control))
-                .rounded(px(12.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(|s| s.bg(rgba(0xffffff1f)))
-                .child(glyph)
+            icon_button(id, last_part(id), glyph, m.control, CONTROL_HOVER)
         };
         // A menu whose trigger looks like the other panel buttons.
         let menu_button = |state: &gpui_kit::Entity<crate::ui::menu::MenuState>,
                            label: &'static str,
                            glyph: Svg| {
-            Menu::new(state, label)
-                .trigger_style_with(|button| button)
-                .trigger(
-                    div()
-                        .id(label)
-                        .role(gpui_kit::Role::Button)
-                        .aria_label(label)
-                        .tooltip(tip(label))
-                        .size(px(control))
-                        .rounded(px(12.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .hover(|s| s.bg(rgba(0xffffff1f)))
-                        .child(glyph),
-                )
+            icon_menu(state, label, label, glyph, m.control, CONTROL_HOVER)
         };
 
         // Controls overlay the video and fade with pointer activity.
         let visibility = crate::ui::theme::transition_value(
             "player.controls-opacity",
             if self.controls_visible { 1. } else { 0. },
-            t.motion.normal,
+            fade,
             window,
             cx,
         );
@@ -230,12 +196,14 @@ impl Bloom {
                 );
 
             // The header shows the rating when that feature is on; then the panel
-            // does not show it a second time.
+            // does not show it a second time. A phone's header has room for
+            // the title alone.
+            let header_rating = self.enhanced_player_rating().filter(|_| m.extras);
             let rating = self
                 .playing
                 .as_ref()
                 .and_then(|item| item.community_rating)
-                .filter(|_| self.enhanced_player_rating().is_none());
+                .filter(|_| m.extras && header_rating.is_none());
             let favorite = self
                 .playing
                 .as_ref()
@@ -303,7 +271,7 @@ impl Bloom {
                         ),
                     )
                 });
-            if let Some(score) = rating.filter(|_| !phone) {
+            if let Some(score) = rating {
                 left = left.child(
                     div()
                         .ml(px(6.))
@@ -317,16 +285,13 @@ impl Bloom {
                         .child(format!("{score:.1}")),
                 );
             }
-            if s.duration > 0. && !phone {
+            if s.duration > 0. && m.extras {
                 left = left.child(
                     div()
                         .ml(px(10.))
                         .text_size(px(14.))
                         .text_color(soft)
-                        .child(format!(
-                            "Ends at {}",
-                            crate::macos::ends_at((remaining / self.speed.max(0.25) as f64) as i64)
-                        )),
+                        .child(self.ends_at_label()),
                 );
             }
 
@@ -334,7 +299,7 @@ impl Bloom {
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .when(!phone, |el| el.child(
+                .when(m.extras, |el| el.child(
                     button(
                         "player.favorite",
                         filled(
@@ -355,7 +320,7 @@ impl Bloom {
                     "Subtitles",
                     filled(Filled::Captions, 24., if has_subs { white } else { soft }),
                 ))
-                .when(!phone, |el| el.child(
+                .when(m.extras, |el| el.child(
                     button(
                         "player.mute",
                         filled(
@@ -372,7 +337,7 @@ impl Bloom {
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_mute(cx))),
                 ))
                 // The volume is the phone's buttons; the bookmarks wait.
-                .when(!phone, |el| {
+                .when(m.extras, |el| {
                     el.child(
                         div().w(px(120.)).mr(px(8.)).child(
                             Slider::new(&self.volume_slider)
@@ -455,29 +420,29 @@ impl Bloom {
 
             let panel = div()
                 .absolute()
-                .left(px(panel_left))
-                .right(px(panel_right))
-                .bottom(px(panel_bottom))
+                .left(px(m.panel.0))
+                .right(px(m.panel.1))
+                .bottom(px(m.panel.2))
                 .rounded(px(24.))
                 .opacity(visibility)
-                .on_mouse_down(MouseButton::Left, cx.listener(swallow))
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::swallow_to_player))
                 // A phone: the glass of the tab bar, tint and light edge
                 // (Daniel, 2026-10-23: the darker tint read as a slab, not
                 // as the glass of the menus and the tab bar).
-                .when(phone, |el| el.border_1().border_color(rgba(0xf5f5f733)))
-                .child(if phone {
+                .when(m.phone, |el| el.border_1().border_color(rgba(0xf5f5f733)))
+                .child(if m.phone {
                     crate::ui::glass::bar_glass(px(24.), crate::ui::glass::POPUP_TINT)
                 } else {
                     glass(px(24.), rgba(0x1c1c1cb8))
                 })
-                .px(px(if phone { 14. } else { 20. }))
+                .px(px(m.panel_pad))
                 .pt(px(10.))
                 .pb(px(8.))
                 .flex()
                 .flex_col()
                 .gap(px(2.))
                 .child(seek)
-                .child(if phone {
+                .child(if m.phone {
                     // The transport in the middle, as the players of iOS;
                     // the tools at the right.
                     div()
@@ -500,7 +465,7 @@ impl Bloom {
                 .top_0()
                 .left_0()
                 .right_0()
-                .h(px(if phone { 84. } else { 110. }))
+                .h(px(m.header_h))
                 .opacity(visibility)
                 .bg(linear_gradient(
                     180.,
@@ -510,21 +475,13 @@ impl Bloom {
                 .child(
                     div()
                         .absolute()
-                        .top(px(if phone { 8. + top_in } else { 12. }))
-                        // The traffic lights sit at the left edge of a Mac
-                        // window; the notch at a side of a phone.
-                        .left(px(if phone {
-                            16. + left_in
-                        } else if fullscreen || cfg!(not(target_os = "macos")) {
-                            20.
-                        } else {
-                            84.
-                        }))
-                        .right(px(if phone { 16. + right_in } else { 24. }))
+                        .top(px(m.header.0))
+                        .left(px(m.header.1))
+                        .right(px(m.header.2))
                         .flex()
                         .items_center()
                         .gap(px(6.))
-                        .on_mouse_down(MouseButton::Left, cx.listener(swallow))
+                        .on_mouse_down(MouseButton::Left, cx.listener(Self::swallow_to_player))
                         .child(
                             // Back ends playback and returns to the page before.
                             button("player.close", icon(LucideIcon::ArrowLeft, 20., white))
@@ -541,8 +498,7 @@ impl Bloom {
                                 .truncate()
                                 .child(s.title.clone()),
                         )
-                        // A phone's header has room for the title alone.
-                        .children(self.enhanced_player_rating().filter(|_| !phone))
+                        .children(header_rating)
                         .children(self.sync_player_chip(cx)),
                 );
             (header, panel)
@@ -554,7 +510,7 @@ impl Bloom {
         // "Skip Intro" and its relatives, from the server's marked ranges.
         // A phone's panels take the same corner: the button waits while one
         // is open.
-        let corner_taken = self.phone() && self.panel_open();
+        let corner_taken = m.phone && self.panel_open();
         let skip = self.current_segment().filter(|_| up_next.is_none() && !corner_taken).map(|segment| {
             let end = segment.end_secs();
             let text = match segment.kind.as_str() {
@@ -567,8 +523,8 @@ impl Bloom {
             div()
                 .id("player.skip")
                 .absolute()
-                .right(px(self.panel_corner().0))
-                .bottom(px(self.panel_corner().1))
+                .right(px(m.corner.0))
+                .bottom(px(m.corner.1))
                 .h(px(44.))
                 .px(px(20.))
                 .rounded(px(12.))
@@ -580,7 +536,7 @@ impl Bloom {
                 .text_size(px(16.))
                 .font_weight(gpui_kit::FontWeight::BOLD)
                 .text_color(rgba(0xffffffde))
-                .on_mouse_down(MouseButton::Left, cx.listener(swallow))
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::swallow_to_player))
                 .child(text)
                 .child(icon(LucideIcon::SkipForward, 18., white))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -651,7 +607,7 @@ impl Bloom {
                 el.children(skip)
                     .children(up_next)
                     .when_some(chrome, |el, (header, panel)| el.child(header).child(panel))
-                    .children(self.render_episode_picker(self.panel_corner().1, cx))
+                    .children(self.render_episode_picker(m.corner.1, cx))
                     .children(self.render_bookmarks_panel(cx))
                     .children(self.render_sync_panel(None, cx))
                     .children(self.render_cast_panel(None, cx))
@@ -663,16 +619,69 @@ impl Bloom {
             })
     }
 
+    /// The sizes of the player for the window as it is. `fullscreen`: a
+    /// Mac window that fills the screen has no traffic lights to keep
+    /// clear of.
+    fn player_metrics(&self, fullscreen: bool) -> PlayerMetrics {
+        if self.phone() {
+            let (top, left, bottom, right) = crate::views::shell::safe_insets();
+            return PlayerMetrics {
+                phone: true,
+                extras: false,
+                control: 44.,
+                panel: (12. + left, 12. + right, 8. + bottom),
+                panel_pad: 14.,
+                header_h: 84.,
+                header: (8. + top, 16. + left, 16. + right),
+                corner: (12. + right, bottom + 8. + 100.),
+            };
+        }
+        // The traffic lights sit at the left edge of a Mac window.
+        let lights = cfg!(target_os = "macos") && !fullscreen;
+        PlayerMetrics {
+            phone: false,
+            extras: true,
+            control: 40.,
+            panel: (PANEL_MARGIN, PANEL_MARGIN, PANEL_MARGIN),
+            panel_pad: 20.,
+            header_h: 110.,
+            header: (12., if lights { 84. } else { 20. }, 24.),
+            corner: (PANEL_MARGIN + 24., PANEL_MARGIN + 110.),
+        }
+    }
+
     /// Where a panel of the player sits over the control bar: its distance
     /// from the right edge, and from the bottom. On a phone the bar is
     /// lower and inside the safe area.
     pub fn panel_corner(&self) -> (f32, f32) {
-        if self.phone() {
-            let (_, _, bottom_in, right_in) = crate::views::shell::safe_insets();
-            (12. + right_in, bottom_in + 8. + 100.)
-        } else {
-            (PANEL_MARGIN + 24., PANEL_MARGIN + 110.)
-        }
+        self.player_metrics(false).corner
+    }
+
+    /// Reports the video area to the renderer, so frames are sized to fit.
+    fn video_measure(&self, window: &Window) -> impl IntoElement + use<> {
+        let player = self.player.clone();
+        let scale = window.scale_factor();
+        canvas(
+            move |bounds, _, _| {
+                player.set_target_size(
+                    (f32::from(bounds.size.width) * scale) as u32,
+                    (f32::from(bounds.size.height) * scale) as u32,
+                );
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full()
+    }
+
+    /// "Ends at 21:40": the time the item ends at the speed it plays.
+    fn ends_at_label(&self) -> String {
+        let s = &self.player_status;
+        let remaining = (s.duration - s.position).max(0.);
+        format!(
+            "Ends at {}",
+            crate::macos::ends_at((remaining / self.speed.max(0.25) as f64) as i64)
+        )
     }
 
     /// The seek slider with its chapter marks, and over it the preview of
@@ -800,9 +809,10 @@ impl Bloom {
     /// The card of the item that plays next, in the last moments of an item.
     fn render_up_next(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let (next, secs) = self.up_next()?;
-        let client = self.session.as_ref()?.client.clone();
+        let client = &self.session.as_ref()?.client;
+        let corner = self.panel_corner();
         let white = rgb(0xffffff);
-        let thumb = next.wide_url(&client, 480).map(|url| {
+        let thumb = next.wide_url(client, 480).map(|url| {
             crate::images::remote_with(url, px(10.), ObjectFit::Cover)
                 .w(px(160.))
                 .h(px(90.))
@@ -828,8 +838,8 @@ impl Bloom {
             div()
                 .id("player.up-next")
                 .absolute()
-                .right(px(self.panel_corner().0))
-                .bottom(px(self.panel_corner().1))
+                .right(px(corner.0))
+                .bottom(px(corner.1))
                 .w(px(440f32.min(self.viewport_w - 48.)))
                 .p(px(12.))
                 .rounded(px(16.))
@@ -838,13 +848,7 @@ impl Bloom {
                 .child(glass(px(16.), rgba(0x1c1c1cd9)))
                 .flex()
                 .gap(px(14.))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                        window.focus(&this.player_focus, cx);
-                        cx.stop_propagation();
-                    }),
-                )
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::swallow_to_player))
                 .children(thumb)
                 .child(
                     div()
@@ -905,37 +909,14 @@ impl Bloom {
     /// to seek, pause, stop, and go back to the full player. The window moves
     /// by a drag anywhere on the video.
     fn render_pip(&self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
-        let t = UiTheme::read(cx).clone();
+        let fade = UiTheme::read(cx).motion.normal;
         let s = &self.player_status;
         let white = rgb(0xffffff);
-
-        let player = self.player.clone();
-        let scale = window.scale_factor();
-        let measure = canvas(
-            move |bounds, _, _| {
-                player.set_target_size(
-                    (f32::from(bounds.size.width) * scale) as u32,
-                    (f32::from(bounds.size.height) * scale) as u32,
-                );
-            },
-            |_, _, _, _| {},
-        )
-        .absolute()
-        .size_full();
-
-        fn swallow(
-            this: &mut Bloom,
-            _: &MouseDownEvent,
-            window: &mut Window,
-            cx: &mut Context<Bloom>,
-        ) {
-            window.focus(&this.player_focus, cx);
-            cx.stop_propagation();
-        }
+        let measure = self.video_measure(window);
         let visibility = crate::ui::theme::transition_value(
             "player.pip-opacity",
             if self.controls_visible { 1. } else { 0. },
-            t.motion.normal,
+            fade,
             window,
             cx,
         );
@@ -952,7 +933,7 @@ impl Bloom {
                 .cursor_pointer()
                 .bg(rgba(0x00000066))
                 .hover(|s| s.bg(rgba(0x000000a6)))
-                .on_mouse_down(MouseButton::Left, cx.listener(swallow))
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::swallow_to_player))
                 .child(glyph)
         };
 
@@ -1044,7 +1025,7 @@ impl Bloom {
                     .left(px(12.))
                     .right(px(12.))
                     .bottom(px(4.))
-                    .on_mouse_down(MouseButton::Left, cx.listener(swallow))
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::swallow_to_player))
                     .child(Slider::new(&self.seek_slider).aria_label("Seek").w_full()),
             );
 
@@ -1110,7 +1091,7 @@ impl Bloom {
         cx: &mut Context<Self>,
     ) -> Option<Stateful<Div>> {
         let item = self.playing.as_ref()?;
-        let client = self.session.as_ref()?.client.clone();
+        let client = &self.session.as_ref()?.client;
         let s = &self.player_status;
         let size = window.viewport_size();
         let (vw, vh) = (f32::from(size.width), f32::from(size.height));
@@ -1119,8 +1100,8 @@ impl Bloom {
         let soft = rgba(0xffffffcc);
 
         let backdrop = item
-            .backdrop_url(&client, (vw * 2.).min(1920.) as u32)
-            .or_else(|| item.wide_url(&client, 1280))
+            .backdrop_url(client, (vw * 2.).min(1920.) as u32)
+            .or_else(|| item.wide_url(client, 1280))
             .map(|url| {
                 div().absolute().inset_0().opacity(0.28).child(
                     crate::images::remote_with(url, px(0.), ObjectFit::Cover)
@@ -1128,7 +1109,7 @@ impl Bloom {
                         .inset_0(),
                 )
             });
-        let title = match item.logo_url(&client, 900) {
+        let title = match item.logo_url(client, 900) {
             Some(url) => div()
                 .w(px(vw * 0.45))
                 .h(px(vh * 0.2))
@@ -1156,7 +1137,6 @@ impl Bloom {
         } else {
             0.
         };
-        let remaining = (s.duration - s.position).max(0.);
         let progress = div()
             .absolute()
             .left(px(left))
@@ -1191,10 +1171,7 @@ impl Bloom {
                         format_duration(s.duration as i64)
                     ))
                     .child(format!("{:.0}% watched", fraction * 100.))
-                    .child(format!(
-                        "Ends at {}",
-                        crate::macos::ends_at((remaining / self.speed.max(0.25) as f64) as i64)
-                    )),
+                    .child(self.ends_at_label()),
             );
 
         Some(

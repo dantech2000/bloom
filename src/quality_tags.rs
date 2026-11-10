@@ -9,7 +9,7 @@
 //! only for a media stub (a `.disc` file): BluRay, HD DVD, DVD, VHS, HDTV or
 //! Physical.
 
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::{collections::HashMap, sync::Mutex};
 
 use gpui_kit::{Div, ParentElement as _, Styled, div, px, rgb, rgba};
 
@@ -91,14 +91,14 @@ pub struct Prefs {
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self {
-            show: [true; 6],
-            order: [1, 2, 3, 4, 5, 6],
-        }
+        Self::DEFAULT
     }
 }
 
 impl Prefs {
+    /// Every category on, in the stack order of the plugin.
+    const DEFAULT: Prefs = Prefs { show: [true; 6], order: [1, 2, 3, 4, 5, 6] };
+
     /// Reads the choices: the user's value, else the server default, else
     /// "on" and the default order (as `JE.loadSettings` does).
     pub fn from_settings(own: &serde_json::Value, public: &serde_json::Value) -> Self {
@@ -121,34 +121,19 @@ impl Prefs {
     }
 }
 
-/// Choices in force, packed: six switches in `SHOW`, six orders (4 bits each,
-/// 0 to 15) in `ORDER`. A static, as the master switch in `jellyfin.rs`: a
-/// card reads it while it is built.
-static SHOW: AtomicU8 = AtomicU8::new(0b11_1111);
-static ORDER: AtomicU32 = AtomicU32::new(0x0065_4321);
-/// Categories the debug channel switches on although the plugin has them off.
-static FORCED: AtomicU8 = AtomicU8::new(0);
+/// The choices in force, and the categories the debug channel switches on
+/// although the plugin has them off. A static, as the master switch in
+/// `jellyfin.rs`: a card reads it while it is built.
+static CHOICES: Mutex<(Prefs, [bool; 6])> = Mutex::new((Prefs::DEFAULT, [false; 6]));
 
 pub fn set_prefs(prefs: Prefs) {
-    let mut show = 0u8;
-    let mut order = 0u32;
-    for i in 0..6 {
-        if prefs.show[i] {
-            show |= 1 << i;
-        }
-        order |= (prefs.order[i].clamp(0, 15) as u32) << (i * 4);
-    }
-    SHOW.store(show, Ordering::Relaxed);
-    ORDER.store(order, Ordering::Relaxed);
+    CHOICES.lock().unwrap().0 = prefs;
 }
 
 pub fn prefs() -> Prefs {
-    let (show, order) = (SHOW.load(Ordering::Relaxed), ORDER.load(Ordering::Relaxed));
-    let forced = FORCED.load(Ordering::Relaxed);
-    let mut prefs = Prefs::default();
-    for i in 0..6 {
-        prefs.show[i] = show & (1 << i) != 0 || forced & (1 << i) != 0;
-        prefs.order[i] = ((order >> (i * 4)) & 0xf) as i64;
+    let (mut prefs, forced) = *CHOICES.lock().unwrap();
+    for (show, forced) in prefs.show.iter_mut().zip(forced) {
+        *show |= forced;
     }
     prefs
 }
@@ -156,7 +141,7 @@ pub fn prefs() -> Prefs {
 /// For the debug channel: shows the categories named in a list such as
 /// "codec,audio" regardless of the plugin setting. An empty list clears it.
 pub fn force_categories(names: &str) -> Result<(), String> {
-    let mut bits = 0u8;
+    let mut forced = [false; 6];
     for name in names.split(',').map(str::trim).filter(|n| !n.is_empty()) {
         let category = match name {
             "resolution" => Category::Resolution,
@@ -166,14 +151,14 @@ pub fn force_categories(names: &str) -> Result<(), String> {
             "codec" => Category::VideoCodec,
             "audio" => Category::Audio,
             "all" => {
-                bits = 0b11_1111;
+                forced = [true; 6];
                 continue;
             }
             other => return Err(format!("no tag category {other:?}")),
         };
-        bits |= 1 << category.index();
+        forced[category.index()] = true;
     }
-    FORCED.store(bits, Ordering::Relaxed);
+    CHOICES.lock().unwrap().1 = forced;
     Ok(())
 }
 
@@ -193,17 +178,22 @@ pub(crate) impl Client {
             .unwrap_or(Value::Null);
         let prefs = Prefs::from_settings(&own, &public);
         set_prefs(prefs);
-        let enabled = own
-            .get("QualityTagsEnabled")
-            .or_else(|| public.get("QualityTagsEnabled"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        // A null of the user is no choice: the server default counts
+        // then, as for the categories (`Prefs::from_settings`).
+        let enabled = master_switch(&own, &public);
         Some((
             enabled,
             prefs.show[Category::Resolution.index()],
             prefs.show[Category::DynamicRange.index()],
         ))
     }
+}
+
+/// The master switch of the tags: the value of the user, else the server
+/// default, else off.
+fn master_switch(own: &serde_json::Value, public: &serde_json::Value) -> bool {
+    let pick = |settings: &serde_json::Value| settings.get("QualityTagsEnabled").and_then(|v| v.as_bool());
+    pick(own).or_else(|| pick(public)).unwrap_or(false)
 }
 
 // ----- the rules of the plugin -------------------------------------------------
@@ -514,10 +504,30 @@ fn is_imax(text: &str) -> bool {
     imax && !non_imax
 }
 
+/// One tag and the category it was derived for.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Tag {
+    pub category: Category,
+    pub label: String,
+}
+
+impl Tag {
+    fn new(category: Category, label: impl Into<String>) -> Self {
+        Self { category, label: label.into() }
+    }
+}
+
+/// A tag prints as its label, in the lists of the debug channel.
+impl std::fmt::Debug for Tag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.label)
+    }
+}
+
 /// The tags the plugin derives, before the choices of the user apply. Order
 /// of the plugin: IMAX, resolution, codec, range, audio, 3D, stub.
-pub fn detect(input: &Input) -> Vec<String> {
-    let mut tags: Vec<String> = Vec::new();
+pub fn detect(input: &Input) -> Vec<Tag> {
+    let mut tags: Vec<Tag> = Vec::new();
     let video = input.streams.iter().find(|s| s.kind == "Video").copied();
     let audio_streams: Vec<&MediaStream> = input
         .streams
@@ -543,15 +553,15 @@ pub fn detect(input: &Input) -> Vec<String> {
         .collect::<Vec<_>>()
         .join(" | ");
     if is_imax(&context) {
-        tags.push("IMAX".into());
+        tags.push(Tag::new(Category::SpecialFormat, "IMAX"));
     }
 
     if let Some(video) = video {
-        tags.extend(resolution(video).map(String::from));
-        tags.extend(video_codec(video).map(String::from));
-        tags.extend(dynamic_range(video).map(String::from));
+        tags.extend(resolution(video).map(|tag| Tag::new(Category::Resolution, tag)));
+        tags.extend(video_codec(video).map(|tag| Tag::new(Category::VideoCodec, tag)));
+        tags.extend(dynamic_range(video).map(|tag| Tag::new(Category::DynamicRange, tag)));
     }
-    tags.extend(audio(&audio_streams));
+    tags.extend(audio(&audio_streams).map(|tag| Tag::new(Category::Audio, tag)));
 
     // 3D: a path with "3d" and a 3D layout word.
     let has_3d = input.sources.iter().any(|source| {
@@ -562,7 +572,7 @@ pub fn detect(input: &Input) -> Vec<String> {
                 .any(|w| path.contains(w))
     });
     if has_3d {
-        tags.push("3D".into());
+        tags.push(Tag::new(Category::SpecialFormat, "3D"));
     }
 
     // A media stub (.disc file) names the disc type.
@@ -580,7 +590,8 @@ pub fn detect(input: &Input) -> Vec<String> {
         .to_lowercase();
     if stub.contains(".disc") {
         let has = |words: &[&str]| words.iter().any(|w| stub.contains(w));
-        tags.push(
+        tags.push(Tag::new(
+            Category::Source,
             if has(&["bluray", "blu-ray", "bdrip", "bd-rip", "bdremux"]) {
                 "BluRay"
             } else if has(&["hddvd", "hd-dvd", "hd dvd"]) {
@@ -593,9 +604,8 @@ pub fn detect(input: &Input) -> Vec<String> {
                 "HDTV"
             } else {
                 "Physical"
-            }
-            .into(),
-        );
+            },
+        ));
     }
     tags
 }
@@ -610,39 +620,15 @@ fn base(tag: &str) -> &str {
     tag
 }
 
-fn category_of(tag: &str) -> Option<Category> {
-    let base = base(tag);
-    if let Some(found) = Category::ALL.into_iter().find(|c| c.items().contains(&base)) {
-        return Some(found);
-    }
-    // A bare channel layout such as "2.0".
-    let dotted = tag.split_once('.').is_some_and(|(a, b)| {
-        !a.is_empty()
-            && !b.is_empty()
-            && a.chars().all(|c| c.is_ascii_digit())
-            && b.chars().all(|c| c.is_ascii_digit())
-    });
-    dotted.then_some(Category::Audio)
-}
-
 /// Applies the choices of the user: drops the categories that are off, keeps
 /// the best resolution, sorts inside a category and stacks the categories in
 /// the order of the user (`insertOverlay` of the plugin).
-pub fn arrange(tags: &[String], prefs: &Prefs) -> Vec<String> {
-    let mut buckets: Vec<(Category, Vec<String>)> = Vec::new();
-    let mut other: Vec<String> = Vec::new();
-    for tag in tags {
-        match category_of(tag) {
-            Some(category) => {
-                if !prefs.show[category.index()] {
-                    continue;
-                }
-                match buckets.iter_mut().find(|(c, _)| *c == category) {
-                    Some((_, list)) => list.push(tag.clone()),
-                    None => buckets.push((category, vec![tag.clone()])),
-                }
-            }
-            None => other.push(tag.clone()),
+pub fn arrange(tags: &[Tag], prefs: &Prefs) -> Vec<String> {
+    let mut buckets: Vec<(Category, Vec<&str>)> = Vec::new();
+    for tag in tags.iter().filter(|tag| prefs.show[tag.category.index()]) {
+        match buckets.iter_mut().find(|(c, _)| *c == tag.category) {
+            Some((_, list)) => list.push(&tag.label),
+            None => buckets.push((tag.category, vec![&tag.label])),
         }
     }
     for (category, list) in &mut buckets {
@@ -661,17 +647,49 @@ pub fn arrange(tags: &[String], prefs: &Prefs) -> Vec<String> {
     buckets
         .into_iter()
         .flat_map(|(_, list)| list)
-        .chain(other)
+        .map(str::to_string)
         .collect()
+}
+
+/// The tags derived for the items seen, by item id, with the shape of the
+/// item they were derived from (`shape`). A card asks for its labels at
+/// each frame, and deriving them reads every stream title of the item.
+static SEEN: Mutex<Option<HashMap<String, ([usize; 4], Vec<Tag>)>>> = Mutex::new(None);
+/// The map starts again when it holds this many items.
+const SEEN_MAX: usize = 4096;
+
+/// What the tags of an item were derived from, as far as a look that
+/// costs nothing can tell: a list has an item without its streams, the
+/// detail page has it with them, under one id.
+fn shape(item: &Item) -> [usize; 4] {
+    [
+        item.media_streams.len(),
+        item.media_sources.len(),
+        item.media_sources.first().map_or(0, |source| source.media_streams.len()),
+        item.name.len(),
+    ]
 }
 
 /// The labels to show for an item, with the choices in force.
 pub fn labels(item: &Item) -> Vec<String> {
-    let input = Input::of(item);
-    if input.streams.is_empty() && input.sources.is_empty() {
+    if item.media_streams.is_empty() && item.media_sources.is_empty() {
         return Vec::new();
     }
-    arrange(&detect(&input), &prefs())
+    let shape = shape(item);
+    let mut seen = SEEN.lock().unwrap();
+    let seen = seen.get_or_insert_with(HashMap::new);
+    if let Some((known, tags)) = seen.get(&item.id)
+        && *known == shape
+    {
+        return arrange(tags, &prefs());
+    }
+    let tags = detect(&Input::of(item));
+    let shown = arrange(&tags, &prefs());
+    if seen.len() >= SEEN_MAX {
+        seen.clear();
+    }
+    seen.insert(item.id.clone(), (shape, tags));
+    shown
 }
 
 /// One tag, in the look of the tags on the posters.
@@ -717,7 +735,7 @@ mod tests {
         }
     }
 
-    fn tags_of(streams: &[MediaStream]) -> Vec<String> {
+    fn tags_of(streams: &[MediaStream]) -> Vec<Tag> {
         let input = Input {
             streams: streams.iter().collect(),
             sources: &[],
@@ -860,7 +878,7 @@ mod tests {
                 name,
                 original_title: "",
             };
-            detect(&input)
+            detect(&input).into_iter().map(|tag| tag.label).collect::<Vec<String>>()
         };
         assert!(detect_with("Dune", "/m/Dune.2021.IMAX.1080p.mkv").contains(&"IMAX".to_string()));
         assert!(detect_with("Dune", "/m/Dune.IMAX-Enhanced.mkv").contains(&"IMAX".to_string()));
@@ -877,105 +895,73 @@ mod tests {
         assert_eq!(plain, ["1080p", "H264"]);
     }
 
-    /// `is_imax` as it was: a list of characters for each compare.
-    fn is_imax_before(text: &str) -> bool {
-        let text = text.to_lowercase();
-        let chars: Vec<char> = text.chars().collect();
-        let at = |i: usize, s: &str| {
-            let s: Vec<char> = s.chars().collect();
-            chars.len() >= i + s.len() && chars[i..i + s.len()] == s[..]
-        };
-        let left = |i: usize| i == 0 || !word(chars[i - 1]);
-        let sep = |c: char| matches!(c, ' ' | '.' | '_' | '-');
-        let (mut imax, mut non_imax) = (false, false);
-        for i in 0..chars.len() {
-            if at(i, "imax") && left(i) {
-                let end = i + 4;
-                let plain = chars.get(end).is_none_or(|c| !word(*c));
-                let enhanced = (at(end, "enhanced") && chars.get(end + 8).is_none_or(|c| !word(*c)))
-                    || (chars.get(end).is_some_and(|c| sep(*c))
-                        && at(end + 1, "enhanced")
-                        && chars.get(end + 9).is_none_or(|c| !word(*c)));
-                if plain || enhanced {
-                    imax = true;
-                }
-            }
-            if at(i, "non") && left(i) {
-                let mut j = i + 3;
-                if chars.get(j).is_some_and(|c| sep(*c)) {
-                    j += 1;
-                }
-                if at(j, "imax") && chars.get(j + 4).is_none_or(|c| !word(*c)) {
-                    non_imax = true;
-                }
-            }
+    #[test]
+    fn the_imax_check() {
+        let cases = [
+            ("", false),
+            ("imax", true),
+            ("IMAX", true),
+            ("nonimax", false),
+            ("NON IMAX", false),
+            ("non-imax", false),
+            ("Dune.IMAX", true),
+            ("Dune.IMAXX", false),
+            ("IMAX Enhanced", true),
+            ("IMAX.ENHANCED", true),
+            ("IMAXENHANCED", true),
+            ("IMAX_ENHANCEDX", false),
+            ("imax non_imax", false),
+            ("a non", false),
+            ("non", false),
+            ("ima", false),
+            ("Élan IMAX", true),
+            // The small letter of this capital is two characters.
+            ("İMAX", false),
+            ("x imax enhance", true),
+            ("NONIMAX IMAX", false),
+            // Never inside a word.
+            ("aimaxb", false),
+            ("Climax", false),
+        ];
+        for (text, want) in cases {
+            assert_eq!(is_imax(text), want, "{text:?}");
+            // The same at the end and at the start of a longer text.
+            assert_eq!(is_imax(&format!("Film | {text}")), want, "after a name: {text:?}");
+            assert_eq!(is_imax(&format!("{text} | English - AAC")), want, "before a title: {text:?}");
         }
-        imax && !non_imax
     }
 
-    /// The IMAX check gives the answers it gave, and costs less. The text
-    /// is what a card with quality tags gives it: the names, and the titles
-    /// of the streams of a film with a few sound and subtitle tracks.
+    /// The labels of an item are derived once and kept by its id; the same
+    /// id with other streams (the detail page has more than a list) is
+    /// derived again.
     #[test]
-    fn the_imax_check_is_the_same_and_cheaper() {
-        let texts = [
-            "", "imax", "IMAX", "nonimax", "NON IMAX", "non-imax", "Dune.IMAX", "Dune.IMAXX",
-            "IMAX Enhanced", "IMAX.ENHANCED", "IMAXENHANCED", "IMAX_ENHANCEDX", "imax non_imax",
-            "a non", "non", "ima", "Élan IMAX", "İMAX", "x imax enhance", "NONIMAX IMAX",
-        ];
-        for text in texts {
-            assert_eq!(is_imax(text), is_imax_before(text), "{text:?}");
-            // Each text also at the end and in the middle of a longer one.
-            for wrapped in [format!("Film | {text}"), format!("{text} | English - AAC"), format!("a{text}b")] {
-                assert_eq!(is_imax(&wrapped), is_imax_before(&wrapped), "{wrapped:?}");
-            }
-        }
+    fn labels_are_kept_by_item_and_shape() {
+        let mut item: Item = serde_json::from_value(serde_json::json!({
+            "Id": "labels-kept-1", "Name": "Film", "Type": "Movie",
+            "MediaStreams": [{"Type": "Video", "Codec": "hevc", "Width": 3840, "Height": 2160, "DisplayTitle": "4K HEVC"}]
+        }))
+        .unwrap();
+        let first = labels(&item);
+        assert!(first.contains(&"4K".to_string()), "{first:?}");
+        assert_eq!(labels(&item), first);
+        assert!(SEEN.lock().unwrap().as_ref().unwrap().contains_key("labels-kept-1"));
+        item.media_streams.push(sound("English - Dolby TrueHD Atmos - 7.1", "truehd", "", 8, "7.1"));
+        assert!(labels(&item).iter().any(|label| label.starts_with("ATMOS")));
+        let bare: Item = serde_json::from_value(serde_json::json!({"Id": "labels-kept-2", "Name": "Film", "Type": "Movie"})).unwrap();
+        assert!(labels(&bare).is_empty());
+    }
 
-        let mut streams = vec![video("4K HEVC HDR10", "hevc", "HDR10", 3840, 2160)];
-        for language in ["English", "German", "French"] {
-            streams.push(sound(&format!("{language} - Dolby TrueHD Atmos - 7.1 - Default"), "truehd", "", 8, "7.1"));
-        }
-        for language in ["English", "English (SDH)", "German", "French", "Spanish", "Italian"] {
-            streams.push(MediaStream {
-                kind: "Subtitle".into(),
-                display_title: Some(format!("{language} - SUBRIP - External")),
-                ..Default::default()
-            });
-        }
-        let input = Input {
-            streams: streams.iter().collect(),
-            sources: &[],
-            name: "The Lord of the Rings: The Return of the King",
-            original_title: "The Lord of the Rings: The Return of the King",
-        };
-        let context = std::iter::once(input.name)
-            .chain(std::iter::once(input.original_title))
-            .chain(streams.iter().filter_map(|s| s.display_title.as_deref()))
-            .collect::<Vec<_>>()
-            .join(" | ");
-        const RUNS: u32 = 2000;
-        let time = |check: &dyn Fn(&str) -> bool| {
-            let started = std::time::Instant::now();
-            for _ in 0..RUNS {
-                std::hint::black_box(check(std::hint::black_box(&context)));
-            }
-            started.elapsed() / RUNS
-        };
-        // The best of a few rounds: other tests run at the same time.
-        let before = (0..5).map(|_| time(&is_imax_before)).min().unwrap();
-        let after = (0..5).map(|_| time(&is_imax)).min().unwrap();
-        let whole = {
-            let started = std::time::Instant::now();
-            for _ in 0..RUNS {
-                std::hint::black_box(detect(std::hint::black_box(&input)));
-            }
-            started.elapsed() / RUNS
-        };
-        println!(
-            "IMAX check of {} characters: {before:?} before, {after:?} now; all tags of the item: {whole:?}",
-            context.chars().count()
-        );
-        // The times are printed, not asserted: a loaded machine can turn them.
+    #[test]
+    fn the_master_switch_falls_back_to_the_server_default() {
+        let on = serde_json::json!({"QualityTagsEnabled": true});
+        let off = serde_json::json!({"QualityTagsEnabled": false});
+        let null = serde_json::json!({"QualityTagsEnabled": null});
+        let none = serde_json::json!({});
+        assert!(master_switch(&null, &on), "a null of the user is no choice");
+        assert!(master_switch(&none, &on));
+        assert!(!master_switch(&off, &on));
+        assert!(master_switch(&on, &off));
+        assert!(!master_switch(&none, &none));
     }
 
     #[test]

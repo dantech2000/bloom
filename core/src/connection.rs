@@ -66,6 +66,9 @@ pub fn classify_ureq(err: &ureq::Error) -> Verdict {
     match err {
         ureq::Error::StatusCode(code) => classify_status(*code),
         ureq::Error::HostNotFound => Verdict::Unreachable(Why::Dns),
+        // A body over the limit of the reader comes as an io error with
+        // the client's own error in it: the server sent it, so it is there.
+        ureq::Error::Io(err) if matches!(inner(err), Some(ureq::Error::BodyExceedsLimit(_))) => Verdict::Answered,
         // macOS reports a name that does not resolve as an io error:
         // "failed to lookup address information: nodename nor servname...".
         ureq::Error::Io(err) if err.to_string().contains("lookup") => Verdict::Unreachable(Why::Dns),
@@ -78,29 +81,29 @@ pub fn classify_ureq(err: &ureq::Error) -> Verdict {
     }
 }
 
-/// The verdict of a failed request. A request of `jellyfin::Client` carries
-/// its verdict; any other error is read from its text, by the old rule: a
-/// status code is an answer of the server, anything else is the network.
+/// The error of the HTTP client inside an io error, when it put one there.
+fn inner(err: &std::io::Error) -> Option<&ureq::Error> {
+    err.get_ref()?.downcast_ref()
+}
+
+/// The verdict of a failed request, by the type of the error and not by
+/// its text. A request of `jellyfin::Client` carries its verdict; an error
+/// of the HTTP client or of a socket anywhere in the chain is read by the
+/// rule above. Any other error did not come from the network ("not signed
+/// in", an answer the app could not use): the server is not in doubt.
 pub fn classify(err: &anyhow::Error) -> Verdict {
-    if let Some(request) = err.downcast_ref::<crate::jellyfin::RequestError>() {
-        return request.verdict;
+    for cause in err.chain() {
+        if let Some(request) = cause.downcast_ref::<crate::jellyfin::RequestError>() {
+            return request.verdict;
+        }
+        if let Some(client) = cause.downcast_ref::<ureq::Error>() {
+            return classify_ureq(client);
+        }
+        if cause.is::<std::io::Error>() {
+            return Verdict::Unreachable(Why::Connect);
+        }
     }
-    let text = format!("{err:#}");
-    if text.starts_with("unauthorized") {
-        Verdict::Unauthorized
-    } else if let Some(rest) = text.strip_prefix("HTTP ") {
-        let code: u16 = rest
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect::<String>()
-            .parse()
-            .unwrap_or(0);
-        classify_status(code)
-    } else if text.starts_with("decode ") {
-        Verdict::Answered
-    } else {
-        Verdict::Unreachable(Why::Connect)
-    }
+    Verdict::Answered
 }
 
 /// The wait before retry number `attempt` (from 0) while offline.
@@ -400,15 +403,11 @@ mod tests {
         assert_eq!(classify_ureq(&ureq::Error::BadUri("x".into())), Verdict::Answered);
     }
 
+    /// The verdict comes from the type of the error, under any context a
+    /// caller put on it; the text decides nothing.
     #[test]
-    fn an_error_without_a_verdict_is_read_from_its_text() {
-        assert_eq!(classify(&anyhow::anyhow!("HTTP 530 at /Items")), Verdict::Unreachable(Why::Gateway(530)));
-        assert_eq!(classify(&anyhow::anyhow!("HTTP 500 at /Items")), Verdict::Answered);
-        assert_eq!(classify(&anyhow::anyhow!("HTTP 404 at /Items")), Verdict::Answered);
-        assert_eq!(classify(&anyhow::anyhow!("unauthorized (401) at /Items")), Verdict::Unauthorized);
-        assert_eq!(classify(&anyhow::anyhow!("decode /Items")), Verdict::Answered);
-        assert_eq!(classify(&anyhow::anyhow!("io: connection refused (/Items)")), Verdict::Unreachable(Why::Connect));
-        // The typed way: the verdict of the request, not its text.
+    fn an_error_is_read_by_its_type_not_its_text() {
+        use anyhow::Context as _;
         let err: anyhow::Error = crate::jellyfin::RequestError::new(
             Verdict::Unreachable(Why::Timeout),
             "timeout: global (/Items)".into(),
@@ -416,6 +415,29 @@ mod tests {
         .into();
         assert_eq!(classify(&err), Verdict::Unreachable(Why::Timeout));
         assert_eq!(format!("{err:#}"), "timeout: global (/Items)");
+        assert_eq!(classify(&err.context("load the page")), Verdict::Unreachable(Why::Timeout));
+        // An error of the HTTP client a caller wrapped itself.
+        let client = |err: ureq::Error| Err::<(), _>(err).context("bitrate test").unwrap_err();
+        assert_eq!(classify(&client(ureq::Error::StatusCode(530))), Verdict::Unreachable(Why::Gateway(530)));
+        assert_eq!(classify(&client(ureq::Error::StatusCode(401))), Verdict::Unauthorized);
+        assert_eq!(classify(&client(ureq::Error::StatusCode(404))), Verdict::Answered);
+        assert_eq!(classify(&client(ureq::Error::ConnectionFailed)), Verdict::Unreachable(Why::Connect));
+        // A socket error with no HTTP client around it.
+        let socket = anyhow::Error::from(std::io::Error::other("connection reset")).context("the socket");
+        assert_eq!(classify(&socket), Verdict::Unreachable(Why::Connect));
+        // An error that is not of the network starts no probe, whatever
+        // its text says.
+        assert_eq!(classify(&anyhow::anyhow!("not signed in")), Verdict::Answered);
+        assert_eq!(classify(&anyhow::anyhow!("io: connection refused (/Items)")), Verdict::Answered);
+        assert_eq!(classify(&anyhow::anyhow!("HTTP 530 at /Items")), Verdict::Answered);
+    }
+
+    /// An answer larger than the reader takes is an answer: the server is
+    /// there, and no probe starts for it.
+    #[test]
+    fn a_body_over_the_limit_is_an_answer() {
+        let over = ureq::Error::Io(std::io::Error::other(ureq::Error::BodyExceedsLimit(10)));
+        assert_eq!(classify_ureq(&over), Verdict::Answered);
     }
 
     /// Finding 8 of the review: a probe of the session before a reset must

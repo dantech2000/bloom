@@ -30,7 +30,6 @@ pub enum Action {
     Play,
     Pause,
     Seek(f64),
-    Unload,
 }
 
 #[derive(Debug)]
@@ -131,11 +130,12 @@ impl Control {
         self.want_play
     }
 
-    pub fn stop(&mut self) -> Vec<Action> {
+    /// The item is over: a load on its way is stale, and no seek waits.
+    /// The engine takes the item from the player when it must.
+    pub fn stop(&mut self) {
         self.phase = Phase::Idle;
         self.pending_seek = None;
         self.in_flight = None;
-        vec![Action::Unload]
     }
 }
 
@@ -183,7 +183,7 @@ mod tests {
         let mut c = Control::default();
         let t0 = Instant::now();
         c.send(1, 0., true);
-        assert_eq!(c.stop(), vec![Action::Unload]);
+        c.stop();
         assert_eq!(c.phase, Phase::Idle);
         assert_eq!(c.ready(1, t0), None);
         // A newer send also makes the old token stale.

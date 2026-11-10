@@ -4,11 +4,16 @@
 //! rest: enable or disable, the web settings, uninstall (2026-10-23; four
 //! buttons on every card before).
 
-use std::{collections::HashSet, rc::Rc};
+use std::{
+    collections::{HashMap, HashSet},
+    rc::Rc,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use gpui_kit::{
-    ClickEvent, Context, Div, ObjectFit, ParentElement as _, Rgba,
+    ClickEvent, Context, Div, ParentElement as _, Rgba,
     SharedString, StatefulInteractiveElement as _, Styled, div,
     prelude::FluentBuilder as _, px, rgb, rgba,
 };
@@ -56,32 +61,84 @@ pub struct Data {
     pub settings: HashSet<String>,
 }
 
+/// How long an answer to "has this plugin settings?" holds. The page loads
+/// again after each action on a plugin, and asked every plugin again each
+/// time, whole configurations for a yes or no.
+const PROBE_HOLDS: Duration = Duration::from_secs(60);
+
+/// What the last loads learned: the server asked, when, and for each
+/// plugin (id and version) whether it has settings.
+struct Probed {
+    server: String,
+    at: Instant,
+    settings: HashMap<(String, String), bool>,
+}
+
+static PROBED: Mutex<Option<Probed>> = Mutex::new(None);
+
+impl Probed {
+    /// The answers that still hold for this server; none after the time.
+    fn known(&self, server: &str, now: Instant) -> Option<&HashMap<(String, String), bool>> {
+        (self.server == server && now.duration_since(self.at) < PROBE_HOLDS).then_some(&self.settings)
+    }
+}
+
 pub fn load(client: &Client) -> Result<Data> {
     let mut plugins: Vec<Plugin> = client.get("/Plugins", &[])?;
     plugins.sort_by_key(|p| p.name.to_lowercase());
+    let server = client.url("", &[]);
+    let now = Instant::now();
+    let mut known = PROBED
+        .lock()
+        .ok()
+        .and_then(|probed| probed.as_ref()?.known(&server, now).cloned())
+        .unwrap_or_default();
     // A plugin has settings when the server answers its configuration with
     // an object that is not empty. A plugin with none answers 404 or {}.
-    // One request for each plugin that runs, all at the same time.
-    let settings = std::thread::scope(|scope| {
+    // One request for each plugin that runs and is not known yet, all at
+    // the same time.
+    let asked: Vec<((String, String), bool)> = std::thread::scope(|scope| {
         let asks: Vec<_> = plugins
             .iter()
             .filter(|p| matches!(p.status.as_str(), "Active" | "Restart"))
-            .map(|p| {
-                let path = format!("/Plugins/{}/Configuration", p.id);
-                (p.id.clone(), scope.spawn(move || client.get::<serde_json::Value>(&path, &[])))
+            .map(|p| (p.id.clone(), p.version.clone()))
+            .filter(|key| !known.contains_key(key))
+            .map(|key| {
+                let path = format!("/Plugins/{}/Configuration", key.0);
+                (key, scope.spawn(move || client.get::<serde_json::Value>(&path, &[])))
             })
             .collect();
         asks.into_iter()
-            .filter_map(|(id, ask)| {
-                let value = ask.join().ok()?.ok()?;
-                value.as_object().is_some_and(|o| !o.is_empty()).then_some(id)
+            .map(|(key, ask)| {
+                let has = ask
+                    .join()
+                    .ok()
+                    .and_then(Result::ok)
+                    .is_some_and(|value| value.as_object().is_some_and(|o| !o.is_empty()));
+                (key, has)
             })
-            .collect::<HashSet<String>>()
+            .collect()
     });
+    let fresh = known.is_empty();
+    known.extend(asked);
+    let settings = plugins
+        .iter()
+        .filter(|p| matches!(p.status.as_str(), "Active" | "Restart"))
+        .filter(|p| known.get(&(p.id.clone(), p.version.clone())).copied().unwrap_or(false))
+        .map(|p| p.id.clone())
+        .collect();
+    if let Ok(mut probed) = PROBED.lock() {
+        // The time runs from the first answer, so every answer is asked
+        // for again within it.
+        let at = match probed.as_ref() {
+            Some(old) if !fresh && old.server == server => old.at,
+            _ => now,
+        };
+        *probed = Some(Probed { server, at, settings: known });
+    }
     Ok(Data { plugins, settings })
 }
 
-/// Text and colour of the badge for a plugin status.
 /// What the "…" menu of a plugin needs to know.
 #[derive(Clone)]
 struct MenuPlugin {
@@ -189,6 +246,7 @@ impl MenuPlugin {
     }
 }
 
+/// Text and colour of the badge for a plugin status.
 fn status_badge(status: &str) -> (&'static str, Rgba) {
     match status {
         "Active" => ("Active", rgb(0x2e7d32)),
@@ -208,8 +266,7 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
         return div();
     };
     let content_w = app.admin_content_w().max(CARD_MIN_W);
-    let columns = (((content_w + CARD_GAP) / (CARD_MIN_W + CARD_GAP)).floor() as usize).max(1);
-    let card_w = ((content_w - CARD_GAP * (columns - 1) as f32) / columns as f32).floor();
+    let (_, card_w) = super::rows::grid(content_w, CARD_MIN_W, CARD_GAP, 1, usize::MAX);
 
     let active = data.plugins.iter().filter(|p| p.status == "Active").count();
     let restart = data
@@ -223,6 +280,14 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
     }
 
     let mut grid = div().flex().flex_wrap().gap(px(CARD_GAP));
+    if data.plugins.is_empty() {
+        grid = grid.child(
+            super::card(cx)
+                .text_size(px(15.))
+                .text_color(t.colors.foreground.opacity(0.6))
+                .child("No plugins are installed."),
+        );
+    }
     for plugin in &data.plugins {
         let (status, status_color) = status_badge(&plugin.status);
         let image = plugin.has_image.then(|| {
@@ -294,45 +359,18 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                     matches!(plugin.status.as_str(), "Disabled" | "Superseded" | "Deleted"),
                     |el| el.opacity(0.62),
                 )
-                // The image, over a coloured tile with the first letter. The
+                // The image, over a quiet tile with the first letter. The
                 // tile stays when the plugin has no image or it cannot load.
-                .child(
+                .child(super::libraries::image_header(
+                    div().h(px(IMAGE_H)).bg(rgba(0xffffff0f)),
                     div()
-                        .relative()
-                        .w_full()
-                        .h(px(IMAGE_H))
-                        // The corners of the card, inside its 1 px edge.
-                        .rounded_t(px(23.))
-                        .bg(rgba(0xffffff0f))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            div()
-                                .text_size(px(56.))
-                                .font_weight(gpui_kit::FontWeight::BOLD)
-                                .text_color(rgba(0xffffff59))
-                                .child(initial),
-                        )
-                        .when_some(image, |el, url| {
-                            el.child(
-                                crate::images::remote_corners(
-                                    url,
-                                    gpui_kit::Corners { top_left: px(23.), top_right: px(23.), ..Default::default() },
-                                    ObjectFit::Cover,
-                                )
-                                .absolute()
-                                .inset_0(),
-                            )
-                        })
-                        .child(
-                            div()
-                                .absolute()
-                                .top(px(10.))
-                                .right(px(10.))
-                                .child(badge(status, status_color).bg(rgba(0x000000a6))),
-                        ),
-                )
+                        .text_size(px(56.))
+                        .font_weight(gpui_kit::FontWeight::BOLD)
+                        .text_color(rgba(0xffffff59))
+                        .child(initial),
+                    image,
+                    badge(status, status_color),
+                ))
                 .child(
                     div()
                         .flex_1()
@@ -394,4 +432,22 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                 .child(summary),
         )
         .child(grid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_probe_holds_for_its_server_and_its_time() {
+        let at = Instant::now();
+        let probed = Probed {
+            server: "http://a".to_string(),
+            at,
+            settings: HashMap::from([(("p".to_string(), "1.0".to_string()), true)]),
+        };
+        assert!(probed.known("http://a", at + Duration::from_secs(5)).is_some());
+        assert!(probed.known("http://b", at + Duration::from_secs(5)).is_none());
+        assert!(probed.known("http://a", at + PROBE_HOLDS).is_none());
+    }
 }

@@ -7,7 +7,7 @@
 use std::{
     collections::HashMap,
     io::Cursor,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicU64},
     time::{Duration, Instant},
 };
 
@@ -141,11 +141,12 @@ pub struct Gate {
 
 struct GateState {
     active: usize,
-    waiting: Vec<async_channel::Sender<()>>,
+    waiting: Vec<async_channel::Sender<Permit>>,
 }
 
-/// A slot of the [`Gate`]; it is given back when dropped.
-pub struct Permit(Arc<Gate>);
+/// A slot of the [`Gate`]; it is given back when dropped. Empty once its
+/// slot went on.
+pub struct Permit(Option<Arc<Gate>>);
 
 impl Gate {
     fn new(limit: usize) -> Arc<Self> {
@@ -167,24 +168,45 @@ impl Gate {
                 Some(rx)
             }
         };
-        if let Some(rx) = wait {
-            // The slot is handed over by the permit that was dropped.
-            let _ = rx.recv().await;
+        if let Some(rx) = wait
+            // The permit that was dropped hands its slot over as a permit:
+            // a waiter that goes away before it takes it drops the permit
+            // with the channel, and the slot goes on to the next. With a
+            // bare signal, such a slot was lost for good.
+            && let Ok(permit) = rx.recv().await
+        {
+            return permit;
         }
-        Permit(self.clone())
+        Permit(Some(self.clone()))
     }
 }
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        let mut state = self.0.state.lock().unwrap();
-        // Pass the slot on to the newest waiter that is still there.
-        while let Some(tx) = state.waiting.pop() {
-            if tx.try_send(()).is_ok() {
-                return;
+        let Some(gate) = self.0.take() else { return };
+        // The sender that took the slot is dropped after the lock: when
+        // its waiter is gone by then, the permit in the channel is dropped
+        // with it, and that drop takes the lock again.
+        let mut handed = None;
+        {
+            let mut state = gate.state.lock().unwrap();
+            // Pass the slot on to the newest waiter that is still there.
+            loop {
+                let Some(tx) = state.waiting.pop() else {
+                    state.active -= 1;
+                    break;
+                };
+                match tx.try_send(Permit(Some(gate.clone()))) {
+                    Ok(()) => {
+                        handed = Some(tx);
+                        break;
+                    }
+                    // The waiter is gone: its permit has no slot to give.
+                    Err(refused) => refused.into_inner().0 = None,
+                }
             }
         }
-        state.active -= 1;
+        drop(handed);
     }
 }
 
@@ -229,14 +251,31 @@ struct Fetched {
 
 impl Fetched {
     /// Keeps bytes of the network in the cache on disk. Called only after
-    /// the whole image decoded ([`decodes`] where the caller keeps the
+    /// the whole image decoded ([`looks_like_image`] where the caller keeps the
     /// bytes and not the pixels): a 200 that is no image (the sign-in page
     /// of a proxy), or an image with a damaged body, must not sit in the
     /// cache for ever.
     fn commit(&self) {
         if let Origin::Network(Some(file)) = &self.origin {
             disk_write(file, &self.bytes);
+            static WRITTEN: AtomicU64 = AtomicU64::new(0);
+            trim_after(&WRITTEN, file.parent(), self.bytes.len() as u64, TRIM_EVERY, DISK_MAX_BYTES);
         }
+    }
+}
+
+/// The cache is trimmed after this many bytes written to it, so an app
+/// that runs for days does not go far over the limit: the trim at the
+/// start of the app was the only one for the images of the pages.
+const TRIM_EVERY: u64 = 64 * 1024 * 1024;
+
+/// Counts `bytes` written to the cache in `dir`, and trims the cache each
+/// time `every` bytes have come in.
+fn trim_after(written: &AtomicU64, dir: Option<&std::path::Path>, bytes: u64, every: u64, max_bytes: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if written.fetch_add(bytes, Relaxed) + bytes >= every {
+        written.store(0, Relaxed);
+        trim_disk_cache_in(dir, max_bytes);
     }
 }
 
@@ -284,10 +323,7 @@ fn fetch(agent: &ureq::Agent, url: &str, cache: Option<&std::path::Path>) -> any
 /// True when the whole image decodes, as the loader decodes it. The
 /// downloads ask before they keep artwork. Blocks for a decode (about 1 to
 /// 2 ms for a poster): not for a GPUI thread.
-pub fn looks_like_image(bytes: &[u8]) -> bool {
-    decodes(bytes)
-}
-
+///
 /// The check for bytes that are kept and not shown now (the raw bytes of
 /// the Now Playing tile, the prewarm of the posters): the complete image
 /// decodes, with the same code the loader uses, so what passes here shows
@@ -306,8 +342,14 @@ pub fn looks_like_image(bytes: &[u8]) -> bool {
 /// found by any decoder here. Damage in the later frames of an animated
 /// GIF is not found either (only the first frame is decoded, as the loader
 /// does).
-fn decodes(bytes: &[u8]) -> bool {
-    decode_checked("", bytes).is_ok_and(|(_, whole)| whole)
+pub fn looks_like_image(bytes: &[u8]) -> bool {
+    let Some(format) = sniff(bytes) else { return false };
+    // The pixels are dropped, so they are not put in the order of a paint.
+    let drawn = match format {
+        Format::Svg => decode_svg(bytes).is_ok(),
+        _ => rgba(format, bytes).is_ok(),
+    };
+    drawn && complete(format, bytes)
 }
 
 /// True when the bytes are not cut short. Only a JPEG needs the question:
@@ -448,16 +490,16 @@ pub fn fetch_bytes(agent: &ureq::Agent, url: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 /// The caller wants the bytes, not the pixels, but they are kept only when
-/// the whole image decodes ([`decodes`]); a file of the cache that does not
+/// the whole image decodes ([`looks_like_image`]); a file of the cache that does not
 /// decode goes and the server is asked once more. For a background thread:
 /// the decode takes a few ms.
 fn fetch_bytes_in(agent: &ureq::Agent, url: &str, cache: Option<&std::path::Path>) -> anyhow::Result<Vec<u8>> {
     let mut fetched = fetch(agent, url, cache)?;
-    let mut whole = decodes(&fetched.bytes);
+    let mut whole = looks_like_image(&fetched.bytes);
     if !whole && let Origin::Disk(file) = &fetched.origin {
         let _ = std::fs::remove_file(file);
         fetched = fetch(agent, url, cache)?;
-        whole = decodes(&fetched.bytes);
+        whole = looks_like_image(&fetched.bytes);
     }
     if whole {
         fetched.commit();
@@ -471,9 +513,6 @@ const PREWARM_MAX_URLS: usize = 3000;
 /// Lost connections in a row after which a prewarm gives up: with the
 /// server gone, each try would wait for its timeout.
 const PREWARM_GIVE_UP: u32 = 3;
-/// A long prewarm trims the cache after this many bytes written, so it
-/// does not go over the limit until its end.
-const PREWARM_TRIM_EVERY: u64 = 64 * 1024 * 1024;
 
 /// The bounds of a prewarm; a test sets small ones.
 #[derive(Clone, Copy)]
@@ -485,7 +524,7 @@ struct PrewarmLimits {
 
 const PREWARM_LIMITS: PrewarmLimits = PrewarmLimits {
     max_urls: PREWARM_MAX_URLS,
-    trim_every: PREWARM_TRIM_EVERY,
+    trim_every: TRIM_EVERY,
     cache_max_bytes: DISK_MAX_BYTES,
 };
 
@@ -542,7 +581,7 @@ fn prewarm_in(
                 lost_in_a_row = 0;
                 // The decode is the cost of a prewarm, on this thread; the
                 // pixels are dropped at once, nothing stays in memory.
-                if decodes(&fetched.bytes) {
+                if looks_like_image(&fetched.bytes) {
                     fetched.commit();
                     outcome.fetched += 1;
                     written += fetched.bytes.len() as u64;
@@ -577,8 +616,11 @@ pub fn decode_fetched(mime: &str, bytes: &[u8]) -> anyhow::Result<Bgra> {
 /// The image, and whether its bytes are whole ([`complete`]). A cut JPEG
 /// still shows (the decoder fills it in), but it is not kept.
 fn decode_checked(mime: &str, bytes: &[u8]) -> anyhow::Result<(Bgra, bool)> {
-    let format = Format::from_mime(mime)
-        .or_else(|| sniff(bytes))
+    // What the bytes are, then what the server calls them: a PNG sent as
+    // "image/jpeg" is a PNG, and it is one when it comes back from the
+    // cache on disk, where no type is kept.
+    let format = sniff(bytes)
+        .or_else(|| Format::from_mime(mime))
         .ok_or_else(|| anyhow::anyhow!("unknown image type {mime:?}"))?;
     Ok((decode(format, bytes)?, complete(format, bytes)))
 }
@@ -588,7 +630,7 @@ pub fn download(agent: &ureq::Agent, url: &str) -> anyhow::Result<Bgra> {
 }
 
 /// Fetches and decodes an image. The bytes go to the cache on disk only
-/// once they decoded whole ([`decodes`]). A file of the cache that does not
+/// once they decoded whole ([`looks_like_image`]). A file of the cache that does not
 /// (kept by a run before this check, or damaged) goes, and the server is
 /// asked once more.
 fn download_in(agent: &ureq::Agent, url: &str, cache: Option<&std::path::Path>) -> anyhow::Result<Bgra> {
@@ -960,6 +1002,65 @@ mod tests {
         assert!(peak_busy.load(SeqCst) <= MAX_FETCHES, "requests: {}", peak_busy.load(SeqCst));
         assert!(peak_open.load(SeqCst) <= MAX_FETCHES, "connections: {}", peak_open.load(SeqCst));
         eprintln!("peak connections {}, peak requests {}", peak_open.load(SeqCst), peak_busy.load(SeqCst));
+    }
+
+    /// A waiter that goes away after the slot was handed to it, and before
+    /// it took it, gives the slot back. It was lost: six such waiters and
+    /// no image loaded any more.
+    #[test]
+    fn a_slot_handed_to_a_waiter_that_left_is_not_lost() {
+        use std::future::Future as _;
+        let gate = Gate::new(1);
+        let first = block_on(gate.acquire());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        {
+            let mut waiter = std::pin::pin!(gate.acquire());
+            assert!(waiter.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(gate.state.lock().unwrap().waiting.len(), 1);
+            // The slot goes to the waiter, which never runs again.
+            drop(first);
+        }
+        assert_eq!(gate.state.lock().unwrap().active, 0, "the slot of the waiter that left is still taken");
+        let mut next = std::pin::pin!(gate.acquire());
+        assert!(next.as_mut().poll(&mut cx).is_ready(), "the gate is shut for good");
+        // And a waiter that left before the slot came is passed over.
+        let held = block_on(gate.acquire());
+        {
+            let mut gone = std::pin::pin!(gate.acquire());
+            assert!(gone.as_mut().poll(&mut cx).is_pending());
+        }
+        drop(held);
+        assert_eq!(gate.state.lock().unwrap().active, 0);
+    }
+
+    /// The images of the pages count against the limit of the cache while
+    /// the app runs, not only at its next start.
+    #[test]
+    fn the_cache_is_trimmed_as_the_pages_fill_it() {
+        let dir = cache_dir("browse");
+        let written = AtomicU64::new(0);
+        for i in 0..10u64 {
+            let file = dir.join(format!("{i:02}"));
+            std::fs::write(&file, vec![0u8; 1000]).unwrap();
+            let age = std::time::SystemTime::now() - Duration::from_secs(100 - i);
+            std::fs::File::options().write(true).open(&file).unwrap().set_modified(age).unwrap();
+            trim_after(&written, Some(&dir), 1000, 4000, 5000);
+            assert!(files_in(&dir) <= 7, "{} files after image {i}", files_in(&dir));
+        }
+        // The newest stayed.
+        assert!(dir.join("09").exists());
+        assert!(!dir.join("00").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bytes say what an image is, not the type the server names: the
+    /// same bytes decode from the network as they do from the cache.
+    #[test]
+    fn an_image_under_a_wrong_type_decodes() {
+        assert!(decode_fetched("image/jpeg", &png(2)).is_ok());
+        assert!(decode_fetched("text/html", &png(2)).is_ok());
+        // With no magic bytes the named type is what is left.
+        assert!(decode_fetched("image/png", b"not an image").is_err());
     }
 
     #[test]
@@ -1356,7 +1457,7 @@ mod tests {
     fn the_damaged_pictures_have_a_good_header_and_a_bad_body() {
         for (name, format) in FORMATS {
             let (good, bad) = (picture(format), damaged(format));
-            assert!(decodes(&good), "{name}: the good picture does not decode");
+            assert!(looks_like_image(&good), "{name}: the good picture does not decode");
             let kind = sniff(&bad).unwrap_or_else(|| panic!("{name}: no magic bytes"));
             let reader = |bytes: &[u8]| image::ImageReader::with_format(Cursor::new(bytes.to_vec()), format);
             assert!(reader(&bad).into_dimensions().is_ok(), "{name}: the header of the damaged picture does not parse");
@@ -1364,7 +1465,7 @@ mod tests {
             // others fail. Either way the picture is not whole.
             assert_eq!(decode(kind, &bad).is_err(), name != "jpeg", "{name}");
             assert!(!complete(kind, &bad) || name != "jpeg", "{name}: a cut JPEG counts as whole");
-            assert!(!decodes(&bad), "{name}: the damaged picture counts as whole");
+            assert!(!looks_like_image(&bad), "{name}: the damaged picture counts as whole");
         }
     }
 
@@ -1466,7 +1567,7 @@ mod tests {
         assert!(bytes.len() < 1_000_000, "the test file is small next to its 48 MB of pixels: {}", bytes.len());
         let err = decode(Format::Png, &bytes).err().expect("the picture was decoded");
         assert!(format!("{err:#}").contains("too large"), "{err:#}");
-        assert!(!decodes(&bytes), "a picture that is not decoded is not kept");
+        assert!(!looks_like_image(&bytes), "a picture that is not decoded is not kept");
     }
 
     /// A raster picture inside an SVG is decoded at its own size by the
@@ -1499,9 +1600,9 @@ mod tests {
     fn an_svg_is_kept_when_it_draws() {
         let good = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10"/></svg>"#;
         let bad = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10""#;
-        assert!(decodes(good));
-        assert!(!decodes(bad), "a cut SVG was accepted");
-        assert!(!decodes(b"<html>Please sign in</html>"));
+        assert!(looks_like_image(good));
+        assert!(!looks_like_image(bad), "a cut SVG was accepted");
+        assert!(!looks_like_image(b"<html>Please sign in</html>"));
     }
 
     /// A prewarm takes the first `PREWARM_MAX_URLS` of its list and no

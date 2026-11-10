@@ -2,19 +2,19 @@
 //! The `chromecast` command of the debug channel: drives the engine with
 //! no panel. The verbs marked "acts on the device" start or change what
 //! the TV shows; the others only look.
+//!
+//! `connect` and `status` open the connection the panel uses
+//! (`Bloom::chromecast_open`) and do not make the device the target: a
+//! look at a TV must not send the next play of the app to it. `cast
+//! chromecast <device>` (`src/cast/debug.rs`) chooses it as the target.
 
 use std::time::{Duration, Instant};
 
 use gpui_kit::{Context, Window};
 use serde_json::Value;
 
-use super::{
-    jellyfin::{self, Identity, ItemStub},
-    mdns::{self, Device},
-    messages::{self, LoadMedia},
-    session::{Event, JellyfinLoad, LoadRequest, Session},
-};
-use crate::app::Bloom;
+use super::{jellyfin, mdns::Device, messages, session::Session};
+use crate::{app::Bloom, cast::target::Kind};
 
 const HELP: &str = "chromecast scan | status <device> | latency | state | media-status | connect <device> | disconnect | \
     launch [app id|default] | load <item id> [start secs] | play | pause | seek <s> | volume <0-100> | mute <on|off> | \
@@ -32,9 +32,11 @@ impl Bloom {
         let arg = arg.trim();
         match verb {
             "scan" => {
-                let discovery = self.chromecast.discovery.get_or_insert_with(mdns::discover);
-                discovery.rescan();
-                let devices = discovery.devices();
+                self.debug_cast_search(cx);
+                if let Some(discovery) = &self.chromecast.discovery {
+                    discovery.rescan();
+                }
+                let devices = self.chromecast_devices();
                 if devices.is_empty() {
                     return "scanning; no device yet, ask again".into();
                 }
@@ -44,18 +46,22 @@ impl Bloom {
                     .collect::<Vec<_>>()
                     .join("\n")
             }
-            "connect" => match self.cast_connect(arg, cx) {
-                Ok(()) => self.cast_state(),
+            "connect" => match self.debug_cast_connect(arg, cx) {
+                Ok(()) => self.chromecast_state(),
                 Err(text) => text,
             },
+            // A device that is the target is left as the panel leaves it.
             "disconnect" => {
-                self.chromecast.session = None;
-                self.chromecast.task = None;
+                if self.cast.kind() == Kind::Chromecast {
+                    self.cast_off(cx);
+                } else {
+                    self.chromecast_close();
+                }
                 "disconnected".into()
             }
             "status" => {
                 if !arg.is_empty()
-                    && let Err(text) = self.cast_connect(arg, cx)
+                    && let Err(text) = self.debug_cast_connect(arg, cx)
                 {
                     return text;
                 }
@@ -107,7 +113,7 @@ impl Bloom {
                     Err(_) => "error: no answer".into(),
                 }
             }
-            "state" => self.cast_state(),
+            "state" => self.chromecast_state(),
             "launch" => {
                 let Some(session) = &self.chromecast.session else {
                     return "error: connect first".into();
@@ -134,36 +140,36 @@ impl Bloom {
                     cx,
                     move |client| client.item(&id),
                     move |this, result, cx| match result {
-                        Ok(item) => this.cast_load(&item, start_secs, cx),
+                        Ok(item) => this.chromecast_load(std::slice::from_ref(&item), start_secs, cx),
                         Err(err) => this.toast("Could not load the item", format!("{err:#}"), cx),
                     },
                 );
                 "loading".into()
             }
-            "play" => self.cast_do(|s| s.play()),
-            "pause" => self.cast_do(|s| s.pause()),
+            "play" => self.chromecast_send(|s| s.play()),
+            "pause" => self.chromecast_send(|s| s.pause()),
             "seek" => match arg.parse::<f64>() {
-                Ok(secs) => self.cast_do(|s| s.seek(secs)),
+                Ok(secs) => self.chromecast_send(|s| s.seek(secs)),
                 Err(_) => "error: seek <seconds>".into(),
             },
             "volume" => match arg.parse::<f64>() {
-                Ok(level) => self.cast_do(|s| s.set_volume(level.clamp(0., 100.) / 100.)),
+                Ok(level) => self.chromecast_send(|s| s.set_volume(level.clamp(0., 100.) / 100.)),
                 Err(_) => "error: volume <0-100>".into(),
             },
-            "mute" => self.cast_do(|s| s.set_muted(arg == "on")),
+            "mute" => self.chromecast_send(|s| s.set_muted(arg == "on")),
             "audio" => match arg.parse::<i64>() {
-                Ok(index) => self.cast_do(|s| s.set_audio(index)),
+                Ok(index) => self.chromecast_send(|s| s.set_audio(index)),
                 Err(_) => "error: audio <stream index>".into(),
             },
             "subtitle" => {
                 let track = arg.parse::<i64>().ok();
-                self.cast_do(|s| s.set_subtitle(track))
+                self.chromecast_send(|s| s.set_subtitle(track))
             }
-            "stop" => self.cast_do(|s| s.stop_media()),
-            "stop-app" => self.cast_do(|s| s.stop_app()),
-            "join" => self.cast_do(|s| s.join()),
+            "stop" => self.chromecast_send(|s| s.stop_media()),
+            "stop-app" => self.chromecast_send(|s| s.stop_app()),
+            "join" => self.chromecast_send(|s| s.join()),
             // Asks the app for its media status; `state` shows the answer.
-            "media-status" => self.cast_do(|s| s.media_status()),
+            "media-status" => self.chromecast_send(|s| s.media_status()),
             // Any request, to the app when one is connected, else to the
             // device: `raw urn:x-cast:com.google.cast.receiver {"type":"GET_STATUS"}`.
             "raw" => {
@@ -184,7 +190,7 @@ impl Bloom {
     }
 
     /// Runs a verb that acts on the device.
-    fn cast_do(&mut self, act: impl FnOnce(&Session)) -> String {
+    fn chromecast_send(&mut self, act: impl FnOnce(&Session)) -> String {
         match &self.chromecast.session {
             Some(session) => {
                 act(session);
@@ -194,10 +200,19 @@ impl Bloom {
         }
     }
 
-    /// The device named by part of its name or model, its id or its address.
-    fn cast_device(&mut self, name: &str) -> Result<Device, String> {
-        let discovery = self.chromecast.discovery.get_or_insert_with(mdns::discover);
-        let devices = discovery.devices();
+    /// Starts the search for a test: it stays with the panel closed, so
+    /// the next ask finds what answered meanwhile.
+    fn debug_cast_search(&mut self, cx: &mut Context<Self>) {
+        self.chromecast.keep_search = true;
+        self.start_cast_search(cx);
+    }
+
+    /// The device named by part of its name or model, its id or its
+    /// address, among the ones the search found (and the fake one of a
+    /// test).
+    pub(crate) fn chromecast_find(&mut self, name: &str, cx: &mut Context<Self>) -> Result<Device, String> {
+        self.debug_cast_search(cx);
+        let devices = self.chromecast_devices();
         let wanted = name.to_lowercase();
         devices
             .iter()
@@ -218,62 +233,13 @@ impl Bloom {
     }
 
     /// Opens the connection to a device, unless it is open already.
-    fn cast_connect(&mut self, name: &str, cx: &mut Context<Self>) -> Result<(), String> {
-        let device = self.cast_device(name)?;
-        if self.chromecast.session.as_ref().is_some_and(|s| s.device().id == device.id) {
-            return Ok(());
-        }
-        let (session, events) = Session::connect(device);
-        self.chromecast.session = Some(session);
-        self.chromecast.events.clear();
-        self.chromecast.task = Some(cx.spawn(async move |this, cx| {
-            while let Ok(event) = events.recv().await {
-                let fed = this.update(cx, |this, cx| {
-                    this.chromecast.note(&event);
-                    if let Event::Error(text) = &event {
-                        log::warn!("cast: {text}");
-                    }
-                    cx.notify();
-                });
-                if fed.is_err() {
-                    break;
-                }
-            }
-        }));
+    fn debug_cast_connect(&mut self, name: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        let device = self.chromecast_find(name, cx)?;
+        self.chromecast_open(device, cx);
         Ok(())
     }
 
-    /// Plays an item on the device, both ways in one request.
-    fn cast_load(&mut self, item: &crate::jellyfin::Item, start_secs: f64, cx: &mut Context<Self>) {
-        let (Some(session), Some(account)) = (&self.chromecast.session, &self.session) else {
-            return;
-        };
-        let client = &account.client;
-        let jellyfin = Identity::from_client(client, &account.server_id, "").map(|identity| JellyfinLoad {
-            identity,
-            items: vec![ItemStub::from_item(item)],
-            start_secs,
-            audio_index: None,
-            subtitle_index: None,
-        });
-        let play_session_id = uuid::Uuid::new_v4().simple().to_string();
-        let media = jellyfin::stream_url(client, &item.id, &play_session_id).map(|url| LoadMedia {
-            url,
-            content_type: jellyfin::STREAM_CONTENT_TYPE.into(),
-            title: item.display_title(),
-            subtitle: item.series_name.clone().unwrap_or_default(),
-            image_url: Some(client.image_url(&item.id, "Primary", None, 480)),
-            start_secs,
-            duration: item.run_time_ticks.map(|t| t as f64 / crate::jellyfin::TICKS_PER_SECOND as f64),
-            tracks: Vec::new(),
-            active_tracks: Vec::new(),
-            live: false,
-        });
-        session.load(LoadRequest { jellyfin, media });
-        cx.notify();
-    }
-
-    fn cast_state(&self) -> String {
+    fn chromecast_state(&self) -> String {
         let Some(session) = &self.chromecast.session else {
             return "no session".into();
         };

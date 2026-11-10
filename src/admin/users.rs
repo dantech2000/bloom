@@ -4,7 +4,7 @@
 //! buttons each before). Also holds the small widgets that the devices,
 //! activity and API key pages share.
 
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
 
 use anyhow::Result;
 use gpui_icons::LucideIcon;
@@ -16,14 +16,11 @@ use gpui_kit::{
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{Confirm, Field, Prompt, ago, badge, parse_date};
+use super::{Confirm, Field, Prompt, ago, badge, find_field, nothing_found, parse_date};
 use crate::{
     app::Bloom,
     jellyfin::Client,
-    ui::{
-        input::{Input, Keyboard},
-        theme::UiTheme,
-    },
+    ui::theme::UiTheme,
     views::cards::icon,
 };
 
@@ -48,7 +45,8 @@ pub struct User {
     pub last_login_date: Option<String>,
     #[serde(default)]
     pub last_activity_date: Option<String>,
-    /// Whole policy as the server sent it, so a change sends back every field.
+    /// The policy as the list of the users gave it, for the badges. A
+    /// change reads the policy from the server again and sends that back.
     #[serde(default)]
     pub policy: Value,
 }
@@ -78,13 +76,20 @@ impl User {
 }
 
 pub struct Data {
-    pub users: Vec<User>,
+    /// Shared, so the click handlers of a page take a user without a copy
+    /// of its policy.
+    pub users: Vec<Arc<User>>,
 }
 
 pub fn load(client: &Client) -> Result<Data> {
     let mut users: Vec<User> = client.get("/Users", &[])?;
     users.sort_by_key(|u| u.name.to_lowercase());
-    Ok(Data { users })
+    Ok(Data { users: users.into_iter().map(Arc::new).collect() })
+}
+
+/// The user of the Users page with this name. For the debug channel.
+pub(super) fn user_named(app: &Bloom, name: &str) -> Option<Arc<User>> {
+    app.admin_data()?.users.as_ref()?.users.iter().find(|user| user.name == name).cloned()
 }
 
 pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
@@ -119,7 +124,7 @@ fn render_list(app: &Bloom, data: &Data, session: &crate::app::Session, cx: &mut
     let open = data.users.iter().filter(|u| !u.has_password).count();
 
     let query = app.admin_users_filter.read(cx).value().trim().to_lowercase();
-    let shown: Vec<&User> = data
+    let shown: Vec<&Arc<User>> = data
         .users
         .iter()
         .filter(|user| query.is_empty() || user.name.to_lowercase().contains(&query))
@@ -163,14 +168,7 @@ fn render_list(app: &Bloom, data: &Data, session: &crate::app::Session, cx: &mut
     }
     // A field to find a user, once there are enough to look for one.
     if data.users.len() > 6 {
-        page = page.child(
-            Input::new(&app.admin_users_filter)
-                .keyboard(Keyboard::plain())
-                .aria_label("Find a user")
-                .w_full()
-                .h(px(if compact { 50. } else { 44. }))
-                .when(compact, |el| el.text_size(px(17.)).line_height(px(22.))),
-        );
+        page = page.child(find_field(&app.admin_users_filter, "Find a user", compact));
     }
 
     let mut rows = div().relative().flex().flex_col();
@@ -181,16 +179,7 @@ fn render_list(app: &Bloom, data: &Data, session: &crate::app::Session, cx: &mut
         rows = rows.child(user_row(user, user.id == session.user_id, client, compact, &t, cx));
     }
     if shown.is_empty() {
-        rows = rows.child(
-            div()
-                .h(px(60.))
-                .px(px(16.))
-                .flex()
-                .items_center()
-                .text_size(px(15.))
-                .text_color(t.colors.foreground.opacity(0.6))
-                .child(format!("No user named \u{201c}{}\u{201d}.", query)),
-        );
+        rows = rows.child(nothing_found("user", &query, cx));
     }
     if compact {
         // On a phone the new user is the last row of the list, where iOS
@@ -295,7 +284,7 @@ fn user_row(
 
 /// The page of one user: the picture and the name, the facts, and the
 /// actions as rows, the dangerous one last.
-fn render_user(app: &Bloom, user: &User, session: &crate::app::Session, cx: &mut Context<Bloom>) -> Div {
+fn render_user(app: &Bloom, user: &Arc<User>, session: &crate::app::Session, cx: &mut Context<Bloom>) -> Div {
     let t = UiTheme::read(cx).clone();
     let compact = app.compact_w();
     let me = user.id == session.user_id;
@@ -546,56 +535,29 @@ fn ask_set_disabled(app: &mut Bloom, user: &User, disable: bool, cx: &mut Contex
 
 /// Opens the page of the user with this name. For the debug channel.
 pub(crate) fn open_user_named(app: &mut Bloom, name: &str, cx: &mut Context<Bloom>) -> bool {
-    let crate::app::Page::Admin(data) = &app.page else {
-        return false;
-    };
-    let id = data
-        .users
-        .as_ref()
-        .and_then(|users| users.users.iter().find(|user| user.name == name).map(|user| user.id.clone()));
-    match id {
-        Some(id) => {
-            app.admin_open_user(id, cx);
-            true
-        }
-        None => false,
+    let user = user_named(app, name);
+    if let Some(user) = &user {
+        app.admin_open_user(user.id.clone(), cx);
     }
+    user.is_some()
 }
 
 /// Opens the password form for the user with this name. For the debug channel.
 pub(crate) fn ask_password_named(app: &mut Bloom, name: &str, cx: &mut Context<Bloom>) -> bool {
-    let crate::app::Page::Admin(data) = &app.page else {
-        return false;
-    };
-    let user = data
-        .users
-        .as_ref()
-        .and_then(|users| users.users.iter().find(|user| user.name == name).cloned());
-    match user {
-        Some(user) => {
-            ask_password(app, &user, cx);
-            true
-        }
-        None => false,
+    let user = user_named(app, name);
+    if let Some(user) = &user {
+        ask_password(app, user, cx);
     }
+    user.is_some()
 }
 
 /// Asks to delete a user, by name. For the debug channel.
 pub(crate) fn ask_delete_named(app: &mut Bloom, name: &str, cx: &mut Context<Bloom>) -> bool {
-    let crate::app::Page::Admin(data) = &app.page else {
-        return false;
-    };
-    let user = data
-        .users
-        .as_ref()
-        .and_then(|users| users.users.iter().find(|user| user.name == name).cloned());
-    match user {
-        Some(user) => {
-            ask_delete(app, &user, cx);
-            true
-        }
-        None => false,
+    let user = user_named(app, name);
+    if let Some(user) = &user {
+        ask_delete(app, user, cx);
     }
+    user.is_some()
 }
 
 pub(crate) fn ask_new(app: &mut Bloom, cx: &mut Context<Bloom>) {

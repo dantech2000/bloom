@@ -210,11 +210,15 @@ pub struct RemoteImage {
 /// Images of one type that the providers offer.
 pub struct Browse {
     pub kind: String,
+    /// A page is on its way: the first one, or the next after "Show more".
     pub loading: bool,
     pub error: Option<String>,
     pub images: Vec<RemoteImage>,
     pub total: usize,
 }
+
+/// Images of the providers that one request asks for.
+const BROWSE_PAGE: usize = 30;
 
 /// The open dialog.
 pub struct Manager {
@@ -232,6 +236,11 @@ pub struct Manager {
     pub status: String,
     pub lock: bool,
     pub locked: Vec<String>,
+    /// The status and the locks as the item has them on the server, to
+    /// tell whether the user changed one.
+    saved: (String, bool, Vec<String>),
+    /// The images of the item; `None` while they load and after a load
+    /// that failed (`error` says why).
     pub images: Option<Vec<ImageInfo>>,
     pub browse: Option<Browse>,
     pub refresh_mode: RefreshMode,
@@ -260,6 +269,49 @@ impl Manager {
             "Movie" | "Series" | "BoxSet" | "Trailer" | "Person" | "MusicAlbum" | "MusicArtist"
         )
     }
+
+    /// An action starts, when none is under way: one at a time. False
+    /// when the dialog is busy, and the action must not go.
+    fn action_starts(&mut self) -> bool {
+        !std::mem::replace(&mut self.busy, true)
+    }
+
+    /// The server answered an action. `reloads` says the dialog loads
+    /// again now (the action went through, and there is a session): it
+    /// stays busy until that load is in, as the images have their old
+    /// numbers on the screen until then. `keep_texts` keeps the text of
+    /// the fields over that load.
+    fn action_answered(&mut self, reloads: bool, keep_texts: bool) {
+        self.busy = reloads;
+        self.keep_texts = keep_texts;
+    }
+
+    /// The load of the dialog is in: the next action can go. A question
+    /// asked before it goes: it names an image by the number it had in
+    /// the list of before, and the load numbered the images again.
+    fn reload_in(&mut self) {
+        self.busy = false;
+        self.confirm = None;
+    }
+
+    /// True when the Details tab holds a change that is not saved: `texts`
+    /// is the text of its fields now, the overview last.
+    fn edited(&self, texts: &[String]) -> bool {
+        if self.item.is_none() {
+            return false;
+        }
+        let fields = texts.iter().zip(&self.initial).any(|(now, then)| now.trim() != then.trim());
+        fields || (self.status.as_str(), self.lock, &self.locked) != (self.saved.0.as_str(), self.saved.1, &self.saved.2)
+    }
+}
+
+/// What an action leaves of the text the user typed in the fields.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Texts {
+    /// The action was on an image: the fields stay as the user has them.
+    Keep,
+    /// The action changed the fields of the item: they are read again.
+    Reload,
 }
 
 /// State of the metadata manager that lives as long as the app.
@@ -275,6 +327,9 @@ pub struct State {
     fill: bool,
     /// The dialog opened since the last render and wants the focus.
     fresh: bool,
+    /// The dialog closed with no window at hand (the answer to "Discard
+    /// the changes?"): the next render gives the focus back to the app.
+    closed: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -309,6 +364,7 @@ impl State {
             scroll: ScrollHandle::new(),
             fill: false,
             fresh: false,
+            closed: false,
             _subscriptions: subscriptions,
         }
     }
@@ -325,20 +381,12 @@ fn text(item: &Value, key: &str) -> String {
 
 /// Names of a list of the item, joined with commas.
 fn names(item: &Value, key: &str) -> String {
-    item[key]
-        .as_array()
-        .map(|list| {
-            list.iter()
-                .filter_map(|v| v.as_str().or_else(|| v["Name"].as_str()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default()
+    name_list(item, key).join(", ")
 }
 
-/// The same, for a list whose names can have a comma in them ("Lucasfilm,
-/// Ltd."): the names the item has now (`known`) stay whole where the text
-/// still has them, and the rest splits at the commas.
+/// The parts of a text of names, for a list whose names can have a comma
+/// in them ("Lucasfilm, Ltd."): the names the item has now (`known`) stay
+/// whole where the text still has them, and the rest splits at the commas.
 fn split_keeping(text: &str, known: &[String]) -> Vec<String> {
     let whole = |name: &str| split(name).join(", ");
     let known: Vec<String> = known.iter().map(|name| whole(name)).collect();
@@ -428,12 +476,15 @@ fn apply_field(item: &mut Value, index: usize, value: &str) -> Result<()> {
         if v.is_empty() {
             return Ok(Value::Null);
         }
+        // The shape, and a day the calendar has: the server answers
+        // "2024-13-45" with an error of its own.
         let valid = v.len() == 10
             && v.bytes().enumerate().all(|(i, b)| match i {
                 4 | 7 => b == b'-',
                 _ => b.is_ascii_digit(),
-            });
-        anyhow::ensure!(valid, "{label} must look like 2024-05-31");
+            })
+            && v.parse::<jiff::civil::Date>().is_ok();
+        anyhow::ensure!(valid, "{label} must be a date like 2024-05-31");
         Ok(json!(format!("{v}T00:00:00.0000000Z")))
     };
     match index {
@@ -533,6 +584,7 @@ impl Bloom {
             status: String::new(),
             lock: false,
             locked: Vec::new(),
+            saved: Default::default(),
             images: None,
             browse: None,
             refresh_mode: RefreshMode::Scan,
@@ -560,6 +612,42 @@ impl Bloom {
         cx.notify();
     }
 
+    /// The text of the Details fields now, and the overview last.
+    fn metadata_texts(&self, cx: &gpui_kit::App) -> Vec<String> {
+        let mut texts: Vec<String> = self.metadata.inputs[..DETAIL_FIELDS]
+            .iter()
+            .map(|input| input.read(cx).value().trim().to_string())
+            .collect();
+        texts.push(self.metadata.overview.read(cx).value().trim().to_string());
+        texts
+    }
+
+    /// Closes the dialog as the user asked (Escape, a click beside it, a
+    /// button). With changes on the Details tab that are not saved it
+    /// asks first; before, they went with no word.
+    pub fn ask_close_metadata(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let texts = self.metadata_texts(cx);
+        let Some(manager) = &mut self.metadata.open else {
+            return;
+        };
+        if !manager.edited(&texts) {
+            return self.close_metadata(window, cx);
+        }
+        manager.confirm = Some(Confirm {
+            title: "Discard the changes?".to_string(),
+            message: format!("The changes to {} are not saved.", manager.name),
+            action: "Discard".to_string(),
+            danger: true,
+            // The answer has no window: the next render moves the focus.
+            run: Rc::new(|this, cx| {
+                this.metadata.open = None;
+                this.metadata.closed = true;
+                cx.notify();
+            }),
+        });
+        cx.notify();
+    }
+
     /// Shows another tab of the open dialog.
     pub fn set_metadata_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
         let Some(manager) = &mut self.metadata.open else {
@@ -581,7 +669,9 @@ impl Bloom {
         };
         let id = manager.id.clone();
         let wanted = id.clone();
-        self.fetch(
+        // Every answer of the dialog is for the session that asked: the
+        // same id can be another item on another server.
+        self.fetch_in_session(
             cx,
             move |client| -> Result<(Value, Vec<ImageInfo>)> {
                 let user = client.user()?.to_string();
@@ -617,6 +707,7 @@ impl Bloom {
                                     .collect()
                             })
                             .unwrap_or_default();
+                        manager.saved = (manager.status.clone(), manager.lock, manager.locked.clone());
                         if !std::mem::take(&mut manager.keep_texts) {
                             manager.initial = field_texts(&item);
                             this.metadata.fill = true;
@@ -637,15 +728,33 @@ impl Bloom {
         );
     }
 
+    /// Loads the dialog again after a load that failed ("Try again"). The
+    /// fields are read or kept as the load that failed would have done.
+    pub fn reload_metadata(&mut self, cx: &mut Context<Self>) {
+        let Some(manager) = &mut self.metadata.open else {
+            return;
+        };
+        if !manager.action_starts() {
+            return;
+        }
+        self.load_metadata(cx);
+        cx.notify();
+    }
+
     /// Puts the text of the item into the fields and gives the dialog the
     /// focus. The root render calls this, because it has the window.
     pub fn prepare_metadata(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.metadata.closed) && self.metadata.open.is_none() {
+            window.focus(&self.app_focus, cx);
+        }
         let Some(manager) = &self.metadata.open else {
             return;
         };
         if std::mem::take(&mut self.metadata.fill) {
             let texts = manager.initial.clone();
-            for (input, value) in self.metadata.inputs.iter().zip(&texts) {
+            // The Details fields alone: the overview, last of the texts,
+            // is not the first field of the Identify form.
+            for (input, value) in self.metadata.inputs[..DETAIL_FIELDS].iter().zip(&texts) {
                 input.update(cx, |input, cx| input.set_value(value.clone(), window, cx));
             }
             let overview = texts.last().cloned().unwrap_or_default();
@@ -702,6 +811,7 @@ impl Bloom {
     fn metadata_action(
         &mut self,
         done: &'static str,
+        texts: Texts,
         cx: &mut Context<Self>,
         work: impl FnOnce(Client) -> Result<()> + Send + 'static,
     ) {
@@ -714,10 +824,8 @@ impl Bloom {
             return;
         }
         manager.confirm = None;
-        // An action on an image leaves the text of the fields alone.
-        let on_image = done.starts_with("Image");
         let id = manager.id.clone();
-        self.fetch(cx, work, move |this, result, cx| {
+        self.fetch_in_session(cx, work, move |this, result, cx| {
             // The answer is for the dialog that asked: another item may be
             // open in it by now.
             // The dialog stays busy through the load that follows a change:
@@ -731,7 +839,7 @@ impl Bloom {
                 .open
                 .as_mut()
                 .filter(|manager| manager.id == id)
-                .map(|manager| manager.action_answered(reloads, on_image));
+                .map(|manager| manager.action_answered(reloads, texts == Texts::Keep));
             match result {
                 Ok(()) => {
                     this.toast(done, "", cx);
@@ -756,11 +864,7 @@ impl Bloom {
         let Some(mut item) = manager.item.clone() else {
             return;
         };
-        let mut texts: Vec<String> = self.metadata.inputs[..DETAIL_FIELDS]
-            .iter()
-            .map(|input| input.read(cx).value().trim().to_string())
-            .collect();
-        texts.push(self.metadata.overview.read(cx).value().trim().to_string());
+        let texts = self.metadata_texts(cx);
         for (index, value) in texts.iter().enumerate() {
             if manager.initial.get(index).map(|s| s.trim()) == Some(value.as_str()) {
                 continue;
@@ -785,7 +889,7 @@ impl Bloom {
             }
         }
         let id = manager.id.clone();
-        self.metadata_action("Metadata saved", cx, move |client| {
+        self.metadata_action("Metadata saved", Texts::Reload, cx, move |client| {
             client.post(&format!("/Items/{id}"), &item).map(drop)
         });
     }
@@ -809,7 +913,7 @@ impl Bloom {
                 (manager.refresh_mode == RefreshMode::All).to_string(),
             ),
         ];
-        self.fetch(
+        self.fetch_in_session(
             cx,
             move |client| client.call("POST", &format!("/Items/{id}/Refresh"), &query),
             |this, result, cx| match result {
@@ -827,11 +931,25 @@ impl Bloom {
         };
         manager.browse = Some(Browse {
             kind: kind.to_string(),
-            loading: true,
+            loading: false,
             error: None,
             images: Vec::new(),
             total: 0,
         });
+        self.browse_more(cx);
+    }
+
+    /// Loads the next images of the type on show, after the ones that are
+    /// there ("Show more"; the first thirty were all there was before).
+    pub fn browse_more(&mut self, cx: &mut Context<Self>) {
+        let Some(manager) = &mut self.metadata.open else {
+            return;
+        };
+        let Some(browse) = manager.browse.as_mut().filter(|b| !b.loading) else {
+            return;
+        };
+        browse.loading = true;
+        browse.error = None;
         #[derive(Default, Deserialize)]
         #[serde(rename_all = "PascalCase")]
         struct Page {
@@ -840,17 +958,17 @@ impl Bloom {
             #[serde(default)]
             total_record_count: usize,
         }
-        let (id, kind) = (manager.id.clone(), kind.to_string());
+        let (id, kind, start) = (manager.id.clone(), browse.kind.clone(), browse.images.len());
         let wanted = (id.clone(), kind.clone());
-        self.fetch(
+        self.fetch_in_session(
             cx,
             move |client| {
                 client.get::<Page>(
                     &format!("/Items/{id}/RemoteImages"),
                     &[
                         ("type", kind),
-                        ("startIndex", "0".to_string()),
-                        ("limit", "30".to_string()),
+                        ("startIndex", start.to_string()),
+                        ("limit", BROWSE_PAGE.to_string()),
                         ("IncludeAllLanguages", "false".to_string()),
                     ],
                 )
@@ -862,14 +980,19 @@ impl Bloom {
                 let Some(browse) = &mut manager.browse else {
                     return;
                 };
-                if (manager.id.as_str(), browse.kind.as_str()) != (wanted.0.as_str(), wanted.1.as_str()) {
+                // The answer is for the type and the place that asked.
+                if (manager.id.as_str(), browse.kind.as_str()) != (wanted.0.as_str(), wanted.1.as_str())
+                    || browse.images.len() != start
+                {
                     return;
                 }
                 browse.loading = false;
                 match result {
                     Ok(page) => {
-                        browse.total = page.total_record_count;
-                        browse.images = page.images;
+                        // A page with nothing ends the list, whatever the
+                        // total said.
+                        browse.total = if page.images.is_empty() { start } else { page.total_record_count };
+                        browse.images.extend(page.images);
                     }
                     Err(err) => browse.error = Some(format!("{err:#}")),
                 }
@@ -884,6 +1007,11 @@ impl Bloom {
         let Some(manager) = &mut self.metadata.open else {
             return;
         };
+        // Not while an action or the load after it is under way: the
+        // question would go with that load, and its answer do nothing.
+        if manager.busy {
+            return;
+        }
         let Some(kind) = manager.browse.as_ref().map(|b| b.kind.clone()) else {
             return;
         };
@@ -906,7 +1034,7 @@ impl Bloom {
             run: Rc::new(move |this, cx| {
                 let (id, kind, url, provider) =
                     (id.clone(), kind.clone(), url.clone(), provider.clone());
-                this.metadata_action("Image saved", cx, move |client| {
+                this.metadata_action("Image saved", Texts::Keep, cx, move |client| {
                     client.call(
                         "POST",
                         &format!("/Items/{id}/RemoteImages/Download"),
@@ -940,7 +1068,7 @@ impl Bloom {
             danger: true,
             run: Rc::new(move |this, cx| {
                 let (id, kind) = (id.clone(), kind.clone());
-                this.metadata_action("Image deleted", cx, move |client| {
+                this.metadata_action("Image deleted", Texts::Keep, cx, move |client| {
                     client.call("DELETE", &format!("/Items/{id}/Images/{kind}/{index}"), &[])
                 });
             }),
@@ -989,7 +1117,7 @@ impl Bloom {
         manager.searching = true;
         manager.search_error = None;
         let (kind, wanted) = (manager.kind.clone(), manager.id.clone());
-        self.fetch(
+        self.fetch_in_session(
             cx,
             move |client| -> Result<Vec<Value>> {
                 let mut answer = client.post(&format!("/Items/RemoteSearch/{kind}"), &body)?;
@@ -1018,6 +1146,9 @@ impl Bloom {
         let Some(manager) = &mut self.metadata.open else {
             return;
         };
+        if manager.busy {
+            return;
+        }
         let (id, result) = (manager.id.clone(), result.clone());
         let images = manager.apply_images;
         let title = text(&result, "Name");
@@ -1032,7 +1163,7 @@ impl Bloom {
             danger: true,
             run: Rc::new(move |this, cx| {
                 let (id, result) = (id.clone(), result.clone());
-                this.metadata_action("Match applied", cx, move |client| {
+                this.metadata_action("Match applied", Texts::Reload, cx, move |client| {
                     client
                         .post(
                             &format!("/Items/RemoteSearch/Apply/{id}?ReplaceAllImages={images}"),
@@ -1166,34 +1297,11 @@ mod tests {
         assert!(apply_field(&mut changed, TITLE, "").is_err());
         assert!(apply_field(&mut changed, YEAR, "next year").is_err());
         assert!(apply_field(&mut changed, PREMIERE, "18.02.2026").is_err());
+        // The shape of a date, but no day of the calendar.
+        assert!(apply_field(&mut changed, PREMIERE, "2026-13-45").is_err());
+        assert!(apply_field(&mut changed, END, "2026-02-30").is_err());
         assert!(apply_field(&mut changed, COMMUNITY_RATING, "good").is_err());
         assert_eq!(changed, item());
-    }
-}
-
-impl Manager {
-    /// An action starts, when none is under way: one at a time. False
-    /// when the dialog is busy, and the action must not go.
-    fn action_starts(&mut self) -> bool {
-        !std::mem::replace(&mut self.busy, true)
-    }
-
-    /// The server answered an action. `reloads` says the dialog loads
-    /// again now (the action went through, and there is a session): it
-    /// stays busy until that load is in, as the images have their old
-    /// numbers on the screen until then. `on_image` keeps the text of the
-    /// fields over that load.
-    fn action_answered(&mut self, reloads: bool, on_image: bool) {
-        self.busy = reloads;
-        self.keep_texts = on_image;
-    }
-
-    /// The load of the dialog is in: the next action can go. A question
-    /// asked before it goes: it names an image by the number it had in
-    /// the list of before, and the load numbered the images again.
-    fn reload_in(&mut self) {
-        self.busy = false;
-        self.confirm = None;
     }
 }
 
@@ -1264,7 +1372,9 @@ mod dialog_tests {
         });
         cx.run_until_parked();
         let delete = |this: &mut crate::app::Bloom, cx: &mut gpui_kit::Context<crate::app::Bloom>| {
-            this.metadata_action("Image deleted", cx, |client| client.call("DELETE", "/Items/m1/Images/Backdrop/0", &[]));
+            this.metadata_action("Image deleted", super::Texts::Keep, cx, |client| {
+                client.call("DELETE", "/Items/m1/Images/Backdrop/0", &[])
+            });
         };
         bloom.update(cx, |this, cx| {
             // The fields were filled at the first load; the user types.
@@ -1283,5 +1393,110 @@ mod dialog_tests {
         cx.run_until_parked();
         assert_eq!(server.count("DELETE", "/Items/m1/Images"), 2);
     }
-}
+    fn admin(server: &MockServer) -> crate::app::Session {
+        let mut account = session(&server.url, "u1");
+        account.is_admin = true;
+        account
+    }
 
+    /// A question about an image is not asked while the dialog is busy:
+    /// its answer would do nothing, and the load in hand would drop it.
+    /// Before, only the delete of an image looked at the busy state.
+    #[gpui_kit::test]
+    fn no_question_is_asked_while_the_dialog_is_busy(cx: &mut TestAppContext) {
+        let server = MockServer::start(|method, path, _| plain(method, path));
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            this.session = Some(admin(&server));
+            this.open_metadata("m1", "One", "Movie", Tab::Images, cx);
+            this.browse_images("Primary", cx);
+            let image = super::RemoteImage { url: "http://example/a.jpg".to_string(), ..Default::default() };
+            let found = serde_json::json!({ "Name": "One" });
+            this.metadata.open.as_mut().unwrap().busy = true;
+            this.ask_use_image(&image, cx);
+            this.ask_apply_match(&found, cx);
+            assert!(this.metadata.open.as_ref().unwrap().confirm.is_none(), "a question while busy");
+            this.metadata.open.as_mut().unwrap().busy = false;
+            this.ask_use_image(&image, cx);
+            assert!(this.metadata.open.as_ref().unwrap().confirm.is_some());
+        });
+        cx.run_until_parked();
+    }
+
+    /// A close with a change that is not saved asks first; without a
+    /// change it closes. Before, Escape or a click beside the dialog
+    /// dropped what the user had typed.
+    #[gpui_kit::test]
+    fn a_close_with_changes_asks_first(cx: &mut TestAppContext) {
+        let server = MockServer::start(|method, path, _| match (method, path) {
+            ("GET", p) if p.starts_with("/Items/m1/Images") => (200, "[]".to_string()),
+            ("GET", p) if p.starts_with("/Items/m1") => {
+                (200, r#"{"Id":"m1","Name":"One","Type":"Movie"}"#.to_string())
+            }
+            _ => plain(method, path),
+        });
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            this.session = Some(admin(&server));
+            this.open_metadata("m1", "One", "Movie", Tab::Details, cx);
+        });
+        cx.run_until_parked();
+        bloom.update_in(cx, |this, window, cx| {
+            this.prepare_metadata(window, cx);
+            assert!(this.metadata.open.as_ref().unwrap().item.is_some(), "the item did not load");
+            this.metadata.inputs[super::TITLE].update(cx, |input, cx| input.set_value("Two", window, cx));
+            this.ask_close_metadata(window, cx);
+            let manager = this.metadata.open.as_ref().expect("the dialog closed over a change");
+            let confirm = manager.confirm.clone().expect("no question");
+            // "Discard" closes it.
+            (confirm.run)(this, cx);
+            assert!(this.metadata.open.is_none());
+        });
+        bloom.update(cx, |this, cx| this.open_metadata("m1", "One", "Movie", Tab::Details, cx));
+        cx.run_until_parked();
+        bloom.update_in(cx, |this, window, cx| {
+            this.prepare_metadata(window, cx);
+            // A lock is a change too.
+            this.metadata.open.as_mut().unwrap().lock = true;
+            this.ask_close_metadata(window, cx);
+            assert!(this.metadata.open.as_ref().is_some_and(|m| m.confirm.is_some()));
+            let manager = this.metadata.open.as_mut().unwrap();
+            manager.lock = false;
+            manager.confirm = None;
+            this.ask_close_metadata(window, cx);
+            assert!(this.metadata.open.is_none(), "a dialog with no change did not close");
+        });
+        cx.run_until_parked();
+    }
+
+    /// "Show more" asks for the images after the ones on show and adds
+    /// them. Before, the first thirty were all the dialog could show.
+    #[gpui_kit::test]
+    fn show_more_adds_the_next_images(cx: &mut TestAppContext) {
+        let server = MockServer::start(|method, path, _| match (method, path) {
+            ("GET", p) if p.starts_with("/Items/m1/RemoteImages") => {
+                let image = if p.contains("startIndex=1") { "b" } else { "a" };
+                (200, format!(r#"{{"Images":[{{"Url":"http://example/{image}.jpg"}}],"TotalRecordCount":2}}"#))
+            }
+            _ => plain(method, path),
+        });
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            this.session = Some(admin(&server));
+            this.open_metadata("m1", "One", "Movie", Tab::Images, cx);
+            this.browse_images("Backdrop", cx);
+        });
+        cx.run_until_parked();
+        bloom.update(cx, |this, cx| {
+            let browse = this.metadata.open.as_ref().unwrap().browse.as_ref().unwrap();
+            assert_eq!((browse.images.len(), browse.total, browse.loading), (1, 2, false));
+            this.browse_more(cx);
+        });
+        cx.run_until_parked();
+        bloom.update(cx, |this, _| {
+            let browse = this.metadata.open.as_ref().unwrap().browse.as_ref().unwrap();
+            let urls: Vec<&str> = browse.images.iter().map(|i| i.url.as_str()).collect();
+            assert_eq!(urls, ["http://example/a.jpg", "http://example/b.jpg"]);
+        });
+    }
+}

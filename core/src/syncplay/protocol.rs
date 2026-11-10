@@ -33,13 +33,10 @@ mod time {
 /// Group ids compare without regard to hyphens and case: the server writes
 /// them without hyphens in most places and with them in a few.
 pub fn same_id(a: &str, b: &str) -> bool {
-    let plain = |id: &str| -> String {
-        id.chars()
-            .filter(|c| *c != '-')
-            .map(|c| c.to_ascii_lowercase())
-            .collect()
-    };
-    plain(a) == plain(b)
+    fn plain(id: &str) -> impl Iterator<Item = u8> + '_ {
+        id.bytes().filter(|c| *c != b'-').map(|c| c.to_ascii_lowercase())
+    }
+    plain(a).eq(plain(b))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -112,6 +109,86 @@ pub struct QueueItem {
     pub playlist_item_id: String,
 }
 
+/// How the queue of the group goes on at the end of an item. A mode this
+/// app does not know (one of a newer server) reads as no repeat: the queue
+/// update it came in must not be lost for it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub enum RepeatMode {
+    RepeatAll,
+    RepeatOne,
+    #[default]
+    #[serde(other)]
+    RepeatNone,
+}
+
+impl RepeatMode {
+    /// The name the server reads and writes.
+    pub fn name(self) -> &'static str {
+        match self {
+            RepeatMode::RepeatNone => "RepeatNone",
+            RepeatMode::RepeatAll => "RepeatAll",
+            RepeatMode::RepeatOne => "RepeatOne",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        [RepeatMode::RepeatNone, RepeatMode::RepeatAll, RepeatMode::RepeatOne]
+            .into_iter()
+            .find(|mode| mode.name() == name)
+    }
+
+    /// The mode after this one, for a button that steps through them.
+    pub fn next(self) -> Self {
+        match self {
+            RepeatMode::RepeatNone => RepeatMode::RepeatAll,
+            RepeatMode::RepeatAll => RepeatMode::RepeatOne,
+            RepeatMode::RepeatOne => RepeatMode::RepeatNone,
+        }
+    }
+}
+
+impl std::fmt::Display for RepeatMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// The order of the queue of the group. An unknown one reads as sorted.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub enum ShuffleMode {
+    Shuffle,
+    #[default]
+    #[serde(other)]
+    Sorted,
+}
+
+impl ShuffleMode {
+    /// The name the server reads and writes.
+    pub fn name(self) -> &'static str {
+        match self {
+            ShuffleMode::Sorted => "Sorted",
+            ShuffleMode::Shuffle => "Shuffle",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        [ShuffleMode::Sorted, ShuffleMode::Shuffle].into_iter().find(|mode| mode.name() == name)
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            ShuffleMode::Sorted => ShuffleMode::Shuffle,
+            ShuffleMode::Shuffle => ShuffleMode::Sorted,
+        }
+    }
+}
+
+impl std::fmt::Display for ShuffleMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// The queue of the group and the item that plays.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "PascalCase")]
@@ -132,9 +209,9 @@ pub struct PlayQueue {
     #[serde(default)]
     pub is_playing: bool,
     #[serde(default)]
-    pub shuffle_mode: String,
+    pub shuffle_mode: ShuffleMode,
     #[serde(default)]
-    pub repeat_mode: String,
+    pub repeat_mode: RepeatMode,
 }
 
 impl PlayQueue {
@@ -148,9 +225,9 @@ impl PlayQueue {
     /// server counts it: a repeat mode keeps the queue going.
     pub fn has_next(&self) -> bool {
         let index = self.playing_item_index;
-        match self.repeat_mode.as_str() {
-            "RepeatOne" | "RepeatAll" => !self.playlist.is_empty(),
-            _ => index >= 0 && index + 1 < self.playlist.len() as i64,
+        match self.repeat_mode {
+            RepeatMode::RepeatOne | RepeatMode::RepeatAll => !self.playlist.is_empty(),
+            RepeatMode::RepeatNone => index >= 0 && index + 1 < self.playlist.len() as i64,
         }
     }
 }
@@ -181,31 +258,31 @@ pub enum ServerMessage {
 
 /// Reads a socket message; `None` for a type SyncPlay does not use or a
 /// message it cannot read.
-pub fn parse(message_type: &str, data: Value) -> Option<ServerMessage> {
+pub fn parse(message_type: &str, data: &Value) -> Option<ServerMessage> {
     match message_type {
-        "SyncPlayCommand" => serde_json::from_value(data).ok().map(ServerMessage::Command),
+        "SyncPlayCommand" => Command::deserialize(data).ok().map(ServerMessage::Command),
         "SyncPlayGroupUpdate" => {
             let group_id = data.get("GroupId")?.as_str()?.to_string();
-            let kind = data.get("Type")?.as_str()?.to_string();
-            let inner = data.get("Data").cloned().unwrap_or(Value::Null);
+            let kind = data.get("Type")?.as_str()?;
+            let inner = data.get("Data").unwrap_or(&Value::Null);
             let text = || inner.as_str().unwrap_or_default().to_string();
-            let update = match kind.as_str() {
-                "GroupJoined" => GroupUpdate::Joined(serde_json::from_value(inner).ok()?),
-                "GroupUpdate" => GroupUpdate::Info(serde_json::from_value(inner).ok()?),
+            let update = match kind {
+                "GroupJoined" => GroupUpdate::Joined(GroupInfo::deserialize(inner).ok()?),
+                "GroupUpdate" => GroupUpdate::Info(GroupInfo::deserialize(inner).ok()?),
                 "UserJoined" => GroupUpdate::UserJoined(text()),
                 "UserLeft" => GroupUpdate::UserLeft(text()),
                 "GroupLeft" => GroupUpdate::Left,
                 "NotInGroup" => GroupUpdate::NotInGroup,
                 "StateUpdate" => GroupUpdate::State {
-                    state: serde_json::from_value(inner.get("State")?.clone()).ok()?,
+                    state: GroupState::deserialize(inner.get("State")?).ok()?,
                     reason: inner.get("Reason")?.as_str()?.to_string(),
                 },
-                "PlayQueue" => GroupUpdate::Queue(serde_json::from_value(inner).ok()?),
+                "PlayQueue" => GroupUpdate::Queue(PlayQueue::deserialize(inner).ok()?),
                 // The refusals the server has. A type this app does not
                 // know (one of a newer server) is no refusal: it is left
                 // out, and shows no "the server refused" notice.
                 "GroupDoesNotExist" | "LibraryAccessDenied" | "CreateGroupDenied" | "JoinGroupDenied"
-                | "SyncPlayIsDisabled" => GroupUpdate::Denied(kind),
+                | "SyncPlayIsDisabled" => GroupUpdate::Denied(kind.to_string()),
                 _ => return None,
             };
             Some(ServerMessage::Group { group_id, update })
@@ -237,7 +314,6 @@ pub enum Request {
     Pause,
     /// Stops every member of the group. The app never sends it, as the web
     /// client does not (`no_action_of_the_user_asks_the_group_to_stop`).
-    #[allow(dead_code)]
     Stop,
     Seek { position_ticks: i64 },
     Ready(PlayerReport),
@@ -251,8 +327,8 @@ pub enum Request {
     Queue { item_ids: Vec<String>, next: bool },
     RemoveFromPlaylist { playlist_item_ids: Vec<String> },
     MovePlaylistItem { playlist_item_id: String, new_index: usize },
-    SetRepeatMode(String),
-    SetShuffleMode(String),
+    SetRepeatMode(RepeatMode),
+    SetShuffleMode(ShuffleMode),
 }
 
 impl Request {
@@ -316,9 +392,28 @@ impl Request {
                 "PlaylistItemId": playlist_item_id,
                 "NewIndex": new_index,
             }),
-            Request::SetRepeatMode(mode) | Request::SetShuffleMode(mode) => {
-                json!({ "Mode": mode })
-            }
+            Request::SetRepeatMode(mode) => json!({ "Mode": mode.name() }),
+            Request::SetShuffleMode(mode) => json!({ "Mode": mode.name() }),
+        })
+    }
+
+    /// What the user asked for with this request, for the notice when it
+    /// does not reach the server: no message of the socket follows then,
+    /// and the user would wait for nothing. `None` for a request the rules
+    /// of the member make up for by themselves (a pause, a `Ready`).
+    pub fn asked(&self) -> Option<&'static str> {
+        Some(match self {
+            Request::New { .. } => "The group could not be made.",
+            Request::Join { .. } => "The group could not be joined.",
+            Request::Leave => "The group could not be left.",
+            Request::SetNewQueue { .. } => "The group could not be told what to play.",
+            Request::Queue { .. } => "The items could not be added to the queue of the group.",
+            Request::SetPlaylistItem { .. }
+            | Request::RemoveFromPlaylist { .. }
+            | Request::MovePlaylistItem { .. }
+            | Request::SetRepeatMode(_)
+            | Request::SetShuffleMode(_) => "The queue of the group could not be changed.",
+            _ => return None,
         })
     }
 
@@ -361,7 +456,7 @@ mod tests {
             "Command": "Unpause",
             "EmittedAt": "2026-10-03T14:43:24.9000000Z",
         });
-        let Some(ServerMessage::Command(command)) = parse("SyncPlayCommand", data) else {
+        let Some(ServerMessage::Command(command)) = parse("SyncPlayCommand", &data) else {
             panic!("no command");
         };
         assert_eq!(command.command, CommandKind::Unpause);
@@ -374,7 +469,7 @@ mod tests {
     fn reads_the_group_updates() {
         let group = |kind: &str, data: Value| {
             let message = json!({ "GroupId": "abc", "Type": kind, "Data": data });
-            match parse("SyncPlayGroupUpdate", message) {
+            match parse("SyncPlayGroupUpdate", &message) {
                 Some(ServerMessage::Group { update, .. }) => update,
                 other => panic!("{kind}: {other:?}"),
             }
@@ -409,10 +504,11 @@ mod tests {
             panic!("no queue");
         };
         assert_eq!(queue.current().unwrap().playlist_item_id, "p2");
-        assert!(parse("LibraryChanged", json!({})).is_none());
+        assert_eq!((queue.shuffle_mode, queue.repeat_mode), (ShuffleMode::Sorted, RepeatMode::RepeatNone));
+        assert!(parse("LibraryChanged", &json!({})).is_none());
         // A type of a newer server is not read as a refusal.
         let unknown = json!({ "GroupId": "abc", "Type": "SomethingNew", "Data": "" });
-        assert!(parse("SyncPlayGroupUpdate", unknown).is_none());
+        assert!(parse("SyncPlayGroupUpdate", &unknown).is_none());
     }
 
     #[test]
@@ -453,6 +549,32 @@ mod tests {
         assert!(!Request::Pause.replaces(&Request::Seek { position_ticks: 1 }));
     }
 
+    /// A mode of a newer server does not cost the queue update it is in,
+    /// and the modes go to the server by their names.
+    #[test]
+    fn modes_are_read_by_name_and_an_unknown_one_keeps_the_queue() {
+        let queue = |repeat: &str, shuffle: &str| -> PlayQueue {
+            serde_json::from_value(json!({
+                "Reason": "RepeatMode", "LastUpdate": "2026-10-03T14:00:01Z",
+                "Playlist": [], "RepeatMode": repeat, "ShuffleMode": shuffle,
+            }))
+            .unwrap()
+        };
+        let read = queue("RepeatOne", "Shuffle");
+        assert_eq!((read.repeat_mode, read.shuffle_mode), (RepeatMode::RepeatOne, ShuffleMode::Shuffle));
+        let unknown = queue("RepeatBackwards", "Random");
+        assert_eq!((unknown.repeat_mode, unknown.shuffle_mode), (RepeatMode::RepeatNone, ShuffleMode::Sorted));
+        assert_eq!(Request::SetRepeatMode(RepeatMode::RepeatAll).body().unwrap(), json!({ "Mode": "RepeatAll" }));
+        assert_eq!(Request::SetShuffleMode(ShuffleMode::Shuffle).body().unwrap(), json!({ "Mode": "Shuffle" }));
+        assert_eq!(RepeatMode::parse("RepeatOne"), Some(RepeatMode::RepeatOne));
+        assert_eq!(ShuffleMode::parse("sorted"), None);
+        assert_eq!(RepeatMode::RepeatOne.next(), RepeatMode::RepeatNone);
+        // A request of the user has a text for the notice of its failure;
+        // one the member repeats by itself has none.
+        assert!(Request::Join { group_id: "g".into() }.asked().is_some());
+        assert!(Request::Pause.asked().is_none());
+    }
+
     #[test]
     fn ids_compare_with_and_without_hyphens() {
         assert!(same_id(
@@ -460,5 +582,7 @@ mod tests {
             "0a1b2c3d4e5f60718293a4b5c6d7e8f9"
         ));
         assert!(!same_id("a", "b"));
+        assert!(!same_id("abc", "ab"));
+        assert!(same_id("", "--"));
     }
 }

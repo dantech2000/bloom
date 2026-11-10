@@ -25,6 +25,14 @@ use core_video::pixel_buffer::{
 /// oldest, so the two never touch the same surface.
 const POOL_SIZE: usize = 4;
 
+/// A bar is black; a compressed one has some noise.
+const DARK: u8 = 24;
+
+/// A BGRA pixel that is not of a black bar.
+fn bright(pixel: &[u8]) -> bool {
+    pixel[..3].iter().any(|c| *c > DARK)
+}
+
 /// One video frame on the GPU. Cheap to clone (a retain).
 #[derive(Clone)]
 pub struct VideoFrame(CVPixelBuffer);
@@ -66,6 +74,8 @@ pub struct GlRenderer {
     size: (u32, u32),
     pool: Vec<Target>,
     next: usize,
+    /// Frames finished at this size (see `colours`).
+    finished: u32,
 }
 
 impl GlRenderer {
@@ -119,6 +129,7 @@ impl GlRenderer {
             size: (0, 0),
             pool: Vec::new(),
             next: 0,
+            finished: 0,
         })
     }
 
@@ -135,80 +146,56 @@ impl GlRenderer {
     /// count when the two edges agree (a letterbox is the same at both), and
     /// `None` for a frame that is black as a whole or dark at one edge only.
     pub fn black_bars(&mut self) -> Option<u32> {
-        // A bar is black; a compressed one has some noise.
-        const DARK: u8 = 24;
-        let (width, height) = self.size;
-        let mut bars = [height; 2];
-        let mut column = vec![0u8; height as usize * 4];
-        unsafe { gl::glBindFramebuffer(gl::FRAMEBUFFER, self.pool[self.next].fbo) };
-        for part in [0.2, 0.35, 0.5, 0.65, 0.8] {
-            let x = (width as f32 * part) as i32;
-            unsafe {
-                gl::glReadPixels(
-                    x,
-                    0,
-                    1,
-                    height as i32,
-                    gl::BGRA,
-                    gl::UNSIGNED_BYTE,
-                    column.as_mut_ptr().cast(),
-                );
-            }
-            let bright = |pixel: &[u8]| pixel[..3].iter().any(|c| *c > DARK);
-            let pixels = column.chunks_exact(4);
-            let first = pixels.clone().position(bright).unwrap_or(height as usize);
-            let last = pixels.rev().position(bright).unwrap_or(height as usize);
-            bars[0] = bars[0].min(first as u32);
-            bars[1] = bars[1].min(last as u32);
-        }
-        let agree = bars[0].abs_diff(bars[1]) <= (height / 100).max(2);
-        (bars[0] < height / 2 && agree).then(|| bars[0].min(bars[1]))
+        self.black_edges(true)
     }
 
     /// The same count for the left and right edges, in a few rows of the
     /// picture: the bars of a narrow film in a 16:9 video.
     pub fn black_sides(&mut self) -> Option<u32> {
-        const DARK: u8 = 24;
+        self.black_edges(false)
+    }
+
+    /// The black at the two ends of a few lines through the picture:
+    /// columns for the bars at the top and bottom, rows for those at the
+    /// sides.
+    fn black_edges(&mut self, columns: bool) -> Option<u32> {
         let (width, height) = self.size;
-        let mut bars = [width; 2];
-        let mut row = vec![0u8; width as usize * 4];
+        // A line is `along` pixels long; the lines are spread `across`.
+        let (along, across) = if columns { (height, width) } else { (width, height) };
+        let mut bars = [along; 2];
+        let mut line = vec![0u8; along as usize * 4];
         unsafe { gl::glBindFramebuffer(gl::FRAMEBUFFER, self.pool[self.next].fbo) };
         for part in [0.2, 0.35, 0.5, 0.65, 0.8] {
-            let y = (height as f32 * part) as i32;
+            let at = (across as f32 * part) as i32;
+            let (x, y, w, h) = if columns { (at, 0, 1, along as i32) } else { (0, at, along as i32, 1) };
             unsafe {
-                gl::glReadPixels(
-                    0,
-                    y,
-                    width as i32,
-                    1,
-                    gl::BGRA,
-                    gl::UNSIGNED_BYTE,
-                    row.as_mut_ptr().cast(),
-                );
+                gl::glReadPixels(x, y, w, h, gl::BGRA, gl::UNSIGNED_BYTE, line.as_mut_ptr().cast());
             }
-            let bright = |pixel: &[u8]| pixel[..3].iter().any(|c| *c > DARK);
-            let pixels = row.chunks_exact(4);
-            let first = pixels.clone().position(bright).unwrap_or(width as usize);
-            let last = pixels.rev().position(bright).unwrap_or(width as usize);
+            let pixels = line.chunks_exact(4);
+            let first = pixels.clone().position(bright).unwrap_or(along as usize);
+            let last = pixels.rev().position(bright).unwrap_or(along as usize);
             bars[0] = bars[0].min(first as u32);
             bars[1] = bars[1].min(last as u32);
         }
-        let agree = bars[0].abs_diff(bars[1]) <= (width / 100).max(2);
-        (bars[0] < width / 2 && agree).then(|| bars[0].min(bars[1]))
+        let agree = bars[0].abs_diff(bars[1]) <= (along / 100).max(2);
+        (bars[0] < along / 2 && agree).then(|| bars[0].min(bars[1]))
     }
 
-    /// The colours of the frame mpv rendered since `begin`: the mean
-    /// colour of each of `bands` bands of the picture, in the order of the
-    /// rows of the surface. Black bars at the two edges are left out. All
-    /// black for a black frame. Reads a few columns of the frame, which
-    /// waits for the GPU: for some calls a second, not for each frame.
+    /// The colours of the picture: the mean colour of each of `bands`
+    /// bands, in the order of the rows of the surface. Black bars at the
+    /// two edges are left out. All black for a black frame. Call it after
+    /// `finish`. It reads a few columns of the frame before the one just
+    /// finished, whose GPU work is over (the newest one when it is the
+    /// first at this size); a read still waits for the GPU: for some
+    /// calls a second, not for each frame.
     pub fn colours(&mut self, bands: usize) -> Vec<[u8; 3]> {
-        const DARK: u8 = 24;
         let (width, height) = self.size;
+        let back = if self.finished >= 2 { 2 } else { 1 };
+        let target = &self.pool[(self.next + self.pool.len() - back) % self.pool.len()];
         let rows = height as usize;
         let parts = [0.08, 0.2, 0.32, 0.44, 0.56, 0.68, 0.8, 0.92];
         let mut columns = vec![0u8; rows * 4 * parts.len()];
-        unsafe { gl::glBindFramebuffer(gl::FRAMEBUFFER, self.pool[self.next].fbo) };
+        unsafe { gl::glBindFramebuffer(gl::FRAMEBUFFER, target.fbo) };
         for (column, part) in columns.chunks_exact_mut(rows * 4).zip(parts) {
             unsafe {
                 gl::glReadPixels(
@@ -222,6 +209,7 @@ impl GlRenderer {
                 );
             }
         }
+        unsafe { gl::glBindFramebuffer(gl::FRAMEBUFFER, 0) };
         band_colours(&columns, rows, bands, DARK)
     }
 
@@ -229,6 +217,7 @@ impl GlRenderer {
     pub fn finish(&mut self) -> Result<VideoFrame> {
         let target = &self.pool[self.next];
         self.next = (self.next + 1) % self.pool.len();
+        self.finished = self.finished.saturating_add(1);
         unsafe {
             gl::glBindFramebuffer(gl::FRAMEBUFFER, 0);
             // Metal reads the surface from another queue; submit the work now.
@@ -240,8 +229,14 @@ impl GlRenderer {
     fn resize(&mut self, width: u32, height: u32) -> Result<()> {
         self.release_targets();
         for _ in 0..POOL_SIZE {
-            let target = self.target(width, height)?;
-            self.pool.push(target);
+            match self.target(width, height) {
+                Ok(target) => self.pool.push(target),
+                // No pool of a part: the next frame tries again.
+                Err(err) => {
+                    self.release_targets();
+                    return Err(err);
+                }
+            }
         }
         self.size = (width, height);
         self.next = 0;
@@ -293,9 +288,16 @@ impl GlRenderer {
             );
             gl::glBindTexture(gl::TEXTURE_RECTANGLE, 0);
             if code != 0 {
+                gl::glDeleteTextures(1, &texture);
                 return Err(anyhow!("CGLTexImageIOSurface2D failed ({code})"));
             }
-            framebuffer(gl::TEXTURE_RECTANGLE, texture)?
+            match framebuffer(gl::TEXTURE_RECTANGLE, texture) {
+                Ok(fbo) => fbo,
+                Err(err) => {
+                    gl::glDeleteTextures(1, &texture);
+                    return Err(err);
+                }
+            }
         };
         Ok(Target {
             buffer,
@@ -312,6 +314,7 @@ impl GlRenderer {
             }
         }
         self.size = (0, 0);
+        self.finished = 0;
     }
 }
 
@@ -381,6 +384,7 @@ unsafe fn framebuffer(texture_target: u32, texture: u32) -> Result<u32> {
         let status = gl::glCheckFramebufferStatus(gl::FRAMEBUFFER);
         gl::glBindFramebuffer(gl::FRAMEBUFFER, 0);
         if status != gl::FRAMEBUFFER_COMPLETE {
+            gl::glDeleteFramebuffers(1, &fbo);
             return Err(anyhow!("framebuffer incomplete ({status:#x})"));
         }
     }

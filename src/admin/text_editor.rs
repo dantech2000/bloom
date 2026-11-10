@@ -47,9 +47,32 @@ const LINE_H: f32 = 20.;
 /// Height of the dialog besides the field: padding, title, message, footer.
 const CHROME_H: f32 = 176.;
 
+/// The colours of a field of many lines, from the theme. A render sets
+/// them, so a change of the theme reaches a field that is open.
+pub(crate) fn editor_style(t: &UiTheme) -> InputEditorStyle {
+    let colors = &t.colors;
+    InputEditorStyle {
+        foreground: colors.foreground.into(),
+        muted_foreground: colors.muted_foreground.into(),
+        background: colors.background.into(),
+        border: colors.input.into(),
+        selection: colors.ring.opacity(0.3).into(),
+        caret: colors.foreground.into(),
+        ..Default::default()
+    }
+}
+
 impl Bloom {
+    /// The open dialog.
+    fn text_editor(&self) -> Option<&TextEditor> {
+        match &self.page {
+            Page::Admin(admin) => admin.text_editor.as_ref(),
+            _ => None,
+        }
+    }
+
     pub fn text_editor_open(&self) -> bool {
-        matches!(&self.page, Page::Admin(admin) if admin.text_editor.is_some())
+        self.text_editor().is_some()
     }
 
     /// Opens the dialog with the text in the field and the focus in it.
@@ -84,35 +107,26 @@ impl Bloom {
 
     /// The text in the field of the dialog.
     pub fn text_editor_value(&self, cx: &gpui_kit::App) -> Option<String> {
-        let Page::Admin(admin) = &self.page else {
-            return None;
-        };
-        admin.text_editor.as_ref().map(|e| e.state.read(cx).value().to_string())
+        self.text_editor().map(|e| e.state.read(cx).value().to_string())
     }
 
     /// Puts text in the field, for the debug channel.
     pub fn text_editor_set(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Page::Admin(admin) = &self.page else {
-            return false;
-        };
-        let Some(editor) = &admin.text_editor else {
+        let Some(state) = self.text_editor().map(|e| e.state.clone()) else {
             return false;
         };
         let text = text.to_string();
-        editor.state.clone().update(cx, |state, cx| state.set_value(text, window, cx));
+        state.update(cx, |state, cx| state.set_value(text, window, cx));
         cx.notify();
         true
     }
 
     /// Scrolls the field by lines, for the debug channel.
     pub fn text_editor_scroll(&mut self, lines: f32, cx: &mut Context<Self>) -> bool {
-        let Page::Admin(admin) = &self.page else {
+        let Some(state) = self.text_editor().map(|e| e.state.clone()) else {
             return false;
         };
-        let Some(editor) = &admin.text_editor else {
-            return false;
-        };
-        editor.state.clone().update(cx, |state, cx| {
+        state.update(cx, |state, cx| {
             state.set_scroll_offset(gpui_kit::point(px(0.), px(-lines * LINE_H)), cx)
         });
         true
@@ -136,10 +150,7 @@ impl Bloom {
 
     /// The dialog over the page.
     pub(crate) fn render_text_editor(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
-        let Page::Admin(admin) = &self.page else {
-            return None;
-        };
-        let editor = admin.text_editor.as_ref()?;
+        let editor = self.text_editor()?;
         let t = UiTheme::read(cx).clone();
         let colors = t.colors;
         let width = (self.viewport_w - 96.).clamp(420., 960.);
@@ -149,17 +160,7 @@ impl Bloom {
         if editor.rows.replace(rows) != rows {
             state.update(cx, |state, cx| state.set_rows(rows, cx));
         }
-        state.update(cx, |state, _| {
-            state.set_editor_style(InputEditorStyle {
-                foreground: colors.foreground.into(),
-                muted_foreground: colors.muted_foreground.into(),
-                background: colors.background.into(),
-                border: colors.input.into(),
-                selection: colors.ring.opacity(0.3).into(),
-                caret: colors.foreground.into(),
-                ..Default::default()
-            });
-        });
+        state.update(cx, |state, _| state.set_editor_style(editor_style(&t)));
         let text = state.read(cx).value();
         let lines = text.split('\n').count();
         let counts = format!(
@@ -256,6 +257,9 @@ impl Bloom {
                 .items_center()
                 .justify_center()
                 .bg(rgba(0x00000099))
+                // The page behind takes no click meanwhile (see `backdrop`
+                // in `dialogs.rs`).
+                .occlude()
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     this.close_admin_dialog(window, cx)
                 }))

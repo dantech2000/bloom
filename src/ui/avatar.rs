@@ -16,19 +16,6 @@ pub struct Avatar {
     image: Option<ImageSource>,
     fallback: SharedString,
     aria_label: Option<SharedString>,
-    size: AvatarSize,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-/// Nova avatar dimensions.
-pub enum AvatarSize {
-    /// Compact dimensions.
-    Sm,
-    #[default]
-    /// The default Nova presentation.
-    Default,
-    /// Large dimensions.
-    Lg,
 }
 
 impl Avatar {
@@ -40,7 +27,6 @@ impl Avatar {
             image: None,
             fallback: SharedString::default(),
             aria_label: None,
-            size: AvatarSize::Default,
         }
     }
 
@@ -59,22 +45,14 @@ impl Avatar {
         self.aria_label = Some(label.into());
         self
     }
-    /// Selects the Nova control dimensions.
-    pub fn size(mut self, size: AvatarSize) -> Self {
-        self.size = size;
-        self
-    }
 }
 
 impl RenderOnce for Avatar {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let theme = UiTheme::read(cx).clone();
-        let size = match self.size {
-            AvatarSize::Sm => 24.,
-            AvatarSize::Default => 32.,
-            AvatarSize::Lg => 40.,
-        };
-        let image_size = theme.space(size / 4.);
+        let theme = UiTheme::read(cx);
+        let image_size = theme.space(8.);
+        let (muted, ink) = (theme.colors.muted, theme.colors.muted_foreground);
+        let text_size = theme.text(14.);
         let fallback = move || {
             div()
                 .size_full()
@@ -82,13 +60,9 @@ impl RenderOnce for Avatar {
                 .items_center()
                 .justify_center()
                 .rounded_full()
-                .bg(theme.colors.muted)
-                .text_color(theme.colors.muted_foreground)
-                .text_size(theme.text(if self.size == AvatarSize::Sm {
-                    12.
-                } else {
-                    14.
-                }))
+                .bg(muted)
+                .text_color(ink)
+                .text_size(text_size)
                 .child(self.fallback.clone())
                 .into_any_element()
         };

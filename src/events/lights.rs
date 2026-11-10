@@ -80,32 +80,54 @@ impl Drop for Helper {
     }
 }
 
-/// The lights a run of `bloom-lights --scan` printed, one line of JSON
-/// each. The names in it come from the lights themselves: a line that is no
-/// light is left out, a text is cut to a length a page can show, and the
-/// list ends at 32 lights.
-fn found_lines(text: &str) -> Vec<Value> {
-    let lamp = |line: &str| {
-        let value: Value = serde_json::from_str(line).ok()?;
+/// One light, as the helper names it in a look and reads it from the
+/// settings file.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct Lamp {
+    pub driver: String,
+    /// The name the light has for good; empty when it has none.
+    pub id: String,
+    pub model: String,
+    pub address: String,
+}
+
+impl Lamp {
+    /// Reads a light. The names in it come from the lights themselves: a
+    /// value that is no light gives none, and a text is cut to a length a
+    /// page can show.
+    fn read(value: &Value) -> Option<Self> {
         let part = |name: &str| value[name].as_str().map(|text| text.chars().take(64).collect::<String>());
         let (driver, address) = (part("driver").filter(|text| !text.is_empty())?, part("address").filter(|text| !text.is_empty())?);
         // The id is how a light is known again: it is kept whole, and a
         // light with an id of no sane length is left out.
         let id = value["id"].as_str().unwrap_or_default();
-        (id.len() <= 256).then(|| json!({ "driver": driver, "id": id, "model": part("model").unwrap_or_default(), "address": address }))
-    };
-    text.lines().filter_map(lamp).take(32).collect()
+        (id.len() <= 256).then(|| Self { driver, id: id.to_string(), model: part("model").unwrap_or_default(), address })
+    }
+
+    /// Whether two entries are one light: by the name it has for good, or
+    /// by its address when it has no such name.
+    fn same(&self, other: &Lamp) -> bool {
+        self.driver == other.driver
+            && if !self.id.is_empty() && !other.id.is_empty() { self.id == other.id } else { self.address == other.address }
+    }
 }
 
-/// Whether two entries are one light: by the name it has for good, or by
-/// its address when it has no such name.
-fn same_lamp(a: &Value, b: &Value) -> bool {
-    let id = |lamp: &Value| lamp["id"].as_str().filter(|id| !id.is_empty()).map(str::to_string);
-    a["driver"] == b["driver"]
-        && match (id(a), id(b)) {
-            (Some(a), Some(b)) => a == b,
-            _ => a["address"] == b["address"],
-        }
+/// A light as one line of JSON, as the settings file has it.
+impl std::fmt::Display for Lamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", json!(self))
+    }
+}
+
+/// The most lights a list holds.
+const MOST_LAMPS: usize = 32;
+
+/// The lights a run of `bloom-lights --scan` printed, one line of JSON
+/// each. A line that is no light is left out, and the list ends at
+/// `MOST_LAMPS` lights.
+fn found_lines(text: &str) -> Vec<Lamp> {
+    let lamp = |line: &str| Lamp::read(&serde_json::from_str(line).ok()?);
+    text.lines().filter_map(lamp).take(MOST_LAMPS).collect()
 }
 
 /// The settings file of the helper, next to the socket: `lights.json`, or
@@ -147,9 +169,9 @@ pub struct Lights {
     /// The helper, while the lights are on.
     helper: Option<Helper>,
     /// The lights Bloom may use, as the helper reads them.
-    lamps: Vec<Value>,
+    lamps: Vec<Lamp>,
     /// The lights the last look on the network found.
-    found: Vec<Value>,
+    found: Vec<Lamp>,
     /// A look on the network runs.
     pub(super) scanning: bool,
 }
@@ -174,7 +196,7 @@ impl Bloom {
         }
         let mut film = Snapshot {
             active: true,
-            item: Some(ItemInfo { id: "test".into(), kind: "Movie".into(), name: "Test film".into(), ..ItemInfo::default() }),
+            item: Some(std::sync::Arc::new(ItemInfo { id: "test".into(), kind: "Movie".into(), name: "Test film".into(), ..ItemInfo::default() })),
             duration: 5400.,
             rate: 1.,
             fullscreen: true,
@@ -247,13 +269,32 @@ impl Bloom {
             },
             write: None,
             helper: None,
-            lamps: file["lamps"].as_array().map(|lamps| found_lines(&lamps.iter().map(|lamp| format!("{lamp}\n")).collect::<String>())).unwrap_or_default(),
+            lamps: file["lamps"]
+                .as_array()
+                .map(|lamps| lamps.iter().filter_map(Lamp::read).take(MOST_LAMPS).collect())
+                .unwrap_or_default(),
             found: Vec::new(),
             scanning: false,
         });
-        if self.config.lights == Some(true) && hub().on() && crate::options::options().test_name.is_none() {
-            self.lights_helper(true);
+        self.lights_resume(cx);
+    }
+
+    /// Starts the helper again when the user had the lights on and the
+    /// events are there for it: at the start of the app, and when the
+    /// events come back. A test instance starts none by itself. A helper
+    /// that does not start is told, not passed over.
+    pub(super) fn lights_resume(&mut self, cx: &mut Context<Self>) {
+        if self.config.lights != Some(true) || !hub().on() || crate::options::options().test_name.is_some() {
+            return;
         }
+        if let Some(err) = self.lights_helper(true) {
+            self.lights_failed(&err, cx);
+        }
+    }
+
+    fn lights_failed(&self, err: &str, cx: &mut Context<Self>) {
+        log::warn!("lights: the helper did not start: {err}");
+        self.toast("Lights", format!("The lights helper did not start: {err}"), cx);
     }
 
     /// Whether the helper runs.
@@ -310,8 +351,7 @@ impl Bloom {
         // The helper reads the file at its start.
         self.lights_write(cx);
         if let Some(err) = self.lights_helper(on) {
-            log::warn!("lights: the helper did not start: {err}");
-            self.toast("Lights", format!("The lights helper did not start: {err}"), cx);
+            self.lights_failed(&err, cx);
         }
         self.config.lights = Some(self.lights_on());
         self.save_config(cx);
@@ -354,21 +394,21 @@ impl Bloom {
 
     /// The lights of the page: the chosen ones first, then the ones the
     /// last look found, each with whether it is chosen.
-    pub fn lights_rows(&self) -> Vec<(Value, bool)> {
+    pub fn lights_rows(&self) -> Vec<(Lamp, bool)> {
         let Some(lights) = &self.events.lights else { return Vec::new() };
-        let more = lights.found.iter().filter(|found| !lights.lamps.iter().any(|lamp| same_lamp(lamp, found)));
+        let more = lights.found.iter().filter(|found| !lights.lamps.iter().any(|lamp| lamp.same(found)));
         lights.lamps.iter().map(|lamp| (lamp.clone(), true)).chain(more.map(|lamp| (lamp.clone(), false))).collect()
     }
 
     /// Takes a light into the ones Bloom may use, or out of them. The
     /// helper reads the file at its next event.
-    pub fn lights_choose(&mut self, lamp: &Value, cx: &mut Context<Self>) {
+    pub fn lights_choose(&mut self, lamp: &Lamp, cx: &mut Context<Self>) {
         let Some(lights) = &mut self.events.lights else { return };
-        match lights.lamps.iter().position(|chosen| same_lamp(chosen, lamp)) {
+        match lights.lamps.iter().position(|chosen| chosen.same(lamp)) {
             Some(at) => {
                 // It stays in the list of the page, to be chosen again.
                 let left = lights.lamps.remove(at);
-                if !lights.found.iter().any(|found| same_lamp(found, &left)) {
+                if !lights.found.iter().any(|found| found.same(&left)) {
                     lights.found.push(left);
                 }
             }
@@ -378,16 +418,16 @@ impl Bloom {
     }
 
     /// Makes a light blink, to see which one it is.
-    pub fn lights_identify(&mut self, lamp: &Value, cx: &mut Context<Self>) {
+    pub fn lights_identify(&mut self, lamp: &Lamp, cx: &mut Context<Self>) {
         // The blink sets the brightness of the light, and puts back what
         // the light has now: next to a film that would fight the helper.
         if self.events.last.active {
             return self.toast("Lights", "A light can blink when no film plays.", cx);
         }
-        let (Some(path), Some(driver), Some(address)) = (helper_path(), lamp["driver"].as_str(), lamp["address"].as_str()) else {
+        let Some(path) = helper_path() else {
             return self.toast("Lights", "This build has no lights helper.", cx);
         };
-        match Command::new(path).args(["--identify", driver, address]).stdin(Stdio::null()).stdout(Stdio::null()).spawn() {
+        match Command::new(path).args(["--identify", &lamp.driver, &lamp.address]).stdin(Stdio::null()).stdout(Stdio::null()).spawn() {
             // Waited for, so no ended process stays behind.
             Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
             Err(err) => self.toast("Lights", format!("The light could not be told to blink: {err}"), cx),
@@ -520,20 +560,27 @@ mod tests {
         );
         let found = found_lines(&text);
         assert_eq!(found.len(), 2);
-        assert_eq!(found[0]["model"].as_str().unwrap().len(), 64);
+        assert_eq!(found[0].model.len(), 64);
         // The id is kept whole (a light is known again by it), and a line
         // with an id of no sane length is no light.
         let ids = format!("{}\n{}\n", json!({ "driver": "govee", "id": "y".repeat(200), "address": "1.1.1.1" }), json!({ "driver": "govee", "id": "y".repeat(300), "address": "1.1.1.2" }));
         let kept = found_lines(&ids);
-        assert_eq!((kept.len(), kept[0]["id"].as_str().unwrap().len()), (1, 200));
-        assert_eq!(found[0].as_object().unwrap().len(), 4, "a field of the line that is none of a light is kept");
-        assert_eq!(found[1], json!({ "driver": "govee", "id": "", "model": "", "address": "10.0.0.6" }));
+        assert_eq!((kept.len(), kept[0].id.len()), (1, 200));
+        // A field of the line that is none of a light is not kept, and
+        // the settings file gets the four of a light.
+        assert_eq!(json!(found[0]).as_object().unwrap().len(), 4);
+        assert_eq!(json!(found[1]), json!({ "driver": "govee", "id": "", "model": "", "address": "10.0.0.6" }));
+        assert_eq!(found[1].to_string(), json!(found[1]).to_string());
         let many: String = (0..100).map(|n| format!("{}\n", json!({ "driver": "govee", "address": format!("10.0.0.{n}") }))).collect();
         assert_eq!(found_lines(&many).len(), 32);
-        let moved = json!({ "driver": "govee", "id": "AA:BB", "address": "10.0.0.99" });
-        assert!(same_lamp(&found[0], &moved), "a light at a new address is another light");
-        assert!(!same_lamp(&found[0], &found[1]));
-        assert!(same_lamp(&found[1], &json!({ "driver": "govee", "id": "", "address": "10.0.0.6" })));
-        assert!(!same_lamp(&found[1], &json!({ "driver": "hue", "id": "", "address": "10.0.0.6" })));
+        let lamp = |value: Value| Lamp::read(&value).unwrap();
+        let moved = lamp(json!({ "driver": "govee", "id": "AA:BB", "address": "10.0.0.99" }));
+        assert!(found[0].same(&moved), "a light at a new address is another light");
+        assert!(!found[0].same(&found[1]));
+        assert!(found[1].same(&lamp(json!({ "driver": "govee", "id": "", "address": "10.0.0.6" }))));
+        assert!(!found[1].same(&lamp(json!({ "driver": "hue", "id": "", "address": "10.0.0.6" }))));
+        // The lights of the settings file are read as a look is.
+        assert_eq!(Lamp::read(&json!(found[0])).as_ref(), Some(&found[0]));
+        assert_eq!(Lamp::read(&json!([1])), None);
     }
 }

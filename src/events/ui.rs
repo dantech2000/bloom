@@ -4,7 +4,7 @@
 use gpui_kit::{Context, Entity};
 
 use super::{FilmColour, colours::hue_colour, hub, lights_path, socket_path};
-use crate::{app::Bloom, ui::slider::SliderState};
+use crate::{app::Bloom, brand::THIS_DEVICE, ui::slider::SliderState};
 
 impl Bloom {
     /// The Automation page of the settings: the switch of the stream, what
@@ -23,9 +23,9 @@ impl Bloom {
         let mut events = group("Events for other programs", cx).child(field(
             "Send events (experimental)",
             if on {
-                "On. A program on this Mac can read what the player does, as it happens. It cannot control the app."
+                format!("On. A program on {THIS_DEVICE} can read what the player does, as it happens. It cannot control the app.")
             } else {
-                "Off. When on, a program on this Mac can read what the player does, as it happens: for lights that dim at the start of a film, a status, a notice. It cannot control the app."
+                format!("Off. When on, a program on {THIS_DEVICE} can read what the player does, as it happens: for lights that dim at the start of a film, a status, a notice. It cannot control the app.")
             },
             checkbox("automation.events", on, cx)
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_events(!on, cx))),
@@ -113,9 +113,9 @@ impl Bloom {
         lights = lights.child(field(
             "Find lights",
             if panel.scanning {
-                "Looks on your network for two seconds."
+                "Looks on your network for two seconds.".to_string()
             } else {
-                "Looks on your network for lights that answer. A light that is missing: is \"LAN Control\" on for it in the Govee Home app, and is it on the same network as this Mac?"
+                format!("Looks on your network for lights that answer. A light that is missing: is \"LAN Control\" on for it in the Govee Home app, and is it on the same network as {THIS_DEVICE}?")
             },
             raised("automation.find", if panel.scanning { "Looking" } else { "Find" }, cx)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.lights_scan(cx))),
@@ -126,13 +126,12 @@ impl Bloom {
             lights = lights.child(field("No light is chosen", "Find the lights, then tick the ones Bloom may use.", div(), cx));
         }
         for (at, (lamp, chosen)) in rows.into_iter().enumerate() {
-            let text = |name: &str| lamp[name].as_str().unwrap_or_default().to_string();
-            let name = match (text("driver").as_str(), text("model")) {
-                ("govee", model) if model.is_empty() => "Govee light".to_string(),
+            let name = match (lamp.driver.as_str(), lamp.model.as_str()) {
+                ("govee", "") => "Govee light".to_string(),
                 ("govee", model) => format!("Govee {model}"),
                 (driver, model) => format!("{driver} {model}"),
             };
-            let detail = [text("id"), text("address")].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" \u{b7} ");
+            let detail = [lamp.id.as_str(), lamp.address.as_str()].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" \u{b7} ");
             let (identify, choose) = (lamp.clone(), lamp.clone());
             lights = lights.child(field(
                 name,
