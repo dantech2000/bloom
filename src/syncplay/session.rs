@@ -167,6 +167,7 @@ impl Session {
                         token: self.next_load,
                         audio: None,
                         subtitle: None,
+                        burn_in: false,
                     },
                 );
                 ui.push(Ui::NowPlaying { item_id });

@@ -20,7 +20,7 @@ use serde::Deserialize;
 use crate::{
     app::Bloom,
     jellyfin::{Client, Item, TICKS_PER_SECOND},
-    player::{PlayRequest, PlayState, Player, SubtitleFile},
+    player::{PlayRequest, PlayState, Player, PlayerStatus, SubtitleFile},
     ui::{glass::glass, menu::MenuItem},
 };
 
@@ -113,6 +113,9 @@ pub struct State {
     pub wanted_audio: Option<usize>,
     /// The same for the subtitle; `Some(None)` is none.
     pub wanted_subtitle: Option<Option<usize>>,
+    /// Subtitle files of the item that did not come (server indexes): a
+    /// choice of one of them burns it in at once.
+    pub failed_files: Vec<i64>,
 }
 
 /// Takes the settings of the config and ends a transcode when the app
@@ -224,6 +227,9 @@ pub struct Stream {
     pub display_title: Option<String>,
     #[serde(default)]
     pub is_external: bool,
+    /// A subtitle of text (SubRip, ASS, VTT); false for an image track.
+    #[serde(default)]
+    pub is_text_subtitle_stream: bool,
     /// How a subtitle gets to the player: "Embed" (in the stream),
     /// "External" (a file at `delivery_url`), "Encode" (burned in).
     #[serde(default)]
@@ -263,6 +269,8 @@ pub struct ExternalSub {
     pub url: String,
     pub title: String,
     pub language: String,
+    /// An image track (PGS, VobSub), fetched when chosen.
+    pub graphical: bool,
 }
 
 /// The decision of the server for one load.
@@ -288,6 +296,8 @@ pub struct Resolved {
     pub external_subs: Vec<ExternalSub>,
     /// The external subtitle that starts selected, by server index.
     pub selected_external: Option<i64>,
+    /// The load asked for the subtitle burned in (see `Load::burn_in`).
+    pub burn_in: bool,
 }
 
 impl Resolved {
@@ -312,34 +322,44 @@ impl Resolved {
             .map(|s| s.index)
     }
 
-    /// The server index of the subtitle mpv shows as its track `sid`: the
-    /// ones in the file come first, then the ones added from files.
-    pub fn subtitle_of(&self, sid: i64) -> Option<i64> {
-        let embedded = if self.play_method == PlayMethod::Transcode {
-            Vec::new()
-        } else {
-            self.embedded("Subtitle")
-        };
-        let place = (sid - 1).max(0) as usize;
-        if let Some(stream) = embedded.get(place) {
-            return Some(stream.index);
+    /// The server index of the subtitle mpv shows as its track `sid`: a
+    /// file added to the item, by the map the worker keeps of them
+    /// (`PlayerStatus::external_sids`), else one in the file by its place
+    /// (a transcode carries none).
+    pub fn subtitle_of(&self, sid: i64, status: &PlayerStatus) -> Option<i64> {
+        if let Some((index, _)) = status.external_sids.iter().find(|(_, id)| *id == sid) {
+            return Some(*index);
         }
-        self.external_subs
-            .get(place - embedded.len())
+        if self.play_method == PlayMethod::Transcode {
+            return None;
+        }
+        self.embedded("Subtitle")
+            .get((sid - 1).max(0) as usize)
             .map(|s| s.index)
     }
 
-    /// The id mpv gives an external subtitle, by server index.
-    pub fn sid_of_external(&self, index: i64) -> Option<i64> {
-        let embedded = if self.play_method == PlayMethod::Transcode {
-            0
-        } else {
-            self.embedded("Subtitle").len()
-        };
-        self.external_subs
+    /// The id mpv gave an external subtitle, by server index; none for a
+    /// file that is not added yet (on its way, chosen later, or lost).
+    pub fn sid_of_external(&self, index: i64, status: &PlayerStatus) -> Option<i64> {
+        status
+            .external_sids
             .iter()
-            .position(|s| s.index == index)
-            .map(|place| (embedded + place) as i64 + 1)
+            .find(|(i, _)| *i == index)
+            .map(|(_, sid)| *sid)
+    }
+
+    /// The file of an external subtitle, by server index, as the player
+    /// fetches one; it starts shown.
+    pub fn external_file(&self, index: i64) -> Option<SubtitleFile> {
+        let sub = self.external_subs.iter().find(|s| s.index == index)?;
+        Some(SubtitleFile {
+            index: sub.index,
+            url: sub.url.clone(),
+            title: sub.title.clone(),
+            lang: sub.language.clone(),
+            select: true,
+            graphical: sub.graphical,
+        })
     }
 }
 
@@ -360,6 +380,9 @@ pub struct Load {
     /// Server index of the subtitle; -1 for none; `None` leaves it to the
     /// server.
     pub subtitle: Option<i64>,
+    /// The subtitle is burned into the transcode, whatever the profile
+    /// says: after its file did not come (`subtitle_file_failed`).
+    pub burn_in: bool,
 }
 
 /// The limit sent for "Auto": above every file. The server still applies
@@ -375,10 +398,18 @@ const NO_LIMIT: u64 = 1_000_000_000;
 /// 12.1.0: a Dolby Vision file (The Agency, 4K at 25.8 Mbps over a 25 Mbps
 /// limit) came as HEVC instead of H.264, but still tone mapped to SDR
 /// (bt.709) with the HDR ranges declared below; the server tone maps a
-/// Dolby Vision source whatever the client says. Text subtitles can come
-/// as files; the server burns in the rest.
+/// Dolby Vision source whatever the client says. Text subtitles come as
+/// files, and so do PGS and VobSub tracks (`GRAPHICAL`): the server
+/// extracts an embedded one to a `.sup` or an `.mks` and serves the file,
+/// which mpv takes on the side, so an image track on a transcode is not
+/// burned in and a switch of it does not load the item again. The server
+/// burns in the rest (DVB, teletext, an external `.idx/.sub` pair).
 pub fn device_profile(max_bitrate: Option<u64>) -> serde_json::Value {
     const TEXT: [&str; 4] = ["srt", "ass", "ssa", "vtt"];
+    // The server names the two image formats so; "vobsub" needs the
+    // container, since ffmpeg cannot write an `.idx/.sub` pair (the
+    // web client's profile has the same two entries).
+    const GRAPHICAL: [(&str, Option<&str>); 2] = [("pgssub", None), ("vobsub", Some("mks"))];
     const EMBEDDED: [&str; 24] = [
         "srt", "subrip", "ass", "ssa", "vtt", "webvtt", "mov_text", "text", "ttml", "sami",
         "microdvd", "subviewer", "eia_608", "dvb_teletext", "pgssub", "pgs",
@@ -393,6 +424,13 @@ pub fn device_profile(max_bitrate: Option<u64>) -> serde_json::Value {
         TEXT.iter()
             .map(|format| serde_json::json!({ "Format": format, "Method": "External" })),
     );
+    subtitles.extend(GRAPHICAL.iter().map(|(format, container)| {
+        let mut entry = serde_json::json!({ "Format": format, "Method": "External" });
+        if let Some(container) = container {
+            entry["Container"] = serde_json::Value::from(*container);
+        }
+        entry
+    }));
     let mut profile = serde_json::json!({
         "Name": crate::config::APP_NAME,
         "MaxStaticBitrate": 120_000_000u64,
@@ -461,7 +499,7 @@ fn request_body(client: &Client, load: &Load, max_bitrate: Option<u64>) -> serde
         "AllowVideoStreamCopy": true,
         "AllowAudioStreamCopy": true,
         "AutoOpenLiveStream": true,
-        "AlwaysBurnInSubtitleWhenTranscoding": false,
+        "AlwaysBurnInSubtitleWhenTranscoding": load.burn_in,
     });
     body["MaxStreamingBitrate"] = serde_json::Value::from(max_bitrate.unwrap_or(NO_LIMIT));
     if let Some(audio) = load.audio {
@@ -616,6 +654,7 @@ pub fn resolve(
                 url: format!("{}{}", client.base, without_key(url)),
                 title: s.title(),
                 language: s.language.clone().unwrap_or_default(),
+                graphical: !s.is_text_subtitle_stream,
             })
         })
         .collect();
@@ -635,6 +674,7 @@ pub fn resolve(
         burned_subtitle,
         external_subs,
         selected_external,
+        burn_in: false,
     })
 }
 
@@ -663,7 +703,19 @@ pub fn negotiate(client: &Client, load: &Load) -> Result<Resolved> {
             info = client.playback_info(load, max_bitrate)?;
         }
     }
-    let resolved = resolve(client, &load.item_id, &info, load.subtitle)?;
+    let finish = |mut resolved: Resolved| {
+        resolved.burn_in = load.burn_in;
+        // The track the server burns in on request is not wanted as a
+        // file as well (the server still names it as one).
+        if load.burn_in && let Some(burned) = resolved.burned_subtitle {
+            resolved.external_subs.retain(|s| s.index != burned);
+            if resolved.selected_external == Some(burned) {
+                resolved.selected_external = None;
+            }
+        }
+        resolved
+    };
+    let resolved = finish(resolve(client, &load.item_id, &info, load.subtitle)?);
     if resolved.play_method != PlayMethod::Transcode || load.audio.is_some() {
         return Ok(resolved);
     }
@@ -679,7 +731,7 @@ pub fn negotiate(client: &Client, load: &Load) -> Result<Resolved> {
         Some(index) if Some(index) != resolved.audio_index => {
             let again = Load { audio: Some(index), ..load.clone() };
             let info = client.playback_info(&again, max_bitrate)?;
-            resolve(client, &load.item_id, &info, load.subtitle)
+            resolve(client, &load.item_id, &info, load.subtitle).map(finish)
         }
         _ => Ok(resolved),
     }
@@ -743,10 +795,12 @@ pub fn start(player: &Player, client: Client, load: Load) {
                     .external_subs
                     .iter()
                     .map(|sub| SubtitleFile {
+                        index: sub.index,
                         url: sub.url.clone(),
                         title: sub.title.clone(),
                         lang: sub.language.clone(),
                         select: resolved.selected_external == Some(sub.index),
+                        graphical: sub.graphical,
                     })
                     .collect();
                 let request = PlayRequest {
@@ -812,6 +866,7 @@ impl Bloom {
             Some(place) => item.streams("Subtitle").get(place).map_or(-1, |s| s.index),
             None => -1,
         });
+        self.stream.failed_files.clear();
         start(
             &self.player,
             session.client.clone(),
@@ -823,6 +878,7 @@ impl Bloom {
                 token: 0,
                 audio,
                 subtitle,
+                burn_in: false,
             },
         );
     }
@@ -832,6 +888,25 @@ impl Bloom {
     /// `audio` and `subtitle` are server indexes that replace the ones
     /// that play.
     pub fn stream_reload(&mut self, audio: Option<i64>, subtitle: Option<i64>) {
+        self.stream_reload_with(audio, subtitle, false);
+    }
+
+    /// A subtitle file the user chose did not come (a server before 12.2
+    /// cannot serve a VobSub as a file): the item loads again with the
+    /// track burned in, once.
+    pub fn subtitle_file_failed(&mut self, index: i64) {
+        let Some(resolved) = current() else { return };
+        if resolved.burn_in || !resolved.external_subs.iter().any(|s| s.index == index) {
+            return;
+        }
+        log::info!("subtitle {index} did not come as a file: burned in instead");
+        if !self.stream.failed_files.contains(&index) {
+            self.stream.failed_files.push(index);
+        }
+        self.stream_reload_with(None, Some(index), true);
+    }
+
+    fn stream_reload_with(&mut self, audio: Option<i64>, subtitle: Option<i64>, burn_in: bool) {
         let (Some(item), Some(resolved), Some(session)) =
             (self.playing.as_ref(), current(), self.session.as_ref())
         else {
@@ -848,7 +923,7 @@ impl Bloom {
         });
         let subtitle = subtitle.or_else(|| {
             resolved.burned_subtitle.or_else(|| {
-                Some(selected("sub").and_then(|t| resolved.subtitle_of(t.id)).unwrap_or(-1))
+                Some(selected("sub").and_then(|t| resolved.subtitle_of(t.id, status)).unwrap_or(-1))
             })
         });
         start(
@@ -862,6 +937,7 @@ impl Bloom {
                 token: 0,
                 audio,
                 subtitle,
+                burn_in,
             },
         );
     }
@@ -957,12 +1033,12 @@ impl Bloom {
                 );
             }
         } else {
-            let shown = self
-                .player_status
+            let status = &self.player_status;
+            let shown = status
                 .tracks
                 .iter()
                 .find(|t| t.kind == "sub" && t.selected)
-                .and_then(|t| resolved.subtitle_of(t.id))
+                .and_then(|t| resolved.subtitle_of(t.id, status))
                 .or(resolved.burned_subtitle);
             let handle = this.clone();
             items.push(
@@ -976,10 +1052,16 @@ impl Bloom {
             );
             for stream in resolved.streams.iter().filter(|s| s.kind == "Subtitle") {
                 let (index, handle) = (stream.index, this.clone());
-                let burned = resolved.sid_of_external(index).is_none();
+                // A track with no file is burned in by the server; a file
+                // on its way says so (an image track comes when chosen).
+                let detail = match resolved.external_subs.iter().any(|s| s.index == index) {
+                    false => "Burned in",
+                    true if status.pending_subs.contains(&index) && resolved.sid_of_external(index, status).is_none() => "Loading…",
+                    true => "",
+                };
                 items.push(
                     MenuItem::new(SharedString::from(format!("track.sub.{index}")), stream.title())
-                        .detail(if burned { "Burned in" } else { "" })
+                        .detail(detail)
                         .radio(shown == Some(index))
                         .on_click(move |_, _, cx| {
                             handle.update(cx, |t, _| t.stream_subtitle(index)).ok();
@@ -999,9 +1081,11 @@ impl Bloom {
         Some(items)
     }
 
-    /// Shows a subtitle (server index; -1 for none) while a transcode
-    /// plays: a text subtitle switches in mpv, any other one is burned in
-    /// by the server, so the item loads again.
+    /// Shows a subtitle by server index (-1 for none): a subtitle the
+    /// server gives as a file switches in mpv (an image track is fetched
+    /// first, when it is chosen), one in the file of a direct play is
+    /// mpv's own track, and any other one is burned in by the server, so
+    /// the item loads again.
     pub fn stream_subtitle(&mut self, index: i64) {
         let Some(resolved) = current() else { return };
         let burned = resolved.burned_subtitle.is_some();
@@ -1013,10 +1097,30 @@ impl Bloom {
             }
             return;
         }
-        match resolved.sid_of_external(index) {
-            Some(sid) if !burned => self.player.set_subtitle(Some(sid)),
-            _ => self.stream_reload(None, Some(index)),
+        if self.stream.failed_files.contains(&index) {
+            self.stream_reload_with(None, Some(index), true);
+            return;
         }
+        let status = self.player.status();
+        if !burned {
+            if let Some(sid) = resolved.sid_of_external(index, &status) {
+                self.player.set_subtitle(Some(sid));
+                return;
+            }
+            // A file not added yet: an image track, or a text one the
+            // server did not give at the start. mpv shows it when it comes.
+            if let Some(file) = resolved.external_file(index) {
+                self.player.fetch_subtitle_file(file);
+                return;
+            }
+        }
+        if resolved.play_method != PlayMethod::Transcode
+            && let Some(place) = resolved.embedded("Subtitle").iter().position(|s| s.index == index)
+        {
+            self.player.set_subtitle(Some(place as i64 + 1));
+            return;
+        }
+        self.stream_reload(None, Some(index));
     }
 
     /// The card of the "Playback info" overlay: how the item plays.
@@ -1215,11 +1319,15 @@ mod tests {
         assert_eq!(hdr["Codec"], "hevc");
         assert_eq!(hdr["Conditions"][0]["Property"], "VideoRangeType");
         assert!(hdr["Conditions"][0]["Value"].as_str().unwrap().contains("DOVIWithHDR10Plus"));
-        assert!(profile["SubtitleProfiles"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|p| p["Format"] == "pgssub" && p["Method"] == "Embed"));
+        let subtitles = profile["SubtitleProfiles"].as_array().unwrap();
+        let has = |format: &str, method: &str| subtitles.iter().any(|p| p["Format"] == format && p["Method"] == method);
+        assert!(has("pgssub", "Embed"));
+        // An image track comes as a file too: PGS as it is, VobSub in an
+        // `.mks` (the container is the server's condition for that).
+        assert!(has("pgssub", "External"));
+        let vobsub = subtitles.iter().find(|p| p["Format"] == "vobsub" && p["Method"] == "External").unwrap();
+        assert_eq!(vobsub["Container"], "mks");
+        assert!(has("srt", "External"));
         assert_eq!(device_profile(None)["MaxStreamingBitrate"], NO_LIMIT);
         let load = Load {
             item_id: ITEM.into(),
@@ -1227,6 +1335,7 @@ mod tests {
             start_secs: 90.,
             paused: false,
             token: 0,
+            burn_in: false,
             audio: Some(1),
             subtitle: None,
         };
@@ -1254,7 +1363,7 @@ mod tests {
         assert!(resolved.external_subs.is_empty());
         // mpv's first audio track is stream 1; its first subtitle is stream 2.
         assert_eq!(resolved.audio_of(1), Some(1));
-        assert_eq!(resolved.subtitle_of(1), Some(2));
+        assert_eq!(resolved.subtitle_of(1, &PlayerStatus::default()), Some(2));
     }
 
     #[test]
@@ -1279,11 +1388,52 @@ mod tests {
         assert!(resolved.external_subs[0].url.starts_with("https://media.example.com/Videos/"));
         assert!(!resolved.external_subs[0].url.contains("ApiKey="), "the key stays out of the address");
         assert_eq!(resolved.selected_external, Some(2));
-        assert_eq!(resolved.sid_of_external(2), Some(1));
-        assert_eq!(resolved.subtitle_of(1), Some(2));
+        assert!(!resolved.external_subs[0].graphical);
+        // The file is not added yet; once the worker has, its id maps.
+        let mut status = PlayerStatus::default();
+        assert_eq!(resolved.sid_of_external(2, &status), None);
+        status.external_sids.push((2, 1));
+        assert_eq!(resolved.sid_of_external(2, &status), Some(1));
+        assert_eq!(resolved.subtitle_of(1, &status), Some(2));
+        assert_eq!(resolved.subtitle_of(2, &status), None);
         // The user chose no subtitle.
         let none = resolve(&client(), ITEM, &info, Some(-1)).unwrap();
         assert_eq!(none.selected_external, None);
+    }
+
+    /// An image track the server hands over as a file (a PGS marked
+    /// External, as the profile asks) is a file mpv adds, not a burn-in:
+    /// the address is the server's, without the key, and the transcode
+    /// carries no subtitle.
+    #[test]
+    fn transcode_takes_a_pgs_track_as_a_file() {
+        let mut json: serde_json::Value = serde_json::from_str(TRANSCODE).unwrap();
+        json["MediaSources"][0]["MediaStreams"].as_array_mut().unwrap().push(serde_json::json!({
+            "Codec": "PGSSUB", "Language": "eng", "DisplayTitle": "English - PGSSUB", "Type": "Subtitle",
+            "Index": 3, "IsExternal": false, "DeliveryMethod": "External",
+            "DeliveryUrl": format!("/Videos/{ITEM}/{ITEM}/Subtitles/3/0/Stream.pgssub?ApiKey=REDACTED"),
+            "IsTextSubtitleStream": false, "SupportsExternalStream": true
+        }));
+        let info: PlaybackInfo = serde_json::from_value(json).unwrap();
+        let resolved = resolve(&client(), ITEM, &info, Some(3)).unwrap();
+        assert_eq!(resolved.play_method, PlayMethod::Transcode);
+        assert_eq!(resolved.burned_subtitle, None);
+        let indexes: Vec<i64> = resolved.external_subs.iter().map(|s| s.index).collect();
+        assert_eq!(indexes, vec![2, 3]);
+        let pgs = &resolved.external_subs[1];
+        assert_eq!(pgs.url, format!("https://media.example.com/Videos/{ITEM}/{ITEM}/Subtitles/3/0/Stream.pgssub?"));
+        assert_eq!(pgs.title, "English - PGSSUB");
+        assert!(pgs.graphical);
+        assert_eq!(resolved.selected_external, Some(3));
+        let file = resolved.external_file(3).unwrap();
+        assert!(file.select && file.graphical && file.index == 3);
+        // The text file did not come (the server failed it), the PGS did:
+        // the PGS is mpv's first file all the same.
+        let mut status = PlayerStatus::default();
+        status.external_sids.push((3, 1));
+        assert_eq!(resolved.sid_of_external(3, &status), Some(1));
+        assert_eq!(resolved.sid_of_external(2, &status), None);
+        assert_eq!(resolved.subtitle_of(1, &status), Some(3));
     }
 
     /// Finding 9 of the review: the URL of a direct play names the media

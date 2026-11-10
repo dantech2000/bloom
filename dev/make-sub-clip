@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""A clip with every kind of subtitle, for tests of the subtitle paths.
+
+  dev/make-sub-clip <folder> [<name>]
+
+writes into <folder> (made when missing; files that exist stay):
+
+  <name>.mkv       20 s of testsrc2 with a tone, and three subtitle tracks
+                   in the file: SubRip, PGS and VobSub, all "eng"
+  <name>.eng.sup   the PGS as a sidecar
+  <name>.eng.mks   the VobSub as a sidecar (an .mks, as the server makes
+                   one: ffmpeg cannot write an .idx/.sub pair)
+
+The default name is "Subtitle Clip (2026)". Each caption names its format
+("First caption, PGS"), so a screenshot tells which track plays.
+
+ffmpeg has no PGS encoder, so the PGS is written here: drawtext renders a
+caption to a bitmap, and the five segment kinds of the format (the
+composition, the window, the palette, the run-length object, the end)
+are packed by hand. ffprobe reads the result as hdmv_pgs_subtitle, and
+ffmpeg's overlay paints it, so every decoder takes it. The VobSub is the
+same bitmaps through ffmpeg's dvdsub encoder.
+"""
+import os
+import struct
+import subprocess
+import sys
+
+CAPTIONS = [(1.0, 4.0, "First caption"), (5.0, 8.0, "Second caption"),
+            (10.0, 13.0, "Third caption"), (15.0, 18.0, "Last caption")]
+# Three seconds each: a VobSub packet carries no end of its own (ffmpeg's
+# dvdsub encoder gets none from a PGS), so every packet gets this as its
+# duration. mpv ends the caption there; ffmpeg's own burn-in does not, it
+# shows a VobSub caption until the next one.
+CAPTION_SECS = 3
+W, H = 1280, 720
+FONT = "/System/Library/Fonts/Helvetica.ttc"
+DURATION = 20
+
+
+def run(*cmd):
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def render(text, w, h):
+    """A w x h gray bitmap of the text, white on black."""
+    safe = text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "’")
+    cmd = ["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", f"color=black:size={w}x{h}",
+           "-vf", f"drawtext=fontfile={FONT}:text='{safe}':fontcolor=white:fontsize={h * 2 // 3}"
+                  ":x=(w-tw)/2:y=(h-th)/2",
+           "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"]
+    return subprocess.run(cmd, check=True, capture_output=True).stdout
+
+
+def rle(bitmap, w, h):
+    """The run-length coding of PGS: colour 0 is clear, 1 the ink."""
+    out = bytearray()
+    for y in range(h):
+        row = bitmap[y * w:(y + 1) * w]
+        x = 0
+        while x < w:
+            c = 1 if row[x] > 127 else 0
+            n = 1
+            while x + n < w and (1 if row[x + n] > 127 else 0) == c:
+                n += 1
+            if c == 0:
+                out += bytes([0, n]) if n < 64 else bytes([0, 0x40 | (n >> 8), n & 0xff])
+            else:
+                out += bytes([0, 0x80 | n, c]) if n < 64 else bytes([0, 0xC0 | (n >> 8), n & 0xff, c])
+            x += n
+        out += bytes([0, 0])
+    return bytes(out)
+
+
+def segment(pts, kind, payload):
+    return b"PG" + struct.pack(">IIBH", int(pts * 90000), 0, kind, len(payload)) + payload
+
+
+def display_set(n, pts, w, h, x, y, bitmap):
+    """One display set: shows the bitmap, or clears the screen without one."""
+    out = bytearray()
+    state = 0x80 if bitmap is not None else 0x00
+    objects = 1 if bitmap is not None else 0
+    pcs = struct.pack(">HHBHBBBB", W, H, 0x10, n, state, 0, 0, objects)
+    if bitmap is not None:
+        pcs += struct.pack(">HBBHH", 0, 0, 0, x, y)
+    out += segment(pts, 0x16, pcs)
+    out += segment(pts, 0x17, struct.pack(">BBHHHH", 1, 0, x, y, w, h))
+    if bitmap is not None:
+        palette = bytes([0, 0]) + bytes([0, 16, 128, 128, 0]) + bytes([1, 235, 128, 128, 255])
+        out += segment(pts, 0x14, palette)
+        body = struct.pack(">HH", w, h) + rle(bitmap, w, h)
+        out += segment(pts, 0x15, struct.pack(">HBB", 0, 0, 0xC0) + struct.pack(">I", len(body))[1:] + body)
+    out += segment(pts, 0x80, b"")
+    return bytes(out)
+
+
+def write_sup(path, label):
+    w, h = W * 3 // 4, H // 8
+    x, y = (W - w) // 2, H - h - H // 16
+    with open(path, "wb") as f:
+        for n, (start, end, text) in enumerate(CAPTIONS):
+            f.write(display_set(2 * n, start, w, h, x, y, render(f"{text}, {label}", w, h)))
+            f.write(display_set(2 * n + 1, end, w, h, x, y, None))
+
+
+def write_srt(path, label):
+    def stamp(s):
+        return "%02d:%02d:%02d,%03d" % (s // 3600, s % 3600 // 60, s % 60, round(s % 1 * 1000))
+    with open(path, "w") as f:
+        for n, (start, end, text) in enumerate(CAPTIONS):
+            f.write(f"{n + 1}\n{stamp(start)} --> {stamp(end)}\n{text}, {label}\n\n")
+
+
+def main():
+    if len(sys.argv) not in (2, 3):
+        sys.exit(__doc__.strip().splitlines()[2].strip())
+    folder = sys.argv[1]
+    name = sys.argv[2] if len(sys.argv) == 3 else "Subtitle Clip (2026)"
+    os.makedirs(folder, exist_ok=True)
+    clip = os.path.join(folder, name + ".mkv")
+    sup = os.path.join(folder, name + ".eng.sup")
+    mks = os.path.join(folder, name + ".eng.mks")
+    if all(os.path.exists(p) for p in (clip, sup, mks)):
+        return
+    work = os.path.join(folder, ".make-sub-clip")
+    os.makedirs(work, exist_ok=True)
+    srt = os.path.join(work, "text.srt")
+    pgs = os.path.join(work, "pgs.sup")
+    vob_src = os.path.join(work, "vobsub.sup")
+    write_srt(srt, "SubRip")
+    write_sup(pgs, "PGS")
+    write_sup(vob_src, "VobSub")
+    # -copyts: the PGS starts at 1 s and ffmpeg would shift it to 0.
+    run("ffmpeg", "-loglevel", "error", "-y", "-copyts", "-i", vob_src, "-c:s", "dvdsub",
+        "-bsf:s", f"setts=duration={CAPTION_SECS}/TB", "-f", "matroska", mks)
+    # -copyts: the PGS starts at 1 s and ffmpeg would shift it to 0.
+    run("ffmpeg", "-loglevel", "error", "-y", "-copyts",
+        "-f", "lavfi", "-i", f"testsrc2=size={W}x{H}:rate=24:duration={DURATION}",
+        "-f", "lavfi", "-i", f"sine=frequency=440:duration={DURATION}",
+        "-i", srt, "-i", pgs, "-i", mks,
+        "-map", "0:v", "-map", "1:a", "-map", "2:s", "-map", "3:s", "-map", "4:s",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-c:s", "copy",
+        "-metadata:s:s:0", "language=eng", "-metadata:s:s:1", "language=eng", "-metadata:s:s:2", "language=eng",
+        "-t", str(DURATION), clip)
+    os.replace(pgs, sup)
+    for leftover in (srt, vob_src):
+        os.remove(leftover)
+    os.rmdir(work)
+
+
+if __name__ == "__main__":
+    main()
