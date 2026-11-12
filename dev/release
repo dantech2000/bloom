@@ -148,8 +148,11 @@ if [ "$stage" != sign ]; then
 if [ -z "$check_version" ]; then
   /usr/bin/sed -i '' "1,/^version = /s/^version = \".*\"/version = \"$version\"/" "$dir/Cargo.toml"
 fi
-# The `ship` profile of Cargo.toml: smaller, slower to build.
-(cd "$dir" && cargo build ${check_version:+--locked} --profile ship) || exit 1
+# The `ship` profile of Cargo.toml: smaller, slower to build. Without the
+# default features: the fake cast device of the tests (`cast-mock`) does
+# not ship. The packages are named, so `bloom-core` is built as the app
+# asks for it and not with its own defaults.
+(cd "$dir" && cargo build ${check_version:+--locked} --profile ship --no-default-features -p bloom -p bloom-lights) || exit 1
 "$dir/dev/bundle" >/dev/null || exit 1
 
 rm -f "$archive"

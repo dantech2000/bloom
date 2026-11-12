@@ -45,7 +45,7 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub(super) fn item_json(&self, titles: bool) -> Value {
+    pub fn item_json(&self, titles: bool) -> Value {
         match &self.item {
             None => Value::Null,
             Some(item) if titles => json!({
@@ -56,11 +56,11 @@ impl Snapshot {
         }
     }
 
-    pub(super) fn window_json(&self) -> Value {
+    pub fn window_json(&self) -> Value {
         json!({ "fullscreen": self.fullscreen, "pip": self.pip })
     }
 
-    pub(super) fn playback_json(&self, session: u64, titles: bool) -> Value {
+    pub fn playback_json(&self, session: u64, titles: bool) -> Value {
         json!({
             "session": session,
             "item": self.item_json(titles),

@@ -2,12 +2,13 @@
 //! Libraries: a card for each media library with its artwork, item counts,
 //! folders and scan state. A library can be scanned alone, or all at once.
 
+use crate::ui::tone::{self, State};
 use anyhow::Result;
 use gpui_icons::LucideIcon;
 use gpui_kit::{
     ClickEvent, Context, Div, ObjectFit, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _, px,
-    rgb, rgba,
+    SharedString, Styled, div, prelude::FluentBuilder as _, px,
+    rgba,
 };
 use serde::Deserialize;
 
@@ -16,7 +17,7 @@ use crate::{
     app::Bloom,
     jellyfin::Client,
     ui::theme::UiTheme,
-    views::cards::icon,
+    icons::icon,
 };
 
 /// Smallest width of a library card; the grid fits as many as the page holds.
@@ -70,18 +71,11 @@ fn counted_types(kind: Option<&str>) -> &'static [(&'static str, &'static str)] 
     }
 }
 
-pub fn load(client: &Client) -> Result<Data> {
-    load_with(client, &[])
-}
-
-/// Loads the page again while it is open. The counts of a library are
-/// asked for again only while it scans, or when its scan has just ended;
-/// the others keep the counts of `previous`.
-pub fn refresh(client: &Client, previous: &[Library]) -> Result<Data> {
-    load_with(client, previous)
-}
-
-fn load_with(client: &Client, previous: &[Library]) -> Result<Data> {
+/// Loads the page. `previous` is what the page shows while it is open,
+/// or nothing at its first load: the counts of a library are asked for
+/// again only while it scans, or when its scan has just ended; the others
+/// keep the counts of `previous`.
+pub fn load(client: &Client, previous: &[Library]) -> Result<Data> {
     #[derive(Deserialize)]
     #[serde(rename_all = "PascalCase")]
     struct Count {
@@ -124,9 +118,6 @@ fn load_with(client: &Client, previous: &[Library]) -> Result<Data> {
     });
     Ok(Data { libraries })
 }
-
-/// The green of a scan that runs (see `tasks::RUNNING`).
-const WORKING: u32 = 0x7ee787;
 
 /// The top of a card with artwork: `base` (its height and fill) with the
 /// card's upper corners, `placeholder` in its middle, the image over it
@@ -175,26 +166,13 @@ fn kind_label(kind: Option<&str>) -> (&'static str, LucideIcon) {
     }
 }
 
-/// 4090 as "4,090".
-fn grouped(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
 pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
     let t = UiTheme::read(cx).clone();
     let Some(client) = app.session.as_ref().map(|s| s.client.clone()) else {
         return div();
     };
     let content_w = app.admin_content_w().max(CARD_MIN_W);
-    let (_, card_w) = super::rows::grid(content_w, CARD_MIN_W, CARD_GAP, 1, data.libraries.len());
+    let (_, card_w) = crate::ui::rows::grid(content_w, CARD_MIN_W, CARD_GAP, 1, data.libraries.len());
     let image_h = (card_w * 9. / 16.).round();
 
     let folders: usize = data.libraries.iter().map(|l| l.locations.len()).sum();
@@ -258,7 +236,7 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
         let counts = library
             .counts
             .iter()
-            .map(|(n, noun)| format!("{} {noun}", grouped(*n)))
+            .map(|(n, noun)| format!("{} {noun}", bloom_core::subtitles::thousands(*n as i64)))
             .collect::<Vec<_>>()
             .join(" · ");
 
@@ -299,20 +277,20 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                     icon(glyph, 44., t.colors.muted_foreground),
                     image,
                     match status {
-                        "Idle" => badge("Idle", rgba(0xffffff2e)),
-                        "Queued" => badge("Queued", rgba(0xffffff2e)),
+                        "Idle" => badge("Idle", None),
+                        "Queued" => badge("Queued", None),
                         // A scan that runs is the live state: the green dot.
-                        _ => badge("Scanning", rgb(WORKING)),
+                        _ => badge("Scanning", Some(State::Ok)),
                     },
                 ))
                 // Scan progress, as a line under the artwork.
                 .when_some(progress.filter(|_| busy), |el, value| {
                     el.child(
-                        div().h(px(4.)).w_full().bg(rgba(0xffffff1f)).child(
+                        div().h(px(4.)).w_full().bg(tone::HOVER).child(
                             div()
                                 .h_full()
                                 .w(gpui_kit::relative(value))
-                                .bg(rgb(WORKING)),
+                                .bg(State::Ok.color()),
                         ),
                     )
                 })

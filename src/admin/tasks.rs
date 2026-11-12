@@ -3,6 +3,7 @@
 //! schedule of a task, and its progress while it runs. A task can be started
 //! and a running task can be stopped.
 
+use crate::ui::tone::{self, State};
 use anyhow::Result;
 use gpui_icons::LucideIcon;
 use gpui_kit::{
@@ -13,11 +14,12 @@ use gpui_kit::{
 use serde::Deserialize;
 
 use crate::{
-    admin::{ButtonKind, ago, badge, button, panel, parse_date, rows::rows},
+    admin::{ButtonKind, ago, badge, button, panel, parse_date},
+    ui::rows::rows,
     app::Bloom,
     jellyfin::Client,
     ui::{menu::MenuItem, theme::UiTheme},
-    views::cards::icon,
+    icons::icon,
 };
 
 /// The schedule column shows only when the page is at least this wide.
@@ -109,10 +111,6 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The green of a task that works now: a colour is a state, and "running"
-/// is the live one (blue before, which is no state of the dashboard).
-const RUNNING: u32 = 0x7ee787;
-
 /// Colour of the dot for the result of a run.
 fn result_color(status: &str) -> Rgba {
     match status {
@@ -151,10 +149,10 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
             data.groups.len()
         ));
     if running > 0 {
-        summary = summary.child(badge(format!("{running} running"), rgb(RUNNING)));
+        summary = summary.child(badge(format!("{running} running"), Some(State::Ok)));
     }
     if failed > 0 {
-        summary = summary.child(badge(format!("{failed} failed"), rgb(0xc62828)));
+        summary = summary.child(badge(format!("{failed} failed"), Some(State::Bad)));
     }
 
     let mut page = div().flex().flex_col().gap(px(18.)).child(summary);
@@ -285,7 +283,8 @@ fn row(
                     .flex()
                     .justify_between()
                     .text_size(px(13.))
-                    .text_color(rgb(RUNNING))
+                    // A task that works now is the live state: green.
+                    .text_color(State::Ok.color())
                     .child(if task.state == "Cancelling" {
                         "Stopping…"
                     } else {
@@ -298,13 +297,13 @@ fn row(
                     .h(px(6.))
                     .rounded_full()
                     .overflow_hidden()
-                    .bg(rgba(0xffffff1f))
+                    .bg(tone::HOVER)
                     .child(
                         div()
                             .h_full()
                             .rounded_full()
                             .w(gpui_kit::relative(progress))
-                            .bg(rgb(RUNNING)),
+                            .bg(State::Ok.color()),
                     ),
             )
     } else {

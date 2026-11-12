@@ -14,6 +14,10 @@
 //! The devices use a certificate of their own, signed by nobody the system
 //! knows. The connection takes the certificate the device shows, and from
 //! then on only that one: a connect-again with another certificate fails.
+//! The app keeps the certificate with its config, by the id of the device
+//! ([`Event::Pinned`]), and gives it back at the next connection
+//! ([`Session::connect`]), so the trust of the first use holds across
+//! runs of the app.
 //!
 //! A command does not open a connection: the socket stays open, so a pause
 //! or a seek is one message on a warm connection. Seeks are coalesced: a
@@ -44,7 +48,7 @@ use serde_json::Value;
 
 use super::{
     jellyfin::{self, Identity, ItemStub},
-    mdns::Device,
+    discovery::Device,
     messages::{self, App, LoadMedia, MediaStatus, NS_CONNECTION, NS_HEARTBEAT, NS_MEDIA, NS_RECEIVER, RECEIVER, ReceiverStatus, SENDER},
     proto::{CastMessage, Inbox},
 };
@@ -94,6 +98,10 @@ pub enum Event {
     /// `load` is the number [`Session::load`] gave for it, so the app can
     /// tell the end of the item before from the item it just sent.
     Ended { load: u64 },
+    /// The certificate the connection trusts from now on, for the app to
+    /// keep: the one of a first connection, or the new one of a device
+    /// that made itself another (see `Worker::run`).
+    Pinned(Vec<u8>),
     Closed,
 }
 
@@ -236,16 +244,26 @@ impl Drop for Session {
 
 impl Session {
     /// Opens the connection on its own thread. The events come on the
-    /// returned channel.
-    pub fn connect(device: Device) -> (Self, async_channel::Receiver<Event>) {
-        Self::connect_with(device, Timing::default())
+    /// returned channel. `pin` is the certificate the device showed at an
+    /// earlier connection, when the app kept one: the device must show it
+    /// again. With none, the certificate it shows now is taken and told
+    /// ([`Event::Pinned`]).
+    pub fn connect(device: Device, pin: Option<Vec<u8>>) -> (Self, async_channel::Receiver<Event>) {
+        Self::start(device, pin, Timing::default())
     }
 
+    /// With no certificate kept and times of its own, for a test.
     pub fn connect_with(device: Device, timing: Timing) -> (Self, async_channel::Receiver<Event>) {
+        Self::start(device, None, timing)
+    }
+
+    fn start(device: Device, pin: Option<Vec<u8>>, timing: Timing) -> (Self, async_channel::Receiver<Event>) {
         let (tx, rx) = async_channel::unbounded();
         let (commands, inputs) = mpsc::channel();
         let shared = Arc::new(Shared { status: Mutex::new(Status::default()), loads: AtomicU64::new(0) });
-        let worker = Worker::new(device.clone(), timing, tx, shared.clone(), commands.clone(), inputs);
+        let mut worker = Worker::new(device.clone(), timing, tx, shared.clone(), commands.clone(), inputs);
+        worker.told_pin = pin.clone();
+        worker.verifier = Arc::new(DeviceCertificate { pinned: Mutex::new(pin) });
         let _ = thread::Builder::new()
             .name(format!("cast-{}", device.name))
             .spawn(move || worker.run());
@@ -429,6 +447,9 @@ struct Worker {
     /// not for this one.
     link: u64,
     verifier: Arc<DeviceCertificate>,
+    /// The certificate the app knows of: the one it gave, or the last one
+    /// told with [`Event::Pinned`].
+    told_pin: Option<Vec<u8>>,
     status: Status,
     next_id: u64,
     pending: HashMap<u64, Pending>,
@@ -501,6 +522,7 @@ impl Worker {
             feed,
             link: 0,
             verifier: Arc::new(DeviceCertificate::default()),
+            told_pin: None,
             status: Status::default(),
             next_id: 1,
             pending: HashMap::new(),
@@ -653,6 +675,13 @@ impl Worker {
         self.status.connected = true;
         self.status.error = None;
         self.emit(Event::Connected { again });
+        // The certificate of this connection is the one kept from now on;
+        // the app hears of a new one.
+        let pinned = self.verifier.pinned.lock().unwrap().clone();
+        if let Some(certificate) = pinned.filter(|pinned| self.told_pin.as_ref() != Some(pinned)) {
+            self.told_pin = Some(certificate.clone());
+            self.emit(Event::Pinned(certificate));
+        }
         self.publish();
         // The app transport of before: ask again, and connect to it when
         // the app still runs (see `on_receiver_status`). The commands held
@@ -2048,6 +2077,45 @@ mod tests {
         until(&session, &events, &mut log, "launch error", 5., |s| s.error.is_some());
         drain(&events, &mut log);
         assert_eq!(ended(&log), [load], "{log:?}");
+    }
+
+    /// The certificate of the first connection is told, for the app to
+    /// keep. A connection that is given it takes the device that shows it
+    /// with no word, and refuses a device that shows another one: the
+    /// trust of the first use holds across runs of the app.
+    #[test]
+    fn the_kept_certificate_is_told_once_and_holds_at_the_next_connection() {
+        let mock = Mock::start();
+        let pinned = |log: &[Event]| -> Vec<Vec<u8>> {
+            log.iter()
+                .filter_map(|e| match e {
+                    Event::Pinned(certificate) => Some(certificate.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        // A first connection: the certificate the device shows is told.
+        let (session, events) = Session::start(mock.device(), None, timing());
+        let mut log = Vec::new();
+        until(&session, &events, &mut log, "connect", 5., |s| s.connected);
+        drain(&events, &mut log);
+        let told = pinned(&log);
+        assert_eq!(told, [crate::chromecast::mock::CERT.to_vec()]);
+        drop(session);
+        // The next run gives it back: connected, and nothing new to keep.
+        let (session, events) = Session::start(mock.device(), Some(told[0].clone()), timing());
+        let mut log = Vec::new();
+        until(&session, &events, &mut log, "connect with the kept one", 5., |s| s.connected);
+        drain(&events, &mut log);
+        assert!(pinned(&log).is_empty(), "{log:?}");
+        drop(session);
+        // Another certificate was kept for this id: the device is refused.
+        let (session, events) = Session::start(mock.device(), Some(b"another certificate".to_vec()), timing());
+        let mut log = Vec::new();
+        let status = until(&session, &events, &mut log, "the refusal", 5., |s| s.error.is_some());
+        assert!(!status.connected);
+        assert!(status.error.as_deref().is_some_and(|e| e.contains(OTHER_CERTIFICATE)), "{:?}", status.error);
+        assert!(pinned(&log).is_empty());
     }
 
     /// A device that cannot be reached: the status says why, so the panel

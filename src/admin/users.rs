@@ -4,14 +4,15 @@
 //! buttons each before). Also holds the small widgets that the devices,
 //! activity and API key pages share.
 
+use crate::ui::tone::{self, State};
 use std::{rc::Rc, sync::Arc};
 
 use anyhow::Result;
 use gpui_icons::LucideIcon;
 use gpui_kit::{
-    ClickEvent, Context, Div, InteractiveElement as _, ObjectFit, ParentElement as _, Rgba,
+    ClickEvent, Context, Div, InteractiveElement as _, ObjectFit, ParentElement as _,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled, div,
-    prelude::FluentBuilder as _, px, rgb, rgba,
+    prelude::FluentBuilder as _, px, rgba,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -21,14 +22,9 @@ use crate::{
     app::Bloom,
     jellyfin::Client,
     ui::theme::UiTheme,
-    views::cards::icon,
+    icons::icon,
 };
 
-pub const GREEN: u32 = 0x2e9e5bff;
-pub const AMBER: u32 = 0xc98a1bff;
-pub const RED: u32 = 0xc62828ff;
-pub const BLUE: u32 = 0x3b6fd4ff;
-pub const GREY: u32 = 0xffffff2e;
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -199,7 +195,7 @@ fn render_list(app: &Bloom, data: &Data, session: &crate::app::Session, cx: &mut
                 .gap(px(14.))
                 .cursor_pointer()
                 .hover(|s| s.bg(rgba(0xf5f5f714)))
-                .child(icon_disc(LucideIcon::UserPlus, t.colors.foreground, 40.))
+                .child(icon_disc(LucideIcon::UserPlus, None, 40.))
                 .child(
                     div()
                         .text_size(px(17.))
@@ -292,16 +288,16 @@ fn render_user(app: &Bloom, user: &Arc<User>, session: &crate::app::Session, cx:
 
     let mut badges = div().flex().flex_wrap().gap(px(6.));
     if me {
-        badges = badges.child(badge("You", rgba(BLUE)));
+        badges = badges.child(badge("You", None));
     }
     if user.is_admin() {
-        badges = badges.child(badge("Admin", rgba(GREY)));
+        badges = badges.child(badge("Admin", None));
     }
     if user.is_disabled() {
-        badges = badges.child(badge("Disabled", rgba(RED)));
+        badges = badges.child(badge("Disabled", Some(State::Bad)));
     }
     if user.is_hidden() {
-        badges = badges.child(badge("Hidden", rgba(GREY)));
+        badges = badges.child(badge("Hidden", None));
     }
 
     let seen = |date: &Option<String>| match date.as_deref().filter(|d| is_real_date(d)) {
@@ -684,10 +680,10 @@ pub(super) fn avatar(name: &str, image: Option<String>, size: f32) -> Div {
         .flex()
         .items_center()
         .justify_center()
-        .bg(rgba(super::DISC))
+        .bg(tone::DISC)
         .text_size(px(size * 0.42))
         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-        .text_color(rgb(0xf5f5f7))
+        .text_color(tone::INK)
         .when(image.is_none(), |el| el.child(initial))
         .when_some(image, |el, url| {
             el.child(
@@ -699,9 +695,9 @@ pub(super) fn avatar(name: &str, image: Option<String>, size: f32) -> Div {
         })
 }
 
-/// Round icon on the quiet disc of the theme. The colour shows only when
-/// it stands for a state (see `state_color`).
-pub(super) fn icon_disc(glyph: LucideIcon, color: Rgba, size: f32) -> Div {
+/// Round icon on the quiet disc of the theme, in the ink, or in the
+/// colour of the state it stands for.
+pub(super) fn icon_disc(glyph: LucideIcon, state: Option<State>, size: f32) -> Div {
     div()
         .size(px(size))
         .flex_shrink_0()
@@ -709,12 +705,8 @@ pub(super) fn icon_disc(glyph: LucideIcon, color: Rgba, size: f32) -> Div {
         .flex()
         .items_center()
         .justify_center()
-        .bg(rgba(super::DISC))
-        .child(icon(
-            glyph,
-            size * 0.48,
-            super::state_color(color).unwrap_or(rgb(0xf5f5f7)),
-        ))
+        .bg(tone::DISC)
+        .child(icon(glyph, size * 0.48, tone::state_ink(state)))
 }
 
 /// A number with its label, for the summary line at the top of a page.
@@ -793,24 +785,13 @@ pub(super) fn primary(
     glyph: LucideIcon,
     label: &'static str,
     cx: &Context<Bloom>,
-) -> Stateful<Div> {
-    let t = UiTheme::read(cx);
-    let color = t.colors.primary_foreground;
-    // `super::button` puts its label first; here the icon leads.
-    div()
-        .id(id)
+) -> gpui_kit::base::Button {
+    let color = UiTheme::read(cx).colors.primary_foreground;
+    // `button` puts its label alone; here an icon leads, a little smaller.
+    crate::ui::button::frame(id, label, super::ButtonKind::Primary, cx)
         .h(px(36.))
-        .px(px(16.))
-        .rounded(px(12.))
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .cursor_pointer()
-        .bg(t.colors.primary)
-        .text_color(color)
         .text_size(px(14.))
         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-        .hover(|s| s.opacity(0.88))
         .child(icon(glyph, 16., color))
         .child(label)
 }

@@ -36,6 +36,7 @@ mod quality_tags;
 mod queue;
 mod seasons;
 mod settings;
+mod signal;
 mod socket;
 mod stream;
 mod subtitles;
@@ -171,7 +172,7 @@ pub fn open_main_window(cx: &mut App, config: Config) {
     #[cfg(target_os = "macos")]
     let options = {
         let saved = config.window.map(|[x, y, w, h]| {
-            Bounds::new(point(px(x), px(y)), size(px(w.max(900.)), px(h.max(600.))))
+            Bounds::new(point(px(x), px(y)), size(px(w.max(pip::NORMAL_MIN_SIZE.0)), px(h.max(pip::NORMAL_MIN_SIZE.1))))
         });
         let bounds = saved
             .filter(|bounds| {
@@ -190,7 +191,7 @@ pub fn open_main_window(cx: &mut App, config: Config) {
                 )),
             }),
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(900.), px(600.))),
+            window_min_size: Some(size(px(pip::NORMAL_MIN_SIZE.0), px(pip::NORMAL_MIN_SIZE.1))),
             window_background: WindowBackgroundAppearance::Opaque,
             // A test instance must not take the keyboard from the
             // person at the Mac: the keys he types would go to its

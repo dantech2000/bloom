@@ -77,7 +77,7 @@ pub fn picture_bands(picture: &image::RgbaImage, bands: usize) -> Vec<[u8; 3]> {
 }
 
 /// A hue in degrees as a colour at full strength.
-pub(super) fn hue_colour(hue: f32) -> [u8; 3] {
+pub fn hue_colour(hue: f32) -> [u8; 3] {
     let part = |shift: f32| {
         let k = (shift + hue / 60.).rem_euclid(6.);
         (255. * (1. - k.min(4. - k).clamp(0., 1.))).round() as u8

@@ -214,7 +214,7 @@ impl GlRenderer {
     }
 
     /// Returns the surface of the frame mpv rendered since `begin`.
-    pub fn finish(&mut self) -> Result<VideoFrame> {
+    pub fn finish(&mut self) -> VideoFrame {
         let target = &self.pool[self.next];
         self.next = (self.next + 1) % self.pool.len();
         self.finished = self.finished.saturating_add(1);
@@ -223,7 +223,7 @@ impl GlRenderer {
             // Metal reads the surface from another queue; submit the work now.
             gl::glFlush();
         }
-        Ok(VideoFrame(target.buffer.clone()))
+        VideoFrame(target.buffer.clone())
     }
 
     fn resize(&mut self, width: u32, height: u32) -> Result<()> {

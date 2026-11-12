@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The dialog of the metadata manager and its four tabs.
 
+use crate::ui::tone::{self, State};
 use gpui_icons::LucideIcon;
 use gpui_kit::{
     ClickEvent, Context, Div, InteractiveElement as _, KeyDownEvent,
@@ -21,8 +22,8 @@ use crate::{
     admin::{ButtonKind, badge, button},
     app::Bloom,
     jellyfin::Client,
-    ui::{glass::glass, input::Input, scroll_area::ScrollArea, theme::UiTheme},
-    views::cards::icon,
+    ui::{input::Input, scroll_area::ScrollArea, theme::UiTheme},
+    icons::icon,
 };
 use crate::ui::tip::tip;
 
@@ -37,7 +38,7 @@ const TILE_W: f32 = 196.;
 
 impl Bloom {
     /// The metadata manager over the page.
-    pub fn render_metadata(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub fn render_metadata(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
         let manager = self.metadata.open.as_ref()?;
         let client = self.session.as_ref()?.client.clone();
         let t = UiTheme::read(cx).clone();
@@ -101,10 +102,10 @@ impl Bloom {
                                     .child(manager.name.clone()),
                             )
                             .when(!manager.kind.is_empty(), |el| {
-                                el.child(badge(manager.kind.clone(), rgba(0xffffff29)))
+                                el.child(badge(manager.kind.clone(), None))
                             })
                             .when(manager.lock, |el| {
-                                el.child(badge("Locked", rgb(0xb7791f).into()))
+                                el.child(badge("Locked", Some(State::Warn)))
                             }),
                     ),
             )
@@ -117,7 +118,7 @@ impl Bloom {
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgba(0xffffff1f)))
+                    .hover(|s| s.bg(tone::HOVER))
                     .child(icon(LucideIcon::X, 18., t.colors.foreground))
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.ask_close_metadata(window, cx)
@@ -204,7 +205,7 @@ impl Bloom {
             .px(px(PAD))
             .py(px(16.))
             .border_t_1()
-            .border_color(rgba(0xf5f5f71f))
+            .border_color(tone::FAINT)
             .flex()
             .items_center()
             .gap(px(10.))
@@ -240,16 +241,8 @@ impl Bloom {
             _ => footer.child(cancel("Close", cx)),
         };
 
-        let card = div()
-            .id("meta.card")
-            .relative()
-            .w(px(card_w))
+        let card = crate::ui::dialog::card("meta.card", card_w)
             .h(px(card_h))
-            .rounded(px(24.))
-            .border_1()
-            .border_color(rgba(0xf5f5f733))
-            .child(glass(px(24.), crate::ui::glass::POPUP_TINT))
-            .on_click(|_: &ClickEvent, _, cx| cx.stop_propagation())
             .child(
                 div()
                     .relative()
@@ -271,15 +264,10 @@ impl Bloom {
             .children(self.metadata_confirm(manager, cx));
 
         Some(
-            div()
-                .id("meta.overlay")
-                .absolute()
-                .inset_0()
-                .occlude()
+            // A darker layer than the other dialogs: this one covers most
+            // of the window.
+            crate::ui::dialog::layer("meta.overlay", card, cx)
                 .track_focus(&self.metadata.focus)
-                .flex()
-                .items_center()
-                .justify_center()
                 .bg(rgba(0x000000a6))
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                     let keystroke = &event.keystroke;
@@ -314,9 +302,9 @@ impl Bloom {
                 // A click beside the dialog closes it.
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     this.ask_close_metadata(window, cx)
-                }))
-                .child(card),
+                })),
         )
+        .map(|layer| crate::ui::dialog::shown(layer, "meta.overlay", cx))
     }
 
     /// The question of the dialog, over its content.
@@ -348,7 +336,7 @@ impl Bloom {
                         .w(px(420.))
                         .rounded(px(20.))
                         .border_1()
-                        .border_color(rgba(0xf5f5f733))
+                        .border_color(tone::EDGE)
                         .bg(rgb(0x2a2a2a))
                         .p(px(22.))
                         .flex()
@@ -621,7 +609,7 @@ impl Bloom {
         cx: &mut Context<Self>,
     ) -> Div {
         let t = UiTheme::read(cx).clone();
-        let (_, tile_w) = crate::admin::rows::grid(content_w, TILE_W, GAP, 2, usize::MAX);
+        let (_, tile_w) = crate::ui::rows::grid(content_w, TILE_W, GAP, 2, usize::MAX);
         let images = manager.images.as_deref().unwrap_or_default();
 
         let mut current = div().flex().flex_wrap().gap(px(GAP));
@@ -827,7 +815,7 @@ impl Bloom {
                 })),
             );
 
-        let (_, tile_w) = crate::admin::rows::grid(content_w, 150., GAP, 2, usize::MAX);
+        let (_, tile_w) = crate::ui::rows::grid(content_w, 150., GAP, 2, usize::MAX);
         let results = match (&manager.search_error, &manager.results) {
             (Some(error), _) => muted_note(error.clone(), cx),
             (None, None) => muted_note(
@@ -928,9 +916,9 @@ impl Bloom {
                     .rounded(px(14.))
                     .border_1()
                     .border_color(if selected {
-                        rgba(0xf5f5f7b3)
+                        tone::INK_70
                     } else {
-                        rgba(0xf5f5f71f)
+                        tone::FAINT
                     })
                     .bg(if selected {
                         rgba(0xffffff1a)
@@ -1253,16 +1241,11 @@ fn small_button(
     label: &'static str,
     danger: bool,
     cx: &Context<Bloom>,
-) -> Stateful<Div> {
+) -> gpui_kit::base::Button {
     let t = UiTheme::read(cx);
-    div()
-        .id(id.into())
+    crate::ui::button::bare(id.into(), label)
         .h(px(30.))
         .rounded(px(10.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
         .bg(rgba(0xffffff1a))
         .hover(|s| s.bg(rgba(0xffffff2e)))
         .text_size(px(13.))

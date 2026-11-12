@@ -1,65 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The pages of the settings, one for each section.
 
+use bloom_core::languages;
+use gpui_kit::base::Button as BaseButton;
+use crate::ui::tone;
 use gpui_icons::LucideIcon;
 use gpui_kit::{
     ClickEvent, Context, Div, ObjectFit, ParentElement as _,
-    SharedString, Stateful, StatefulInteractiveElement as _, Styled, div, px, rgba,
+    SharedString, StatefulInteractiveElement as _, Styled, div, px,
 };
 use serde_json::Value;
 
-use super::{Choice, checkbox, field, group, icon_button, raised, select};
+use super::Choice;
+use crate::ui::{
+    button::raised,
+    form::{card, checkbox, control_max_w, field, group, row_icon as icon_button, select, select_capped},
+};
 use crate::{
     app::Bloom,
     config::SubtitleLook,
     ui::{theme::UiTheme, tip::tip},
 };
-
-/// Languages a select offers: code as the server stores it, and name. The
-/// server knows some 500; these are the ones in common use for audio and
-/// subtitles. A value outside the list still shows, by its code.
-const LANGUAGES: [(&str, &str); 40] = [
-    ("ara", "Arabic"),
-    ("bul", "Bulgarian"),
-    ("cat", "Catalan"),
-    ("chi", "Chinese"),
-    ("hrv", "Croatian"),
-    ("cze", "Czech"),
-    ("dan", "Danish"),
-    ("dut", "Dutch"),
-    ("eng", "English"),
-    ("est", "Estonian"),
-    ("fil", "Filipino"),
-    ("fin", "Finnish"),
-    ("fre", "French"),
-    ("ger", "German"),
-    ("gre", "Greek"),
-    ("heb", "Hebrew"),
-    ("hin", "Hindi"),
-    ("hun", "Hungarian"),
-    ("ice", "Icelandic"),
-    ("ind", "Indonesian"),
-    ("ita", "Italian"),
-    ("jpn", "Japanese"),
-    ("kor", "Korean"),
-    ("lav", "Latvian"),
-    ("lit", "Lithuanian"),
-    ("may", "Malay"),
-    ("nor", "Norwegian"),
-    ("per", "Persian"),
-    ("pol", "Polish"),
-    ("por", "Portuguese"),
-    ("rum", "Romanian"),
-    ("rus", "Russian"),
-    ("srp", "Serbian"),
-    ("slo", "Slovak"),
-    ("spa", "Spanish"),
-    ("swe", "Swedish"),
-    ("tha", "Thai"),
-    ("tur", "Turkish"),
-    ("ukr", "Ukrainian"),
-    ("vie", "Vietnamese"),
-];
 
 /// Subtitle modes of the server, with the web client's texts.
 const SUBTITLE_MODES: [(&str, &str, &str); 5] = [
@@ -112,10 +73,7 @@ fn language_name(code: &str) -> String {
     if code.is_empty() {
         return "Any language".to_string();
     }
-    LANGUAGES
-        .iter()
-        .find(|(known, _)| *known == code)
-        .map_or_else(|| code.to_string(), |(_, name)| name.to_string())
+    languages::name(code).map_or_else(|| code.to_string(), str::to_string)
 }
 
 /// A select that opens its list at the pointer. `choices` makes the list
@@ -126,7 +84,7 @@ fn select_field(
     longest: &str,
     choices: impl Fn(&Bloom) -> Vec<Choice> + 'static,
     cx: &mut Context<Bloom>,
-) -> Stateful<Div> {
+) -> BaseButton {
     select(id, value, longest, cx).on_click(cx.listener(
         move |this, event: &ClickEvent, window, cx| {
             let choices = choices(this);
@@ -136,7 +94,7 @@ fn select_field(
 }
 
 /// A checkbox for a yes-or-no field of the user's configuration on the server.
-fn server_check(key: &'static str, default: bool, app: &Bloom, cx: &mut Context<Bloom>) -> Stateful<Div> {
+fn server_check(key: &'static str, default: bool, app: &Bloom, cx: &mut Context<Bloom>) -> BaseButton {
     let on = app.prefs.flag(key, default);
     checkbox(SharedString::from(format!("settings.check.{key}")), on, cx).on_click(cx.listener(
         move |this, _: &ClickEvent, _, cx| this.set_user_config(key, Value::Bool(!on), cx),
@@ -144,7 +102,7 @@ fn server_check(key: &'static str, default: bool, app: &Bloom, cx: &mut Context<
 }
 
 /// A select of a language field of the user's configuration.
-fn language_select(id: &'static str, key: &'static str, app: &Bloom, cx: &mut Context<Bloom>) -> Stateful<Div> {
+fn language_select(id: &'static str, key: &'static str, app: &Bloom, cx: &mut Context<Bloom>) -> BaseButton {
     let current = app.prefs.text(key);
     select_field(
         id,
@@ -155,7 +113,7 @@ fn language_select(id: &'static str, key: &'static str, app: &Bloom, cx: &mut Co
             let mut choices = vec![Choice::new("Any language", current.is_empty(), move |this, cx| {
                 this.set_user_config(key, Value::String(String::new()), cx)
             })];
-            choices.extend(LANGUAGES.iter().map(|(code, name)| {
+            choices.extend(languages::LANGUAGES.iter().map(|languages::Language { code, name, .. }| {
                 Choice::new(*name, current == *code, move |this, cx| {
                     this.set_user_config(key, Value::String(code.to_string()), cx)
                 })
@@ -184,7 +142,7 @@ impl Bloom {
             .flex_shrink_0()
             .rounded_full()
             .overflow_hidden()
-            .bg(rgba(0xcccccf69))
+            .bg(tone::DISC)
             .flex()
             .items_center()
             .justify_center()
@@ -209,7 +167,7 @@ impl Bloom {
         }
         // The profile header of the theme: a glass card with the picture
         // and the name.
-        let header = super::card(cx)
+        let header = card(cx)
             .p(px(22.))
             .flex()
             .items_center()
@@ -537,7 +495,7 @@ impl Bloom {
             current: Option<T>,
             set: fn(&mut SubtitleLook, Option<T>),
             cx: &mut Context<Bloom>,
-        ) -> Stateful<Div> {
+        ) -> BaseButton {
             let name = options
                 .iter()
                 .find(|(_, value)| *value == current)
@@ -681,11 +639,11 @@ impl Bloom {
             }
             // A phone: the choice leaves room for the two arrows beside it.
             let pick_max = if crate::views::shell::compact_now() {
-                super::control_max_w() - 84.
+                control_max_w() - 84.
             } else {
                 340.
             };
-            let pick = super::select_capped(
+            let pick = select_capped(
                 SharedString::from(format!("settings.home.{slot}")),
                 name_of(kind),
                 longest,
@@ -742,16 +700,17 @@ impl Bloom {
             cx,
         ));
         let mut enhanced = group("Jellyfin Enhanced", cx);
-        for (key, label) in crate::enhanced::TOGGLES {
-            if !self.enhanced_toggle_shown(key) {
+        for feature in crate::enhanced::Feature::ALL {
+            let key = feature.key();
+            if !self.enhanced_toggle_shown(feature) {
                 continue;
             }
             enhanced = enhanced.child(field(
-                label,
+                feature.label(),
                 "",
-                checkbox(SharedString::from(format!("settings.check.je.{key}")), self.je(key), cx)
+                checkbox(SharedString::from(format!("settings.check.je.{key}")), self.je(feature), cx)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.toggle_enhanced(key, cx)
+                        this.toggle_enhanced(feature, cx)
                     })),
                 cx,
             ));

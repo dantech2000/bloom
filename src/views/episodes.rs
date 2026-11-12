@@ -2,6 +2,7 @@
 //! Episode list of the player: the seasons of the series that plays and the
 //! episodes of one season, each with its still image. A click plays it.
 
+use crate::ui::tone;
 use gpui_icons::LucideIcon;
 use gpui_kit::{
     ClickEvent, Context, Div, InteractiveElement as _, IntoElement as _, MouseButton,
@@ -214,7 +215,7 @@ impl Bloom {
                             el.bg(colors.primary).text_color(colors.primary_foreground)
                         })
                         .when(!selected, |el| {
-                            el.bg(rgba(0xffffff1f))
+                            el.bg(tone::HOVER)
                                 .text_color(colors.foreground)
                                 .hover(|s| s.bg(rgba(0xffffff33)))
                         })
@@ -233,11 +234,11 @@ impl Bloom {
             PICKER_W.min(self.viewport_w - 48.)
         };
         let row_w = picker_w - 30.;
-        // Only the rows in view are built (`admin::rows`): the video
+        // Only the rows in view are built (`ui::rows`): the video
         // redraws the player at each of its frames, and a season can have
         // a hundred episodes.
         let count = picker.episodes.len();
-        let rows = div().w(px(row_w)).child(crate::admin::rows::rows(
+        let rows = div().w(px(row_w)).child(crate::ui::rows::rows(
             cx,
             count,
             row_h,
@@ -296,7 +297,7 @@ impl Bloom {
                 .w(px(picker_w))
                 .rounded(px(24.))
                 .border_1()
-                .border_color(rgba(0xf5f5f733))
+                .border_color(tone::EDGE)
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::swallow_to_player))
                 .child(glass(px(24.), crate::ui::glass::POPUP_TINT))
                 .p(px(14.))
@@ -358,7 +359,7 @@ fn picker_row(
         .items_center()
         .gap(px(14.))
         .cursor_pointer()
-        .when(current, |el| el.bg(rgba(0xffffff1f)))
+        .when(current, |el| el.bg(tone::HOVER))
         .hover(|s| s.bg(rgba(0xffffff29)))
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
             this.pick_episode(pick.clone(), cx)

@@ -3,6 +3,7 @@
 //! at this moment, tasks that run, recent activity, alerts and storage.
 //! The part that changes by itself ([`Live`]) loads again every few seconds.
 
+use crate::ui::tone::{self, State};
 use std::rc::Rc;
 
 use anyhow::Result;
@@ -16,7 +17,7 @@ use serde::Deserialize;
 
 use super::{
     ButtonKind, Confirm,
-    activity::{PLAYED, collapse},
+    activity::{Entry, collapse},
     ago, badge, button, card, fact, panel, parse_date,
     plugin_config,
     users::{avatar, icon_disc},
@@ -25,7 +26,7 @@ use crate::{
     app::Bloom,
     jellyfin::{Client, Item, format_duration},
     ui::theme::UiTheme,
-    views::cards::icon,
+    icons::icon,
 };
 
 /// Space between two cards.
@@ -36,11 +37,6 @@ const ACTIVE_SECONDS: i64 = 960;
 const SESSION_H: f32 = 196.;
 /// Height of the card of a device that plays nothing.
 const IDLE_H: f32 = 100.;
-
-const GREEN: u32 = 0x2e9d5b;
-const AMBER: u32 = 0xc98a1b;
-const RED: u32 = 0xc62828;
-const BLUE: u32 = 0x3d7be0;
 
 pub struct Data {
     info: Info,
@@ -186,7 +182,7 @@ struct Devices {
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 struct ActivityPage {
-    items: Vec<super::activity::Entry>,
+    items: Vec<Entry>,
 }
 
 #[derive(Default, Deserialize, PartialEq)]
@@ -198,22 +194,6 @@ struct Task {
     current_progress_percentage: Option<f64>,
 }
 
-#[derive(Default, Deserialize, PartialEq)]
-#[serde(rename_all = "PascalCase", default)]
-struct Entry {
-    name: String,
-    #[serde(rename = "Type")]
-    kind: String,
-    date: String,
-    severity: String,
-    short_overview: Option<String>,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "PascalCase", default)]
-struct Entries {
-    items: Vec<Entry>,
-}
 
 pub fn load(client: &Client) -> Result<Data> {
     std::thread::scope(|scope| {
@@ -239,25 +219,13 @@ pub fn refresh(client: &Client) -> Result<Live> {
                 "/System/ActivityLog/Entries",
                 &[("Limit", "30".to_string()), ("HasUserId", "true".to_string())],
             )
-            .map(|page| {
-                collapse(page.items)
-                    .into_iter()
-                    .take(7)
-                    .map(|e| Entry {
-                        name: e.name,
-                        kind: e.kind,
-                        date: e.date,
-                        severity: e.severity,
-                        short_overview: e.short_overview,
-                    })
-                    .collect::<Vec<_>>()
-            })
+            .map(|page| collapse(page.items).into_iter().take(7).collect::<Vec<_>>())
             .unwrap_or_default()
     };
     // What the server did by itself: no user is named.
     let alerts = || {
         client
-            .get::<Entries>(
+            .get::<ActivityPage>(
                 "/System/ActivityLog/Entries",
                 &[("Limit", "7".to_string()), ("HasUserId", "false".to_string())],
             )
@@ -381,13 +349,13 @@ fn server_card(data: &Data, wide: bool, cx: &mut Context<Bloom>) -> Div {
         &info.operating_system_display_name
     };
     let state = if info.is_shutting_down {
-        badge("Shutting down", rgb(RED))
+        badge("Shutting down", Some(State::Bad))
     } else if info.has_pending_restart {
-        badge("Restart needed", rgb(AMBER))
+        badge("Restart needed", Some(State::Warn))
     } else if info.has_update_available {
-        badge("Update available", rgb(BLUE))
+        badge("Update available", None)
     } else {
-        badge("Online", rgb(GREEN))
+        badge("Online", Some(State::Ok))
     };
     let chip = |text: String| {
         div()
@@ -474,7 +442,7 @@ fn server_card(data: &Data, wide: bool, cx: &mut Context<Bloom>) -> Div {
         .items_center()
         .gap(px(16.))
         .min_w_0()
-        .child(icon_disc(LucideIcon::Server, t.colors.foreground, 56.))
+        .child(icon_disc(LucideIcon::Server, None, 56.))
         .child(
             div()
                 .min_w_0()
@@ -577,7 +545,7 @@ fn count_tiles(data: &Data, width: f32, cx: &mut Context<Bloom>) -> Div {
                 .flex_row()
                 .items_center()
                 .gap(px(14.))
-                .child(icon_disc(glyph, t.colors.foreground, 44.))
+                .child(icon_disc(glyph, None, 44.))
                 .child(
                     div()
                         .min_w_0()
@@ -587,7 +555,7 @@ fn count_tiles(data: &Data, width: f32, cx: &mut Context<Bloom>) -> Div {
                                 .line_height(px(32.))
                                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                                 .text_color(t.colors.foreground)
-                                .child(grouped(count)),
+                                .child(bloom_core::subtitles::thousands(count as i64)),
                         )
                         .child(
                             div()
@@ -619,7 +587,7 @@ fn sessions(app: &Bloom, sessions: &[Session], width: f32, cx: &mut Context<Bloo
                 .child("Active Devices"),
         )
         .when(playing > 0, |el| {
-            el.child(badge(format!("{playing} playing"), rgb(GREEN)))
+            el.child(badge(format!("{playing} playing"), Some(State::Ok)))
         });
     let Some(client) = app.session.as_ref().map(|s| s.client.clone()) else {
         return div();
@@ -754,10 +722,10 @@ fn session_card(
         .as_ref()
         .filter(|_| session.play_state.play_method.as_deref() == Some("Transcode"));
     let method = match (session.play_state.play_method.as_deref(), transcode) {
-        (_, Some(info)) if info.is_video_direct => badge("Remux", rgb(BLUE)),
-        (_, Some(_)) => badge("Transcode", rgb(AMBER)),
-        (Some("DirectStream"), _) => badge("Direct Stream", rgb(BLUE)),
-        _ => badge("Direct Play", rgb(GREEN)),
+        (_, Some(info)) if info.is_video_direct => badge("Remux", None),
+        (_, Some(_)) => badge("Transcode", Some(State::Warn)),
+        (Some("DirectStream"), _) => badge("Direct Stream", None),
+        _ => badge("Direct Play", Some(State::Ok)),
     };
     let title = item.series_name.clone().unwrap_or_else(|| item.name.clone());
     let subtitle = match (&item.series_name, item.episode_code()) {
@@ -797,7 +765,7 @@ fn session_card(
                         .gap(px(10.))
                         .child(head.flex_1().min_w_0())
                         .when(session.play_state.is_paused, |el| {
-                            el.child(badge("Paused", rgba(0xffffff40)))
+                            el.child(badge("Paused", None))
                         })
                         .child(method),
                 )
@@ -940,7 +908,7 @@ fn running_tasks(tasks: &[Task], cx: &mut Context<Bloom>) -> Div {
                 .text_color(t.colors.foreground)
                 .child(icon(LucideIcon::RefreshCw, 15., t.colors.foreground.opacity(0.7)))
                 .child(div().w(px(260.)).flex_shrink_0().truncate().child(task.name.clone()))
-                .child(bar(percent as f32 / 100., rgb(0xf5f5f7)).flex_1())
+                .child(bar(percent as f32 / 100., tone::INK).flex_1())
                 .child(
                     div()
                         .w(px(96.))
@@ -967,7 +935,7 @@ fn entries(title: &'static str, entries: &[Entry], empty: &'static str, cx: &mut
         );
     }
     for (i, entry) in entries.iter().enumerate() {
-        let (glyph, tint) = entry_glyph(entry);
+        let (glyph, state) = entry.look();
         list = list.child(
             div()
                 .py(px(9.))
@@ -975,7 +943,7 @@ fn entries(title: &'static str, entries: &[Entry], empty: &'static str, cx: &mut
                 .flex()
                 .items_center()
                 .gap(px(12.))
-                .child(icon_disc(glyph, tint, 30.))
+                .child(icon_disc(glyph, state, 30.))
                 .child(
                     div()
                         .flex_1()
@@ -1008,32 +976,6 @@ fn entries(title: &'static str, entries: &[Entry], empty: &'static str, cx: &mut
         );
     }
     list
-}
-
-fn entry_glyph(entry: &Entry) -> (LucideIcon, Rgba) {
-    match entry.severity.as_str() {
-        "Error" | "Critical" | "Fatal" => return (LucideIcon::TriangleAlert, rgb(0xff6b6b)),
-        "Warning" | "Warn" => return (LucideIcon::TriangleAlert, rgb(0xf2c14e)),
-        _ => {}
-    }
-    let kind = entry.kind.as_str();
-    if kind == PLAYED {
-        (LucideIcon::Play, rgb(0xb0b0b8))
-    } else if kind.contains("PlaybackStopped") {
-        (LucideIcon::Pause, rgb(0xb0b0b8))
-    } else if kind.contains("Playback") {
-        (LucideIcon::Play, rgb(0xb0b0b8))
-    } else if kind.contains("Failed") || kind.contains("LockedOut") {
-        (LucideIcon::ShieldAlert, rgb(0xff6b6b))
-    } else if kind.contains("Session") || kind.contains("Authentication") || kind.contains("User") {
-        (LucideIcon::User, rgb(0xb0b0b8))
-    } else if kind.contains("Task") {
-        (LucideIcon::Clock, rgb(0xb0b0b8))
-    } else if kind.contains("Plugin") || kind.contains("Package") {
-        (LucideIcon::Zap, rgb(0xb0b0b8))
-    } else {
-        (LucideIcon::Info, rgb(0xb0b0b8))
-    }
 }
 
 // ----- storage, paths ---------------------------------------------------------
@@ -1114,7 +1056,7 @@ fn storage(storage: &Storage, cx: &mut Context<Bloom>) -> Div {
             // Colour only when the disk is nearly full.
             f if f >= 0.95 => rgb(0xff7b72),
             f if f >= 0.85 => rgb(0xe3b341),
-            _ => rgb(0xf5f5f7),
+            _ => tone::INK,
         };
         list = list.child(
             div()
@@ -1138,7 +1080,7 @@ fn storage(storage: &Storage, cx: &mut Context<Bloom>) -> Div {
                                 .child(disk.labels.join(", ")),
                         )
                         .when(disk.kind == "Network", |el| {
-                            el.child(badge("Network", rgba(0xffffff26)))
+                            el.child(badge("Network", None))
                         })
                         .child(
                             div()
@@ -1198,19 +1140,6 @@ fn bar(value: f32, color: Rgba) -> Div {
                 .w(relative(value.clamp(0., 1.)))
                 .bg(color),
         )
-}
-
-/// 4090 as "4,090".
-fn grouped(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
 }
 
 /// A size in the unit that fits: "194 GB", "11.7 TB".

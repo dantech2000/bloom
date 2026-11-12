@@ -9,20 +9,14 @@
 use std::rc::Rc;
 
 use gpui_kit::{
-    AnyElement, ClickEvent, ClipboardItem, Context, Div, Focusable as _, InteractiveElement as _,
-    ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _, Styled, Window, div,
-    px, rgba,
+    AnyElement, ClickEvent, ClipboardItem, Context, Div, Focusable as _, ParentElement as _, Stateful,
+    StatefulInteractiveElement as _, Styled, Window, div, px, rgba,
 };
 
 use super::{ButtonKind, button};
 use crate::{
     app::Bloom,
-    ui::{
-        glass::glass,
-        input::Input,
-        motion::{Enter, enter},
-        theme::UiTheme,
-    },
+    ui::{dialog, input::Input, theme::UiTheme},
 };
 
 /// The dialogs that wait for the user. One shows at a time.
@@ -256,7 +250,7 @@ impl Bloom {
             );
         }
         Some(
-            dialog("admin.prompt", &prompt.title, &prompt.message, cx)
+            dialog::titled("admin.prompt", &prompt.title, &prompt.message, cx)
                 .child(fields)
                 .child(
                     div()
@@ -293,7 +287,7 @@ impl Bloom {
         let t = UiTheme::read(cx).clone();
         let value = secret.value.clone();
         Some(
-            dialog("admin.secret", &secret.title, &secret.message, cx)
+            dialog::titled("admin.secret", &secret.title, &secret.message, cx)
                 .child(
                     div()
                         .px(px(12.))
@@ -334,61 +328,13 @@ impl Bloom {
     }
 }
 
-/// Dark layer over the page with a dialog in its middle. A click beside the
-/// dialog closes it. The layer fades in and the dialog settles into place.
+/// The layer of a dialog of the dashboard (`ui::dialog`). A click beside
+/// the dialog closes it.
 fn backdrop(id: &'static str, card: Stateful<Div>, cx: &mut Context<Bloom>) -> AnyElement {
-    let card = enter(card, SharedString::from(format!("{id}.card.in")), Enter::Settle, cx);
-    let layer = div()
-        .id(id)
-        .absolute()
-        .inset_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        // A phone: a field of the dialog raises the keyboard, and the
-        // dialog centres in the room above it.
-        .pb(px(crate::views::shell::keyboard_inset()))
-        .bg(rgba(0x00000099))
-        // The page behind takes no click while the dialog is open: a
-        // hitbox does not block by itself, and the click that closes the
-        // dialog also pressed the button under the pointer.
-        .occlude()
-        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-            this.close_admin_dialog(window, cx)
-        }))
-        .child(card);
-    enter(layer, SharedString::from(format!("{id}.in")), Enter::Fade, cx)
-}
-
-/// The glass card of a dialog with its title and message.
-fn dialog(id: &'static str, title: &str, message: &str, cx: &Context<Bloom>) -> Stateful<Div> {
-    let t = UiTheme::read(cx);
-    div()
-        .id(id)
-        .relative()
-        .w(px(440.))
-        .rounded(px(24.))
-        .border_1()
-        .border_color(rgba(0xf5f5f733))
-        .child(glass(px(24.), crate::ui::glass::POPUP_TINT))
-        .p(px(24.))
-        .flex()
-        .flex_col()
-        .gap(px(12.))
-        .on_click(|_: &ClickEvent, _, cx| cx.stop_propagation())
-        .child(
-            div()
-                .text_size(px(20.))
-                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                .text_color(t.colors.foreground)
-                .child(title.to_string()),
-        )
-        .child(
-            div()
-                .text_size(px(15.))
-                .text_color(t.colors.foreground.opacity(0.8))
-                .child(message.to_string()),
-        )
+    let layer = dialog::layer(id, card, cx).on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+        this.close_admin_dialog(window, cx)
+    }));
+    dialog::shown(layer, id, cx)
 }
 
 #[cfg(test)]

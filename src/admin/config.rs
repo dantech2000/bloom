@@ -10,13 +10,15 @@
 //! puts the edits in it and posts it, so every key the page does not show
 //! goes back as the server has it.
 
+use gpui_kit::base::Button as BaseButton;
+use crate::ui::tone;
 use std::{rc::Rc, sync::Arc};
 
 use anyhow::Result;
 use gpui_icons::LucideIcon;
 use gpui_kit::{
-    ClickEvent, Context, Div, InteractiveElement as _, ParentElement as _, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled, Window, div, px, rgba,
+    ClickEvent, Context, Div, InteractiveElement as _, ParentElement as _, SharedString,
+    Styled, Window, div, px,
 };
 use gpui_kit::IntoElement as _;
 use serde_json::{Value, json};
@@ -25,9 +27,9 @@ use super::{Ask, ButtonKind, Confirm, Draft, Section, button, choice_box, list_e
 use crate::{
     app::{Bloom, Page},
     jellyfin::Client,
-    settings::{checkbox, field, group},
+    ui::form::{checkbox, field, group},
     ui::{glass::glass, theme::UiTheme},
-    views::cards::icon,
+    icons::icon,
 };
 
 /// How a field is shown and edited.
@@ -904,8 +906,8 @@ pub(super) fn unsaved_text(changes: usize, saving: bool) -> String {
 pub(super) fn bar_shell(
     (left, right, bottom): (f32, f32, f32),
     text: String,
-    discard: Stateful<Div>,
-    save: Stateful<Div>,
+    discard: impl gpui_kit::IntoElement,
+    save: impl gpui_kit::IntoElement,
     cx: &Context<Bloom>,
 ) -> Div {
     let t = UiTheme::read(cx).clone();
@@ -917,7 +919,7 @@ pub(super) fn bar_shell(
         .h(px(64.))
         .rounded(px(24.))
         .border_1()
-        .border_color(rgba(0xf5f5f733))
+        .border_color(tone::EDGE)
         .child(glass(px(24.), crate::ui::glass::POPUP_TINT))
         .px(px(20.))
         .flex()
@@ -945,13 +947,13 @@ pub fn branding_of(data: &Data) -> Option<&Value> {
 /// fill and the edge of a text field at rest (`ui::input`), so it reads
 /// as a field before the pointer reaches it (it read as text with a
 /// pencil beside it, 2026-10-23).
-pub(super) fn value_button(id: SharedString, value: String, cx: &Context<Bloom>) -> Stateful<Div> {
+pub(super) fn value_button(id: SharedString, value: String, cx: &Context<Bloom>) -> BaseButton {
     let t = UiTheme::read(cx);
     let empty = value.is_empty();
-    div()
-        .id(id)
+    let label = if empty { "Not set".to_string() } else { value.clone() };
+    crate::ui::button::bare(id, label)
         .min_w(px(120.))
-        .max_w(px(crate::settings::control_max_w()))
+        .max_w(px(crate::ui::form::control_max_w()))
         .h(px(38.))
         .pl(px(12.))
         .pr(px(10.))
@@ -959,14 +961,11 @@ pub(super) fn value_button(id: SharedString, value: String, cx: &Context<Bloom>)
         .border_1()
         .border_color(t.colors.input)
         .bg(t.colors.input.opacity(0.3))
-        .flex()
-        .items_center()
         .justify_between()
         .gap(px(10.))
-        .cursor_pointer()
         .text_size(px(15.))
         .text_color(if empty { t.colors.foreground.opacity(0.5) } else { t.colors.foreground })
-        .hover(|s| s.border_color(rgba(0xf5f5f766)))
+        .hover(|s| s.border_color(tone::INK_40))
         .child(div().min_w_0().truncate().child(if empty { "Not set".to_string() } else { value }))
         .child(icon(LucideIcon::Pencil, 15., t.colors.foreground.opacity(0.7)))
 }
@@ -995,7 +994,7 @@ fn field_row(
     let id = SharedString::from(format!("config.{section:?}.{g}.{n}"));
     let value = data.value(entry);
     let (source, path) = (entry.source, entry.path.clone());
-    let control: Stateful<Div> = match &entry.kind {
+    let control: BaseButton = match &entry.kind {
         Kind::Bool => {
             let on = value.as_bool().unwrap_or(false);
             checkbox(id, on, cx).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -1052,7 +1051,7 @@ pub fn render(section: Section, data: &Data, cx: &mut Context<Bloom>) -> Div {
             // A long group: the rows of the fields in view only. They read
             // the edits from the app each time they are built.
             let spec = data.spec.clone();
-            card = card.child(super::lazy::lazy(
+            card = card.child(crate::ui::lazy::lazy(
                 cx,
                 format!("config.{section:?}.{g}"),
                 fields.len(),

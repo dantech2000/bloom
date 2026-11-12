@@ -3,6 +3,7 @@
 //! entries of the card menu, the chip in the top bar, the Downloads page
 //! and the settings section. One ink; a colour only for a state.
 
+use crate::ui::tone::{self, State};
 use std::{
     collections::{BTreeMap, HashMap},
     rc::Rc,
@@ -13,26 +14,28 @@ use gpui_kit::{
     Bounds, Canvas, ClickEvent, Context, Div, InteractiveElement as _, IntoElement as _, ObjectFit,
     ParentElement as _, Path, Pixels, Point, Rgba, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled, Window, canvas, div, point, prelude::FluentBuilder as _,
-    px, rgb, rgba,
+    px, rgba,
 };
 
 use super::{Entry, EntryState, engine, engine::Key, format_bytes};
 use crate::{
-    admin::{Confirm, rows::rows},
+    admin::Confirm,
+    ui::rows::rows,
     app::{Bloom, Page},
     jellyfin::{Item, ItemKind},
-    settings::{Choice, field, group, icon_button, raised, select},
+    settings::Choice,
+    ui::{button::raised, form::{field, group, row_icon as icon_button, select}},
     ui::{menu::MenuItem, scroll_area::ScrollArea, theme::UiTheme, tip::tip},
     views::cards::{CARD_RADIUS, icon},
 };
 
 /// Green for a download under way, amber for one that waits, red for one
 /// that failed: the state colours of the dashboard.
-fn state_dot(state: EntryState) -> Option<Rgba> {
+fn state_dot(state: EntryState) -> Option<State> {
     match state {
-        EntryState::Downloading => Some(rgb(0x7ee787)),
-        EntryState::Queued | EntryState::Paused => Some(rgb(0xe3b341)),
-        EntryState::Failed => Some(rgb(0xff7b72)),
+        EntryState::Downloading => Some(State::Ok),
+        EntryState::Queued | EntryState::Paused => Some(State::Warn),
+        EntryState::Failed => Some(State::Bad),
         EntryState::Done => None,
     }
 }
@@ -119,7 +122,9 @@ fn sum_progress(entries: &[&Entry]) -> f32 {
 }
 
 /// Height of a row of the Downloads page: the artwork (a still of 50
-/// points, a poster of 66) and 6 points over and under it.
+/// points, a poster of 66) and 6 points over and under it. The text
+/// beside it is 48 points at most: a title line of 20, a detail line of
+/// 16, and the progress bar with its gaps (3 + 3 + 2 + 4).
 const ROW_EPISODE: f32 = 62.;
 const ROW_MOVIE: f32 = 78.;
 
@@ -270,7 +275,7 @@ impl Bloom {
             let ids: Vec<String> = episodes.iter().map(|e| e.id.clone()).collect();
             return Some(
                 button()
-                    .bg(rgba(0xf5f5f733))
+                    .bg(tone::EDGE)
                     .tooltip(tip("Season downloaded · Click to remove the files"))
                     .child(icon(LucideIcon::CircleCheck, 25., fg))
                     .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
@@ -317,14 +322,14 @@ impl Bloom {
                             .right(px(8.))
                             .size(px(8.))
                             .rounded_full()
-                            .bg(rgb(0xff7b72)),
+                            .bg(State::Bad.color()),
                     )
                     .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
                         super::engine().resume(&id);
                         cx.notify();
                     })),
                 EntryState::Done => button()
-                    .bg(rgba(0xf5f5f733))
+                    .bg(tone::EDGE)
                     .tooltip(tip("Downloaded · Click to remove the file"))
                     .child(icon(LucideIcon::CircleCheck, 25., fg))
                     .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
@@ -422,7 +427,7 @@ impl Bloom {
                 .h(px(36.))
                 .px(px(12.))
                 .rounded_full()
-                .bg(rgba(0xffffff1f))
+                .bg(tone::HOVER)
                 .hover(|s| s.bg(rgba(0xffffff29)))
                 .cursor_pointer()
                 .flex()
@@ -528,8 +533,8 @@ impl Bloom {
                 div()
                     .rounded(px(24.))
                     .border_1()
-                    .border_color(rgba(0xf5f5f733))
-                    .bg(rgba(0x2a2a2ab0))
+                    .border_color(tone::EDGE)
+                    .bg(tone::CARD)
                     .px(px(22.))
                     .py(px(14.))
                     .flex()
@@ -591,7 +596,6 @@ impl Bloom {
                     .size_full()
                     .child(page),
             )
-            .children(self.render_confirm(cx))
     }
 
     /// One item of the Downloads page: artwork, title, state and size, a
@@ -649,8 +653,11 @@ impl Bloom {
                     .items_center()
                     .gap(px(6.))
                     .text_size(px(12.))
+                    // With the line of the page (20 points) a row with a
+                    // progress bar is 52 points, and a row has 50.
+                    .line_height(px(16.))
                     .text_color(quiet)
-                    .children(dot.map(|color| div().size(px(6.)).rounded_full().flex_shrink_0().bg(color)))
+                    .children(dot.map(|state| div().size(px(6.)).rounded_full().flex_shrink_0().bg(state.color())))
                     .child(div().truncate().child(detail)),
             );
         if entry.state != EntryState::Done {
@@ -661,7 +668,7 @@ impl Bloom {
                     .w_full()
                     .rounded_full()
                     .overflow_hidden()
-                    .bg(rgba(0xffffff1f))
+                    .bg(tone::HOVER)
                     .child(
                         div()
                             .h_full()
@@ -741,7 +748,7 @@ impl Bloom {
             .items_center()
             .gap(px(12.))
             .cursor_pointer()
-            .hover(|s| s.bg(rgba(0xffffff1f)))
+            .hover(|s| s.bg(tone::HOVER))
             .child(art)
             .child(text)
             .child(buttons)

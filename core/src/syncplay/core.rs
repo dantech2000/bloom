@@ -118,11 +118,8 @@ pub enum Intent {
     Remove { playlist_item_ids: Vec<String> },
     Move { playlist_item_id: String, new_index: usize },
     Jump { playlist_item_id: String },
-    /// The repeat mode and the order of the queue, by the names the server
-    /// has for them (`RepeatMode::name`, `ShuffleMode::name`): the debug
-    /// channel gives a text. A name that is none does nothing.
-    Repeat(String),
-    Shuffle(String),
+    Repeat(RepeatMode),
+    Shuffle(ShuffleMode),
     /// Stop to follow the group, but stay a member.
     StopFollowing,
     /// Follow the group again.
@@ -997,16 +994,8 @@ impl Core {
             Intent::Jump { playlist_item_id } => {
                 send(out, Request::SetPlaylistItem { playlist_item_id })
             }
-            Intent::Repeat(mode) => {
-                if let Some(mode) = RepeatMode::parse(&mode) {
-                    send(out, Request::SetRepeatMode(mode));
-                }
-            }
-            Intent::Shuffle(mode) => {
-                if let Some(mode) = ShuffleMode::parse(&mode) {
-                    send(out, Request::SetShuffleMode(mode));
-                }
-            }
+            Intent::Repeat(mode) => send(out, Request::SetRepeatMode(mode)),
+            Intent::Shuffle(mode) => send(out, Request::SetShuffleMode(mode)),
             Intent::StopFollowing => {
                 if self.following {
                     self.following = false;
@@ -1499,6 +1488,14 @@ mod tests {
         assert_eq!(
             sent(&rig.user(Intent::Play { item_ids: vec!["a".into(), "b".into()], index: 1, start: 1_000. })),
             [&Request::SetNewQueue { item_ids: vec!["a".into(), "b".into()], index: 1, start_ticks: 10_000_000 }]
+        );
+        assert_eq!(
+            sent(&rig.user(Intent::Repeat(RepeatMode::RepeatAll))),
+            [&Request::SetRepeatMode(RepeatMode::RepeatAll)]
+        );
+        assert_eq!(
+            sent(&rig.user(Intent::Shuffle(ShuffleMode::Shuffle))),
+            [&Request::SetShuffleMode(ShuffleMode::Shuffle)]
         );
         // Outside a group only create and join do something.
         let mut alone = Rig::new();

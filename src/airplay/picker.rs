@@ -9,22 +9,7 @@ use std::sync::Mutex;
 
 use gpui_kit::Window;
 
-use crate::macos::{Id, class, send};
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Size {
-    width: f64,
-    height: f64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Rect {
-    x: f64,
-    y: f64,
-    size: Size,
-}
+use crate::macos::{CGRect, Id, class, send};
 
 /// The view that is in the window now, as an address.
 static VIEW: Mutex<usize> = Mutex::new(0);
@@ -44,11 +29,11 @@ pub fn show(window: &Window, player: Id, place: Place) -> bool {
         return false;
     }
     // AppKit counts from the bottom left.
-    let height = send!(Rect, content, c"frame").size.height;
+    let height = send!(CGRect, content, c"frame").height;
     let [x, y, w, h] = place.map(f64::from);
-    let frame = Rect { x, y: height - y - h, size: Size { width: w, height: h } };
+    let frame = CGRect { x, y: height - y - h, width: w, height: h };
     let view = send!(Id, class(c"AVRoutePickerView"), c"alloc");
-    let view = send!(Id, view, c"initWithFrame:", frame => Rect);
+    let view = send!(Id, view, c"initWithFrame:", frame => CGRect);
     if view.is_null() {
         return false;
     }

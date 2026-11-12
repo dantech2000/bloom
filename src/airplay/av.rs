@@ -7,14 +7,14 @@
 //! Struct returns (`CMTime`) go through plain `objc_msgSend`, as the window
 //! frame does in `src/pip.rs`: this is the arm64 calling convention.
 
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::c_void;
 
 // A struct comes back from `objc_msgSend` itself on arm64 alone; on x86_64
 // it needs `objc_msgSend_stret`, which nothing here calls.
 #[cfg(not(target_arch = "aarch64"))]
 compile_error!("src/airplay/av.rs and picker.rs read struct returns (CMTime, NSRect) the arm64 way");
 
-use crate::macos::{Id, class, send};
+use crate::macos::{Id, class, ns_string, send, string_of};
 // The pool is shared with the render threads of the players.
 pub use crate::macos::Pool;
 
@@ -60,34 +60,12 @@ impl CMTime {
     }
 }
 
-pub(crate) fn nsstring(text: &str) -> Id {
-    let data = send!(
-        Id, class(c"NSData"), c"dataWithBytes:length:",
-        text.as_ptr() => *const u8, text.len() => usize
-    );
-    let string = send!(Id, class(c"NSString"), c"alloc");
-    // NSUTF8StringEncoding
-    let string = send!(Id, string, c"initWithData:encoding:", data => Id, 4_usize => usize);
-    send!(Id, string, c"autorelease")
-}
-
-pub(crate) fn string_of(object: Id) -> Option<String> {
-    if object.is_null() {
-        return None;
-    }
-    let ptr = send!(*const c_char, object, c"UTF8String");
-    if ptr.is_null() {
-        return None;
-    }
-    Some(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
-}
-
 /// `localizedDescription` of an `NSError`, with its underlying error.
 fn error_text(error: Id) -> Option<String> {
     let mut text = string_of(send!(Id, error, c"localizedDescription"))?;
     let info = send!(Id, error, c"userInfo");
     if !info.is_null() {
-        let under = send!(Id, info, c"objectForKey:", nsstring("NSUnderlyingError") => Id);
+        let under = send!(Id, info, c"objectForKey:", ns_string("NSUnderlyingError") => Id);
         if let Some(more) = string_of(send!(Id, under, c"localizedDescription")) {
             text.push_str(": ");
             text.push_str(&more);
@@ -136,7 +114,7 @@ impl Player {
     /// an item made of nil must not reach the player (an exception of
     /// Objective-C through this code ends the app).
     pub fn load(&self, url: &str) -> Result<(), String> {
-        let address = send!(Id, class(c"NSURL"), c"URLWithString:", nsstring(url) => Id);
+        let address = send!(Id, class(c"NSURL"), c"URLWithString:", ns_string(url) => Id);
         if address.is_null() {
             return Err("the address of the stream is not a URL".into());
         }

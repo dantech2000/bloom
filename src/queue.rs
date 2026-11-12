@@ -7,6 +7,7 @@ use std::{
     rc::Rc,
 };
 
+use bloom_core::queue::replacement;
 use gpui_kit::{Bounds, Context, Pixels};
 
 use crate::{
@@ -42,11 +43,6 @@ pub struct PlayQueue {
     pub resume_first: bool,
     /// Counts the queues, so an answer for an old queue is dropped.
     pub epoch: u64,
-    /// The user chose the audio track of this item; the choice of the
-    /// server does not replace it.
-    pub explicit_audio: bool,
-    /// The same for the subtitle.
-    pub explicit_subtitle: bool,
     /// The preview frame painted last. It stays up while the sheet of the
     /// next one is not decoded yet.
     pub preview_last: Rc<RefCell<Option<std::sync::Arc<gpui_kit::RenderImage>>>>,
@@ -151,7 +147,7 @@ impl Bloom {
                     // server for the item before can still be the last one.
                     let transcoding = crate::stream::transcoding(&item_id);
                     if let Some(track) = timeline.default_audio
-                        && !this.queue.explicit_audio
+                        && !this.stream.explicit_audio
                         && !transcoding
                     {
                         this.player.set_audio(Some(track));
@@ -159,7 +155,7 @@ impl Bloom {
                     // The subtitle the server chose from the subtitle mode
                     // and language of the user ("no" for none).
                     if let Some(choice) = timeline.default_subtitle
-                        && !this.queue.explicit_subtitle
+                        && !this.stream.explicit_subtitle
                         && !transcoding
                     {
                         this.player.set_subtitle(choice);
@@ -412,45 +408,5 @@ fn frame_at(trickplay: &Trickplay, secs: f64) -> u32 {
     match trickplay.thumbnail_count {
         0 => index,
         count => index.min(count - 1),
-    }
-}
-
-/// The episode that stands where `lost` stood: the same season and episode
-/// numbers, under another id.
-fn replacement<'a>(lost: &Item, episodes: &'a [Item]) -> Option<&'a Item> {
-    episodes.iter().find(|e| {
-        e.id != lost.id
-            && e.index_number == lost.index_number
-            && e.parent_index_number == lost.parent_index_number
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn episode(id: &str, season: Option<i32>, number: i32) -> Item {
-        let mut value = serde_json::json!({"Id": id, "Name": id, "Type": "Episode", "IndexNumber": number});
-        if let Some(season) = season {
-            value["ParentIndexNumber"] = season.into();
-        }
-        serde_json::from_value(value).unwrap()
-    }
-
-    #[test]
-    fn the_replacement_has_the_numbers_of_the_lost_episode_under_another_id() {
-        let lost = episode("old2", Some(2), 2);
-        let episodes = [episode("new1", Some(2), 1), episode("new2", Some(2), 2), episode("new3", Some(2), 3)];
-        assert_eq!(replacement(&lost, &episodes).map(|e| e.id.as_str()), Some("new2"));
-        // An episode of another season with the same number is not it.
-        let other_season = [episode("s1e2", Some(1), 2)];
-        assert!(replacement(&lost, &other_season).is_none());
-        // The lost episode itself, listed still, is no replacement.
-        let itself = [episode("old2", Some(2), 2)];
-        assert!(replacement(&lost, &itself).is_none());
-        // A series with no seasons matches on the episode number alone.
-        let flat_lost = episode("old7", None, 7);
-        let flat = [episode("new7", None, 7)];
-        assert_eq!(replacement(&flat_lost, &flat).map(|e| e.id.as_str()), Some("new7"));
     }
 }

@@ -1155,8 +1155,11 @@ impl Bloom {
             cx,
             |client| Ok(client.quality_prefs()),
             |this, result, cx| {
-                if let Ok(Some(settings)) = result {
-                    this.je_quality_tags = settings;
+                if let Ok(Some((enabled, prefs))) = result {
+                    use crate::quality_tags::Category;
+                    crate::quality_tags::set_prefs(prefs);
+                    this.je_quality_tags =
+                        (enabled, prefs.shows(Category::Resolution), prefs.shows(Category::DynamicRange));
                     this.apply_quality_tags(cx);
                 }
             },
@@ -2798,8 +2801,6 @@ impl Bloom {
             self.airplay_send(item, start_secs as f64, cx);
             return;
         }
-        self.queue.explicit_audio = false;
-        self.queue.explicit_subtitle = false;
         // A downloaded item plays from its file on this Mac; otherwise the
         // server says how the item plays (the file, or a transcode).
         self.stream_begin(item, start_secs as f64);

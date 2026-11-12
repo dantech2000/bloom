@@ -7,6 +7,12 @@ license = "AGPL-3.0-or-later"
 description = "The parts of Bloom with no window: the Jellyfin client, the config and the state machines"
 publish = false
 
+# The fake cast device of the tests; see the note in the Cargo.toml of
+# the app.
+[features]
+default = ["cast-mock"]
+cast-mock = []
+
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

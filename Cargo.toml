@@ -17,9 +17,18 @@ path = "src/lib.rs"
 name = "bloom"
 path = "src/main.rs"
 
+# `cast-mock` is the fake cast device of the tests
+# (`BLOOM_CHROMECAST_MOCK`, core/src/chromecast/mock.rs): a TLS server with
+# a key of its own. Every build for work has it, `dev/run-test` among
+# them; the build that ships leaves it out (`dev/release` builds with
+# `--no-default-features`).
+[features]
+default = ["cast-mock"]
+cast-mock = ["bloom-core/cast-mock"]
+
 [dependencies]
 # The parts with no window (core/).
-bloom-core = { path = "core" }
+bloom-core = { path = "core", default-features = false }
 # Makes a trait of an `impl Client` block in a module of the app: the type
 # is `bloom-core`'s, and a crate may not add methods to it in another way.
 easy-ext = "1"

@@ -3,7 +3,8 @@
 //! Shared media presentation: cards, section rows, small helpers. Sizes and
 //! colours follow the Jellyfin web client with the Abyss theme.
 
-use gpui_icons::{LucideIcon, lucide};
+use crate::ui::tone;
+use gpui_icons::{LucideIcon};
 use std::{collections::HashMap, rc::Rc, time::Duration};
 
 use gpui_kit::{
@@ -88,9 +89,9 @@ impl Metrics {
     }
 }
 
-pub fn icon(name: LucideIcon, size: f32, color: gpui_kit::Rgba) -> Svg {
-    lucide(name).size(px(size)).text_color(color)
-}
+// The icon helper lives in `icons.rs`; the modules that are not moved
+// yet take it from here.
+pub use crate::icons::icon;
 
 pub fn card_id(prefix: &'static str, item: &Item) -> ElementId {
     ElementId::from(SharedString::from(format!("{prefix}.{}", item.id)))
@@ -164,7 +165,7 @@ pub fn image_edge(hover: bool) -> Div {
         .border_1()
         .border_color(rgba(0xc8c8c81f))
         .when(hover, |el| {
-            el.hover(|s| s.bg(rgba(0x00000066)).border_color(rgba(0xf5f5f733)))
+            el.hover(|s| s.bg(rgba(0x00000066)).border_color(tone::EDGE))
         })
 }
 
@@ -199,7 +200,7 @@ pub fn indicator(item: &Item) -> Option<Div> {
             .flex()
             .items_center()
             .justify_center()
-            .text_color(rgb(0x121212))
+            .text_color(tone::ON_ACCENT)
             .text_size(px(13.))
             .font_weight(gpui_kit::FontWeight::BOLD)
     };
@@ -210,15 +211,15 @@ pub fn indicator(item: &Item) -> Option<Div> {
             } else {
                 n.to_string()
             };
-            return Some(chip().bg(rgba(0xf5f5f7cc)).child(text));
+            return Some(chip().bg(tone::INK_80).child(text));
         }
         _ => {}
     }
     if item.user_data.played {
         return Some(
             chip()
-                .bg(rgb(0xf5f5f7))
-                .child(icon(LucideIcon::Check, 16., rgb(0x121212))),
+                .bg(tone::INK)
+                .child(icon(LucideIcon::Check, 16., tone::ON_ACCENT)),
         );
     }
     None
@@ -300,7 +301,7 @@ fn hover_overlay(item: &Rc<Item>, row: CardRow, cx: &mut Context<Bloom>) -> Div 
         .rounded(px(CARD_RADIUS))
         .bg(rgba(0x000000b3))
         .border_1()
-        .border_color(rgba(0xf5f5f733))
+        .border_color(tone::EDGE)
         .flex()
         .items_center()
         .justify_center();
@@ -335,7 +336,7 @@ fn hover_overlay(item: &Rc<Item>, row: CardRow, cx: &mut Context<Bloom>) -> Div 
                     icon(
                         LucideIcon::Check,
                         20.,
-                        if played { rgb(0xf5f5f7) } else { dim },
+                        if played { tone::INK } else { dim },
                     ),
                 )
                 .tooltip(tip(if played { "Mark unplayed" } else { "Mark played" }))

@@ -7,6 +7,7 @@ use gpui_kit::{Context, Window};
 
 use super::{
     protocol::{PlayCommand, SessionInfo},
+    remote::Track,
     target::{Kind, Target},
 };
 use crate::app::{Bloom, Panel};
@@ -19,7 +20,7 @@ impl Bloom {
             Some([x, y, w, h]) => format!("{x:.0},{y:.0} {w:.0}x{h:.0}"),
             None => "off".into(),
         };
-        match &self.cast.target {
+        match &self.cast.target() {
             Target::Local => format!(
                 "kind=local target=none sessions={} chromecast_devices={} airplay_routes={} searching={} subscribed={} panel={} picker={} error={:?}",
                 self.cast.sessions.len(),
@@ -116,7 +117,7 @@ impl Bloom {
             "devices" => {
                 self.chromecast.keep_search = true;
                 self.start_cast_search(cx);
-                let mut lines = vec![format!("this device: {}", if self.cast.target.is_local() { "chosen" } else { "-" })];
+                let mut lines = vec![format!("this device: {}", if !self.cast.active() { "chosen" } else { "-" })];
                 for s in &self.cast.sessions {
                     lines.push(format!("jellyfin: {} device={:?} client={:?}", s.id, s.device_name, s.client));
                 }
@@ -225,7 +226,7 @@ impl Bloom {
                 cx,
             ),
             "audio" | "subtitle" => match arg.parse::<i64>() {
-                Ok(index) => self.target_set_track(if verb == "audio" { "Audio" } else { "Subtitle" }, index, cx),
+                Ok(index) => self.target_set_track(if verb == "audio" { Track::Audio } else { Track::Subtitle }, index, cx),
                 Err(_) => return format!("error: usage: cast {verb} <stream index>"),
             },
             "caps" => {

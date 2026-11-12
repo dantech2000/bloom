@@ -14,17 +14,16 @@ pub mod config;
 pub mod dashboard;
 pub mod devices;
 pub mod dialogs;
-pub mod lazy;
 pub mod libraries;
 pub mod logs;
 pub mod plugin_config;
 pub mod plugins;
-pub mod rows;
 pub mod tasks;
 pub mod triggers;
 pub mod text_editor;
 pub mod users;
 
+use crate::ui::tone::{self, State};
 use std::{
     collections::HashMap,
     rc::Rc,
@@ -37,19 +36,18 @@ use gpui_icons::LucideIcon;
 use gpui_kit::{
     AnyElement, ClickEvent, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled, div,
-    prelude::FluentBuilder as _, px, rgb, rgba,
+    prelude::FluentBuilder as _, px, rgba,
 };
 
 use crate::{
     app::{Bloom, Page},
     jellyfin::Client,
     ui::{
-        glass::glass,
         motion::{Enter, enter},
         scroll_area::ScrollArea,
         theme::UiTheme,
     },
-    views::cards::icon,
+
 };
 
 /// Width of the section list at the left.
@@ -323,46 +321,6 @@ pub struct Ask {
     pub required: bool,
 }
 
-/// A server object in an editor: as the server gave it, and the copy the
-/// user edits. Nothing goes to the server before a save, and the page
-/// shows the Save bar while the two differ.
-#[derive(Clone, Default)]
-pub struct Draft {
-    pub original: serde_json::Value,
-    pub edited: serde_json::Value,
-    /// A save is on its way.
-    pub saving: bool,
-}
-
-impl Draft {
-    pub fn new(value: serde_json::Value) -> Self {
-        Self { edited: value.clone(), original: value, saving: false }
-    }
-
-    pub fn dirty(&self) -> bool {
-        self.original != self.edited
-    }
-
-    pub fn discard(&mut self) {
-        self.edited = self.original.clone();
-    }
-
-    /// The object to send: the one the server has now, with the edits in
-    /// it (see [`with_changes`]).
-    pub fn body(&self, fresh: &serde_json::Value) -> serde_json::Value {
-        with_changes(fresh, &self.original, &self.edited)
-    }
-
-    /// The server took a save, and holds `server` now. What the user
-    /// changed since the save went out (`sent` is the copy it was made
-    /// from) stays an edit, on top of what the server holds.
-    pub fn saved(&mut self, server: serde_json::Value, sent: &serde_json::Value) {
-        self.edited = with_changes(&server, sent, &self.edited);
-        self.original = server;
-        self.saving = false;
-    }
-}
-
 /// A question the user must answer before an action runs.
 #[derive(Clone)]
 pub struct Confirm {
@@ -421,10 +379,7 @@ impl Bloom {
                 data.list = false;
                 data.error = None;
                 // A question of the section before goes with it.
-                self.dialogs.confirm = None;
-                self.dialogs.prompt = None;
-                self.dialogs.prompt_fresh = false;
-                self.dialogs.secret = None;
+                self.dialogs.forget();
                 // A click in the list of sections shows the list of the
                 // section; an editor with edits that are not saved stays.
                 data.triggers = None;
@@ -435,7 +390,6 @@ impl Bloom {
                 if data.plugin_editor.as_ref().is_some_and(|editor| !editor.dirty()) {
                     data.plugin_editor = None;
                     data.plugin_open = None;
-                    lazy::forget("plugin.");
                 }
                 self.page_scroll
                     .set_offset(gpui_kit::point(px(0.), px(0.)));
@@ -559,7 +513,7 @@ impl Bloom {
                 Ok(match section {
                     Section::Dashboard => Loaded::Dashboard(dashboard::load(client)?),
                     Section::Users => Loaded::Users(users::load(client)?),
-                    Section::Libraries => Loaded::Libraries(libraries::load(client)?),
+                    Section::Libraries => Loaded::Libraries(libraries::load(client, &[])?),
                     Section::Devices => Loaded::Devices(devices::load(client)?),
                     Section::Activity => Loaded::Activity(activity::load(client)?),
                     Section::Plugins => Loaded::Plugins(plugins::load(client)?),
@@ -663,7 +617,7 @@ impl Bloom {
                     .unwrap_or_default();
                 self.live_load(
                     cx,
-                    move |client| libraries::refresh(&client, &previous),
+                    move |client| libraries::load(&client, &previous),
                     |data, libraries| {
                         let changed = data.libraries.as_ref() != Some(&libraries);
                         data.libraries = Some(libraries);
@@ -782,50 +736,20 @@ impl Bloom {
                     .child(heading),
             );
             for section in sections.iter().copied() {
-                let selected = section == data.section;
-                let color = if selected {
-                    t.colors.primary_foreground
-                } else {
-                    t.colors.foreground
-                };
-                // The theme's `.navMenuOption`, as on the Settings page: a
-                // rounded row with a round icon disc, the accent fill and
-                // dark text when selected.
+                // The row of the Settings page, a little smaller.
                 sidebar = sidebar.child(
-                    div()
-                        .id(SharedString::from(format!("admin.nav.{section:?}")))
-                        .role(gpui_kit::Role::Button)
-                        .aria_label(section.label())
-                        .mx(px(12.))
-                        .mb(px(2.))
-                        .px(px(14.))
-                        .py(px(7.))
-                        .min_h(px(row_h))
-                        .rounded(px(12.))
-                        .flex()
-                        .items_center()
-                        .gap(px(12.))
-                        .cursor_pointer()
-                        .text_size(px(16.))
-                        .font_weight(gpui_kit::FontWeight::MEDIUM)
-                        .text_color(color)
-                        .when(selected, |el| el.bg(t.colors.primary))
-                        .when(!selected, |el| el.hover(|s| s.bg(rgba(0xf5f5f71f))))
-                        .child(
-                            div()
-                                .size(px(34.))
-                                .flex_shrink_0()
-                                .rounded_full()
-                                .bg(if selected { rgba(0x12121226) } else { rgba(0xcccccf69) })
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(icon(section.glyph(), 17., color)),
-                        )
-                        .child(section.label())
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.open_admin(section, cx)
-                        })),
+                    crate::ui::form::nav_row(
+                        SharedString::from(format!("admin.nav.{section:?}")),
+                        section.glyph(),
+                        section.label(),
+                        section == data.section,
+                        (34., 17., 16.),
+                        cx,
+                    )
+                    .mx(px(12.))
+                    .py(px(7.))
+                    .min_h(px(row_h))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_admin(section, cx))),
                 );
             }
         }
@@ -928,7 +852,6 @@ impl Bloom {
             .children(self.render_config_bar(cx))
             .children(self.render_plugin_bar(cx))
             .children(self.render_access_bar(cx))
-            .children(self.render_confirm(cx))
             .children(self.render_prompt(cx))
             .children(self.render_secret(cx))
             .children(self.render_text_editor(cx))
@@ -937,34 +860,8 @@ impl Bloom {
     /// The question dialog over the page.
     pub(crate) fn render_confirm(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let confirm = self.dialogs.confirm.clone()?;
-        let t = UiTheme::read(cx).clone();
         let run = confirm.run.clone();
-        let card = div()
-                        .id("admin.confirm.card")
-                        .relative()
-                        .w(px(440.))
-                        .rounded(px(24.))
-                        .border_1()
-                        .border_color(rgba(0xf5f5f733))
-                        .child(glass(px(24.), crate::ui::glass::POPUP_TINT))
-                        .p(px(24.))
-                        .flex()
-                        .flex_col()
-                        .gap(px(12.))
-                        .on_click(|_: &ClickEvent, _, cx| cx.stop_propagation())
-                        .child(
-                            div()
-                                .text_size(px(20.))
-                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                .text_color(t.colors.foreground)
-                                .child(confirm.title.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(15.))
-                                .text_color(t.colors.foreground.opacity(0.8))
-                                .child(confirm.message.clone()),
-                        )
+        let card = crate::ui::dialog::titled("admin.confirm.card", &confirm.title, &confirm.message, cx)
                         .child(
                             div()
                                 .mt(px(8.))
@@ -998,24 +895,14 @@ impl Bloom {
                                     )),
                                 ),
                         );
-        let backdrop = div()
-                .id("admin.confirm")
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(rgba(0x00000099))
-                // The page behind takes no click meanwhile (see `backdrop`
-                // in `dialogs.rs`).
-                .occlude()
-                // A click beside the dialog closes it.
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.dialogs.confirm = None;
-                    cx.notify();
-                }))
-                .child(enter(card, "admin.confirm.card.in", Enter::Settle, cx));
-        Some(enter(backdrop, "admin.confirm.in", Enter::Fade, cx))
+        // A click beside the dialog closes it.
+        let layer = crate::ui::dialog::layer("admin.confirm", card, cx).on_click(cx.listener(
+            |this, _: &ClickEvent, _, cx| {
+                this.dialogs.confirm = None;
+                cx.notify();
+            },
+        ));
+        Some(crate::ui::dialog::shown(layer, "admin.confirm", cx))
     }
 }
 
@@ -1145,8 +1032,8 @@ pub fn surface<E: Styled + gpui_kit::ParentElement + gpui_kit::prelude::FluentBu
     let liquid = crate::ui::glass::liquid();
     el.rounded(px(24.))
         .border_1()
-        .border_color(rgba(0xf5f5f733))
-        .when(!liquid, |el| el.bg(rgba(0x2a2a2ab0)))
+        .border_color(tone::EDGE)
+        .when(!liquid, |el| el.bg(tone::CARD))
         .when(liquid, |el| el.relative().child(crate::ui::glass::card_glass(px(24.), crate::ui::glass::POPUP_TINT)))
 }
 
@@ -1197,10 +1084,10 @@ pub fn more_button(id: impl Into<SharedString>, cx: &Context<Bloom>) -> Stateful
         .items_center()
         .justify_center()
         .cursor_pointer()
-        .bg(rgba(0x282828cc))
+        .bg(tone::RAISED)
         .hover(|s| s.bg(rgba(0xffffff2e)))
         .tooltip(crate::ui::tip::tip("More"))
-        .child(crate::views::cards::icon(LucideIcon::Ellipsis, 16., t.colors.foreground))
+        .child(crate::icons::icon(LucideIcon::Ellipsis, 16., t.colors.foreground))
 }
 
 /// A plain card surface: the glass group of the theme, as the Settings
@@ -1236,94 +1123,27 @@ pub fn fact(label: impl Into<SharedString>, value: impl Into<SharedString>, cx: 
         )
 }
 
-/// The colour of a state, when a colour stands for one: green for "works"
-/// or "live", amber for "needs a look", red for "failed" or "dangerous".
-/// Any other colour gives `None`. The dashboard has one ink; a colour that
-/// only tells one kind of thing from another is not used.
-pub fn state_color(color: gpui_kit::Rgba) -> Option<gpui_kit::Rgba> {
-    let (r, g, b) = (color.r, color.g, color.b);
-    if g > r * 1.25 && g > b * 1.1 {
-        Some(rgb(0x7ee787))
-    } else if r > b * 2. && g > b * 1.4 && r >= g {
-        Some(rgb(0xe3b341))
-    } else if r > g * 1.7 && r > b * 1.7 {
-        Some(rgb(0xff7b72))
-    } else {
-        None
-    }
-}
-
-/// The quiet round disc icons and letters sit on, as in the navigation.
-pub const DISC: u32 = 0xcccccf40;
-
 /// A small label, such as a status ("Active") or a role ("Admin"). It is a
-/// quiet pill; a colour that stands for a state shows as a dot before the
-/// text.
-pub fn badge(text: impl Into<SharedString>, color: gpui_kit::Rgba) -> Div {
+/// quiet pill; a state shows as a dot of its colour before the text. The
+/// dashboard has one ink: a kind of thing has no colour.
+pub fn badge(text: impl Into<SharedString>, state: Option<State>) -> Div {
     div()
         .px(px(9.))
         .py(px(2.))
         .rounded_full()
-        .bg(rgba(0xffffff1f))
+        .bg(tone::HOVER)
         .flex()
         .items_center()
         .gap(px(6.))
         .text_size(px(12.))
         .font_weight(gpui_kit::FontWeight::MEDIUM)
-        .text_color(rgb(0xf5f5f7))
-        .children(state_color(color).map(|dot| div().size(px(6.)).rounded_full().bg(dot)))
+        .text_color(tone::INK)
+        .children(state.map(|state| div().size(px(6.)).rounded_full().bg(state.color())))
         .child(text.into())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ButtonKind {
-    /// Accent fill, for the main action of a page.
-    Primary,
-    /// Quiet outline.
-    Plain,
-    /// Red fill, for actions that stop or delete something.
-    Danger,
-}
-
-/// A text button. Add `.on_click(...)`.
-pub fn button(
-    id: impl Into<SharedString>,
-    label: impl Into<SharedString>,
-    kind: ButtonKind,
-    cx: &Context<Bloom>,
-) -> Stateful<Div> {
-    let t = UiTheme::read(cx);
-    // The theme's `.raised` button: dark, and the accent with dark text
-    // under the pointer. The main action of a page has the accent already.
-    let (bg, fg) = match kind {
-        ButtonKind::Primary => (t.colors.primary, t.colors.primary_foreground),
-        ButtonKind::Plain => (rgba(0x282828cc), t.colors.foreground),
-        ButtonKind::Danger => (rgb(0xc62828), rgb(0xffffff)),
-    };
-    let (accent, ink) = (t.colors.primary, t.colors.primary_foreground);
-    let label = label.into();
-    div()
-        .id(id.into())
-        // For assistive tech and the tests that tap by label.
-        .role(gpui_kit::Role::Button)
-        .aria_label(label.clone())
-        .h(px(38.))
-        .px(px(16.))
-        .rounded(px(12.))
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .cursor_pointer()
-        .bg(bg)
-        .text_color(fg)
-        .text_size(px(15.))
-        .font_weight(gpui_kit::FontWeight::MEDIUM)
-        .hover(move |s| match kind {
-            ButtonKind::Plain => s.bg(accent).text_color(ink),
-            _ => s.opacity(0.88),
-        })
-        .child(label)
-}
+pub use bloom_core::draft::{Draft, with_changes};
+pub use crate::ui::button::{ButtonKind, button};
 
 /// A server date ("2026-10-03T09:56:25.8420000Z") as a timestamp.
 pub fn parse_date(date: &str) -> Option<jiff::Timestamp> {
@@ -1394,8 +1214,8 @@ pub fn choice_box(
     current: serde_json::Value,
     cx: &mut Context<Bloom>,
     put: impl Fn(&mut Bloom, &serde_json::Value, &mut Context<Bloom>) + 'static,
-) -> Stateful<Div> {
-    use crate::settings::{Choice, select};
+) -> gpui_kit::base::Button {
+    use crate::{settings::Choice, ui::form::select};
     let shown = options
         .iter()
         .find(|(option, _)| *option == current)
@@ -1440,103 +1260,6 @@ pub fn load_note(loading: bool, error: Option<&str>, failed: &str, cx: &Context<
     };
     let t = UiTheme::read(cx);
     Some(div().py(px(30.)).text_size(px(15.)).text_color(t.colors.muted_foreground).child(text))
-}
-
-/// The object to send for a save: the object of the server now (`fresh`),
-/// with the places the user changed (where `edited` differs from
-/// `original`) taken from `edited`, and only those. What another client
-/// or a save of another page changed since `original` was read stays. An
-/// object inside is merged place by place; a list or a value goes whole.
-pub fn with_changes(fresh: &serde_json::Value, original: &serde_json::Value, edited: &serde_json::Value) -> serde_json::Value {
-    changed(Some(fresh), Some(original), Some(edited)).unwrap_or(serde_json::Value::Null)
-}
-
-/// One place of [`with_changes`]; `None` is a key that is not there, which
-/// is not the same as a key with the value null.
-fn changed(
-    fresh: Option<&serde_json::Value>,
-    original: Option<&serde_json::Value>,
-    edited: Option<&serde_json::Value>,
-) -> Option<serde_json::Value> {
-    use serde_json::{Map, Value};
-    if original == edited {
-        return fresh.cloned();
-    }
-    let edited = edited?;
-    let (Some(original_object), Some(edited_object)) = (original.and_then(Value::as_object), edited.as_object())
-    else {
-        return Some(edited.clone());
-    };
-    // The object is gone on the server, or is no object there any more:
-    // the changes of the user go into an empty one, and the places the
-    // user left alone do not come back from the old read.
-    let empty = Map::new();
-    let fresh_object = fresh.and_then(Value::as_object).unwrap_or(&empty);
-    let mut merged = fresh_object.clone();
-    for key in original_object.keys().chain(edited_object.keys().filter(|key| !original_object.contains_key(*key))) {
-        let (was, now) = (original_object.get(key), edited_object.get(key));
-        if was == now {
-            continue;
-        }
-        match changed(fresh_object.get(key), was, now) {
-            Some(value) => merged.insert(key.clone(), value),
-            None => merged.remove(key),
-        };
-    }
-    Some(Value::Object(merged))
-}
-
-#[cfg(test)]
-mod with_changes_tests {
-    use super::with_changes;
-    use serde_json::json;
-
-    /// A save sends the change of the user and nothing else: a value that
-    /// changed on the server since the page was read is not put back.
-    #[test]
-    fn a_save_keeps_what_changed_on_the_server_meanwhile() {
-        let original = json!({ "ServerName": "old", "MinResumePct": 5, "Paths": { "Cache": "/a", "Temp": "/t" }, "Tags": ["x"] });
-        let mut edited = original.clone();
-        edited["ServerName"] = json!("new");
-        edited["Paths"]["Cache"] = json!("/b");
-        // Another page saved `MinResumePct` and `Paths.Temp`, and the
-        // server has a key this app never saw.
-        let fresh = json!({ "ServerName": "old", "MinResumePct": 10, "Paths": { "Cache": "/a", "Temp": "/t2" }, "Tags": ["x"], "New": true });
-        assert_eq!(
-            with_changes(&fresh, &original, &edited),
-            json!({ "ServerName": "new", "MinResumePct": 10, "Paths": { "Cache": "/b", "Temp": "/t2" }, "Tags": ["x"], "New": true })
-        );
-    }
-
-    #[test]
-    fn no_change_sends_the_object_of_the_server_and_a_list_goes_whole() {
-        let original = json!({ "A": 1, "List": [1, 2], "Gone": true });
-        let fresh = json!({ "A": 2, "List": [9], "Gone": true });
-        assert_eq!(with_changes(&fresh, &original, &original), fresh);
-        let mut edited = original.clone();
-        edited["List"] = json!([1, 2, 3]);
-        edited.as_object_mut().unwrap().remove("Gone");
-        assert_eq!(with_changes(&fresh, &original, &edited), json!({ "A": 2, "List": [1, 2, 3] }));
-    }
-
-    /// A key the user added with the value null is sent, though the server
-    /// has another value there by now: null is not "not there".
-    #[test]
-    fn a_null_the_user_set_is_a_change() {
-        assert_eq!(with_changes(&json!({ "A": 42 }), &json!({}), &json!({ "A": null })), json!({ "A": null }));
-        assert_eq!(with_changes(&json!({ "A": 42 }), &json!({ "A": null }), &json!({})), json!({}));
-    }
-
-    /// The server dropped an object, or put a value in its place: the
-    /// change of the user goes in, and what the user left alone in the old
-    /// read does not come back.
-    #[test]
-    fn an_object_gone_on_the_server_takes_the_change_alone() {
-        let original = json!({ "P": { "A": 1, "B": 2 } });
-        let edited = json!({ "P": { "A": 3, "B": 2 } });
-        assert_eq!(with_changes(&json!({}), &original, &edited), json!({ "P": { "A": 3 } }));
-        assert_eq!(with_changes(&json!({ "P": 7 }), &original, &edited), json!({ "P": { "A": 3 } }));
-    }
 }
 
 #[cfg(test)]

@@ -20,12 +20,12 @@ use serde_json::{Value, json};
 use super::{
     jellyfin,
     messages::{NS_CONNECTION, NS_HEARTBEAT, NS_MEDIA, NS_RECEIVER},
-    mdns::Device,
+    discovery::Device,
     proto::{CastMessage, Inbox},
 };
 
 /// A certificate the device signed itself, like the real ones.
-const CERT: &[u8] = include_bytes!("testdata/mock-cert.der");
+pub(crate) const CERT: &[u8] = include_bytes!("testdata/mock-cert.der");
 const KEY: &[u8] = include_bytes!("testdata/mock-key.der");
 
 #[derive(Clone, Debug, Default)]

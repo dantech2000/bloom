@@ -4,6 +4,7 @@
 //! last lines of the one that is open. The Mac shows the list beside the
 //! viewer; a phone shows the list, and a file opens as a page of its own.
 
+use crate::ui::tone::{self, State};
 use anyhow::Result;
 use gpui_icons::LucideIcon;
 use gpui_kit::{
@@ -14,11 +15,12 @@ use gpui_kit::{
 use serde::Deserialize;
 
 use crate::{
-    admin::{ago, badge, panel, rows::rows, users::icon_disc},
+    admin::{ago, badge, panel, users::icon_disc},
+    ui::rows::rows,
     app::{Bloom, Page},
     jellyfin::Client,
     ui::theme::UiTheme,
-    views::cards::icon,
+    icons::icon,
 };
 
 /// Lines of the log that the page keeps and shows.
@@ -201,8 +203,8 @@ fn level_style(level: Level) -> (&'static str, Rgba, Rgba) {
         Level::Error => ("ERR", rgb(0xef5350), rgb(0xffb4ab)),
         Level::Warning => ("WRN", rgb(0xffb300), rgb(0xffe0a3)),
         // A level that needs no look has the ink, not a colour of its own.
-        Level::Info => ("INF", rgba(0xf5f5f799), rgba(0xf5f5f7cc)),
-        Level::Debug => ("DBG", rgba(0xf5f5f766), rgba(0xf5f5f780)),
+        Level::Info => ("INF", tone::INK_60, tone::INK_80),
+        Level::Debug => ("DBG", tone::INK_40, tone::INK_50),
     }
 }
 
@@ -391,7 +393,7 @@ fn file_row(
         .cursor_pointer()
         .when(open, |el| el.bg(rgba(0xffffff14)))
         .hover(|s| s.bg(rgba(0xf5f5f714)))
-        .child(icon_disc(kind.glyph(), t.colors.foreground, if compact { 36. } else { 32. }))
+        .child(icon_disc(kind.glyph(), None, if compact { 36. } else { 32. }))
         .child(
             div()
                 .flex_1()
@@ -477,13 +479,13 @@ fn viewer(data: &Data, compact: bool, cx: &mut Context<Bloom>) -> Div {
     if warnings > 0 {
         heading = heading.child(badge(
             format!("{warnings} {}", if warnings == 1 { "warning" } else { "warnings" }),
-            rgb(0xb26a00),
+            Some(State::Warn),
         ));
     }
     if errors > 0 {
         heading = heading.child(badge(
             format!("{errors} {}", if errors == 1 { "error" } else { "errors" }),
-            rgb(0xc62828),
+            Some(State::Bad),
         ));
     }
 

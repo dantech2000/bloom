@@ -2,6 +2,7 @@
 //! Home hero: a slideshow of random unwatched titles, after the Media Bar
 //! Enhanced plugin of the web client as styled by the Abyss theme.
 
+use crate::ui::tone;
 #[cfg(target_os = "macos")]
 use gpui_kit::surface;
 use std::time::{Duration, Instant};
@@ -565,7 +566,7 @@ impl Bloom {
                 .cursor_pointer()
                 .relative()
                 .rounded(px(radius))
-                .child(frosted(px(radius), rgba(0xffffff1f)))
+                .child(frosted(px(radius), tone::HOVER))
                 .border_1()
                 .border_color(crate::ui::glass::ring(rgba(0xffffff33)))
                 .hover(|s| s.opacity(0.8))

@@ -7,7 +7,7 @@
 use gpui_kit::Window;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-use crate::macos::{Id, send};
+use crate::macos::{CGRect, CGSize, Id, send};
 
 /// Size of the small window when no place is saved.
 const DEFAULT_SIZE: (f64, f64) = (480., 270.);
@@ -15,27 +15,13 @@ const DEFAULT_SIZE: (f64, f64) = (480., 270.);
 const MIN_SIZE: (f64, f64) = (280., 158.);
 /// Space between the small window and the screen edges.
 const MARGIN: f64 = 24.;
-/// Smallest size of the normal window, as set when it is created.
-const NORMAL_MIN_SIZE: (f64, f64) = (900., 600.);
+/// Smallest size of the normal window: the window is created with it
+/// (`open_main_window`), and gets it back when the small one ends.
+pub const NORMAL_MIN_SIZE: (f32, f32) = (900., 600.);
 
 /// A window frame in Cocoa screen coordinates (origin at the bottom left):
 /// x, y, width, height.
 pub type Frame = [f64; 4];
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Size {
-    width: f64,
-    height: f64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Rect {
-    x: f64,
-    y: f64,
-    size: Size,
-}
 
 /// Place of the close button in the window, from the top left. The window
 /// is made with it, and the player puts the buttons back at it.
@@ -53,20 +39,13 @@ pub(crate) fn ns_window(window: &Window) -> Option<Id> {
 }
 
 fn frame_of(window: Id) -> Frame {
-    let rect = send!(Rect, window, c"frame");
-    [rect.x, rect.y, rect.size.width, rect.size.height]
+    let rect = send!(CGRect, window, c"frame");
+    [rect.x, rect.y, rect.width, rect.height]
 }
 
 fn set_frame(window: Id, frame: Frame) {
-    let rect = Rect {
-        x: frame[0],
-        y: frame[1],
-        size: Size {
-            width: frame[2],
-            height: frame[3],
-        },
-    };
-    send!((), window, c"setFrame:display:animate:", rect => Rect, true => bool, true => bool);
+    let rect = CGRect { x: frame[0], y: frame[1], width: frame[2], height: frame[3] };
+    send!((), window, c"setFrame:display:animate:", rect => CGRect, true => bool, true => bool);
 }
 
 /// The close, minimise and zoom buttons of the window, those it has.
@@ -124,18 +103,18 @@ fn place_buttons(window: Id, buttons: &[Id]) {
         return;
     }
     let (x, y) = (TRAFFIC_LIGHTS.0 as f64, TRAFFIC_LIGHTS.1 as f64);
-    let close_frame = send!(Rect, *close, c"frame");
-    let step = send!(Rect, *minimize, c"frame").x - close_frame.x;
-    let height = close_frame.size.height + y + y;
-    let mut frame = send!(Rect, container, c"frame");
-    frame.y = send!(Rect, window, c"frame").size.height - height;
-    frame.size.height = height;
-    send!((), container, c"setFrame:", frame => Rect);
+    let close_frame = send!(CGRect, *close, c"frame");
+    let step = send!(CGRect, *minimize, c"frame").x - close_frame.x;
+    let height = close_frame.height + y + y;
+    let mut frame = send!(CGRect, container, c"frame");
+    frame.y = send!(CGRect, window, c"frame").height - height;
+    frame.height = height;
+    send!((), container, c"setFrame:", frame => CGRect);
     for (i, button) in buttons.iter().enumerate() {
-        let mut frame = send!(Rect, *button, c"frame");
+        let mut frame = send!(CGRect, *button, c"frame");
         frame.x = x + step * i as f64;
         frame.y = y;
-        send!((), *button, c"setFrame:", frame => Rect);
+        send!((), *button, c"setFrame:", frame => CGRect);
     }
 }
 
@@ -145,11 +124,11 @@ fn on_screen(window: Id, frame: Frame) -> bool {
     if screen.is_null() {
         return false;
     }
-    let visible = send!(Rect, screen, c"visibleFrame");
+    let visible = send!(CGRect, screen, c"visibleFrame");
     frame[0] >= visible.x - 1.
         && frame[1] >= visible.y - 1.
-        && frame[0] + frame[2] <= visible.x + visible.size.width + 1.
-        && frame[1] + frame[3] <= visible.y + visible.size.height + 1.
+        && frame[0] + frame[2] <= visible.x + visible.width + 1.
+        && frame[1] + frame[3] <= visible.y + visible.height + 1.
 }
 
 /// Current frame of the window.
@@ -169,25 +148,22 @@ pub fn enter(window: &Window, saved: Option<Frame>) -> Option<Frame> {
         if screen.is_null() {
             return None;
         }
-        let visible = send!(Rect, screen, c"visibleFrame");
+        let visible = send!(CGRect, screen, c"visibleFrame");
         Some([
-            visible.x + visible.size.width - DEFAULT_SIZE.0 - MARGIN,
+            visible.x + visible.width - DEFAULT_SIZE.0 - MARGIN,
             visible.y + MARGIN,
             DEFAULT_SIZE.0,
             DEFAULT_SIZE.1,
         ])
     })?;
-    let min = Size {
-        width: MIN_SIZE.0,
-        height: MIN_SIZE.1,
-    };
+    let min = CGSize { width: MIN_SIZE.0, height: MIN_SIZE.1 };
     // NSFloatingWindowLevel
     send!((), ns, c"setLevel:", 3_isize => isize);
     set_buttons_hidden(ns, true);
     // The caller is inside a gpui update, where gpui cannot take the news
     // of the new size; the resize waits until the update is over.
     after_event_with(ns, move |ns| {
-        send!((), ns, c"setContentMinSize:", min => Size);
+        send!((), ns, c"setContentMinSize:", min => CGSize);
         set_frame(ns, target);
     });
     Some(normal)
@@ -201,12 +177,9 @@ pub fn leave(window: &Window, normal: Frame) {
     // NSNormalWindowLevel
     send!((), ns, c"setLevel:", 0_isize => isize);
     set_buttons_hidden(ns, false);
-    let min = Size {
-        width: NORMAL_MIN_SIZE.0,
-        height: NORMAL_MIN_SIZE.1,
-    };
+    let min = CGSize { width: f64::from(NORMAL_MIN_SIZE.0), height: f64::from(NORMAL_MIN_SIZE.1) };
     after_event_with(ns, move |ns| {
         set_frame(ns, normal);
-        send!((), ns, c"setContentMinSize:", min => Size);
+        send!((), ns, c"setContentMinSize:", min => CGSize);
     });
 }

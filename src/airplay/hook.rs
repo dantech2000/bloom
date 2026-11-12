@@ -4,28 +4,47 @@
 
 use gpui_kit::{Context, Window};
 
-use super::{AirPlayState, SendRequest, StreamOptions, picker};
-use crate::{app::Bloom, jellyfin::Item};
+use super::{AirPlayState, picker};
+use crate::{
+    app::Bloom,
+    cast::{
+        remote::{Remote, send_request},
+        target::CastTracks,
+    },
+    jellyfin::Item,
+};
 
 impl Bloom {
-    /// Sends an item to the receiver. The local player stops: one item
-    /// plays at a time, and it is the one on the receiver.
+    /// Sends an item to the receiver, with the streams the server chooses.
+    /// The local player stops: one item plays at a time, and it is the one
+    /// on the receiver.
     pub fn airplay_send(&mut self, item: &Item, start_secs: f64, cx: &mut Context<Self>) -> Option<u64> {
+        self.airplay_send_with(item, start_secs, CastTracks::default(), cx)
+    }
+
+    /// As [`Bloom::airplay_send`], with the audio stream and the subtitle
+    /// that are chosen for the item (`cast::remote::send_request` makes the
+    /// stream with them; the panel of "Play on" sends the same request
+    /// when the user chooses a stream there).
+    pub fn airplay_send_with(
+        &mut self,
+        item: &Item,
+        start_secs: f64,
+        tracks: CastTracks,
+        cx: &mut Context<Self>,
+    ) -> Option<u64> {
         let client = self.session.as_ref()?.client.clone();
         if self.player_open {
             self.player.stop();
             self.close_player_view(cx);
         }
         self.playing = Some(item.clone());
-        // The limit the user set for the player holds for the receiver too.
-        let options = StreamOptions { max_bitrate: self.config.max_bitrate, ..StreamOptions::new() };
-        Some(self.airplay.send(SendRequest {
-            client,
-            item_id: item.id.clone(),
-            title: item.display_title(),
-            start_secs,
-            options,
-        }))
+        // With AirPlay as the target, the panel shows this item.
+        if let Some(Remote::AirPlay(remote)) = &mut self.cast.remote {
+            remote.item = Some(item.clone());
+        }
+        let request = send_request(&client, item, start_secs, self.config.max_bitrate, tracks);
+        Some(self.airplay.send(request))
     }
 
     /// Debug channel: `airplay <verb> [args]`.

@@ -123,6 +123,11 @@ impl Filled {
     }
 }
 
+/// A Lucide icon of a size and colour.
+pub fn icon(name: gpui_icons::LucideIcon, size: f32, color: Rgba) -> Svg {
+    gpui_icons::lucide(name).size(px(size)).text_color(color)
+}
+
 /// A filled icon of a size and colour.
 pub fn filled(icon: Filled, size: f32, color: Rgba) -> Svg {
     svg().path(icon.asset()).size(px(size)).text_color(color)

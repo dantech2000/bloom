@@ -12,6 +12,7 @@
 //! is not lost. The app keeps the file as it got it, so keys it does not know
 //! stay.
 
+use crate::ui::tone;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use gpui_icons::LucideIcon;
@@ -32,7 +33,7 @@ use crate::{
         theme::UiTheme,
         tip::tip,
     },
-    views::cards::icon,
+    icons::icon,
 };
 
 /// Width of the panel in the player.
@@ -328,7 +329,7 @@ impl Bloom {
     /// True when the plugin has bookmarks on for this server and the user
     /// has not switched them off in this app.
     pub fn bookmarks_on(&self) -> bool {
-        self.enhanced_feature("bookmarks")
+        self.enhanced_feature(crate::enhanced::Feature::Bookmarks)
     }
 
     /// Reads `bookmark.json` of the user.
@@ -547,8 +548,8 @@ impl Bloom {
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
-                .hover(|s| s.bg(rgba(0xffffff1f)))
-                .when(open, |el| el.bg(rgba(0xffffff1f)))
+                .hover(|s| s.bg(tone::HOVER))
+                .when(open, |el| el.bg(tone::HOVER))
                 .tooltip(tip("Bookmarks (B adds one)"))
                 .child(icon(LucideIcon::Bookmark, 22., gpui_kit::rgb(0xffffff)))
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -579,7 +580,7 @@ impl Bloom {
                     .top(px(3.))
                     .size(px(7.))
                     .rounded(px(2.))
-                    .bg(rgba(0xf5f5f7ff))
+                    .bg(tone::INK)
                     .border_1()
                     .border_color(rgba(0x000000a0))
             })
@@ -592,7 +593,7 @@ impl Bloom {
             return None;
         }
         let t = UiTheme::read(cx).clone();
-        let soft = rgba(0xf5f5f7b3);
+        let soft = tone::INK_70;
         let item = self.playing.clone()?;
         self.learn_bookmark_target(&item, cx);
         let list = self.bookmarks_of(&item);
@@ -618,7 +619,7 @@ impl Bloom {
                 .w(px(PANEL_W.min(self.viewport_w - 48.)))
                 .rounded(px(24.))
                 .border_1()
-                .border_color(rgba(0xf5f5f733))
+                .border_color(tone::EDGE)
                 .on_mouse_down(MouseButton::Left, cx.listener(swallow))
                 // A click anywhere else closes the panel, as it closes a menu.
                 .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -660,7 +661,7 @@ impl Bloom {
                                 .items_center()
                                 .gap(px(6.))
                                 .cursor_pointer()
-                                .bg(rgba(0xffffff1f))
+                                .bg(tone::HOVER)
                                 .hover(|s| s.bg(rgba(0xffffff33)))
                                 .text_size(px(14.))
                                 .font_weight(gpui_kit::FontWeight::MEDIUM)
@@ -694,7 +695,7 @@ impl Bloom {
     /// and ids of its own. The caller adds what a click on the row does.
     fn bookmark_row(&self, b: &Bookmark, detail: bool, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = UiTheme::read(cx).clone();
-        let soft = rgba(0xf5f5f7b3);
+        let soft = tone::INK_70;
         let (row_id, delete_id) = match detail {
             true => (format!("detail.bookmark.{}", b.id), format!("detail.bookmark.delete.{}", b.id)),
             false => (format!("bookmark.row.{}", b.id), format!("bookmark.delete.{}", b.id)),
@@ -710,7 +711,7 @@ impl Bloom {
             .items_center()
             .gap(px(12.))
             .cursor_pointer()
-            .hover(|s| s.bg(rgba(0xffffff1f)))
+            .hover(|s| s.bg(tone::HOVER))
             .when(detail, |el| el.child(icon(LucideIcon::Bookmark, 16., soft)))
             .child(
                 div()

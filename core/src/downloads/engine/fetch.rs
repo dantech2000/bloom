@@ -221,7 +221,7 @@ pub(super) fn get_file(agent: &ureq::Agent, url: &str, auth: Option<&Client>, pa
     if head.starts_with(b"<!DOCTYPE") || head.starts_with(b"<html") {
         return Err(anyhow!("not a subtitle file"));
     }
-    fsutil::write_atomic_with(path, |file| {
+    fsutil::write_atomic_with(path, None, |file| {
         file.write_all(&head)?;
         let size = head.len() as u64 + std::io::copy(&mut reader, file)?;
         match size > MOST_SUBTITLE {

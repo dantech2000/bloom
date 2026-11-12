@@ -12,9 +12,9 @@ use std::{collections::HashSet, rc::Rc};
 use anyhow::Result;
 use gpui_icons::LucideIcon;
 use gpui_kit::{
-    ClickEvent, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
-    Point, SharedString, Stateful, StatefulInteractiveElement as _, Styled, Window, div,
-    prelude::FluentBuilder as _, px, rgb, rgba,
+    ClickEvent, Context, IntoElement, ParentElement as _, Pixels,
+    Point, SharedString, Styled, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 use serde_json::Value;
 
@@ -27,13 +27,11 @@ use crate::{
         scroll_area::ScrollArea,
         theme::UiTheme,
     },
-    views::cards::icon,
+
 };
 
 /// Width of the section list at the left.
 const NAV_W: f32 = 264.;
-/// The theme's dark text on an accent fill.
-const INK: u32 = 0x121212;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
@@ -543,7 +541,7 @@ impl Bloom {
             move |client| {
                 // The document of the server now, with the changes of the
                 // user in it: the one this app read can be old.
-                let merged = crate::admin::with_changes(&client.fresh_doc(doc)?, &known, &body);
+                let merged = bloom_core::draft::with_changes(&client.fresh_doc(doc)?, &known, &body);
                 match doc {
                     Doc::Configuration => client.save_user_configuration(&merged),
                     Doc::Display => client.save_display_preferences(&merged),
@@ -568,7 +566,7 @@ impl Bloom {
                             // changed shows now, and a change made here
                             // since the save went out stays on top.
                             Some(taken) => {
-                                *current = crate::admin::with_changes(&taken, &sent, current);
+                                *current = bloom_core::draft::with_changes(&taken, &sent, current);
                                 save.acknowledged = taken;
                             }
                             None => revert_failed(current, &sent, &save.acknowledged),
@@ -700,45 +698,18 @@ impl Bloom {
         let (show_list, show_page) = if compact { (self.settings_list, !self.settings_list) } else { (true, true) };
 
         let nav_item = |section: Section, cx: &mut Context<Self>| {
-            let selected = section == open;
-            let ink = if selected { rgb(INK) } else { t.colors.foreground };
-            // The theme's `.navMenuOption`: rounded row, round icon disc,
-            // accent fill and dark text when selected or under the pointer.
-            div()
-                .id(SharedString::from(format!("settings.nav.{section:?}")))
-                .role(gpui_kit::Role::Button)
-                .aria_label(section.label())
-                .group("settings-nav")
-                .mb(px(2.))
-                .px(px(14.))
-                .py(px(8.))
-                .when(compact, |el| el.min_h(px(44.)))
-                .rounded(px(12.))
-                .flex()
-                .flex_shrink_0()
-                .items_center()
-                .gap(px(12.))
-                .cursor_pointer()
-                .text_size(px(17.))
-                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                .text_color(ink)
-                .when(selected, |el| el.bg(t.colors.primary))
-                .when(!selected, |el| el.hover(|s| s.bg(rgba(0xf5f5f71f))))
-                .child(
-                    div()
-                        .size(px(38.))
-                        .flex_shrink_0()
-                        .rounded_full()
-                        .bg(if selected { rgba(0x12121226) } else { rgba(0xcccccf69) })
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(icon(section.glyph(), 18., ink)),
-                )
-                .child(section.label())
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.open_settings(section, cx)
-                }))
+            crate::ui::form::nav_row(
+                SharedString::from(format!("settings.nav.{section:?}")),
+                section.glyph(),
+                section.label(),
+                section == open,
+                (38., 18., 17.),
+                cx,
+            )
+            .py(px(8.))
+            .when(compact, |el| el.min_h(px(44.)))
+            .flex_shrink_0()
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_settings(section, cx)))
         };
         let mut nav = div().flex().flex_shrink_0();
         nav = if compact {
@@ -832,248 +803,8 @@ impl Bloom {
                 })
             })
             .when(show_page, |el| el.child(content))
-            .children(self.render_confirm(cx))
             .children(self.render_prompt(cx))
     }
-}
-
-// ----- widgets, in the look of the theme ---------------------------------------
-
-/// The card of a settings page: the theme's `.verticalSection` (tinted
-/// glass, 32 px corners, thin light border), with no content and no
-/// padding yet.
-pub fn card(cx: &Context<Bloom>) -> Div {
-    // Liquid glass prototype: the card is a glass panel with the ink of the
-    // theme; off, it is the flat tint of the dark theme as before.
-    let liquid = crate::ui::glass::liquid();
-    let edge = if crate::ui::glass::liquid_light(cx) { rgb(0x121212).opacity(0.2) } else { rgba(0xf5f5f733) };
-    div()
-        .rounded(px(32.))
-        .border_1()
-        .border_color(edge)
-        .when(!liquid, |el| el.bg(rgba(0x2a2a2ab0)))
-        .when(liquid, |el| {
-            el.relative().child(crate::ui::glass::card_glass(px(32.), crate::ui::glass::POPUP_TINT))
-        })
-}
-
-/// A group of settings: a [`card`] with a title.
-pub fn group(title: impl Into<SharedString>, cx: &Context<Bloom>) -> Div {
-    let t = UiTheme::read(cx);
-    card(cx)
-        .px(px(22.))
-        .pt(px(18.))
-        .pb(px(10.))
-        .flex()
-        .flex_col()
-        .child(
-            div()
-                .mb(px(6.))
-                .text_size(px(20.))
-                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                .text_color(t.colors.foreground)
-                .child(title.into()),
-        )
-}
-
-/// One setting: its label (weight 500, as `.inputLabel`) and description
-/// (`.fieldDescription`) at the left, its control at the right.
-pub fn field(
-    label: impl Into<SharedString>,
-    description: impl Into<SharedString>,
-    control: impl IntoElement,
-    cx: &Context<Bloom>,
-) -> Div {
-    let t = UiTheme::read(cx);
-    let description: SharedString = description.into();
-    // A phone: a wide control (a choice, a value) goes under the label
-    // instead of squeezing it to a letter a line.
-    let compact = crate::views::shell::compact_now();
-    div()
-        .py(px(11.))
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap(px(20.))
-        .when(compact, |el| el.flex_wrap().gap(px(10.)))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .when(compact, |el| el.min_w(px(230.)))
-                .flex()
-                .flex_col()
-                .gap(px(2.))
-                .child(
-                    div()
-                        .text_size(px(15.))
-                        .font_weight(gpui_kit::FontWeight::MEDIUM)
-                        .text_color(t.colors.foreground)
-                        .child(label.into()),
-                )
-                .when(!description.is_empty(), |el| {
-                    el.child(
-                        div()
-                            .text_size(px(13.))
-                            .line_height(px(18.))
-                            .text_color(t.colors.foreground.opacity(0.6))
-                            .child(description),
-                    )
-                }),
-        )
-        .child(div().flex_shrink_0().child(control))
-}
-
-/// The theme's checkbox: 8 px corners, a faint accent outline, and an accent
-/// fill with a dark mark when checked. Add `.on_click(...)`.
-pub fn checkbox(id: impl Into<SharedString>, checked: bool, cx: &Context<Bloom>) -> Stateful<Div> {
-    let t = UiTheme::read(cx);
-    let id: SharedString = id.into();
-    // For assistive tech and the tests that tap by label: the last part of
-    // the id in words, as the player's buttons ("RememberAudioSelections",
-    // a key of the server, reads as "Remember audio selections").
-    let label: SharedString = control_label(id.rsplit('.').next().unwrap_or(&id)).into();
-    div()
-        .id(id)
-        .role(gpui_kit::Role::CheckBox)
-        .aria_label(label)
-        .aria_toggled(if checked { gpui_kit::accesskit::Toggled::True } else { gpui_kit::accesskit::Toggled::False })
-        .size(px(26.))
-        .rounded(px(8.))
-        .border_1()
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .when(checked, |el| {
-            el.bg(t.colors.primary)
-                .border_color(t.colors.primary)
-                .child(icon(LucideIcon::Check, 18., rgb(INK)))
-        })
-        .when(!checked, |el| {
-            el.border_color(rgba(0xf5f5f74d))
-                .hover(|s| s.border_color(rgba(0xf5f5f799)))
-        })
-}
-
-/// The theme's select: 8 px corners and a dark outline, the value at the
-/// left and the arrow at the right. `longest` is the longest option, so the
-/// field is as wide as its list needs. Add `.on_click(...)`.
-pub fn select(
-    id: impl Into<SharedString>,
-    value: impl Into<SharedString>,
-    longest: &str,
-    cx: &Context<Bloom>,
-) -> Stateful<Div> {
-    select_capped(id, value, longest, control_max_w(), cx)
-}
-
-/// `select` with its own most width (a row that has buttons beside it).
-pub fn select_capped(
-    id: impl Into<SharedString>,
-    value: impl Into<SharedString>,
-    longest: &str,
-    max_w: f32,
-    cx: &Context<Bloom>,
-) -> Stateful<Div> {
-    let t = UiTheme::read(cx);
-    let width = (longest.chars().count() as f32 * 8.2 + 58.).clamp(120., max_w.max(120.));
-    let value: SharedString = value.into();
-    div()
-        .id(id.into())
-        // For assistive tech and the tests: a choice, named by its value.
-        .role(gpui_kit::Role::ComboBox)
-        .aria_label(value.clone())
-        .w(px(width))
-        .h(px(38.))
-        .pl(px(12.))
-        .pr(px(8.))
-        .rounded(px(8.))
-        .border_1()
-        .border_color(rgba(0x282828cc))
-        .bg(rgba(0x00000059))
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap(px(8.))
-        .cursor_pointer()
-        .text_size(px(15.))
-        .text_color(t.colors.foreground)
-        .hover(|s| s.border_color(rgba(0xf5f5f766)))
-        .child(div().min_w_0().truncate().child(value))
-        .child(icon(LucideIcon::ChevronDown, 18., t.colors.foreground.opacity(0.7)))
-}
-
-/// The words of a control's key, in lower case: "PlayDefaultAudioTrack"
-/// and "remember_audio" become "play default audio track" and "remember
-/// audio" (the accessibility bridge capitalizes the first letter).
-pub fn control_label(key: &str) -> String {
-    let mut out = String::with_capacity(key.len() + 4);
-    let mut prev_lower = false;
-    for c in key.chars() {
-        if c == '_' || c == '-' {
-            out.push(' ');
-            prev_lower = false;
-        } else if c.is_uppercase() {
-            if prev_lower {
-                out.push(' ');
-            }
-            out.extend(c.to_lowercase());
-            prev_lower = false;
-        } else {
-            out.push(c);
-            prev_lower = c.is_lowercase() || c.is_ascii_digit();
-        }
-    }
-    out
-}
-
-/// The most width a control of a field takes: 340, or on a phone the
-/// window less the margins of the page and the group.
-pub fn control_max_w() -> f32 {
-    let w = crate::views::shell::viewport_w_now();
-    if crate::views::shell::compact_now() { (w - 80.).max(120.) } else { 340. }
-}
-
-/// The theme's `.raised` button: dark fill; accent fill and dark, bold text
-/// under the pointer. Add `.on_click(...)`.
-pub fn raised(id: impl Into<SharedString>, label: impl Into<SharedString>, cx: &Context<Bloom>) -> Stateful<Div> {
-    let t = UiTheme::read(cx);
-    div()
-        .id(id.into())
-        .h(px(38.))
-        .px(px(16.))
-        .rounded(px(12.))
-        .bg(rgba(0x282828cc))
-        .flex()
-        .items_center()
-        .justify_center()
-        .gap(px(8.))
-        .cursor_pointer()
-        .text_size(px(15.))
-        .font_weight(gpui_kit::FontWeight::MEDIUM)
-        .text_color(t.colors.foreground)
-        .hover(|s| {
-            s.bg(t.colors.primary)
-                .text_color(rgb(INK))
-                .font_weight(gpui_kit::FontWeight::BOLD)
-        })
-        .child(label.into())
-}
-
-/// A small square button with one icon, for a list row.
-pub fn icon_button(id: impl Into<SharedString>, glyph: LucideIcon, enabled: bool, cx: &Context<Bloom>) -> Stateful<Div> {
-    let t = UiTheme::read(cx);
-    let color = t.colors.foreground.opacity(if enabled { 0.9 } else { 0.25 });
-    div()
-        .id(id.into())
-        .size(px(34.))
-        .rounded(px(12.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .when(enabled, |el| el.cursor_pointer().hover(|s| s.bg(rgba(0x00000066))))
-        .child(icon(glyph, 18., color))
 }
 
 impl Bloom {
@@ -1484,16 +1215,5 @@ mod race_tests {
         cx.run_until_parked();
         assert_eq!(one.count("GET", "/DisplayPreferences/usersettings"), 1);
         bloom.read_with(cx, |this, _| assert!(this.prefs.loaded));
-    }
-}
-
-#[cfg(test)]
-mod control_label_tests {
-    #[test]
-    fn keys_become_words() {
-        assert_eq!(super::control_label("PlayDefaultAudioTrack"), "play default audio track");
-        assert_eq!(super::control_label("remember_audio"), "remember audio");
-        assert_eq!(super::control_label("debug-channel"), "debug channel");
-        assert_eq!(super::control_label("upnext"), "upnext");
     }
 }

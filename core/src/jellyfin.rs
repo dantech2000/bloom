@@ -1732,26 +1732,7 @@ impl Client {
                 std::collections::HashMap<String, serde_json::Value>,
             >,
             #[serde(default)]
-            media_sources: Vec<Source>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Source {
-            default_audio_stream_index: Option<i64>,
-            default_subtitle_stream_index: Option<i64>,
-            #[serde(default)]
-            media_streams: Vec<Stream>,
-        }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "PascalCase")]
-        struct Stream {
-            #[serde(rename = "Type", default)]
-            kind: String,
-            #[serde(default)]
-            index: i64,
-            #[serde(default)]
-            is_external: bool,
-            language: Option<String>,
+            media_sources: Vec<MediaSource>,
         }
         let user = self.user()?.to_string();
         let full: Full = self.get(&format!("/Items/{item_id}"), &[("userId", user)])?;
@@ -1772,7 +1753,7 @@ impl Client {
         // moment ago in another client counts.
         let language = self.audio_language();
         let default_audio = full.media_sources.first().and_then(|source| {
-            let tracks: Vec<&Stream> = source
+            let tracks: Vec<&MediaStream> = source
                 .media_streams
                 .iter()
                 .filter(|stream| stream.kind == "Audio" && !stream.is_external)
@@ -1780,9 +1761,13 @@ impl Client {
             // A track in the language of the user comes first. The server
             // can name another one: it remembers the track of an earlier
             // playback, also when that was the default track of the file.
+            // "ger" and "deu" are one language (`languages`).
+            let speaks = |track: &MediaStream, language: &str| {
+                track.language.as_deref().is_some_and(|l| crate::languages::same_language(l, language))
+            };
             let preferred = language
                 .as_deref()
-                .and_then(|language| tracks.iter().position(|t| t.language.as_deref() == Some(language)));
+                .and_then(|language| tracks.iter().position(|t| speaks(t, language)));
             let chosen = source
                 .default_audio_stream_index
                 .and_then(|wanted| tracks.iter().position(|t| t.index == wanted));
@@ -1793,12 +1778,7 @@ impl Client {
                 return Some(None);
             };
             // A subtitle in a file of its own is not in the stream mpv plays.
-            source
-                .media_streams
-                .iter()
-                .filter(|stream| stream.kind == "Subtitle" && !stream.is_external)
-                .position(|stream| stream.index == wanted)
-                .map(|place| Some(place as i64 + 1))
+            crate::playback::mpv_id(&source.media_streams, "Subtitle", wanted).map(Some)
         });
         Ok(TimelineInfo {
             chapters: full.chapters,

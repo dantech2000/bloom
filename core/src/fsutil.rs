@@ -21,15 +21,32 @@ fn partial_of(path: &Path) -> PathBuf {
 
 /// Writes `bytes` to `path`, whole or not at all.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    write_atomic_with(path, |file| file.write_all(bytes))
+    write_atomic_with(path, None, |file| file.write_all(bytes))
 }
 
 /// The same for a file that comes in pieces: `fill` writes it. An error of
-/// `fill` leaves `path` as it was.
-pub fn write_atomic_with<T>(path: &Path, fill: impl FnOnce(&mut fs::File) -> io::Result<T>) -> io::Result<T> {
+/// `fill` leaves `path` as it was. `mode` is the mode of the file on Unix
+/// (0o600 for a file that holds tokens), set when the file is made, so it
+/// is at no time open to others; `None` leaves it to the umask.
+pub fn write_atomic_with<T>(
+    path: &Path,
+    mode: Option<u32>,
+    fill: impl FnOnce(&mut fs::File) -> io::Result<T>,
+) -> io::Result<T> {
     let partial = partial_of(path);
+    // One a run before left has the mode it was made with.
+    let _ = fs::remove_file(&partial);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
     let result = (|| {
-        let mut file = fs::File::create(&partial)?;
+        let mut file = options.open(&partial)?;
         let out = fill(&mut file)?;
         file.sync_all()?;
         fs::rename(&partial, path)?;
@@ -73,12 +90,35 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// A file with a mode has it from the first byte on, also over a
+    /// file that was open to all and over a leftover of a run before.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_with_a_mode_is_made_with_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp("mode");
+        let path = dir.join("config.json");
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(partial_of(&path), b"left over").unwrap();
+        let seen = write_atomic_with(&path, Some(0o600), |file| {
+            file.write_all(b"token")?;
+            Ok(mode(&partial_of(&path)))
+        })
+        .unwrap();
+        assert_eq!(seen, 0o600, "the file was open to others while it was written");
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(fs::read(&path).unwrap(), b"token");
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_write_that_fails_leaves_the_file_as_it_was() {
         let dir = temp("fail");
         let path = dir.join("meta.json");
         write_atomic(&path, b"whole").unwrap();
-        let failed = write_atomic_with(&path, |file| {
+        let failed = write_atomic_with(&path, None, |file| {
             file.write_all(b"ha")?;
             Err::<(), _>(io::Error::other("the line was cut"))
         });

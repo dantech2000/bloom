@@ -1,13 +1,14 @@
 #!/bin/sh
 # Builds target/<name>.app from the binary of the `ship` profile (the name
 # is in core/src/brand.rs), so the app has its icon and name in the Dock,
-# Launchpad and the menu bar. Build it first: `cargo build --profile ship`
+# Launchpad and the menu bar. Build it first, as dev/release does:
+# `cargo build --profile ship --no-default-features -p bloom -p bloom-lights`
 # (`BLOOM_BUNDLE_BIN` names another binary, such as target/release/bloom).
 # libmpv (one library with FFmpeg and the rest linked in, see dev/build-mpv)
 # comes from vendor/mpv/lib and goes into the bundle.
 dir=$(cd "$(dirname "$0")/.." && pwd)
 bin=${BLOOM_BUNDLE_BIN:-$dir/target/ship/bloom}
-[ -f "$bin" ] || { echo "no binary at $bin; run: cargo build --profile ship" >&2; exit 1; }
+[ -f "$bin" ] || { echo "no binary at $bin; run: cargo build --profile ship --no-default-features -p bloom -p bloom-lights" >&2; exit 1; }
 name=$(sed -n 's/^pub const NAME: &str = "\(.*\)";/\1/p' "$dir/core/src/brand.rs")
 folder=$(sed -n 's/^pub const FOLDER: &str = "\(.*\)";/\1/p' "$dir/core/src/brand.rs")
 tagline=$(sed -n 's/^pub const TAGLINE: &str = "\(.*\)";/\1/p' "$dir/core/src/brand.rs")

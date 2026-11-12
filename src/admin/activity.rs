@@ -1,20 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Activity log of the server as a timeline, one group for each day.
 
+use crate::ui::rows::rows;
+use crate::ui::tone::State;
 use std::collections::HashMap;
 
 use anyhow::Result;
 use gpui_icons::LucideIcon;
 use gpui_kit::{
-    Context, Div, InteractiveElement as _, IntoElement as _, ParentElement as _, Rgba, Styled,
+    Context, Div, InteractiveElement as _, IntoElement as _, ParentElement as _, Styled,
     div, px, rgba,
 };
 use serde::Deserialize;
 
 use super::{
     ago, badge, card, parse_date,
-    rows::rows,
-    users::{AMBER, GREEN, GREY, RED, avatar, content_width, icon_disc, local, stat},
+    users::{avatar, content_width, icon_disc, local, stat},
 };
 use crate::{app::Bloom, jellyfin::Client, ui::theme::UiTheme};
 
@@ -23,7 +24,7 @@ const LIMIT: usize = 100;
 /// Height of a row of the timeline: two lines of text and the padding.
 const ROW_H: f32 = 58.;
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "PascalCase")]
 pub struct Entry {
     #[serde(default)]
@@ -108,32 +109,32 @@ fn length_label(seconds: i64) -> String {
 }
 
 impl Entry {
-    /// Icon and colour for the kind of event; the severity wins when it is
+    /// Icon and state for the kind of event; the severity wins when it is
     /// a warning or an error.
-    fn look(&self) -> (LucideIcon, u32) {
-        let (glyph, color) = match self.kind.as_str() {
-            "VideoPlayback" | "AudioPlayback" | PLAYED => (LucideIcon::Play, GREEN),
-            "VideoPlaybackStopped" | "AudioPlaybackStopped" => (LucideIcon::Square, GREY),
-            "SessionStarted" => (LucideIcon::LogIn, GREY),
-            "SessionEnded" => (LucideIcon::LogOut, GREY),
-            "AuthenticationSucceeded" => (LucideIcon::KeyRound, GREY),
-            "AuthenticationFailed" | "UserLockedOut" => (LucideIcon::TriangleAlert, RED),
+    pub(super) fn look(&self) -> (LucideIcon, Option<State>) {
+        let (glyph, state) = match self.kind.as_str() {
+            "VideoPlayback" | "AudioPlayback" | PLAYED => (LucideIcon::Play, Some(State::Ok)),
+            "VideoPlaybackStopped" | "AudioPlaybackStopped" => (LucideIcon::Square, None),
+            "SessionStarted" => (LucideIcon::LogIn, None),
+            "SessionEnded" => (LucideIcon::LogOut, None),
+            "AuthenticationSucceeded" => (LucideIcon::KeyRound, None),
+            "AuthenticationFailed" | "UserLockedOut" => (LucideIcon::TriangleAlert, Some(State::Bad)),
             // A kind of event has an icon; a colour is for a state
             // (playback that runs, a sign-in that failed).
-            "UserCreated" => (LucideIcon::UserPlus, GREY),
-            "UserDeleted" => (LucideIcon::UserMinus, GREY),
-            "UserPasswordChanged" | "UserPolicyUpdated" => (LucideIcon::Lock, GREY),
+            "UserCreated" => (LucideIcon::UserPlus, None),
+            "UserDeleted" => (LucideIcon::UserMinus, None),
+            "UserPasswordChanged" | "UserPolicyUpdated" => (LucideIcon::Lock, None),
             kind if kind.starts_with("Plugin") || kind.starts_with("Package") => {
-                (LucideIcon::Boxes, GREY)
+                (LucideIcon::Boxes, None)
             }
-            kind if kind.contains("Task") => (LucideIcon::Clock, GREY),
-            kind if kind.contains("Subtitle") => (LucideIcon::TriangleAlert, AMBER),
-            _ => (LucideIcon::Info, GREY),
+            kind if kind.contains("Task") => (LucideIcon::Clock, None),
+            kind if kind.contains("Subtitle") => (LucideIcon::TriangleAlert, Some(State::Warn)),
+            _ => (LucideIcon::Info, None),
         };
         match self.severity.as_str() {
-            "Error" | "Critical" | "Fatal" => (LucideIcon::CircleAlert, RED),
-            "Warning" | "Warn" => (LucideIcon::TriangleAlert, AMBER),
-            _ => (glyph, color),
+            "Error" | "Critical" | "Fatal" => (LucideIcon::CircleAlert, Some(State::Bad)),
+            "Warning" | "Warn" => (LucideIcon::TriangleAlert, Some(State::Warn)),
+            _ => (glyph, state),
         }
     }
 
@@ -290,7 +291,7 @@ pub fn render(_app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
 fn row(entry: &Entry, data: &Data, show_kind: bool, cx: &mut Context<Bloom>) -> Div {
     // The colours alone: a row is built for every frame of a scroll.
     let colors = UiTheme::read(cx).colors;
-    let (glyph, color) = entry.look();
+    let (glyph, state) = entry.look();
     let user = entry
         .user_id
         .as_ref()
@@ -320,7 +321,7 @@ fn row(entry: &Entry, data: &Data, show_kind: bool, cx: &mut Context<Bloom>) -> 
                 .text_color(colors.foreground.opacity(0.55))
                 .child(time),
         )
-        .child(icon_disc(glyph, tint(color), 32.))
+        .child(icon_disc(glyph, state, 32.))
         .child(
             div()
                 .flex_1()
@@ -350,20 +351,11 @@ fn row(entry: &Entry, data: &Data, show_kind: bool, cx: &mut Context<Bloom>) -> 
         row = row.child(
             div()
                 .flex_shrink_0()
-                .child(badge(entry.kind_label(), Rgba { a: 0.55, ..tint(color) })),
+                .child(badge(entry.kind_label(), state)),
         );
     }
     if let Some(user) = user {
         row = row.child(avatar(&user, None, 26.));
     }
     row
-}
-
-/// The grey of quiet events is too faint for an icon; lift it.
-fn tint(color: u32) -> Rgba {
-    if color == GREY {
-        rgba(0xb8b8c0ff)
-    } else {
-        rgba(color)
-    }
 }

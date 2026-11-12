@@ -258,7 +258,7 @@ impl Bloom {
         self.apply_subtitle_style();
         // The audio track stays as the player chose it: a change after the
         // start would move the position.
-        self.queue.explicit_audio = true;
+        self.stream.chose(crate::stream::Chosen::Audio);
         self.segments.clear();
         self.close_panel(Panel::Episodes);
         // The item of the player is not known until the server answers; a
@@ -637,7 +637,7 @@ impl Bloom {
                                     if shuffle == ShuffleMode::Shuffle { "On".into() } else { "Off".into() },
                                 ))
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.sync_user(Intent::Shuffle(shuffle.next().to_string()), cx)
+                                    this.sync_user(Intent::Shuffle(shuffle.next()), cx)
                                 })),
                         )
                         .child(
@@ -652,7 +652,7 @@ impl Bloom {
                                     },
                                 ))
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.sync_user(Intent::Repeat(repeat.next().to_string()), cx)
+                                    this.sync_user(Intent::Repeat(repeat.next()), cx)
                                 })),
                         );
                 }
@@ -797,6 +797,36 @@ mod race_tests {
                 Some("y"),
                 "the player shows the item the group loaded first"
             );
+        });
+    }
+
+    /// The session ends while the player is in a group and a correction
+    /// of the speed runs (a sign-out, the app goes offline). The `Left`
+    /// of the server never comes then, so the end itself gives the player
+    /// back: out of the group, at the factor 1.
+    #[gpui_kit::test]
+    fn ending_the_session_gives_the_player_back(cx: &mut TestAppContext) {
+        use crate::{jellyfin::Client, realtime::SocketEvent, syncplay::session::Session};
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, _| {
+            // Nothing listens at this port: the leave goes nowhere.
+            let client = Client::new("http://127.0.0.1:9", "restore").with_session("token", "user");
+            let (mut session, _found) = Session::new(client, this.player.clone());
+            let joined = json!({
+                "GroupId": "g1", "Type": "GroupJoined",
+                "Data": {
+                    "GroupId": "g1", "GroupName": "Film night", "State": "Playing",
+                    "Participants": ["ana"], "LastUpdatedAt": "2026-10-03T14:00:00Z",
+                },
+            });
+            session.socket(&SocketEvent::Message { kind: "SyncPlayGroupUpdate".into(), data: joined });
+            assert!(session.core.in_group());
+            this.player.set_sync_speed(1.05);
+            assert_eq!(this.player.sync_state(), (true, 1.05));
+            this.sync.session = Some(session);
+            this.stop_sync();
+            assert!(this.sync.session.is_none());
+            assert_eq!(this.player.sync_state(), (false, 1.), "the player is still the group's");
         });
     }
 }

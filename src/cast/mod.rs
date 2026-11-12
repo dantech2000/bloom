@@ -3,7 +3,8 @@
 //!
 //! As a controller: the user picks a target in the panel: another session
 //! of the server, a cast device, or an AirPlay receiver (`target.rs` has
-//! the one enum of them). While one is set, every play of the app goes to
+//! the one enum of them; `remote.rs` has the target that is set, behind
+//! one trait). While one is set, every play of the app goes to
 //! it, and the panel steers it. A Jellyfin session is told through the
 //! server, and its state comes back in its playback reports, which the
 //! server pushes over the socket (a `Sessions` subscription) or which a
@@ -20,6 +21,7 @@ pub mod debug;
 /// The shapes on the wire are in `bloom-core`, where their tests run
 /// without the app.
 pub use bloom_core::cast::protocol;
+pub mod remote;
 pub mod target;
 pub mod ui;
 
@@ -29,19 +31,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use gpui_kit::{Bounds, Context, Pixels, Task, Window};
 use serde_json::Value;
 
 use self::{
     protocol::{Action, Local, PlayCommand, RemoteCommand, SessionInfo},
-    target::{CastTracks, Kind, Leave, Target, TargetView},
+    remote::{AirPlayRemote, CastLoad, ChromecastRemote, Effect, JellyfinRemote, Play, Remote, RemoteTarget, Track},
+    target::{Kind, Target, TargetView},
 };
 use crate::{
     airplay::{AirPlayEvent, picker},
     app::{Bloom, Panel},
     chromecast::{
-        jellyfin as cast_jellyfin,
-        mdns::{self, Device},
+        discovery::{self, Device},
         session::{Event as CastEvent, Session},
     },
     jellyfin::{Client, Item, ItemsResult},
@@ -95,13 +98,10 @@ pub struct CastState {
     /// The sessions this user can control, for the panel.
     pub sessions: Vec<SessionInfo>,
     pub loading: bool,
-    /// Where playback goes. A Jellyfin session carries its last known
-    /// state; a cast device has its connection in `Bloom::chromecast`,
-    /// AirPlay its engine in `Bloom::airplay`.
-    pub target: Target,
-    /// When the state of a Jellyfin session came, so the position can
-    /// move between reports.
-    pub target_at: Option<Instant>,
+    /// Where playback goes: the target that is set, with what its kind
+    /// keeps (the last state of a Jellyfin session, the connection of a
+    /// cast device, the AirPlay engine). None is this device.
+    pub remote: Option<Remote>,
     /// The choice of the target, among the choices made: a poll of the
     /// sessions that started before the choice says nothing about it.
     target_chosen: crate::app::Revision,
@@ -113,26 +113,17 @@ pub struct CastState {
     pub own: Option<String>,
     /// Why the last request failed, for the debug channel.
     pub error: Option<String>,
-    poll: Option<Task<()>>,
     /// Where the seek bar and the volume bar of the panel were painted.
     pub seek_bounds: Rc<Cell<Bounds<Pixels>>>,
     pub volume_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// What a remote command asks of the window; the next frame does it.
     pending: Vec<Pending>,
-    /// The item this app loaded on the cast device: the device reports
-    /// only its id.
-    pub cast_item: Option<Item>,
-    /// The number the connection gave the load of that item; the end of
-    /// the item comes with it (`CastEvent::Ended`).
-    cast_load: u64,
     /// The cast devices the panel lists, as of the last look (`TICK`).
     pub devices: Vec<Device>,
     /// Looks at what moves with no event while the panel is open or a
     /// target is set (`start_cast_tick`); `ticking` until it ends.
     tick: Option<Task<()>>,
     ticking: bool,
-    /// The streams the Jellyfin receiver app says it plays.
-    pub cast_tracks: CastTracks,
     /// When the search for cast devices started, for "Searching…".
     pub search_started: Option<Instant>,
     search_timer: Option<Task<()>>,
@@ -147,6 +138,7 @@ pub struct CastState {
     /// ask waits on the UI thread, so it is not made again at every frame.
     picker_failed: Option<Instant>,
     /// The fake device of `BLOOM_CHROMECAST_MOCK`.
+    #[cfg(feature = "cast-mock")]
     mock: Option<crate::chromecast::mock::Mock>,
 }
 
@@ -158,28 +150,37 @@ enum Pending {
 impl CastState {
     /// A target is set: plays go to it.
     pub fn active(&self) -> bool {
-        !self.target.is_local()
+        self.remote.is_some()
     }
 
     pub fn kind(&self) -> Kind {
-        self.target.kind()
+        self.remote.as_ref().map_or(Kind::Local, Remote::kind)
+    }
+
+    /// The choice the target is; this device with none.
+    pub fn target(&self) -> Target {
+        self.remote.as_ref().map_or(Target::Local, |remote| remote.target().choice())
     }
 
     pub fn device_name(&self) -> String {
-        self.target.name()
+        self.target().name()
     }
 
     /// The Jellyfin session that is the target, when one is.
     pub fn session(&self) -> Option<&SessionInfo> {
-        match &self.target {
-            Target::JellyfinSession(session) => Some(session),
+        self.jellyfin().map(|remote| &remote.session)
+    }
+
+    fn jellyfin(&self) -> Option<&JellyfinRemote> {
+        match &self.remote {
+            Some(Remote::Jellyfin(remote)) => Some(remote),
             _ => None,
         }
     }
 
-    pub fn session_mut(&mut self) -> Option<&mut SessionInfo> {
-        match &mut self.target {
-            Target::JellyfinSession(session) => Some(session),
+    fn jellyfin_mut(&mut self) -> Option<&mut JellyfinRemote> {
+        match &mut self.remote {
+            Some(Remote::Jellyfin(remote)) => Some(remote),
             _ => None,
         }
     }
@@ -449,7 +450,7 @@ impl Bloom {
     /// the AirPlay row of the panel painted its button at the last frame,
     /// and away when the panel closes or shows a target.
     fn place_picker(&mut self, window: &Window) {
-        let wanted = self.panel_is(Panel::Cast) && self.cast.target.is_local() && self.airplay_row_shown();
+        let wanted = self.panel_is(Panel::Cast) && !self.cast.active() && self.airplay_row_shown();
         if !wanted {
             if self.cast.picker_place.take().is_some() || picker::shown() {
                 picker::hide();
@@ -509,50 +510,55 @@ impl Bloom {
 
     /// The state of the target as the panel and the chip show it.
     pub fn target_view(&self) -> TargetView {
-        match &self.cast.target {
-            Target::Local => TargetView::local(),
-            Target::JellyfinSession(session) => target::from_session(session, self.cast.target_at),
-            Target::Chromecast(device) => {
-                let status = self.chromecast.session.as_ref().map(Session::status).unwrap_or_default();
-                let title = self.cast.cast_item.as_ref().map(Item::display_title);
-                target::from_chromecast(device, &status, title, self.cast.cast_tracks)
-            }
-            Target::AirPlay => target::from_airplay(&self.airplay.status()),
-        }
+        self.cast.remote.as_ref().map_or_else(TargetView::local, |remote| remote.target().view())
     }
 
     /// Makes `chosen` the target and leaves the one before. Local playback
     /// stops: one item plays at a time, on the target.
     pub fn select_target(&mut self, chosen: Target, cx: &mut Context<Self>) {
-        let before = self.cast.target.kind();
-        let (target, leave) = std::mem::take(&mut self.cast.target).switch(chosen);
-        // Nothing left and something was set: the same device again.
-        let same = leave.is_none() && before != Kind::Local;
-        self.cast.target = target;
+        let same = self.cast.target().same(&chosen);
         self.cast.target_chosen = self.next_revision();
-        if let Some(leave) = leave {
-            self.leave_target(leave, cx);
-        }
-        self.cast.target_at = Some(Instant::now());
         self.cast.error = None;
-        match self.cast.target.clone() {
-            Target::Local => {
-                self.cast.target_at = None;
-            }
-            Target::JellyfinSession(session) => {
-                if !same {
-                    self.cast_subscribe();
-                    self.start_cast_poll(cx);
-                    self.toast("Play On", format!("Playback goes to {}.", session.device_name), cx);
+        match chosen {
+            // The same device again: a Jellyfin session comes with its
+            // state of now.
+            Target::JellyfinSession(session) if same => {
+                if let Some(remote) = self.cast.jellyfin_mut() {
+                    remote.update(session);
                 }
+            }
+            _ if same => {}
+            Target::Local => self.leave_remote(cx),
+            Target::JellyfinSession(session) => {
+                self.leave_remote(cx);
+                let name = session.device_name.clone();
+                let mut remote = JellyfinRemote::new(session);
+                remote.poll = Some(self.cast_poll(cx));
+                self.cast.remote = Some(Remote::Jellyfin(remote));
+                self.cast_subscribe();
+                self.toast("Play On", format!("Playback goes to {name}."), cx);
             }
             Target::Chromecast(device) => {
-                let name = device.name.clone();
-                if self.chromecast_open(device, cx) {
-                    self.toast("Play On", format!("Playback goes to {name}."), cx);
-                }
+                self.leave_remote(cx);
+                // A connection the debug channel opened to this device
+                // becomes the target as it is.
+                let remote = match self.chromecast.probe.take() {
+                    Some(probe) if probe.device.id == device.id => probe,
+                    _ => {
+                        self.toast("Play On", format!("Playback goes to {}.", device.name), cx);
+                        self.chromecast_connect(device, cx)
+                    }
+                };
+                self.cast.remote = Some(Remote::Chromecast(remote));
             }
-            Target::AirPlay => self.watch_airplay(cx),
+            Target::AirPlay => {
+                self.leave_remote(cx);
+                self.watch_airplay(cx);
+                // The engine may hold an item already (the debug channel
+                // sends one): it is the one the app plays.
+                let remote = AirPlayRemote::new(self.airplay.clone(), self.playing.clone());
+                self.cast.remote = Some(Remote::AirPlay(remote));
+            }
         }
         if self.cast.active() {
             self.start_cast_tick(cx);
@@ -564,30 +570,17 @@ impl Bloom {
         cx.notify();
     }
 
-    /// Undoes a target that is left: the subscription, the connection to
-    /// the cast device (and the item this app put on it), the AirPlay
-    /// engine.
-    fn leave_target(&mut self, leave: Leave, cx: &mut Context<Self>) {
-        match leave {
-            Leave::Jellyfin => {
-                self.cast.poll = None;
-                if self.cast.subscribed {
-                    self.sync.socket_send("SessionsStop", None);
-                    self.cast.subscribed = false;
-                }
-            }
-            Leave::Chromecast(device) => {
-                log::info!("cast: leaving {:?}", device.name);
-                if let Some(session) = &self.chromecast.session {
-                    // The device keeps what another sender put on it; what
-                    // this app loaded ends with the target.
-                    if self.cast.cast_item.is_some() && session.status().loaded() {
-                        session.stop_media();
-                    }
-                }
-                self.chromecast_close();
-            }
-            Leave::AirPlay => self.airplay.disconnect(),
+    /// Leaves the target that is set: what its kind undoes (the item this
+    /// app put on a cast device, the AirPlay engine), its connection and
+    /// its poll, which go with it, and the push of the sessions.
+    fn leave_remote(&mut self, cx: &mut Context<Self>) {
+        if let Some(mut remote) = self.cast.remote.take() {
+            let effect = remote.target_mut().leave();
+            self.cast_effect(effect, cx);
+        }
+        if self.cast.subscribed {
+            self.sync.socket_send("SessionsStop", None);
+            self.cast.subscribed = false;
         }
         cx.notify();
     }
@@ -610,14 +603,10 @@ impl Bloom {
     /// device or an AirPlay receiver stops. A change of the account calls
     /// this, so it must leave nothing of the account before.
     pub fn cast_off(&mut self, cx: &mut Context<Self>) {
-        let leave = std::mem::take(&mut self.cast.target).leave();
+        self.leave_remote(cx);
         self.cast.target_chosen = self.next_revision();
-        self.cast.target_at = None;
         self.cast.error = None;
-        if let Some(leave) = leave {
-            self.leave_target(leave, cx);
-        }
-        self.chromecast_close();
+        self.chromecast.probe = None;
         cx.notify();
     }
 
@@ -625,13 +614,7 @@ impl Bloom {
     /// from where the target was, when that is known.
     pub fn cast_play_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = self.target_view();
-        let item = match &self.cast.target {
-            Target::Local => None,
-            Target::JellyfinSession(session) => session.now_playing_item.clone(),
-            Target::Chromecast(_) => self.cast.cast_item.clone(),
-            Target::AirPlay => self.playing.clone(),
-        }
-        .filter(|_| view.loaded);
+        let item = self.cast.remote.as_ref().and_then(|remote| remote.target().item().cloned()).filter(|_| view.loaded);
         self.cast_off(cx);
         let Some(mut item) = item else { return };
         let resume = view.position > 0.;
@@ -720,9 +703,8 @@ impl Bloom {
     }
 
     fn cast_target_update(&mut self, fresh: SessionInfo) {
-        if self.cast.session().is_some() {
-            self.cast.target = Target::JellyfinSession(fresh);
-            self.cast.target_at = Some(Instant::now());
+        if let Some(remote) = self.cast.jellyfin_mut() {
+            remote.update(fresh);
         }
     }
 
@@ -733,9 +715,10 @@ impl Bloom {
         }
     }
 
-    /// Reads the sessions on a timer while a session is the target.
-    fn start_cast_poll(&mut self, cx: &mut Context<Self>) {
-        self.cast.poll = Some(cx.spawn(async move |this, cx| {
+    /// Reads the sessions on a timer while a session is the target; the
+    /// target keeps the task and ends it when it goes.
+    fn cast_poll(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
             loop {
                 let wait = this
                     .read_with(cx, |this, _| {
@@ -753,27 +736,24 @@ impl Bloom {
                     break;
                 }
             }
-        }));
+        })
     }
 
     /// Sends items to the target instead of the player. False when there
     /// is no target: the caller plays them itself.
     pub fn cast_play(&mut self, items: &[Item], resume: bool, cx: &mut Context<Self>) -> bool {
-        let Some(first) = items.first() else {
+        let (Some(remote), Some(account), Some(first)) = (&mut self.cast.remote, &self.session, items.first()) else {
             return self.cast.active();
         };
-        let start = if resume { first.resume_secs() as f64 } else { 0. };
-        match self.cast.kind() {
-            Kind::Local => return false,
-            Kind::Jellyfin => {
-                let ids: Vec<String> = items.iter().map(|item| item.id.clone()).collect();
-                self.cast_send_play(ids, PlayCommand::PlayNow, resume.then_some(start), cx);
-            }
-            Kind::Chromecast => self.chromecast_load(items, start, cx),
-            Kind::AirPlay => {
-                self.airplay_send(first, start, cx);
-            }
-        }
+        let effect = remote.target_mut().play(Play {
+            items,
+            start_secs: if resume { first.resume_secs() as f64 } else { 0. },
+            resume,
+            client: &account.client,
+            server_id: &account.server_id,
+            max_bitrate: self.config.max_bitrate,
+        });
+        self.cast_effect(effect, cx);
         true
     }
 
@@ -791,105 +771,57 @@ impl Bloom {
         start_secs: Option<f64>,
         cx: &mut Context<Self>,
     ) {
-        let Some(target) = self.cast.session() else { return };
-        let (id, name) = (target.id.clone(), target.device_name.clone());
-        let query = protocol::play_query(&item_ids, command, start_secs);
-        let what = match command {
-            PlayCommand::PlayNow => format!("Playing on {name}."),
-            PlayCommand::PlayNext => format!("Plays next on {name}."),
-            PlayCommand::PlayLast => format!("Added to the queue of {name}."),
-        };
-        self.cast_request(
-            move |client| client.call("POST", &format!("/Sessions/{id}/Playing"), &query),
-            Some(what),
-            cx,
-        );
-    }
-
-    /// A playstate command for a Jellyfin session: Pause, Unpause,
-    /// PlayPause, Stop, NextTrack, PreviousTrack, or Seek with a position.
-    pub fn cast_playstate(&mut self, command: &str, seek_secs: Option<f64>, cx: &mut Context<Self>) {
-        let Some(target) = self.cast.session() else { return };
-        let id = target.id.clone();
-        // The panel shows the new state at once; the report of the target
-        // confirms it.
-        let position = self.target_view().position;
-        let target = self.cast.session_mut().expect("target");
-        match command {
-            "Pause" => target.play_state.is_paused = true,
-            "Unpause" => target.play_state.is_paused = false,
-            "PlayPause" => target.play_state.is_paused = !target.play_state.is_paused,
-            "Seek" => target.play_state.position_ticks = seek_secs.map(protocol::secs_to_ticks),
-            "Stop" => target.now_playing_item = None,
-            _ => {}
-        }
-        if command != "Seek" {
-            target.play_state.position_ticks = Some(protocol::secs_to_ticks(position));
-        }
-        self.cast.target_at = Some(Instant::now());
-        let mut query = Vec::new();
-        if let Some(secs) = seek_secs.filter(|_| command == "Seek") {
-            query.push(("seekPositionTicks", protocol::secs_to_ticks(secs).to_string()));
-        }
-        let path = format!("/Sessions/{id}/Playing/{command}");
-        self.cast_request(move |client| client.call("POST", &path, &query), None, cx);
+        let Some(remote) = self.cast.jellyfin() else { return };
+        let effect = remote.send_play(item_ids, command, start_secs);
+        self.cast_effect(effect, cx);
     }
 
     /// A general command for a Jellyfin session, with its arguments.
     pub fn cast_general(&mut self, name: &str, arguments: &[(&str, String)], cx: &mut Context<Self>) {
-        let Some(target) = self.cast.session_mut() else { return };
-        let id = target.id.clone();
-        match (name, arguments.first()) {
-            ("SetVolume", Some((_, value))) => {
-                target.play_state.volume_level = value.parse().ok();
-                target.play_state.is_muted = false;
-            }
-            ("ToggleMute", _) => target.play_state.is_muted = !target.play_state.is_muted,
-            ("Mute", _) => target.play_state.is_muted = true,
-            ("Unmute", _) => target.play_state.is_muted = false,
-            ("SetAudioStreamIndex", Some((_, value))) => {
-                target.play_state.audio_stream_index = value.parse().ok();
-            }
-            ("SetSubtitleStreamIndex", Some((_, value))) => {
-                target.play_state.subtitle_stream_index = value.parse().ok();
-            }
-            _ => {}
+        let Some(remote) = self.cast.jellyfin_mut() else { return };
+        let effect = remote.general(name, arguments);
+        self.cast_effect(effect, cx);
+    }
+
+    /// Does what a control of a target left for the app: says its toast,
+    /// and sends its request to the server off the UI thread; a failure
+    /// of that shows as a toast.
+    fn cast_effect(&mut self, effect: Effect, cx: &mut Context<Self>) {
+        if let Some(item) = effect.playing {
+            self.playing = Some(item);
         }
-        let body = protocol::general_command(name, arguments);
-        let path = format!("/Sessions/{id}/Command");
-        self.cast_request(move |client| client.post(&path, &body).map(drop), None, cx);
-    }
-
-    pub fn cast_set_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
-        let volume = volume.clamp(0., 100.).round();
-        self.cast_general("SetVolume", &[("Volume", format!("{volume}"))], cx);
-    }
-
-    /// Sends a request to the target off the UI thread; a failure shows
-    /// as a toast.
-    fn cast_request<W>(&mut self, work: W, done: Option<String>, cx: &mut Context<Self>)
-    where
-        W: FnOnce(crate::jellyfin::Client) -> anyhow::Result<()> + Send + 'static,
-    {
-        self.fetch(cx, work, move |this, result, cx| {
-            match result {
-                Ok(()) => {
-                    this.cast.error = None;
-                    if let Some(text) = done {
-                        this.toast("Play On", text, cx);
+        if let Some(text) = effect.toast {
+            self.toast("Play On", text, cx);
+        }
+        if let Some(request) = effect.request {
+            let done = request.done;
+            self.fetch(cx, request.work, move |this, result, cx| {
+                match result {
+                    Ok(()) => {
+                        this.cast.error = None;
+                        if let Some(text) = done {
+                            this.toast("Play On", text, cx);
+                        }
+                    }
+                    Err(err) => {
+                        this.cast.error = Some(format!("{err:#}"));
+                        this.toast("Play On", format!("The device did not take the command: {err:#}"), cx);
                     }
                 }
-                Err(err) => {
-                    this.cast.error = Some(format!("{err:#}"));
-                    this.toast("Play On", format!("The device did not take the command: {err:#}"), cx);
-                }
-            }
-            cx.notify();
-        });
+                cx.notify();
+            });
+        }
         cx.notify();
     }
 
     // ----- the controls of the panel, for every kind of target ------------
+
+    /// Runs a control on the target that is set; nothing with none.
+    fn target_do(&mut self, control: impl FnOnce(&mut dyn RemoteTarget) -> Effect, cx: &mut Context<Self>) {
+        let Some(remote) = &mut self.cast.remote else { return };
+        let effect = control(remote.target_mut());
+        self.cast_effect(effect, cx);
+    }
 
     pub fn target_toggle_pause(&mut self, cx: &mut Context<Self>) {
         let paused = self.target_view().paused;
@@ -897,104 +829,40 @@ impl Bloom {
     }
 
     pub fn target_set_paused(&mut self, paused: bool, cx: &mut Context<Self>) {
-        match self.cast.kind() {
-            Kind::Local => {}
-            Kind::Jellyfin => self.cast_playstate(if paused { "Pause" } else { "Unpause" }, None, cx),
-            Kind::Chromecast => self.chromecast_do(|s| if paused { s.pause() } else { s.play() }),
-            Kind::AirPlay => {
-                if paused {
-                    self.airplay.pause()
-                } else {
-                    self.airplay.play()
-                }
-            }
-        }
-        cx.notify();
+        self.target_do(|target| target.set_paused(paused), cx);
     }
 
     pub fn target_seek(&mut self, secs: f64, cx: &mut Context<Self>) {
-        let secs = secs.max(0.);
-        match self.cast.kind() {
-            Kind::Local => {}
-            Kind::Jellyfin => self.cast_playstate("Seek", Some(secs), cx),
-            Kind::Chromecast => self.chromecast_do(|s| s.seek(secs)),
-            Kind::AirPlay => self.airplay.seek(secs),
-        }
-        cx.notify();
+        self.target_do(|target| target.seek(secs.max(0.)), cx);
     }
 
     pub fn target_stop(&mut self, cx: &mut Context<Self>) {
-        match self.cast.kind() {
-            Kind::Local => {}
-            Kind::Jellyfin => self.cast_playstate("Stop", None, cx),
-            Kind::Chromecast => self.chromecast_do(|s| s.stop_media()),
-            Kind::AirPlay => self.airplay.stop(),
-        }
-        cx.notify();
+        self.target_do(|target| target.stop(), cx);
     }
 
     /// Next or previous in the queue of the target; only a Jellyfin
     /// session has one.
     pub fn target_skip(&mut self, next: bool, cx: &mut Context<Self>) {
-        if self.cast.kind() == Kind::Jellyfin {
-            self.cast_playstate(if next { "NextTrack" } else { "PreviousTrack" }, None, cx);
-        }
+        self.target_do(|target| target.skip(next), cx);
     }
 
     /// 0 to 100.
     pub fn target_set_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
-        let volume = volume.clamp(0., 100.);
-        match self.cast.kind() {
-            Kind::Local => {}
-            Kind::Jellyfin => self.cast_set_volume(volume, cx),
-            Kind::Chromecast => self.chromecast_do(|s| s.set_volume(f64::from(volume) / 100.)),
-            Kind::AirPlay => self.airplay.set_volume(volume / 100.),
-        }
-        cx.notify();
+        self.target_do(|target| target.set_volume(volume.clamp(0., 100.)), cx);
     }
 
     pub fn target_toggle_mute(&mut self, cx: &mut Context<Self>) {
         let muted = self.target_view().muted;
-        match self.cast.kind() {
-            Kind::Local => {}
-            Kind::Jellyfin => self.cast_general("ToggleMute", &[], cx),
-            Kind::Chromecast => self.chromecast_do(|s| s.set_muted(!muted)),
-            Kind::AirPlay => self.airplay.set_muted(!muted),
-        }
-        cx.notify();
+        self.target_do(|target| target.set_muted(!muted), cx);
     }
 
     /// A stream of the item by its index on the server; -1 turns subtitles
-    /// off. AirPlay carries no track of ours.
-    pub fn target_set_track(&mut self, kind: &str, index: i64, cx: &mut Context<Self>) {
-        let audio = kind == "Audio";
-        match self.cast.kind() {
-            Kind::Local | Kind::AirPlay => {}
-            Kind::Jellyfin => {
-                let name = if audio { "SetAudioStreamIndex" } else { "SetSubtitleStreamIndex" };
-                self.cast_general(name, &[("Index", index.to_string())], cx);
-            }
-            Kind::Chromecast => {
-                if audio {
-                    self.cast.cast_tracks.audio_index = Some(index);
-                    self.chromecast_do(|s| s.set_audio(index));
-                } else {
-                    self.cast.cast_tracks.subtitle_index = Some(index);
-                    self.chromecast_do(|s| s.set_subtitle((index >= 0).then_some(index)));
-                }
-            }
-        }
-        cx.notify();
+    /// off.
+    pub fn target_set_track(&mut self, track: Track, index: i64, cx: &mut Context<Self>) {
+        self.target_do(|target| target.set_track(track, index), cx);
     }
 
     // ----- cast devices -----------------------------------------------------
-
-    fn chromecast_do(&mut self, act: impl FnOnce(&Session)) {
-        match &self.chromecast.session {
-            Some(session) => act(session),
-            None => self.cast.error = Some("not connected to the device".into()),
-        }
-    }
 
     /// Starts the search for cast devices, unless it runs. The panel says
     /// "Searching…" for a moment after.
@@ -1002,12 +870,15 @@ impl Bloom {
         if self.chromecast.discovery.is_some() {
             return;
         }
-        self.chromecast.discovery = Some(mdns::discover());
+        self.chromecast.discovery = Some(discovery::discover());
         self.cast.search_started = Some(Instant::now());
-        if crate::options::options().chromecast_mock && self.cast.mock.is_none() {
-            let mock = crate::chromecast::mock::Mock::start();
-            log::info!("cast: mock device on 127.0.0.1:{}", mock.port);
-            self.cast.mock = Some(mock);
+        #[cfg(feature = "cast-mock")]
+        {
+            if crate::options::options().chromecast_mock && self.cast.mock.is_none() {
+                let mock = crate::chromecast::mock::Mock::start();
+                log::info!("cast: mock device on 127.0.0.1:{}", mock.port);
+                self.cast.mock = Some(mock);
+            }
         }
         self.cast.devices = self.chromecast_devices();
         // The note goes away by itself.
@@ -1046,9 +917,15 @@ impl Bloom {
                 let wait = if looks <= 3 { TICK_AT_FIRST } else { TICK };
                 cx.background_executor().timer(wait).await;
                 let going = this.update(cx, |this, cx| {
-                    let (panel, chromecast) = (this.panel_is(Panel::Cast), this.cast.kind() == Kind::Chromecast);
-                    if !panel && !chromecast {
+                    let (panel, kind) = (this.panel_is(Panel::Cast), this.cast.kind());
+                    if !panel && kind != Kind::Chromecast {
                         this.stop_cast_search();
+                    }
+                    // The browse for AirPlay receivers and the route
+                    // detection of the engine listen on the network too;
+                    // the panel starts them again when it opens.
+                    if !panel && kind != Kind::AirPlay && this.airplay.browsing() {
+                        this.airplay.stop_routes();
                     }
                     let devices = this.chromecast_devices();
                     let mut moved = devices != this.cast.devices;
@@ -1077,48 +954,64 @@ impl Bloom {
     /// one of a test. The panel reads `CastState::devices`, the list of
     /// the last look.
     pub fn chromecast_devices(&self) -> Vec<Device> {
-        let mut devices: Vec<Device> = self.chromecast.discovery.as_ref().map(mdns::Discovery::devices).unwrap_or_default();
-        if let Some(mock) = &self.cast.mock {
-            devices.push(mock.device());
+        let mut devices: Vec<Device> = self.chromecast.discovery.as_ref().map(discovery::Discovery::devices).unwrap_or_default();
+        #[cfg(feature = "cast-mock")]
+        {
+            if let Some(mock) = &self.cast.mock {
+                devices.push(mock.device());
+            }
         }
         devices.sort_by_cached_key(|device| device.name.to_lowercase());
         devices
     }
 
-    /// Opens the connection to the device and reads its state; nothing on
-    /// the device changes until a play or a control. False when the
-    /// connection to this device is open already.
-    pub(crate) fn chromecast_open(&mut self, device: Device, cx: &mut Context<Self>) -> bool {
-        if self.chromecast.session.as_ref().is_some_and(|s| s.device().id == device.id) {
-            return false;
-        }
-        self.chromecast_close();
-        let (session, events) = Session::connect(device);
-        self.chromecast.session = Some(session);
+    /// Opens a connection to the device and reads its state; nothing on
+    /// the device changes until a play or a control. The certificate the
+    /// device showed before, when one is kept, is the one it must show.
+    fn chromecast_connect(&mut self, device: Device, cx: &mut Context<Self>) -> ChromecastRemote {
+        let pin = self.config.cast_pins.get(&device.id).and_then(|kept| BASE64.decode(kept).ok());
+        let (session, events) = Session::connect(device.clone(), pin);
         self.chromecast.events.clear();
-        self.chromecast.task = Some(cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {
                 let fed = this.update(cx, |this, cx| this.on_cast_event(event, cx));
                 if fed.is_err() {
                     break;
                 }
             }
-        }));
+        });
+        ChromecastRemote { device, session, loaded: CastLoad::default(), _task: task }
+    }
+
+    /// The connection to a cast device that is open: the one of the
+    /// target, or the one the debug channel opened with no target.
+    pub(crate) fn chromecast_link(&self) -> Option<&ChromecastRemote> {
+        match &self.cast.remote {
+            Some(Remote::Chromecast(remote)) => Some(remote),
+            _ => self.chromecast.probe.as_ref(),
+        }
+    }
+
+    fn chromecast_link_mut(&mut self) -> Option<&mut ChromecastRemote> {
+        match &mut self.cast.remote {
+            Some(Remote::Chromecast(remote)) => Some(remote),
+            _ => self.chromecast.probe.as_mut(),
+        }
+    }
+
+    /// For the debug channel: a connection to the device with no target,
+    /// to look at it. False when a connection to this device is open
+    /// already (the target's as well).
+    pub(crate) fn chromecast_open(&mut self, device: Device, cx: &mut Context<Self>) -> bool {
+        if self.chromecast_link().is_some_and(|open| open.device.id == device.id) {
+            return false;
+        }
+        self.chromecast.probe = Some(self.chromecast_connect(device, cx));
         true
     }
 
-    /// Closes the connection to the cast device, with what the panel knew
-    /// of the item on it.
-    pub(crate) fn chromecast_close(&mut self) {
-        self.chromecast.session = None;
-        self.chromecast.task = None;
-        self.cast.cast_item = None;
-        self.cast.cast_load = 0;
-        self.cast.cast_tracks = CastTracks::default();
-    }
-
-    /// An event of the cast connection: the status moves the panel; a
-    /// report of the Jellyfin receiver app names the streams it plays.
+    /// An event of the cast connection: the status moves the panel, and
+    /// the connection that is open keeps what the event says of its item.
     fn on_cast_event(&mut self, event: CastEvent, cx: &mut Context<Self>) {
         self.chromecast.note(&event);
         match &event {
@@ -1126,43 +1019,50 @@ impl Bloom {
                 log::warn!("cast: {text}");
                 self.cast.error = Some(text.clone());
             }
-            CastEvent::Message { namespace, payload } if namespace == cast_jellyfin::NAMESPACE => {
-                if let Some(report) = cast_jellyfin::parse_report(payload) {
-                    if report.audio_index.is_some() {
-                        self.cast.cast_tracks.audio_index = report.audio_index;
-                    }
-                    if report.subtitle_index.is_some() {
-                        self.cast.cast_tracks.subtitle_index = report.subtitle_index;
-                    }
-                }
-            }
-            // The item of a load is gone from the device. Only the load of
-            // the item the panel shows counts: a new item makes the device
-            // change its app, and the end of the app before it comes with
-            // the number of the item before it.
-            CastEvent::Ended { load } if *load == self.cast.cast_load => self.cast.cast_item = None,
+            CastEvent::Pinned(certificate) => self.keep_cast_pin(certificate, cx),
             _ => {}
+        }
+        if let Some(open) = self.chromecast_link_mut() {
+            open.loaded.note(&event);
         }
         cx.notify();
     }
 
-    /// Plays items on the cast device: the Jellyfin receiver app with the
-    /// identity of this session takes them all as its queue, and the
-    /// Default Media Receiver the stream URL of the first one when that
-    /// app does not launch.
-    pub(crate) fn chromecast_load(&mut self, items: &[Item], start_secs: f64, cx: &mut Context<Self>) {
-        let (Some(session), Some(account), Some(first)) = (&self.chromecast.session, &self.session, items.first()) else {
-            self.cast.error = Some("not connected to the device".into());
-            cx.notify();
+    /// Keeps the certificate the cast device showed with the config, by
+    /// the id of the device: the next connection takes that one only. The
+    /// fake device of a test (on this Mac) is not kept.
+    fn keep_cast_pin(&mut self, certificate: &[u8], cx: &mut Context<Self>) {
+        let Some(device) = self.chromecast_link().map(|open| &open.device) else { return };
+        if device.address.is_loopback() {
             return;
+        }
+        let (id, kept) = (device.id.clone(), BASE64.encode(certificate));
+        if self.config.cast_pins.get(&id) != Some(&kept) {
+            log::info!("cast: the certificate of {:?} is kept", device.name);
+            self.config.cast_pins.insert(id, kept);
+            self.save_config(cx);
+        }
+    }
+
+    /// For the debug channel: plays items on the cast device that is
+    /// open, the target or not.
+    pub(crate) fn chromecast_load(&mut self, items: &[Item], start_secs: f64, cx: &mut Context<Self>) {
+        let max_bitrate = self.config.max_bitrate;
+        let effect = match (&self.session, &mut self.cast.remote, &mut self.chromecast.probe) {
+            (Some(account), Some(Remote::Chromecast(open)), _) | (Some(account), _, Some(open)) => open.play(Play {
+                items,
+                start_secs,
+                resume: start_secs > 0.,
+                client: &account.client,
+                server_id: &account.server_id,
+                max_bitrate,
+            }),
+            _ => {
+                self.cast.error = Some("not connected to the device".into());
+                Effect::default()
+            }
         };
-        let request = cast_jellyfin::load_request(&account.client, &account.server_id, items, start_secs);
-        let name = session.device().name.clone();
-        self.cast.cast_load = session.load(request);
-        self.cast.cast_item = Some(first.clone());
-        self.cast.cast_tracks = CastTracks::default();
-        self.toast("Play On", format!("Playing on {name}."), cx);
-        cx.notify();
+        self.cast_effect(effect, cx);
     }
 
     // ----- AirPlay -----------------------------------------------------------
@@ -1187,17 +1087,15 @@ impl Bloom {
     /// sent, makes AirPlay the target; the end of it gives the target up.
     fn on_airplay_event(&mut self, event: AirPlayEvent, cx: &mut Context<Self>) {
         let status = self.airplay.status();
-        let before = self.cast.target.clone();
-        let after = before.clone().after_airplay(&event, &status);
-        if after != before {
-            if after == Target::AirPlay {
-                log::info!("airplay: the target");
-                self.select_target(Target::AirPlay, cx);
-            } else {
-                log::info!("airplay: ended; back to this device");
-                self.cast.target = after;
-                self.cast.target_at = None;
-            }
+        let before = self.cast.kind();
+        let after = self.cast.target().after_airplay(&event, &status).kind();
+        if after == Kind::AirPlay && before != Kind::AirPlay {
+            log::info!("airplay: the target");
+            self.select_target(Target::AirPlay, cx);
+        } else if after != before {
+            // The engine ended it itself: nothing is left to undo.
+            log::info!("airplay: ended; back to this device");
+            self.cast.remote = None;
         }
         if let AirPlayEvent::LoadFailed { error, .. } = &event {
             self.cast.error = Some(error.clone());
@@ -1225,27 +1123,6 @@ mod race_tests {
 
     use crate::app::{Screen, race_harness::{MockServer, app, plain, session, tick_until}};
 
-    /// A new item makes the device change its app: the app before goes,
-    /// and its end comes with the number of the item before. That is not
-    /// the end of the new item; the end with its own number is.
-    #[gpui_kit::test]
-    fn the_end_of_the_item_before_keeps_the_new_item(cx: &mut TestAppContext) {
-        use crate::chromecast::session::{Event, Status};
-        let (bloom, cx) = app(cx);
-        bloom.update(cx, |this, cx| {
-            this.cast.cast_item = Some(crate::app::race_harness::item("m2", "Two", "Movie"));
-            this.cast.cast_load = 2;
-            this.on_cast_event(Event::Ended { load: 1 }, cx);
-            assert!(this.cast.cast_item.is_some(), "the end of the item before dropped the new item");
-            // A status with no app (the launch takes a moment; a key on
-            // the remote of the TV sends one) says nothing of the item.
-            this.on_cast_event(Event::Status(Status::default()), cx);
-            assert!(this.cast.cast_item.is_some(), "a status during the launch dropped the item");
-            this.on_cast_event(Event::Ended { load: 2 }, cx);
-            assert!(this.cast.cast_item.is_none(), "the item stays though its app is gone");
-        });
-    }
-
     /// The items of a remote `Play` come in two requests, whatever their
     /// number, and in the order of the ids, whatever order the server
     /// gives them in. An id the server does not know is left out.
@@ -1271,25 +1148,46 @@ mod race_tests {
 
     /// Back to this device leaves nothing of the target: a change of the
     /// account calls `cast_off` and counts on it.
+    #[cfg(feature = "cast-mock")]
     #[gpui_kit::test]
     fn cast_off_leaves_nothing_of_the_target(cx: &mut TestAppContext) {
-        use crate::cast::target::Target;
+        use crate::cast::target::{Kind, Target};
         let mock = crate::chromecast::mock::Mock::start();
         let (bloom, cx) = app(cx);
         bloom.update(cx, |this, cx| {
             this.select_target(Target::Chromecast(mock.device()), cx);
-            this.cast.cast_item = Some(crate::app::race_harness::item("m1", "One", "Movie"));
             this.cast.error = Some("old".into());
-            assert!(this.chromecast.session.is_some());
+            assert_eq!(this.cast.kind(), Kind::Chromecast);
+            assert!(this.chromecast_link().is_some());
             this.cast_off(cx);
-            assert!(this.cast.target.is_local());
-            assert!(this.chromecast.session.is_none() && this.chromecast.task.is_none());
-            assert!(this.cast.cast_item.is_none() && this.cast.error.is_none() && this.cast.target_at.is_none());
+            assert!(!this.cast.active() && this.cast.target() == Target::Local);
+            assert!(this.chromecast_link().is_none());
+            assert!(this.cast.error.is_none());
             // A connection with no target (the debug channel opens one)
             // goes as well.
-            this.chromecast_open(mock.device(), cx);
+            assert!(this.chromecast_open(mock.device(), cx));
+            assert!(this.chromecast_link().is_some() && !this.cast.active());
             this.cast_off(cx);
-            assert!(this.chromecast.session.is_none());
+            assert!(this.chromecast_link().is_none());
+        });
+    }
+
+    /// A connection the debug channel opened to a device becomes the
+    /// target when the device is chosen: one connection, not two.
+    #[cfg(feature = "cast-mock")]
+    #[gpui_kit::test]
+    fn a_connection_with_no_target_becomes_the_target(cx: &mut TestAppContext) {
+        use crate::cast::target::{Kind, Target};
+        let mock = crate::chromecast::mock::Mock::start();
+        let (bloom, cx) = app(cx);
+        bloom.update(cx, |this, cx| {
+            assert!(this.chromecast_open(mock.device(), cx));
+            assert!(!this.chromecast_open(mock.device(), cx), "a second connection to the same device");
+            this.select_target(Target::Chromecast(mock.device()), cx);
+            assert_eq!(this.cast.kind(), Kind::Chromecast);
+            assert!(this.chromecast.probe.is_none());
+            assert!(!this.chromecast_open(mock.device(), cx), "the target has the connection");
+            this.cast_off(cx);
         });
     }
 

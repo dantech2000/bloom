@@ -1,4 +1,5 @@
 //! Nova menus composed from Kit buttons and popup positioning.
+use crate::ui::tone;
 use super::{
     motion::{Enter, enter},
     theme::{UiTheme, apply_style},
@@ -399,14 +400,14 @@ impl Render for MenuState {
         // otherwise the light ink, with the exact values of before (a
         // share of 255 is not the same byte as a rounded fraction).
         let (edge, faint, quiet, hover) = if super::glass::liquid_light(cx) {
-            let ink = gpui_kit::rgb(0x121212);
+            let ink = tone::ON_ACCENT;
             (ink.opacity(0.2), ink.opacity(0.12), ink.opacity(0.7), ink.opacity(0.12))
         } else {
             (
-                gpui_kit::rgba(0xf5f5f733),
-                gpui_kit::rgba(0xf5f5f71f),
-                gpui_kit::rgba(0xf5f5f7b3),
-                gpui_kit::rgba(0xffffff1f),
+                tone::EDGE,
+                tone::FAINT,
+                tone::INK_70,
+                tone::HOVER,
             )
         };
         // A menu is as tall as its entries, up to the room it has: under
@@ -519,7 +520,7 @@ impl Render for MenuState {
                 .font_family(t.fonts.body.clone())
                 .text_size(gpui_kit::px(15.))
                 .font_weight(gpui_kit::FontWeight::MEDIUM)
-                .shadow(t.shadows.md.clone())
+                .shadow(t.shadows.md.to_vec())
                 .on_prepaint(move |bounds, _, cx| {
                     entity.update(cx, |this, _| this.popup_bounds[depth] = bounds)
                 })

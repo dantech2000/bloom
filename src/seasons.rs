@@ -14,16 +14,20 @@ use std::collections::HashSet;
 
 use gpui_icons::LucideIcon;
 use gpui_kit::{
-    ClickEvent, Context, Div, InteractiveElement as _, IntoElement as _, ParentElement as _, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _, px, rgba,
+    ClickEvent, Context, InteractiveElement as _, IntoElement as _, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _, px,
 };
 use serde_json::{Value, json};
 
 use crate::{
     app::{Bloom, Page},
+    icons::icon,
     jellyfin::Client,
-    ui::{glass::glass, scroll_area::ScrollArea, theme::UiTheme},
-    views::cards::icon,
+    ui::{
+        scroll_area::ScrollArea,
+        theme::UiTheme,
+        tone::{self, State},
+    },
 };
 
 /// What Seerr says of a season, as the dialog shows it.
@@ -274,7 +278,7 @@ impl Bloom {
     /// True when the plugin offers "request more" on this server and the user
     /// has it on.
     pub fn request_more_on(&self) -> bool {
-        self.enhanced_feature("request_more")
+        self.enhanced_feature(crate::enhanced::Feature::RequestMore)
     }
 
     /// Checks the open series page for seasons that can be requested.
@@ -333,6 +337,8 @@ impl Bloom {
         if !self.request_more_on() {
             return;
         }
+        // One popup at a time: a panel does not stay beside the dialog.
+        self.close_panels();
         let state = &mut self.enhanced.seasons;
         state.open = true;
         state.loading = true;
@@ -413,13 +419,13 @@ impl Bloom {
     }
 
     /// The dialog over the page.
-    pub fn render_seasons_dialog(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub fn render_seasons_dialog(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
         let state = &self.enhanced.seasons;
         if !state.open {
             return None;
         }
         let t = UiTheme::read(cx).clone();
-        let soft = rgba(0xf5f5f7b3);
+        let soft = tone::INK_70;
         let mut list = div().flex().flex_col().gap(px(2.));
         let mut footer_note = state.error.clone();
         if state.loading {
@@ -440,7 +446,7 @@ impl Bloom {
                 .items_center()
                 .gap(px(12.))
                 .child(if requestable {
-                    let mut tick = crate::settings::checkbox(
+                    let mut tick = crate::ui::form::checkbox(
                         SharedString::from(format!("seasons.check.{number}")),
                         checked,
                         cx,
@@ -488,10 +494,10 @@ impl Bloom {
                         .text_color(if requestable { t.colors.foreground } else { soft })
                         // A colour only for a state: green for what is on the server.
                         .child(div().size(px(8.)).rounded_full().bg(match row.status {
-                            Status::Available => rgba(0x7ee787ff),
-                            Status::Partial | Status::Processing | Status::Pending => rgba(0xe3b341ff),
-                            Status::Blocked => rgba(0xf85149ff),
-                            Status::Missing => rgba(0xf5f5f74d),
+                            Status::Available => State::Ok.color(),
+                            Status::Partial | Status::Processing | Status::Pending => State::Warn.color(),
+                            Status::Blocked => State::Bad.color(),
+                            Status::Missing => tone::INK_30,
                         }))
                         .child(row.status.label()),
                 );
@@ -510,110 +516,79 @@ impl Bloom {
         let title = state.data.as_ref().map(|d| d.title.clone()).unwrap_or_default();
         let height = (state.data.as_ref().map_or(1, |d| d.rows.len().max(1)) as f32 * 56.).min(392.);
 
-        Some(
-            div()
-                .id("seasons.dialog")
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(rgba(0x00000099))
-                // The page behind takes no click while the dialog is open:
-                // a hitbox does not block by itself, and the click that
-                // closes the dialog also pressed the card under the pointer.
-                .occlude()
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_seasons_dialog(cx)))
-                .child(
-                    div()
-                        .id("seasons.card")
-                        .relative()
-                        .w(px(520.))
-                        .max_w_full()
-                        .rounded(px(24.))
-                        .border_1()
-                        .border_color(rgba(0xf5f5f733))
-                        // A click in the card must not close the dialog.
-                        .on_click(|_: &ClickEvent, _, cx| cx.stop_propagation())
-                        .child(glass(px(24.), crate::ui::glass::POPUP_TINT))
-                        .p(px(20.))
-                        .flex()
-                        .flex_col()
-                        .gap(px(12.))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.))
-                                .child(
-                                    div()
-                                        .text_size(px(20.))
-                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                        .text_color(t.colors.foreground)
-                                        .child("Request more seasons"),
-                                )
-                                .child(div().text_size(px(13.)).text_color(soft).truncate().child(title)),
-                        )
-                        .child(div().h(px(height)).child(ScrollArea::new("seasons.scroll").size_full().child(list)))
-                        .children(footer_note.map(|note| {
-                            div().px(px(4.)).text_size(px(13.)).text_color(rgba(0xf85149ff)).child(note)
-                        }))
-                        .child(
-                            div()
-                                .flex()
-                                .justify_end()
-                                .gap(px(8.))
-                                .child(
-                                    div()
-                                        .id("seasons.cancel")
-                                        .h(px(38.))
-                                        .px(px(16.))
-                                        .rounded(px(12.))
-                                        .flex()
-                                        .items_center()
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(rgba(0xffffff1f)))
-                                        .text_size(px(14.))
-                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                        .text_color(t.colors.foreground)
-                                        .child("Cancel")
-                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            this.close_seasons_dialog(cx)
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .id("seasons.request")
-                                        .h(px(38.))
-                                        .px(px(16.))
-                                        .rounded(px(12.))
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(6.))
-                                        .bg(if can_send { t.colors.primary } else { rgba(0xffffff1f).into() })
-                                        .when(can_send, |el| el.cursor_pointer())
-                                        .text_size(px(14.))
-                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                        .text_color(if can_send { gpui_kit::rgb(0x121212) } else { gpui_kit::Rgba::from(soft) })
-                                        .child(icon(
-                                            LucideIcon::Download,
-                                            16.,
-                                            if can_send { gpui_kit::rgb(0x121212) } else { soft },
-                                        ))
-                                        .child(if sending {
-                                            "Requesting…".to_string()
-                                        } else {
-                                            format!("Request {count} season{}", if count == 1 { "" } else { "s" })
-                                        })
-                                        .when(can_send, |el| {
-                                            el.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                this.send_season_request(cx)
-                                            }))
-                                        }),
-                                ),
-                        ),
-                ),
-        )
+        let card = crate::ui::dialog::card("seasons.card", 520.)
+            .p(px(20.))
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_size(px(20.))
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_color(t.colors.foreground)
+                            .child("Request more seasons"),
+                    )
+                    .child(div().text_size(px(13.)).text_color(soft).truncate().child(title)),
+            )
+            .child(div().h(px(height)).child(ScrollArea::new("seasons.scroll").size_full().child(list)))
+            .children(footer_note.map(|note| {
+                div().px(px(4.)).text_size(px(13.)).text_color(State::Bad.color()).child(note)
+            }))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(
+                        crate::ui::button::bare("seasons.cancel", "Cancel")
+                            .h(px(38.))
+                            .px(px(16.))
+                            .rounded(px(12.))
+                            .hover(|s| s.bg(tone::HOVER))
+                            .text_size(px(14.))
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .text_color(t.colors.foreground)
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.close_seasons_dialog(cx)
+                            })),
+                    )
+                    .child(
+                        crate::ui::button::bare("seasons.request", "Request")
+                            .disabled(!can_send)
+                            .h(px(38.))
+                            .px(px(16.))
+                            .rounded(px(12.))
+                            .gap(px(6.))
+                            .bg(if can_send { t.colors.primary } else { tone::HOVER.into() })
+                            .when(!can_send, |el| el.cursor_default())
+                            .text_size(px(14.))
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_color(if can_send { tone::ON_ACCENT } else { gpui_kit::Rgba::from(soft) })
+                            .child(icon(
+                                LucideIcon::Download,
+                                16.,
+                                if can_send { tone::ON_ACCENT } else { soft },
+                            ))
+                            .child(if sending {
+                                "Requesting…".to_string()
+                            } else {
+                                format!("Request {count} season{}", if count == 1 { "" } else { "s" })
+                            })
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.send_season_request(cx)
+                            })),
+                    ),
+            );
+        // A click beside the dialog closes it.
+        let layer = crate::ui::dialog::layer("seasons.dialog", card, cx)
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_seasons_dialog(cx)));
+        Some(crate::ui::dialog::shown(layer, "seasons.dialog", cx))
     }
 
     /// For the debug channel: the status of each season of a series.

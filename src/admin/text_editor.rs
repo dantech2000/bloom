@@ -4,10 +4,11 @@
 //! state lives in the admin page state, because a page renders with
 //! `&Bloom` and cannot make an entity.
 
+use crate::ui::tone;
 use std::{cell::Cell, rc::Rc};
 
 use gpui_kit::{
-    AppContext as _, ClickEvent, Context, Div, InteractiveElement as _, MouseButton, ParentElement as _, Stateful,
+    AppContext as _, ClickEvent, Context, InteractiveElement as _, MouseButton, ParentElement as _,
     StatefulInteractiveElement as _, Styled, Subscription, Window, div, prelude::FluentBuilder as _, px,
     rgba,
     base::input::{InputEditorStyle, InputEvent, Textarea, TextareaState},
@@ -16,7 +17,7 @@ use gpui_kit::{
 use super::{ButtonKind, button};
 use crate::{
     app::{Bloom, Page},
-    ui::{glass::glass, theme::UiTheme},
+    ui::{theme::UiTheme},
 };
 
 /// What a caller asks for.
@@ -149,7 +150,7 @@ impl Bloom {
     }
 
     /// The dialog over the page.
-    pub(crate) fn render_text_editor(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub(crate) fn render_text_editor(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
         let editor = self.text_editor()?;
         let t = UiTheme::read(cx).clone();
         let colors = t.colors;
@@ -177,7 +178,7 @@ impl Bloom {
             .py(px(12.))
             .rounded(px(12.))
             .border_1()
-            .border_color(rgba(0x282828cc))
+            .border_color(tone::RAISED)
             .bg(rgba(0x00000059))
             .overflow_hidden()
             .text_size(px(13.))
@@ -188,20 +189,12 @@ impl Bloom {
                 click.update(cx, |state, cx| state.focus(window, cx));
             })
             .child(Textarea::new(&state));
-        let card = div()
-            .id("admin.text.card")
-            .relative()
-            .w(px(width))
+        let card = crate::ui::dialog::card("admin.text.card", width)
             .h(px(height))
-            .rounded(px(24.))
-            .border_1()
-            .border_color(rgba(0xf5f5f733))
-            .child(glass(px(24.), crate::ui::glass::POPUP_TINT))
             .p(px(24.))
             .flex()
             .flex_col()
             .gap(px(12.))
-            .on_click(|_: &ClickEvent, _, cx| cx.stop_propagation())
             .child(
                 div()
                     .text_size(px(20.))
@@ -248,22 +241,9 @@ impl Bloom {
                         })),
                     ),
             );
-        Some(
-            div()
-                .id("admin.text")
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(rgba(0x00000099))
-                // The page behind takes no click meanwhile (see `backdrop`
-                // in `dialogs.rs`).
-                .occlude()
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.close_admin_dialog(window, cx)
-                }))
-                .child(card),
-        )
+        let layer = crate::ui::dialog::layer("admin.text", card, cx).on_click(cx.listener(
+            |this, _: &ClickEvent, window, cx| this.close_admin_dialog(window, cx),
+        ));
+        Some(crate::ui::dialog::shown(layer, "admin.text", cx))
     }
 }

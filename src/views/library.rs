@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Library grid and search results.
 
+use crate::ui::tone;
 use gpui_icons::LucideIcon;
 use gpui_kit::{
     ClickEvent, Context, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
@@ -134,7 +135,7 @@ impl Bloom {
                                     .pl(px(14.))
                                     .pr(px(8.))
                                     .rounded_full()
-                                    .bg(rgba(0xffffff1f))
+                                    .bg(tone::HOVER)
                                     .flex()
                                     .items_center()
                                     .gap(px(2.))
@@ -310,7 +311,7 @@ impl Bloom {
                                 .cursor_pointer()
                                 .text_color(if selected { colors.primary_foreground } else { soft })
                                 .when(selected, |el| el.bg(colors.primary))
-                                .when(!selected, |el| el.hover(|s| s.bg(rgba(0xf5f5f733))))
+                                .when(!selected, |el| el.hover(|s| s.bg(tone::EDGE)))
                                 .child(*text)
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     this.update_library(

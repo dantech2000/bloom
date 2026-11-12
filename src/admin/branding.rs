@@ -9,6 +9,7 @@
 //! configuration. `DELETE` removes the file and the place. `GET` gives the
 //! custom image, or else the default image of the server, or 404.
 
+use crate::ui::tone;
 use std::{
     path::PathBuf,
     rc::Rc,
@@ -17,7 +18,7 @@ use std::{
 
 use anyhow::Result;
 use gpui_kit::{
-    ClickEvent, Context, Div, ObjectFit, ParentElement as _, StatefulInteractiveElement as _, Styled, Window, div, px, rgba,
+    ClickEvent, Context, Div, ObjectFit, ParentElement as _, Styled, Window, div, px, rgba,
 };
 use serde_json::Value;
 
@@ -92,7 +93,7 @@ pub fn splash_block(branding: &Value, preview: &str, cx: &mut Context<Bloom>) ->
                 .rounded(px(12.))
                 .overflow_hidden()
                 .border_1()
-                .border_color(rgba(0x282828cc))
+                .border_color(tone::RAISED)
                 .bg(rgba(0x00000059))
                 .flex()
                 .items_center()

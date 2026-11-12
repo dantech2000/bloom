@@ -18,7 +18,7 @@
 use std::time::{Duration, Instant};
 
 use core_foundation::{base::TCFType, string::CFString};
-use gpui_kit::{Context, Task};
+use gpui_kit::{Context, Subscription, Task};
 
 use crate::{app::Bloom, cast::target::Kind, player::PlayState};
 
@@ -42,7 +42,7 @@ fn begin_activity() -> Option<usize> {
     // NSActivityUserInitiatedAllowingIdleSystemSleep | NSActivityLatencyCritical
     const OPTIONS: u64 = 0x00EF_FFFF | 0xFF_0000_0000;
     let info = send!(Id, class(c"NSProcessInfo"), c"processInfo");
-    let reason = crate::airplay::av::nsstring("A video plays");
+    let reason = crate::macos::ns_string("A video plays");
     let token = send!(
         Id, info, c"beginActivityWithOptions:reason:",
         OPTIONS => u64, reason => Id
@@ -162,6 +162,9 @@ pub struct Awake {
     /// The result of the last `IOPMAssertionCreateWithName`, for the debug
     /// command when it fails.
     last_error: Option<i32>,
+    /// Gives the assertion back when the app quits; there from the first
+    /// decision on.
+    quit: Option<Subscription>,
 }
 
 impl Awake {
@@ -273,6 +276,12 @@ impl Bloom {
     /// status. Cheap: a few comparisons, and a call to IOKit only on a
     /// change.
     pub fn awake_update(&mut self, cx: &mut Context<Self>) {
+        if self.awake.quit.is_none() {
+            self.awake.quit = Some(cx.on_app_quit(|this, _| {
+                this.awake.release();
+                async {}
+            }));
+        }
         let facts = self.awake_facts();
         self.awake.facts = facts;
         match wanted(&facts) {

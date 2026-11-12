@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Devices that have signed in to the server, newest activity first.
 
+use crate::ui::rows::rows;
+use crate::ui::tone::State;
 use std::rc::Rc;
 
 use anyhow::Result;
@@ -13,8 +15,7 @@ use serde::Deserialize;
 
 use super::{
     Confirm, ago, badge, card, parse_date,
-    rows::rows,
-    users::{BLUE, GREEN, absolute, action, avatar, content_width, icon_disc, is_real_date, stat},
+    users::{absolute, action, avatar, content_width, icon_disc, is_real_date, stat},
 };
 use crate::{app::Bloom, jellyfin::Client, ui::theme::UiTheme};
 
@@ -197,11 +198,7 @@ fn row(
                 .relative()
                 .child(icon_disc(
                     device.glyph(),
-                    if is_active {
-                        rgba(GREEN)
-                    } else {
-                        colors.foreground.opacity(0.7)
-                    },
+                    is_active.then_some(State::Ok),
                     40.,
                 ))
                 // Dot for a device that is in use now.
@@ -240,7 +237,7 @@ fn row(
                                 .text_color(colors.foreground)
                                 .child(device.title().to_string()),
                         )
-                        .when(current, |el| el.child(badge("This device", rgba(BLUE)))),
+                        .when(current, |el| el.child(badge("This device", None))),
                 )
                 .child(
                     div()

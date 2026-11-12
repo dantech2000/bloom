@@ -10,10 +10,10 @@ impl Bloom {
     /// The Automation page of the settings: the switch of the stream, what
     /// an event may say, where a program reads it, and how.
     pub(crate) fn render_settings_automation(&self, cx: &mut Context<Self>) -> gpui_kit::Div {
-        use gpui_kit::{ClickEvent, ParentElement as _, StatefulInteractiveElement as _, Styled as _, div, px};
+        use gpui_kit::{ClickEvent, ParentElement as _, Styled as _, div, px};
 
         use crate::{
-            settings::{checkbox, field, group, raised},
+            ui::{button::raised, form::{checkbox, field, group}},
             ui::slider::Slider,
         };
 

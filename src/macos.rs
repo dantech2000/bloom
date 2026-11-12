@@ -44,9 +44,10 @@ pub fn class(name: &CStr) -> Id {
     unsafe { objc_getClass(name.as_ptr()) }
 }
 
-// `objc_msgSend` takes the signature of the method it calls.
+// `objc_msgSend` takes the signature of the method it calls. The selector
+// is a `&CStr`: a literal, or a name the caller holds.
 macro_rules! send {
-    ($ret:ty, $obj:expr, $name:literal $(, $arg:expr => $ty:ty)*) => {{
+    ($ret:ty, $obj:expr, $name:expr $(, $arg:expr => $ty:ty)*) => {{
         let function: unsafe extern "C" fn(
             $crate::macos::Id,
             $crate::macos::Sel
@@ -121,19 +122,50 @@ pub fn set_app_icon(png: &'static [u8]) {
     send!((), app, c"setApplicationIconImage:", image => Id);
 }
 
-fn ns_string(text: &CStr) -> Id {
-    send!(Id, class(c"NSString"), c"stringWithUTF8String:", text.as_ptr() => *const std::ffi::c_char)
+/// An autoreleased `NSString` of a text. Through its bytes and their
+/// length, so a text with a NUL in it is whole.
+pub fn ns_string(text: &str) -> Id {
+    let data = send!(
+        Id, class(c"NSData"), c"dataWithBytes:length:",
+        text.as_ptr() => *const u8, text.len() => usize
+    );
+    let string = send!(Id, class(c"NSString"), c"alloc");
+    // NSUTF8StringEncoding
+    let string = send!(Id, string, c"initWithData:encoding:", data => Id, 4_usize => usize);
+    send!(Id, string, c"autorelease")
 }
 
-fn string_of(ns_string: Id) -> String {
+/// The text of an `NSString`; none for nil.
+pub fn string_of(ns_string: Id) -> Option<String> {
     if ns_string.is_null() {
-        return String::new();
+        return None;
     }
     let utf8 = send!(*const std::ffi::c_char, ns_string, c"UTF8String");
     if utf8.is_null() {
-        return String::new();
+        return None;
     }
-    unsafe { CStr::from_ptr(utf8) }.to_string_lossy().into_owned()
+    Some(unsafe { CStr::from_ptr(utf8) }.to_string_lossy().into_owned())
+}
+
+/// `CGSize` (`NSSize`). It and `CGRect` come back from `objc_msgSend`
+/// itself, in registers: the arm64 calling convention (see
+/// `src/airplay/av.rs`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CGSize {
+    pub width: f64,
+    pub height: f64,
+}
+
+/// `CGRect` (`NSRect`): the origin, then the size. A window frame has its
+/// origin at the bottom left of the screen.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CGRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 /// Sets the appearance of the app's own windows and panels: dark, light,
@@ -142,8 +174,8 @@ fn string_of(ns_string: Id) -> String {
 pub fn set_app_appearance(dark: Option<bool>) {
     let app = send!(Id, class(c"NSApplication"), c"sharedApplication");
     let appearance = match dark {
-        Some(true) => send!(Id, class(c"NSAppearance"), c"appearanceNamed:", ns_string(c"NSAppearanceNameDarkAqua") => Id),
-        Some(false) => send!(Id, class(c"NSAppearance"), c"appearanceNamed:", ns_string(c"NSAppearanceNameAqua") => Id),
+        Some(true) => send!(Id, class(c"NSAppearance"), c"appearanceNamed:", ns_string("NSAppearanceNameDarkAqua") => Id),
+        Some(false) => send!(Id, class(c"NSAppearance"), c"appearanceNamed:", ns_string("NSAppearanceNameAqua") => Id),
         None => std::ptr::null_mut(),
     };
     send!((), app, c"setAppearance:", appearance => Id);
@@ -157,7 +189,7 @@ pub fn app_appearance() -> String {
     if appearance.is_null() {
         return "none".into();
     }
-    string_of(send!(Id, appearance, c"name"))
+    string_of(send!(Id, appearance, c"name")).unwrap_or_default()
 }
 
 /// Whether "Swipe between pages" of the trackpad settings turns pages with
@@ -201,7 +233,7 @@ pub fn menu_bar() -> Vec<MenuEntry> {
     for index in 0..count {
         let item = send!(Id, main, c"itemAtIndex:", index => isize);
         let menu = send!(Id, item, c"submenu");
-        let mut text = string_of(send!(Id, item, c"title"));
+        let mut text = string_of(send!(Id, item, c"title")).unwrap_or_default();
         if !menu.is_null() && menu == windows_menu {
             text.push_str("  [windowsMenu]");
         }
@@ -224,9 +256,9 @@ fn menu_entries(menu: Id, depth: usize, out: &mut Vec<MenuEntry>) {
             out.push(MenuEntry { depth, title: None, text: "---".into() });
             continue;
         }
-        let title = string_of(send!(Id, item, c"title"));
+        let title = string_of(send!(Id, item, c"title")).unwrap_or_default();
         let mut text = title.clone();
-        let key = string_of(send!(Id, item, c"keyEquivalent"));
+        let key = string_of(send!(Id, item, c"keyEquivalent")).unwrap_or_default();
         if !key.is_empty() {
             let mask = send!(usize, item, c"keyEquivalentModifierMask");
             text.push_str("  ");
@@ -323,10 +355,10 @@ fn clock_is_12_hour() -> bool {
 fn uses_12_hour(locale: Id) -> bool {
     let pattern = send!(
         Id, class(c"NSDateFormatter"), c"dateFormatFromTemplate:options:locale:",
-        ns_string(c"j") => Id, 0usize => usize, locale => Id
+        ns_string("j") => Id, 0usize => usize, locale => Id
     );
     // No pattern for the locale: the 12-hour clock, as before.
-    pattern.is_null() || string_of(pattern).contains('a')
+    string_of(pattern).is_none_or(|pattern| pattern.contains('a'))
 }
 
 fn format_clock(time: jiff::civil::Time, twelve_hour: bool) -> String {
@@ -397,7 +429,7 @@ mod tests {
         assert_eq!(clock_is_12_hour(), clock_is_12_hour());
         // The same call for fixed locales, to see both answers.
         let locale = |name: &CStr| {
-            let name = ns_string(name);
+            let name = ns_string(&name.to_string_lossy());
             let locale = send!(Id, class(c"NSLocale"), c"alloc");
             send!(Id, locale, c"initWithLocaleIdentifier:", name => Id)
         };

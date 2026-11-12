@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::{Context, Window};
 use serde_json::Value;
 
-use super::{jellyfin, mdns::Device, messages, session::Session};
+use super::{jellyfin, discovery::Device, messages, session::Session};
 use crate::{app::Bloom, cast::target::Kind};
 
 const HELP: &str = "chromecast scan | status <device> | latency | state | media-status | connect <device> | disconnect | \
@@ -33,9 +33,6 @@ impl Bloom {
         match verb {
             "scan" => {
                 self.debug_cast_search(cx);
-                if let Some(discovery) = &self.chromecast.discovery {
-                    discovery.rescan();
-                }
                 let devices = self.chromecast_devices();
                 if devices.is_empty() {
                     return "scanning; no device yet, ask again".into();
@@ -55,7 +52,7 @@ impl Bloom {
                 if self.cast.kind() == Kind::Chromecast {
                     self.cast_off(cx);
                 } else {
-                    self.chromecast_close();
+                    self.chromecast.probe = None;
                 }
                 "disconnected".into()
             }
@@ -65,7 +62,7 @@ impl Bloom {
                 {
                     return text;
                 }
-                let Some(session) = &self.chromecast.session else {
+                let Some(session) = self.chromecast_link().map(|open| &open.session) else {
                     return "error: status <device>".into();
                 };
                 let apps = vec![
@@ -103,7 +100,7 @@ impl Bloom {
                 )
             }
             "latency" => {
-                let Some(session) = &self.chromecast.session else {
+                let Some(session) = self.chromecast_link().map(|open| &open.session) else {
                     return "error: connect first".into();
                 };
                 let started = Instant::now();
@@ -115,7 +112,7 @@ impl Bloom {
             }
             "state" => self.chromecast_state(),
             "launch" => {
-                let Some(session) = &self.chromecast.session else {
+                let Some(session) = self.chromecast_link().map(|open| &open.session) else {
                     return "error: connect first".into();
                 };
                 let ids = match arg {
@@ -131,7 +128,7 @@ impl Bloom {
                 if id.is_empty() {
                     return "error: load <item id> [start secs]".into();
                 }
-                if self.chromecast.session.is_none() {
+                if self.chromecast_link().is_none() {
                     return "error: connect first".into();
                 }
                 let start_secs = start.trim().parse::<f64>().unwrap_or(0.);
@@ -177,7 +174,7 @@ impl Bloom {
                 let Ok(payload) = serde_json::from_str::<Value>(json.trim()) else {
                     return "error: raw <namespace> <json>".into();
                 };
-                let Some(session) = &self.chromecast.session else {
+                let Some(session) = self.chromecast_link().map(|open| &open.session) else {
                     return "error: connect first".into();
                 };
                 match session.request(namespace, payload).recv_timeout(ANSWER) {
@@ -191,9 +188,9 @@ impl Bloom {
 
     /// Runs a verb that acts on the device.
     fn chromecast_send(&mut self, act: impl FnOnce(&Session)) -> String {
-        match &self.chromecast.session {
-            Some(session) => {
-                act(session);
+        match self.chromecast_link() {
+            Some(open) => {
+                act(&open.session);
                 "sent".into()
             }
             None => "error: connect first".into(),
@@ -240,7 +237,7 @@ impl Bloom {
     }
 
     fn chromecast_state(&self) -> String {
-        let Some(session) = &self.chromecast.session else {
+        let Some(session) = self.chromecast_link().map(|open| &open.session) else {
             return "no session".into();
         };
         let status = session.status();

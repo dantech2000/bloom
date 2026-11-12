@@ -243,15 +243,14 @@ pub(crate) fn presence(
         .sample(window, cx)
 }
 
-/// Shared shadcn elevation tokens.
+/// Shared shadcn elevation tokens. Fixed arrays, so a copy of the theme
+/// allocates nothing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UiShadows {
-    /// Tailwind `shadow-sm`.
-    pub sm: Vec<BoxShadow>,
     /// Tailwind `shadow-md`.
-    pub md: Vec<BoxShadow>,
+    pub md: [BoxShadow; 2],
     /// Tailwind `shadow-lg`.
-    pub lg: Vec<BoxShadow>,
+    pub lg: [BoxShadow; 2],
 }
 
 /// Base spacing unit from the pinned Nova style.
@@ -340,13 +339,7 @@ impl UiTheme {
             text_scale: 1.,
             spacing: UiSpacing { unit: px(4.) },
             shadows: UiShadows {
-                sm: vec![
-                    BoxShadow::new(px(0.), px(1.), black().alpha(0.10)).blur_radius(px(3.)),
-                    BoxShadow::new(px(0.), px(1.), black().alpha(0.10))
-                        .blur_radius(px(2.))
-                        .spread_radius(px(-1.)),
-                ],
-                md: vec![
+                md: [
                     BoxShadow::new(px(0.), px(4.), black().alpha(0.10))
                         .blur_radius(px(6.))
                         .spread_radius(px(-1.)),
@@ -354,7 +347,7 @@ impl UiTheme {
                         .blur_radius(px(4.))
                         .spread_radius(px(-2.)),
                 ],
-                lg: vec![
+                lg: [
                     BoxShadow::new(px(0.), px(10.), black().alpha(0.10))
                         .blur_radius(px(15.))
                         .spread_radius(px(-3.)),
@@ -510,7 +503,6 @@ mod tests {
         assert_eq!(theme.radius.md, px(8.));
         assert_eq!(theme.radius.lg, px(10.));
         assert_eq!(theme.radius.xl, px(14.));
-        assert_eq!(theme.shadows.sm.len(), 2);
         assert_eq!(theme.shadows.md.len(), 2);
         assert_eq!(theme.shadows.lg.len(), 2);
     }

@@ -16,7 +16,7 @@
 
 use std::{
     ffi::{CStr, c_void},
-    sync::{Mutex, OnceLock},
+    sync::OnceLock,
     time::Instant,
 };
 
@@ -24,12 +24,12 @@ use block::{ConcreteBlock, RcBlock};
 use gpui_kit::{Context, Subscription};
 
 use crate::{
-    airplay::av::{Pool, nsstring, string_of},
     app::Bloom,
     cast::target::Kind,
     jellyfin::Item,
-    macos::{Id, Sel, class, objc_msgSend, sel, send},
+    macos::{CGSize, Id, Pool, class, ns_string, send, string_of},
     player::PlayState,
+    signal::Signal,
 };
 
 // The keys of the info dictionary are constants of the framework; the link
@@ -59,14 +59,6 @@ const HANDLED: isize = 0;
 const SEEK_JUMP_SECS: f64 = 2.;
 /// Width of the artwork asked from the server.
 const ARTWORK_WIDTH: u32 = 600;
-
-/// `CGSize`, for the artwork handler.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CGSize {
-    width: f64,
-    height: f64,
-}
 
 /// A command of the system, as the handlers and the debug command give it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -101,47 +93,19 @@ impl Command {
     }
 }
 
-/// The commands on their way to the UI thread: a queue for each reader
-/// (`install`), and every reader gets every command. With one queue for
-/// all, the task of a window that closed took the command meant for the
-/// window that is open, and dropped it (as the signal of `updates.rs`
-/// did).
-static READERS: Readers = Readers(Mutex::new(Vec::new()));
-
-/// The queues of the readers. A test makes a list of its own: the
-/// app's list holds the readers of the other tests' windows.
-struct Readers(Mutex<Vec<async_channel::Sender<Command>>>);
-
-impl Readers {
-    /// A reader of the commands, from now on.
-    fn reader(&self) -> async_channel::Receiver<Command> {
-        let (tx, rx) = async_channel::bounded(64);
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
-        rx
-    }
-
-    /// The command goes to every reader; a reader that is gone is
-    /// dropped from the list.
-    fn send(&self, command: Command) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).retain(|reader| {
-            if reader.try_send(command).is_err() && !reader.is_closed() {
-                log::warn!("now playing: command {command:?} dropped, the queue is full");
-            }
-            !reader.is_closed()
-        });
-    }
-}
-
-/// A reader of the commands, from now on.
-fn reader() -> async_channel::Receiver<Command> {
-    READERS.reader()
-}
+/// The commands on their way to the UI thread. Every reader (`install`)
+/// gets every command: with one queue for all, the task of a window that
+/// closed took the command meant for the window that is open, and dropped
+/// it.
+static COMMANDS: Signal<Command> = Signal::new(64);
 
 /// What every handler block does with its command, and what the debug
 /// command `nowplaying command` does: the command goes to the UI thread.
 pub fn on_remote(command: Command) {
     log::info!("now playing: command {command:?}");
-    READERS.send(command);
+    if !COMMANDS.send(command) {
+        log::warn!("now playing: command {command:?} dropped, the queue is full");
+    }
 }
 
 fn center() -> Id {
@@ -154,9 +118,7 @@ fn command_center() -> Id {
 
 /// A command of the centre by the name of its property (`playCommand`).
 fn command_named(name: &CStr) -> Id {
-    let function: unsafe extern "C" fn(Id, Sel) -> Id =
-        unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
-    unsafe { function(command_center(), sel(name)) }
+    send!(Id, command_center(), name)
 }
 
 /// The keys of the info dictionary.
@@ -424,12 +386,12 @@ fn publish(item: &Item, published: &Published, artwork: Option<&Artwork>) {
         send!((), info, c"setObject:forKey:", value => Id, key => Id);
     };
     let keys = keys();
-    put(keys.title, nsstring(&title));
+    put(keys.title, ns_string(&title));
     if let Some(artist) = &artist {
-        put(keys.artist, nsstring(artist));
+        put(keys.artist, ns_string(artist));
     }
     if let Some(album) = &album {
-        put(keys.album, nsstring(album));
+        put(keys.album, ns_string(album));
     }
     put(keys.duration, number(published.duration));
     put(keys.elapsed, number(published.elapsed));
@@ -530,10 +492,9 @@ fn describe_commands() -> String {
 }
 
 /// Starts the task that brings the commands to the player, and clears the
-/// tile and the display assertion when the app quits. Called once, from
-/// `Bloom::new`.
+/// tile when the app quits. Called once, from `Bloom::new`.
 pub fn install(cx: &mut Context<Bloom>) -> Subscription {
-    let receiver = reader();
+    let receiver = COMMANDS.reader();
     cx.spawn(async move |this, cx| {
         while let Ok(command) = receiver.recv().await {
             if this.update(cx, |this, cx| this.nowplaying_command(command, cx)).is_err() {
@@ -543,7 +504,6 @@ pub fn install(cx: &mut Context<Bloom>) -> Subscription {
     })
     .detach();
     cx.on_app_quit(|this, _| {
-        this.awake.release();
         if this.nowplaying.published.take().is_some() {
             clear();
         }
@@ -810,21 +770,17 @@ mod tests {
         assert_eq!(labels(&movie), ("Heat (1995)".into(), None, None));
     }
 
-    /// Every reader gets a command: the task of a window that closed
-    /// still reads until it finds its window gone, and with one queue for
-    /// all it took the command of the open window.
+    /// A command reaches each reader of its own (`signal.rs` has the
+    /// test of the queues).
     #[test]
-    fn a_reader_left_behind_does_not_take_the_command_of_another() {
-        let readers = Readers(Mutex::new(Vec::new()));
-        let (stale, live) = (readers.reader(), readers.reader());
-        readers.send(Command::Next);
-        assert_eq!(stale.try_recv(), Ok(Command::Next));
-        assert_eq!(live.try_recv(), Ok(Command::Next), "the stale reader took the command");
-        // A reader that is gone leaves the list at the next command.
-        drop(stale);
-        readers.send(Command::Previous);
-        assert_eq!(live.try_recv(), Ok(Command::Previous));
-        assert_eq!(readers.0.lock().unwrap().len(), 1);
+    fn a_command_reaches_every_reader() {
+        // A list of its own: the app's list holds the readers of the
+        // other tests' windows, and a command to them panics their apps.
+        let commands: Signal<Command> = Signal::new(64);
+        let (first, second) = (commands.reader(), commands.reader());
+        commands.send(Command::Next);
+        assert_eq!(first.try_recv(), Ok(Command::Next));
+        assert_eq!(second.try_recv(), Ok(Command::Next));
     }
 
     #[test]

@@ -6,7 +6,7 @@
 use gpui_icons::LucideIcon;
 use gpui_kit::{
     App, ClickEvent, Context, Div, Entity, InteractiveElement as _, MouseDownEvent,
-    ParentElement as _, Stateful, StatefulInteractiveElement as _, Styled, Svg, Window, div,
+    ParentElement as _, StatefulInteractiveElement as _, Styled, Svg, Window, div,
     px, rgba,
 };
 
@@ -35,19 +35,8 @@ pub fn icon_button(
     glyph: Svg,
     size: f32,
     hover: u32,
-) -> Stateful<Div> {
-    div()
-        .id(id)
-        .role(gpui_kit::Role::Button)
-        .aria_label(label)
-        .size(px(size))
-        .rounded(px(12.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .hover(move |s| s.bg(rgba(hover)))
-        .child(glyph)
+) -> gpui_kit::base::Button {
+    crate::ui::button::ghost_icon(id, label, glyph, size, rgba(hover))
 }
 
 /// The label of a button whose id ends in its name: "play" of
@@ -61,7 +50,7 @@ pub fn last_part(id: &'static str) -> &'static str {
 pub fn menu_over(
     state: &Entity<MenuState>,
     label: &'static str,
-    trigger: Stateful<Div>,
+    trigger: impl gpui_kit::IntoElement,
 ) -> Menu {
     Menu::new(state, label)
         .trigger(trigger)

@@ -105,6 +105,12 @@ pub struct Config {
     /// Downloads that run at the same time: 1 or 2.
     #[serde(default)]
     pub download_parallel: Option<u8>,
+    /// The certificate each cast device showed at its first connection,
+    /// by the id of the device, in base64: a later connection takes that
+    /// one only (`chromecast::session`). A device the app never connected
+    /// to has none.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub cast_pins: std::collections::BTreeMap<String, String>,
 }
 
 /// Look of the subtitles. A part that is not set follows the user's
@@ -304,27 +310,8 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
-    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(format!(".tmp{}", std::process::id()));
-    let tmp = path.with_file_name(tmp_name);
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let result = (|| -> Result<()> {
-        let mut file = options.open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&tmp, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
+    crate::fsutil::write_atomic_with(path, Some(0o600), |file| file.write_all(bytes))?;
+    Ok(())
 }
 
 /// Copies an unreadable config to `<name>.broken`. An existing copy with the
@@ -391,6 +378,21 @@ mod tests {
         let written = serde_json::to_value(&config).unwrap();
         assert_eq!(written["servers"], serde_json::from_str::<serde_json::Value>(before).unwrap()["servers"]);
         assert_eq!(written["servers"][0]["profiles"][0]["token"], "secret-token");
+    }
+
+    /// The certificates of the cast devices are kept with the config: a
+    /// config from before them loads with none and is written as it was,
+    /// and one with them comes back the same.
+    #[test]
+    fn the_cast_pins_round_trip_and_an_older_config_has_none() {
+        let before = r#"{"device_id":"dev","servers":[]}"#;
+        let mut config: Config = serde_json::from_str(before).unwrap();
+        assert!(config.cast_pins.is_empty());
+        assert!(serde_json::to_value(&config).unwrap().get("cast_pins").is_none());
+        config.cast_pins.insert("abc123".into(), "Y2VydA==".into());
+        let written = serde_json::to_string(&config).unwrap();
+        let read: Config = serde_json::from_str(&written).unwrap();
+        assert_eq!(read.cast_pins.get("abc123").map(String::as_str), Some("Y2VydA=="));
     }
 
     /// A debug print of a profile, or of the whole config, has no token.

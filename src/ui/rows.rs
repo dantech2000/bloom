@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! A column of rows of one height that builds only the rows in view. The
-//! long lists of the dashboard (log lines, devices, the activity timeline)
+//! long lists of the app (log lines, devices, the activity timeline, a
+//! playlist, the episodes of a season)
 //! laid out every row on every frame, and Taffy's layout was the whole cost
 //! of a scroll frame. This element takes the height of all its rows in the
 //! layout pass, and in the prepaint pass, when it knows where it lies in the

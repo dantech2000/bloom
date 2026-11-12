@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Server and profile management: add servers, sign in, pick a saved profile.
 
+use crate::ui::tone;
 use std::time::Duration;
 
 use gpui_icons::LucideIcon;
@@ -22,7 +23,6 @@ use crate::{
     ui::{
         glass::glass,
         input::{Input, InputEvent, InputState, Keyboard},
-        motion::{Enter, enter},
         scroll_area::ScrollArea,
     },
     views::{cards::icon, parts::initial},
@@ -680,7 +680,7 @@ impl Bloom {
             .relative()
             .size_full()
             .bg(rgb(0x101010))
-            .text_color(rgb(0xf5f5f7))
+            .text_color(tone::INK)
             .when_some(splash, |el, url| {
                 el.child(
                     crate::images::remote_with(url, px(0.), ObjectFit::Cover)
@@ -722,7 +722,7 @@ impl Bloom {
                             div()
                                 .relative()
                                 .text_size(px(13.))
-                                .text_color(rgba(0xf5f5f799))
+                                .text_color(tone::INK_60)
                                 .child(format!("{} · {}", crate::brand::NAME, crate::brand::TAGLINE)),
                         ),
                 ),
@@ -758,7 +758,7 @@ impl Bloom {
                         .text_size(px(14.))
                         .font_weight(gpui_kit::FontWeight::MEDIUM)
                         .child(glass(px(18.), rgba(0x2a2a2a99)))
-                        .child(icon(LucideIcon::ArrowLeft, 16., rgb(0xf5f5f7)).relative())
+                        .child(icon(LucideIcon::ArrowLeft, 16., tone::INK).relative())
                         .child(
                             div()
                                 .relative()
@@ -782,7 +782,7 @@ impl Bloom {
             .flex_col()
             .items_center()
             .gap(px(6.))
-            .child(crate::icons::logo(44., rgb(0xf5f5f7)))
+            .child(crate::icons::logo(44., tone::INK))
             .child(
                 div()
                     .mt(px(8.))
@@ -795,7 +795,7 @@ impl Bloom {
             .child(
                 div()
                     .text_size(px(14.))
-                    .text_color(rgba(0xf5f5f799))
+                    .text_color(tone::INK_60)
                     .text_center()
                     .child(note.into()),
             )
@@ -840,12 +840,12 @@ impl Bloom {
                     .px(px(14.))
                     .rounded(px(14.))
                     .bg(rgba(0xffffff0f))
-                    .hover(|s| s.bg(rgba(0xffffff1f)))
+                    .hover(|s| s.bg(tone::HOVER))
                     .cursor_pointer()
                     .flex()
                     .items_center()
                     .gap(px(12.))
-                    .child(icon(LucideIcon::Server, 18., rgba(0xf5f5f7cc)))
+                    .child(icon(LucideIcon::Server, 18., tone::INK_80))
                     .child(
                         div()
                             .flex_1()
@@ -862,7 +862,7 @@ impl Bloom {
                             .child(
                                 div()
                                     .text_size(px(12.))
-                                    .text_color(rgba(0xf5f5f780))
+                                    .text_color(tone::INK_50)
                                     .truncate()
                                     .child(format!(
                                         "{} · {} profile{}",
@@ -881,11 +881,11 @@ impl Bloom {
                             .items_center()
                             .justify_center()
                             .hover(|s| s.bg(rgba(0xef535040)))
-                            .when(armed, |el| el.bg(rgb(0xc62828)))
+                            .when(armed, |el| el.bg(tone::DANGER))
                             .child(icon(
                                 if armed { LucideIcon::Check } else { LucideIcon::Trash },
                                 15.,
-                                if armed { rgb(0xffffff) } else { rgba(0xf5f5f799) },
+                                if armed { rgb(0xffffff) } else { tone::INK_60 },
                             ))
                             .tooltip(tip(if armed {
                                 "Click again to remove"
@@ -987,12 +987,12 @@ impl Bloom {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .bg(if armed { rgb(0xc62828) } else { rgba(0x00000066) })
+                        .bg(if armed { tone::DANGER } else { rgba(0x00000066) })
                         .hover(|s| s.bg(rgba(0xef5350cc)))
                         .child(icon(
                             if armed { LucideIcon::Check } else { LucideIcon::X },
                             12.,
-                            rgb(0xf5f5f7),
+                            tone::INK,
                         ))
                         .tooltip(tip(if armed {
                             "Click again to forget"
@@ -1143,7 +1143,7 @@ impl Bloom {
                 el.child(
                     div()
                         .text_size(px(12.))
-                        .text_color(rgba(0xf5f5f780))
+                        .text_color(tone::INK_50)
                         .text_center()
                         .child(text),
                 )
@@ -1199,7 +1199,7 @@ impl Bloom {
                     .rounded(px(14.))
                     .bg(rgba(0xffffff14))
                     .border_1()
-                    .border_color(rgba(0xf5f5f733))
+                    .border_color(tone::EDGE)
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1217,7 +1217,7 @@ impl Bloom {
             .child(
                 div()
                     .text_size(px(14.))
-                    .text_color(rgba(0xf5f5f7cc))
+                    .text_color(tone::INK_80)
                     .text_center()
                     .child(
                         "On a device where you are signed in, open Quick Connect in the user \
@@ -1231,8 +1231,8 @@ impl Bloom {
                     .justify_center()
                     .gap(px(8.))
                     .text_size(px(13.))
-                    .text_color(rgba(0xf5f5f780))
-                    .child(icon(LucideIcon::Clock, 14., rgba(0xf5f5f780)))
+                    .text_color(tone::INK_50)
+                    .child(icon(LucideIcon::Clock, 14., tone::INK_50))
                     .child("Waiting for the approval…"),
             )
             .child(
@@ -1250,101 +1250,78 @@ impl Bloom {
             .map(|s| s.user_name.clone())
             .unwrap_or_default();
         let busy = dialog.busy;
-        Some(
-            div()
-                .id("quick.authorize")
-                .absolute()
-                .inset_0()
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(rgba(0x00000099))
-                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                    if event.keystroke.key == "escape" {
-                        this.close_authorize(window, cx);
-                    }
-                    // The keys of the dialog are not shortcuts of the page.
-                    cx.stop_propagation();
-                }))
-                // A click beside the dialog closes it.
-                .on_click(cx.listener(|this, _, window, cx| this.close_authorize(window, cx)))
-                .child(enter(
-                    div()
-                        .id("quick.authorize.card")
-                        .relative()
-                        .w(px(420.))
-                        .rounded(px(24.))
-                        .border_1()
-                        .border_color(rgba(0xf5f5f733))
-                        .child(glass(px(24.), crate::ui::glass::POPUP_TINT))
-                        .on_click(|_, _, cx| cx.stop_propagation())
-                        .child(
+        let card = crate::ui::dialog::card("quick.authorize.card", 420.)
+            .child(
+                div()
+                    .relative()
+                    .p(px(24.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.))
+                    .text_color(tone::INK)
+                    .child(
+                        div()
+                            .text_size(px(20.))
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .child("Quick Connect"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .text_color(tone::INK_80)
+                            .child(format!(
+                                "Enter the code that the other device shows. The \
+                                 device then signs in as {name}."
+                            )),
+                    )
+                    .child(
+                        field(&self.connect.code, Keyboard::code(), "Quick Connect code")
+                            .disabled(busy)
+                            .invalid(dialog.error.is_some()),
+                    )
+                    .when_some(dialog.error.clone(), |el, error| {
+                        el.child(
                             div()
-                                .relative()
-                                .p(px(24.))
-                                .flex()
-                                .flex_col()
-                                .gap(px(14.))
-                                .text_color(rgb(0xf5f5f7))
-                                .child(
-                                    div()
-                                        .text_size(px(20.))
-                                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                        .child("Quick Connect"),
+                                .text_size(px(13.))
+                                .text_color(rgb(0xffb4ab))
+                                .child(error),
+                        )
+                    })
+                    .child(
+                        div()
+                            .mt(px(4.))
+                            .flex()
+                            .gap(px(10.))
+                            .child(
+                                action("quick.authorize.cancel", "Cancel", false, false)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_authorize(window, cx)
+                                    })),
+                            )
+                            .child(
+                                action(
+                                    "quick.authorize.run",
+                                    if busy { "Authorizing…" } else { "Authorize" },
+                                    true,
+                                    busy,
                                 )
-                                .child(
-                                    div()
-                                        .text_size(px(14.))
-                                        .text_color(rgba(0xf5f5f7cc))
-                                        .child(format!(
-                                            "Enter the code that the other device shows. The \
-                                             device then signs in as {name}."
-                                        )),
-                                )
-                                .child(
-                                    field(&self.connect.code, Keyboard::code(), "Quick Connect code")
-                                        .disabled(busy)
-                                        .invalid(dialog.error.is_some()),
-                                )
-                                .when_some(dialog.error.clone(), |el, error| {
-                                    el.child(
-                                        div()
-                                            .text_size(px(13.))
-                                            .text_color(rgb(0xffb4ab))
-                                            .child(error),
-                                    )
-                                })
-                                .child(
-                                    div()
-                                        .mt(px(4.))
-                                        .flex()
-                                        .gap(px(10.))
-                                        .child(
-                                            action("quick.authorize.cancel", "Cancel", false, false)
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.close_authorize(window, cx)
-                                                })),
-                                        )
-                                        .child(
-                                            action(
-                                                "quick.authorize.run",
-                                                if busy { "Authorizing…" } else { "Authorize" },
-                                                true,
-                                                busy,
-                                            )
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.authorize_quick_connect(cx)
-                                            })),
-                                        ),
-                                ),
-                        ),
-                    "quick.authorize.card.in",
-                    Enter::Settle,
-                    cx,
-                )),
-        )
-        .map(|layer| enter(layer, "quick.authorize.in", Enter::Fade, cx))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.authorize_quick_connect(cx)
+                                })),
+                            ),
+                    ),
+            );
+        let layer = crate::ui::dialog::layer("quick.authorize", card, cx)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    this.close_authorize(window, cx);
+                }
+                // The keys of the dialog are not shortcuts of the page.
+                cx.stop_propagation();
+            }))
+            // A click beside the dialog closes it.
+            .on_click(cx.listener(|this, _, window, cx| this.close_authorize(window, cx)));
+        Some(crate::ui::dialog::shown(layer, "quick.authorize", cx))
     }
 }
 
@@ -1437,7 +1414,7 @@ fn label(text: &'static str) -> Div {
     div()
         .text_size(px(metrics().label_text))
         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-        .text_color(rgba(0xf5f5f780))
+        .text_color(tone::INK_50)
         .child(text)
 }
 
@@ -1450,9 +1427,9 @@ fn action(
     busy: bool,
 ) -> Stateful<Div> {
     let (bg, fg) = if primary {
-        (rgb(0xf5f5f7), rgb(0x121212))
+        (tone::INK, tone::ON_ACCENT)
     } else {
-        (rgba(0xffffff1f), rgb(0xf5f5f7))
+        (tone::HOVER, tone::INK)
     };
     let text = text.into();
     let m = metrics();
@@ -1486,8 +1463,8 @@ fn link(id: &'static str, text: &'static str) -> Stateful<Div> {
         .cursor_pointer()
         .text_size(px(metrics().link_text))
         .when(crate::views::shell::compact_now(), |el| el.h(px(44.)).flex().items_center())
-        .text_color(rgba(0xf5f5f799))
-        .hover(|s| s.text_color(rgb(0xf5f5f7)))
+        .text_color(tone::INK_60)
+        .hover(|s| s.text_color(tone::INK))
         .child(text)
 }
 
@@ -1515,8 +1492,8 @@ fn person(id: SharedString, name: &str, image: Option<String>) -> Stateful<Div> 
                 // One ink: the initial on the quiet disc, as in the
                 // navigation. A colour for each name was a colour for a
                 // kind of thing, not for a state.
-                .bg(rgba(crate::admin::DISC))
-                .text_color(rgb(0xf5f5f7))
+                .bg(tone::DISC)
+                .text_color(tone::INK)
                 .flex()
                 .items_center()
                 .justify_center()

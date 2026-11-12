@@ -17,7 +17,10 @@ use gpui_kit::{
     div, prelude::FluentBuilder as _, px, rgba,
 };
 
-use super::target::{Kind, Target};
+use super::{
+    remote::Track,
+    target::{Kind, Target},
+};
 use crate::{
     app::{Bloom, Panel},
     icons::{Filled, filled},
@@ -235,7 +238,7 @@ impl Bloom {
         };
 
         let mut body = div().flex().flex_col().gap(px(2.));
-        let title = if self.cast.target.is_local() {
+        let title = if !self.cast.active() {
             // ----- the list of what can play -----
             body = body.child(heading("This device".into()));
             body = body.child(
@@ -437,17 +440,13 @@ impl Bloom {
             }
             // The tracks of the item that plays, for a kind that takes a
             // stream index.
-            let item = match &self.cast.target {
-                Target::JellyfinSession(session) => session.now_playing_item.as_ref(),
-                Target::Chromecast(_) => self.cast.cast_item.as_ref(),
-                _ => None,
-            };
+            let item = self.cast.remote.as_ref().and_then(|remote| remote.target().item());
             if let Some(item) = item.filter(|_| view.can_tracks && view.loaded) {
                 let mut tracks = div().flex().flex_col().gap(px(2.));
                 let mut count = 0;
-                for (kind, current, off) in [
-                    ("Audio", view.audio_index, false),
-                    ("Subtitle", view.subtitle_index, true),
+                for (kind, track, current, off) in [
+                    ("Audio", Track::Audio, view.audio_index, false),
+                    ("Subtitle", Track::Subtitle, view.subtitle_index, true),
                 ] {
                     let streams = item.streams(kind);
                     if streams.is_empty() {
@@ -475,7 +474,7 @@ impl Bloom {
                                 }))
                                 .child(label(text, String::new()))
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.target_set_track(kind, index, cx)
+                                    this.target_set_track(track, index, cx)
                                 })),
                         );
                     }

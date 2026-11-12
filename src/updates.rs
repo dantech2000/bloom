@@ -21,6 +21,7 @@
 // The updater is the Mac's (Sparkle); the iOS build keeps the module unused.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
+use crate::ui::tone;
 use std::{
     ffi::{c_char, c_void},
     sync::{Mutex, OnceLock},
@@ -29,10 +30,10 @@ use std::{
 use gpui_kit::{App, ClickEvent, Context, Div, ParentElement, StatefulInteractiveElement};
 
 use crate::{
-    airplay::av::{nsstring, string_of},
     app::Bloom,
-    macos::{Id, Sel, class, sel, send},
-    settings::{checkbox, field, group, raised},
+    macos::{Id, Sel, class, ns_string, sel, send, string_of},
+    signal::Signal,
+    ui::{button::raised, form::{checkbox, field, group}},
 };
 
 /// What the updater does now.
@@ -50,35 +51,8 @@ static STATUS: Mutex<Status> = Mutex::new(Status::Idle);
 /// The block of Sparkle that installs the update and starts the app again,
 /// as a number.
 static INSTALL: Mutex<Option<usize>> = Mutex::new(None);
-/// A signal with a queue for each reader: every reader gets every signal.
-/// With one queue for all, the task of a window that closed took the
-/// signal meant for the window that is open.
-struct Signal {
-    readers: Mutex<Vec<async_channel::Sender<()>>>,
-}
-
-impl Signal {
-    const fn new() -> Self {
-        Self { readers: Mutex::new(Vec::new()) }
-    }
-
-    fn reader(&self) -> async_channel::Receiver<()> {
-        let (tx, rx) = async_channel::bounded(4);
-        self.readers.lock().unwrap().push(tx);
-        rx
-    }
-
-    /// A reader that is gone is dropped from the list; a full queue has
-    /// signals enough.
-    fn send(&self) {
-        self.readers.lock().unwrap().retain(|reader| {
-            let _ = reader.try_send(());
-            !reader.is_closed()
-        });
-    }
-}
-
-static CHANGES: Signal = Signal::new();
+/// Tells every window of a change of the status.
+static CHANGES: Signal<()> = Signal::new(4);
 
 pub fn status() -> Status {
     STATUS.lock().unwrap().clone()
@@ -91,7 +65,7 @@ pub fn changes() -> async_channel::Receiver<()> {
 
 fn set_status(status: Status) {
     *STATUS.lock().unwrap() = status;
-    CHANGES.send();
+    CHANGES.send(());
 }
 
 #[link(name = "objc")]
@@ -229,7 +203,7 @@ static STATE: OnceLock<State> = OnceLock::new();
 
 fn info(key: &str) -> Option<String> {
     let bundle = send!(Id, class(c"NSBundle"), c"mainBundle");
-    let value = send!(Id, bundle, c"objectForInfoDictionaryKey:", nsstring(key) => Id);
+    let value = send!(Id, bundle, c"objectForInfoDictionaryKey:", ns_string(key) => Id);
     // The value could be a number or a list; only a string is of use.
     if value.is_null() || !send!(bool, value, c"isKindOfClass:", class(c"NSString") => Id) {
         return None;
@@ -248,7 +222,7 @@ pub fn start() {
         let bundle = send!(Id, class(c"NSBundle"), c"mainBundle");
         let frameworks = string_of(send!(Id, bundle, c"privateFrameworksPath")).unwrap_or_default();
         let path = format!("{frameworks}/Sparkle.framework");
-        let sparkle = send!(Id, class(c"NSBundle"), c"bundleWithPath:", nsstring(&path) => Id);
+        let sparkle = send!(Id, class(c"NSBundle"), c"bundleWithPath:", ns_string(&path) => Id);
         if sparkle.is_null() || !send!(bool, sparkle, c"load") {
             log::warn!("updates: no Sparkle framework at {path}");
             return State::Off("The update framework is not in this build.");
@@ -366,7 +340,7 @@ impl Bloom {
                 .h(px(36.))
                 .px(px(12.))
                 .rounded_full()
-                .bg(rgba(0xffffff1f))
+                .bg(tone::HOVER)
                 .hover(|s| s.bg(rgba(0xffffff29)))
                 .cursor_pointer()
                 .flex()
@@ -379,7 +353,7 @@ impl Bloom {
                     "{} {version} is downloaded. Click to install it and start again.",
                     crate::brand::NAME
                 )))
-                .child(crate::views::cards::icon(gpui_icons::LucideIcon::RefreshCw, 15., fg))
+                .child(crate::icons::icon(gpui_icons::LucideIcon::RefreshCw, 15., fg))
                 .child("Restart to update")
                 .on_click(cx.listener(|_, _: &ClickEvent, _, _| {
                     restart_to_update();
@@ -528,20 +502,5 @@ mod tests {
         assert_eq!(after_cycle(Status::Downloading("1.0".into())), Status::Idle);
         assert_eq!(after_cycle(Status::Ready("1.0".into())), Status::Ready("1.0".into()));
         assert_eq!(after_cycle(Status::Idle), Status::Idle);
-    }
-
-    /// Each reader hears of a change: the task of a window that closed
-    /// must not take the signal of the window that is open.
-    #[test]
-    fn every_reader_gets_the_signal_of_a_change() {
-        let signal = Signal::new();
-        let (first, second) = (signal.reader(), signal.reader());
-        signal.send();
-        assert!(first.try_recv().is_ok(), "the first reader got no signal");
-        assert!(second.try_recv().is_ok(), "the second reader got no signal");
-        // A reader that is gone leaves the list at the next signal.
-        drop(first);
-        signal.send();
-        assert_eq!(signal.readers.lock().unwrap().len(), 1);
     }
 }

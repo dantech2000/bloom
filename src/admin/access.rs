@@ -7,13 +7,14 @@
 //! A save reads the policy from the server again, changes only the keys the
 //! user edited, and sends the whole object back.
 
+use gpui_kit::base::Button as BaseButton;
 use std::rc::Rc;
 
 use anyhow::{Result, bail};
 use gpui_icons::LucideIcon;
 use gpui_kit::{
-    ClickEvent, Context, Div, ParentElement as _, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled, div, px, rgb, rgba,
+    ClickEvent, Context, Div, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, Styled, div, px, rgb,
 };
 use serde_json::{Value, json};
 
@@ -26,9 +27,9 @@ use super::{
 };
 use crate::{
     app::{Bloom, Page},
-    settings::{checkbox, field, group},
+    ui::form::{checkbox, field, group},
     ui::theme::UiTheme,
-    views::cards::icon,
+    icons::icon,
 };
 
 /// Why the user cannot change a right of the account that is signed in.
@@ -738,7 +739,7 @@ impl Bloom {
 // ----- the page -----------------------------------------------------------------
 
 /// A checkbox that shows a lock: dim, and a click only tells why.
-fn lockable(control: Stateful<Div>, locked: bool) -> Stateful<Div> {
+fn lockable(control: BaseButton, locked: bool) -> BaseButton {
     if locked { control.opacity(0.4) } else { control }
 }
 
@@ -762,7 +763,7 @@ pub fn render(editor: &Editor, cx: &mut Context<Bloom>) -> Div {
                     .text_color(t.colors.foreground)
                     .child(format!("Access of {}", editor.name)),
             )
-            .children(editor.me.then(|| badge("You", rgba(0xffffff2e)))),
+            .children(editor.me.then(|| badge("You", None))),
     );
     if let Some(note) = load_note(
         editor.loading,
@@ -789,7 +790,7 @@ fn rows_card(title: &'static str, list: &'static [Row], editor: &Editor, cx: &mu
         let value = editor.draft.edited.get(row.key).unwrap_or(&Value::Null);
         let locked = editor.locked(row.key);
         let key = row.key;
-        let control: Stateful<Div> = match row.kind {
+        let control: BaseButton = match row.kind {
             Kind::Flag => lockable(checkbox(id, value.as_bool().unwrap_or(false), cx), locked.is_some())
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.access_toggle(key, cx))),
             Kind::Choice(options) => {

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! The one target of playback: this Mac, another Jellyfin session, a cast
-//! device, or an AirPlay receiver. Only one is set at a time; choosing one
-//! leaves the other. Each kind reports its state in its own shape; the
+//! The one target of playback, as a choice: this Mac, another Jellyfin
+//! session, a cast device, or an AirPlay receiver. Only one is set at a
+//! time; choosing one leaves the other (`remote.rs` has the target that is
+//! set). Each kind reports its state in its own shape; the
 //! panel and the chip read one small view of it, made here. No part of the
 //! app is in this file, so a test can check the transitions and the
 //! mapping alone.
@@ -11,7 +12,7 @@ use std::time::Instant;
 use super::protocol::SessionInfo;
 use crate::{
     airplay::{AirPlayEvent, AirPlayState, AirPlayStatus},
-    chromecast::{mdns::Device, session::Status},
+    chromecast::{discovery::Device, session::Status},
 };
 
 /// Where playback goes.
@@ -22,7 +23,7 @@ pub enum Target {
     Local,
     /// Another session of the server, with its last known state.
     JellyfinSession(SessionInfo),
-    /// A cast device; the connection lives in `Bloom::chromecast`.
+    /// A cast device; the target that is set has its connection (`remote.rs`).
     Chromecast(Device),
     /// The AirPlay receiver the user picked in the system picker. macOS
     /// gives no name for it.
@@ -48,14 +49,6 @@ impl Kind {
     }
 }
 
-/// What leaving a target must undo.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Leave {
-    Jellyfin,
-    Chromecast(Device),
-    AirPlay,
-}
-
 impl Target {
     pub fn kind(&self) -> Kind {
         match self {
@@ -64,10 +57,6 @@ impl Target {
             Target::Chromecast(_) => Kind::Chromecast,
             Target::AirPlay => Kind::AirPlay,
         }
-    }
-
-    pub fn is_local(&self) -> bool {
-        matches!(self, Target::Local)
     }
 
     /// The name the panel shows.
@@ -88,26 +77,6 @@ impl Target {
             (Target::Chromecast(a), Target::Chromecast(b)) => a.id == b.id,
             _ => false,
         }
-    }
-
-    /// What leaving this target undoes; nothing for this device.
-    pub fn leave(&self) -> Option<Leave> {
-        match self {
-            Target::Local => None,
-            Target::JellyfinSession(_) => Some(Leave::Jellyfin),
-            Target::Chromecast(device) => Some(Leave::Chromecast(device.clone())),
-            Target::AirPlay => Some(Leave::AirPlay),
-        }
-    }
-
-    /// Chooses `chosen`: the target becomes it, and the old one is left,
-    /// unless it is the same device.
-    pub fn switch(self, chosen: Target) -> (Target, Option<Leave>) {
-        if self.same(&chosen) {
-            return (chosen, None);
-        }
-        let leave = self.leave();
-        (chosen, leave)
     }
 
     /// What an event of the AirPlay engine makes of the target. A route
@@ -315,35 +284,23 @@ mod tests {
         }
     }
 
+    /// Two choices are the same device by its id, whatever state came
+    /// with them; choosing the same one again leaves nothing.
     #[test]
-    fn choosing_a_target_leaves_the_one_before() {
-        // From this device nothing is left.
-        let (target, leave) = Target::Local.switch(Target::JellyfinSession(session("s1", "TV")));
-        assert_eq!(target.kind(), Kind::Jellyfin);
-        assert_eq!(leave, None);
-        // Jellyfin to Chromecast leaves the session.
-        let (target, leave) = target.switch(Target::Chromecast(device("c1")));
-        assert_eq!(target.kind(), Kind::Chromecast);
-        assert_eq!(leave, Some(Leave::Jellyfin));
-        // The same device again leaves nothing.
-        let (target, leave) = target.switch(Target::Chromecast(device("c1")));
-        assert_eq!(target, Target::Chromecast(device("c1")));
-        assert_eq!(leave, None);
-        // Another cast device leaves the first, by its id.
-        let (target, leave) = target.switch(Target::Chromecast(device("c2")));
-        assert_eq!(leave, Some(Leave::Chromecast(device("c1"))));
-        // AirPlay leaves the cast device; back to this device leaves AirPlay.
-        let (target, leave) = target.switch(Target::AirPlay);
-        assert_eq!(target, Target::AirPlay);
-        assert_eq!(leave, Some(Leave::Chromecast(device("c2"))));
-        let (target, leave) = target.switch(Target::Local);
-        assert!(target.is_local());
-        assert_eq!(leave, Some(Leave::AirPlay));
-        assert_eq!(Target::Local.switch(Target::Local), (Target::Local, None));
+    fn two_choices_are_the_same_device_by_its_id() {
+        let tv = Target::JellyfinSession(session("s1", "TV"));
+        assert!(tv.same(&Target::JellyfinSession(session("s1", "TV, renamed"))));
+        assert!(!tv.same(&Target::JellyfinSession(session("s2", "TV"))));
+        let cast = Target::Chromecast(device("c1"));
+        assert!(cast.same(&Target::Chromecast(Device { port: 9, ..device("c1") })));
+        assert!(!cast.same(&Target::Chromecast(device("c2"))));
+        assert!(Target::AirPlay.same(&Target::AirPlay) && Target::Local.same(&Target::Local));
+        assert!(!tv.same(&cast) && !cast.same(&Target::AirPlay) && !Target::AirPlay.same(&Target::Local));
         // Names and kinds for the chip and the debug channel.
         assert_eq!(Target::AirPlay.name(), "AirPlay");
-        assert_eq!(Target::Chromecast(device("c1")).name(), "Living room");
+        assert_eq!(cast.name(), "Living room");
         assert_eq!(Target::JellyfinSession(session("s", "Bedroom")).name(), "Bedroom");
+        assert_eq!((tv.kind(), cast.kind()), (Kind::Jellyfin, Kind::Chromecast));
         assert_eq!(Kind::Chromecast.name(), "chromecast");
     }
 

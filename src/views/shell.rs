@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Main screen: top bar and page content.
 
+use crate::ui::tone;
 use gpui_icons::LucideIcon;
 use gpui_kit::{
     Context, Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _,
@@ -375,7 +376,7 @@ impl Bloom {
             .p(px(4.))
             .rounded(px(24.))
             .border_1()
-            .border_color(gpui_kit::rgba(0xf5f5f733))
+            .border_color(tone::EDGE)
             .child(crate::ui::glass::bar_glass(px(24.), crate::ui::glass::POPUP_TINT))
             .flex()
             .items_center()
@@ -482,6 +483,13 @@ impl Bloom {
                 "tab" => self.next_admin_field(window, cx),
                 _ => return,
             }
+            cx.stop_propagation();
+            return;
+        }
+        // The dialog of "Request more seasons" closes on Escape, as the
+        // other dialogs do.
+        if self.enhanced.seasons.open && keystroke.key == "escape" {
+            self.close_seasons_dialog(cx);
             cx.stop_propagation();
             return;
         }
@@ -802,7 +810,7 @@ impl Bloom {
             .border_color(gpui_kit::transparent_black())
             .relative()
             .when(scrolled, |el| {
-                el.child(glass(px(999.), gpui_kit::rgba(0x2a2a2ab0)))
+                el.child(glass(px(999.), tone::CARD))
                     .border_color(gpui_kit::rgba(0x5757574d))
             })
             .flex()
@@ -856,7 +864,7 @@ impl Bloom {
         };
         // A state the button stands for (a device plays, a group is
         // joined) lights it.
-        let lit = gpui_kit::rgba(0xf5f5f733);
+        let lit = tone::EDGE;
 
         let (name, image) = match &self.session {
             Some(s) => (s.user_name.clone(), s.user_image.clone()),
@@ -1064,7 +1072,7 @@ impl Bloom {
     /// the next try, Retry, and Open Downloads when there are downloads.
     fn render_offline_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::connection::State;
-        use crate::settings::raised;
+        use crate::ui::button::raised;
         let fg = UiTheme::read(cx).colors.foreground;
         let core = &self.connection.core;
         let server = self.offline_server();
@@ -1109,7 +1117,7 @@ impl Bloom {
                         div()
                             .size(px(64.))
                             .rounded_full()
-                            .bg(gpui_kit::rgba(crate::admin::DISC))
+                            .bg(tone::DISC)
                             .flex()
                             .items_center()
                             .justify_center()
@@ -1163,7 +1171,7 @@ impl Bloom {
                 .pl(px(12.))
                 .pr(px(5.))
                 .rounded_full()
-                .bg(gpui_kit::rgba(0xffffff1f))
+                .bg(tone::HOVER)
                 .flex()
                 .items_center()
                 .gap(px(6.))

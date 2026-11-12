@@ -20,37 +20,17 @@
 //! behind is closed.
 //!
 //! The parts: the socket and its readers (`hub`), the events between two
-//! moments of the player (`diff`), the colours of a picture (`colours`),
-//! the tap in the app (`tap`), the lights and their helper
+//! moments of the player (`diff`) and the colours of a picture
+//! (`colours`), which know nothing of the app and are in `bloom-core`;
+//! here the tap in the app (`tap`), the lights and their helper
 //! (`lights`), and the page of the settings (`ui`).
 
-mod colours;
-mod diff;
-mod hub;
 mod lights;
 mod tap;
 mod ui;
 
-pub use colours::{artwork_colour, picture_bands};
-pub use diff::{ItemInfo, Snapshot, between};
-pub use hub::hub;
+// The parts with no window keep their names here.
+pub use bloom_core::events::{ItemInfo, Snapshot, artwork_colour, between, hub, picture_bands, socket_path};
+use bloom_core::events::colours;
 pub use lights::{FilmColour, Lights, lights_path};
 pub use tap::State;
-
-/// The version of the format. 0 while the feature is a proof of concept:
-/// names and fields can still change.
-pub const VERSION: u32 = 0;
-
-/// The socket of the stream, in the folder of the app. A test instance has
-/// its own, so it is not taken for the app the user runs.
-pub fn socket_path() -> String {
-    dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(crate::brand::FOLDER)
-        .join(match &crate::options::options().test_name {
-            Some(name) => format!("events-{name}.sock"),
-            None => "events.sock".into(),
-        })
-        .display()
-        .to_string()
-}

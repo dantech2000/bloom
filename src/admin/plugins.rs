@@ -4,6 +4,7 @@
 //! rest: enable or disable, the web settings, uninstall (2026-10-23; four
 //! buttons on every card before).
 
+use crate::ui::tone::State;
 use std::{
     collections::{HashMap, HashSet},
     rc::Rc,
@@ -13,9 +14,9 @@ use std::{
 
 use anyhow::Result;
 use gpui_kit::{
-    ClickEvent, Context, Div, ParentElement as _, Rgba,
+    ClickEvent, Context, Div, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled, div,
-    prelude::FluentBuilder as _, px, rgb, rgba,
+    prelude::FluentBuilder as _, px, rgba,
 };
 use serde::Deserialize;
 
@@ -246,17 +247,17 @@ impl MenuPlugin {
     }
 }
 
-/// Text and colour of the badge for a plugin status.
-fn status_badge(status: &str) -> (&'static str, Rgba) {
+/// Text and state of the badge for a plugin status.
+fn status_badge(status: &str) -> (&'static str, Option<State>) {
     match status {
-        "Active" => ("Active", rgb(0x2e7d32)),
-        "Restart" => ("Restart needed", rgb(0xb26a00)),
-        "Disabled" => ("Disabled", rgb(0x616161)),
-        "Malfunctioned" => ("Malfunctioned", rgb(0xc62828)),
-        "NotSupported" => ("Not supported", rgb(0xc62828)),
-        "Superseded" => ("Superseded", rgb(0x616161)),
-        "Deleted" => ("Removed at restart", rgb(0x616161)),
-        _ => ("Unknown", rgb(0x616161)),
+        "Active" => ("Active", Some(State::Ok)),
+        "Restart" => ("Restart needed", Some(State::Warn)),
+        "Disabled" => ("Disabled", None),
+        "Malfunctioned" => ("Malfunctioned", Some(State::Bad)),
+        "NotSupported" => ("Not supported", Some(State::Bad)),
+        "Superseded" => ("Superseded", None),
+        "Deleted" => ("Removed at restart", None),
+        _ => ("Unknown", None),
     }
 }
 
@@ -266,7 +267,7 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
         return div();
     };
     let content_w = app.admin_content_w().max(CARD_MIN_W);
-    let (_, card_w) = super::rows::grid(content_w, CARD_MIN_W, CARD_GAP, 1, usize::MAX);
+    let (_, card_w) = crate::ui::rows::grid(content_w, CARD_MIN_W, CARD_GAP, 1, usize::MAX);
 
     let active = data.plugins.iter().filter(|p| p.status == "Active").count();
     let restart = data
@@ -289,7 +290,7 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
         );
     }
     for plugin in &data.plugins {
-        let (status, status_color) = status_badge(&plugin.status);
+        let (status, status_state) = status_badge(&plugin.status);
         let image = plugin.has_image.then(|| {
             client.url(
                 &format!("/Plugins/{}/{}/Image", plugin.id, plugin.version),
@@ -369,7 +370,7 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                         .text_color(rgba(0xffffff59))
                         .child(initial),
                     image,
-                    badge(status, status_color),
+                    badge(status, status_state),
                 ))
                 .child(
                     div()

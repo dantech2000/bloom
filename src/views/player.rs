@@ -4,6 +4,7 @@
 //! the video fills the window, a title bar lies over its top, and the
 //! controls sit in a floating glass panel at the bottom.
 
+use crate::ui::tone;
 #[cfg(target_os = "macos")]
 use gpui_kit::surface;
 use gpui_icons::LucideIcon;
@@ -429,7 +430,7 @@ impl Bloom {
                 // A phone: the glass of the tab bar, tint and light edge
                 // (Daniel, 2026-10-23: the darker tint read as a slab, not
                 // as the glass of the menus and the tab bar).
-                .when(m.phone, |el| el.border_1().border_color(rgba(0xf5f5f733)))
+                .when(m.phone, |el| el.border_1().border_color(tone::EDGE))
                 .child(if m.phone {
                     crate::ui::glass::bar_glass(px(24.), crate::ui::glass::POPUP_TINT)
                 } else {
@@ -829,7 +830,7 @@ impl Bloom {
                 .cursor_pointer()
                 .text_size(px(14.))
                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                .when(primary, |el| el.bg(white).text_color(rgb(0x121212)))
+                .when(primary, |el| el.bg(white).text_color(tone::ON_ACCENT))
                 .when(!primary, |el| el.bg(rgba(0xffffff24)).text_color(white))
                 .hover(|s| s.opacity(0.88))
                 .child(text)

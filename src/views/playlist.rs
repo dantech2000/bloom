@@ -2,6 +2,7 @@
 //! The page of one playlist, and the dialog of the lists ("Add to playlist",
 //! "Add to collection", rename, delete).
 
+use crate::ui::tone;
 use gpui_icons::LucideIcon;
 use gpui_kit::{
     AnyElement, ClickEvent, Context, Div, InteractiveElement as _, IntoElement, KeyDownEvent,
@@ -15,9 +16,7 @@ use crate::{
     jellyfin::{Client, ItemKind, format_runtime},
     lists::{Dialog, Entry, ListKind},
     ui::{
-        glass::glass,
         input::Input,
-        motion::{Enter, enter},
         scroll_area::ScrollArea,
         theme::UiTheme,
         tip::tip,
@@ -263,8 +262,8 @@ impl Bloom {
                     .child({
                         let list = data.list.clone();
                         tool("playlist.delete", LucideIcon::Trash, "Delete playlist").on_click(
-                            cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                this.ask_delete_list(list.clone(), window, cx)
+                            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.ask_delete_list(list.clone(), cx)
                             }),
                         )
                     }),
@@ -279,10 +278,10 @@ impl Bloom {
                 cx,
             )
         } else {
-            // Only the rows in view are built (`admin::rows`): a playlist
+            // Only the rows in view are built (`ui::rows`): a playlist
             // of five hundred entries cost five hundred rows at each frame
             // of a scroll.
-            div().px(px(m.side)).child(crate::admin::rows::rows(
+            div().px(px(m.side)).child(crate::ui::rows::rows(
                 cx,
                 total,
                 ROW_H + ROW_GAP,
@@ -319,9 +318,14 @@ impl Bloom {
 
     /// The dialog of the lists over the page.
     pub fn render_lists_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let dialog = self.lists.dialog.as_ref()?;
+        // The question of the app ("Delete playlist?", "Delete user?")
+        // draws here as well: this is the place the root render has for
+        // a dialog over any page, and one of the two shows at a time.
+        let Some(dialog) = self.lists.dialog.as_ref() else {
+            return self.render_confirm(cx);
+        };
         let fg = UiTheme::read(cx).colors.foreground;
-        let soft = rgba(0xf5f5f7b3);
+        let soft = tone::INK_70;
 
         let (title, message) = match dialog {
             Dialog::Add { kind, item, .. } => (
@@ -329,22 +333,13 @@ impl Bloom {
                 item.display_title(),
             ),
             Dialog::Rename { list } => ("Rename playlist".to_string(), list.name.clone()),
-            Dialog::Confirm { title, message, .. } => (title.clone(), message.clone()),
         };
-        let mut card = div()
-            .id("lists.card")
-            .relative()
-            // A phone: the width of the window less the margins.
-            .w(px((self.viewport_w - 32.).min(440.)))
-            .rounded(px(24.))
-            .border_1()
-            .border_color(rgba(0xf5f5f733))
-            .child(glass(px(24.), crate::ui::glass::POPUP_TINT))
+        // A phone: the width of the window less the margins.
+        let mut card = crate::ui::dialog::card("lists.card", (self.viewport_w - 32.).min(440.))
             .p(px(24.))
             .flex()
             .flex_col()
             .gap(px(12.))
-            .on_click(|_: &ClickEvent, _, cx| cx.stop_propagation())
             .child(
                 div()
                     .text_size(px(20.))
@@ -356,7 +351,7 @@ impl Bloom {
                 div()
                     .text_size(px(15.))
                     .text_color(fg.opacity(0.8))
-                    .when(!matches!(dialog, Dialog::Confirm { .. }), |el| el.truncate())
+                    .truncate()
                     .child(message),
             );
 
@@ -434,7 +429,7 @@ impl Bloom {
                                     .items_center()
                                     .gap(px(12.))
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(rgba(0xffffff1f)))
+                                    .hover(|s| s.bg(tone::HOVER))
                                     .child(icon(
                                         match kind {
                                             ListKind::Playlist => LucideIcon::ListVideo,
@@ -498,26 +493,11 @@ impl Bloom {
                     .child(field("Name"))
                     .child(buttons("Rename".into(), ButtonKind::Primary, cx));
             }
-            Dialog::Confirm { action, .. } => {
-                card = card.child(buttons(action.clone().into(), ButtonKind::Danger, cx));
-            }
         }
 
         Some(
-            div()
-                .id("lists.overlay")
-                .absolute()
-                .inset_0()
-                .occlude()
+            crate::ui::dialog::layer("lists.overlay", card, cx)
                 .track_focus(&self.lists.focus)
-                .flex()
-                .items_center()
-                .justify_center()
-                // A phone: the name field raises the keyboard, and the
-                // dialog centres in the room above it (the buttons were
-                // under the keyboard on 2026-10-22).
-                .pb(px(crate::views::shell::keyboard_inset()))
-                .bg(rgba(0x00000099))
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                     if event.keystroke.key == "escape" {
                         this.close_lists_dialog(window, cx);
@@ -528,10 +508,9 @@ impl Bloom {
                 // A click beside the dialog closes it.
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     this.close_lists_dialog(window, cx)
-                }))
-                .child(enter(card, "lists.card.in", Enter::Settle, cx)),
+                })),
         )
-        .map(|layer| enter(layer, "lists.overlay.in", Enter::Fade, cx))
+        .map(|layer| crate::ui::dialog::shown(layer, "lists.overlay", cx))
     }
 }
 

@@ -23,7 +23,7 @@ use super::{
 };
 use crate::{
     app::{Bloom, Page},
-    settings::{field, group},
+    ui::form::{field, group},
     ui::theme::UiTheme,
 };
 

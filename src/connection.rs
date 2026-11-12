@@ -12,7 +12,6 @@ pub use bloom_core::connection::*;
 use crate::{
     app::{Bloom, Page},
     downloads::engine,
-    downloads::engine::EntryState,
     realtime::SocketEvent,
 };
 
@@ -53,7 +52,7 @@ impl Bloom {
 
     /// True when there is a finished download to play from this Mac.
     pub fn has_downloads(&self) -> bool {
-        engine().entries().iter().any(|e| e.state == EntryState::Done)
+        engine().summary().done > 0
     }
 
     /// A request of a page failed. True when nothing reached the server:

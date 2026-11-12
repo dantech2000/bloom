@@ -8,11 +8,14 @@ use std::rc::Rc;
 
 use gpui_kit::base::Button as BaseButton;
 use gpui_kit::{
-    AnyElement, App, ClickEvent, ElementId, FontWeight, IntoElement, ParentElement, RenderOnce,
-    SharedString, Styled, Window, px,
+    AnyElement, App, ClickEvent, ElementId, FontWeight, InteractiveElement as _, IntoElement,
+    ParentElement, RenderOnce, SharedString, Styled, Window, px,
 };
 
-use super::theme::{ThemeMode, UiRadius, UiTheme};
+use super::{
+    theme::{ThemeMode, UiRadius, UiTheme},
+    tone,
+};
 
 type ButtonClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
@@ -230,6 +233,97 @@ impl gpui_kit::Styled for Button {
     fn style(&mut self) -> &mut gpui_kit::StyleRefinement {
         &mut self.style
     }
+}
+
+// ----- Bloom's buttons ---------------------------------------------------------
+//
+// The buttons of the pages: one set, on the Kit's headless button, which
+// gives each the role, the label and the disabled state. A caller adds
+// `.on_click(...)` and may refine the size or add an icon as a child.
+
+/// What a text button says about its action.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ButtonKind {
+    /// Accent fill, for the main action of a page.
+    Primary,
+    /// The theme's `.raised` button: dark, and the accent with dark text
+    /// under the pointer.
+    Plain,
+    /// Red fill, for actions that stop or delete something.
+    Danger,
+}
+
+/// A button with no look yet: the cursor, the label for assistive tech and
+/// the tests that tap by label. A press leaves the keyboard focus where it
+/// is: the keys belong to the page or the player, and the app has no look
+/// for a focused button (a button that took the focus lit up at the next
+/// key, 2026-11-11).
+pub fn bare(id: impl Into<ElementId>, label: impl Into<SharedString>) -> BaseButton {
+    BaseButton::new(id).focusable(false).accessibility_label(label).cursor_pointer()
+}
+
+/// The frame of a text button with no content yet, for a caller that
+/// puts an icon before the label.
+pub fn frame(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    kind: ButtonKind,
+    cx: &App,
+) -> BaseButton {
+    let colors = UiTheme::read(cx).colors;
+    let (bg, fg) = match kind {
+        ButtonKind::Primary => (colors.primary, colors.primary_foreground),
+        ButtonKind::Plain => (tone::RAISED, colors.foreground),
+        ButtonKind::Danger => (tone::DANGER, gpui_kit::white().into()),
+    };
+    let (accent, ink) = (colors.primary, colors.primary_foreground);
+    bare(id, label)
+        .h(px(38.))
+        .px(px(16.))
+        .rounded(px(12.))
+        .gap(px(8.))
+        .bg(bg)
+        .text_color(fg)
+        .text_size(px(15.))
+        .font_weight(FontWeight::MEDIUM)
+        .hover(move |s| match kind {
+            ButtonKind::Plain => s.bg(accent).text_color(ink),
+            _ => s.opacity(0.88),
+        })
+        .styles(|styles| styles.disabled(|s| s.opacity(0.5).cursor_not_allowed()))
+}
+
+/// A text button. Add `.on_click(...)`.
+pub fn button(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    kind: ButtonKind,
+    cx: &App,
+) -> BaseButton {
+    let label = label.into();
+    frame(id.into(), label.clone(), kind, cx).child(label)
+}
+
+/// The raised button of a settings page ([`ButtonKind::Plain`]).
+pub fn raised(id: impl Into<SharedString>, label: impl Into<SharedString>, cx: &App) -> BaseButton {
+    button(id, label, ButtonKind::Plain, cx)
+}
+
+/// A square button with one glyph and no fill until the pointer is on
+/// it: `size` points, round corners, `hover` as its fill then. A tooltip
+/// is the caller's.
+pub fn ghost_icon(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    glyph: impl IntoElement,
+    size: f32,
+    hover: gpui_kit::Rgba,
+) -> BaseButton {
+    bare(id, label)
+        .size(px(size))
+        .rounded(px(12.))
+        .hover(move |s| s.bg(hover))
+        .child(glyph)
 }
 
 #[cfg(test)]

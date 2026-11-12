@@ -23,7 +23,7 @@ use std::{collections::HashSet, rc::Rc};
 use anyhow::Result;
 use gpui_kit::{
     AppContext as _, ClickEvent, Context, Div, Entity, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled, Subscription, Window, div, px,
+    Styled, Subscription, Window, div, px,
 };
 use serde_json::{Number, Value};
 
@@ -35,7 +35,7 @@ use super::{
 };
 use crate::{
     app::{Bloom, Page, Revision},
-    settings::{checkbox, field, group},
+    ui::form::{checkbox, field, group},
     ui::{
         input::{Input, InputEvent, InputState},
         theme::UiTheme,
@@ -485,7 +485,6 @@ impl Bloom {
             admin.plugin_editor = None;
             admin.plugin_open = None;
         }
-        super::lazy::forget("plugin.");
         cx.notify();
     }
 
@@ -864,7 +863,7 @@ pub fn render(app: &Bloom, editor: &Editor, cx: &mut Context<Bloom>) -> Div {
             // it are the ones the list shows.
             let id = format!("plugin.{}.{title}.{}.{}", editor.id, editor.filter, members.len());
             let count = members.len();
-            card = card.child(super::lazy::lazy(cx, id, count, move |app, range, cx| {
+            card = card.child(crate::ui::lazy::lazy(cx, id, count, move |app, range, cx| {
                 let Some(editor) = app.plugin_editor() else {
                     return Vec::new();
                 };

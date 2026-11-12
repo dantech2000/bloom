@@ -3,6 +3,7 @@
 //! Use it with gpui's own tooltip, which waits half a second and builds the
 //! view only when it shows: `.tooltip(tip("Mute (M)"))`.
 
+use crate::ui::tone;
 use gpui_kit::{
     AnyView, App, AppContext as _, Context, IntoElement, ParentElement as _, Render, SharedString,
     Styled, Window, div, px, rgba,
@@ -21,7 +22,7 @@ impl Render for Tip {
                 .py(px(5.))
                 .rounded(px(9.))
                 .border_1()
-                .border_color(rgba(0xf5f5f733))
+                .border_color(tone::EDGE)
                 .bg(rgba(0x1c1c1cf2))
                 .shadow_md()
                 .font_family(super::theme::UiTheme::read(cx).fonts.body.clone())

@@ -2,11 +2,11 @@
 //! The projects Bloom is made with, for the About page and `CREDITS.md`.
 //! A test keeps the two in step: every entry here must be in the file.
 
-use gpui_kit::{ClickEvent, Context, Div, ParentElement, StatefulInteractiveElement, Styled, div, px};
+use gpui_kit::{ClickEvent, Context, Div, ParentElement, Styled, div, px};
 
 use crate::{
     app::Bloom,
-    settings::{field, group, raised},
+    ui::{button::raised, form::{field, group}},
     ui::theme::UiTheme,
 };
 

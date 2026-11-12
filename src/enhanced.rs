@@ -4,6 +4,7 @@
 //! Each feature follows the setting of the user in the plugin; the profile
 //! menu can set it for this app alone.
 
+use crate::ui::tone;
 use std::{
     collections::HashMap,
     sync::atomic::{AtomicBool, Ordering},
@@ -977,7 +978,7 @@ impl Bloom {
             .items_center()
             .gap(px(6.))
             .cursor_pointer()
-            .bg(rgba(0xffffff1f))
+            .bg(tone::HOVER)
             .hover(|s| s.bg(rgba(0xffffff33)))
             .font_weight(gpui_kit::FontWeight::MEDIUM)
             .children(before.map(|glyph| icon(glyph, 14., ink)))
@@ -1190,7 +1191,7 @@ impl Bloom {
     }
 
     /// The list of keys, over the page.
-    pub fn render_enhanced_help(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+    pub fn render_enhanced_help(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
         if !self.panel_is(Panel::Help) {
             return None;
         }
@@ -1210,7 +1211,7 @@ impl Bloom {
                         .px(px(8.))
                         .py(px(2.))
                         .rounded(px(6.))
-                        .bg(rgba(0xffffff1f))
+                        .bg(tone::HOVER)
                         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                         .text_color(t.colors.foreground)
                         .child(keys.to_string()),
@@ -1262,52 +1263,42 @@ impl Bloom {
         let mut enhanced = rows_of(true);
         let rest = enhanced.split_off(enhanced.len().min(4));
         player.extend(enhanced);
-        Some(
-            div()
-                .id("je.help")
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(rgba(0x00000099))
-                // The page behind takes no click meanwhile: the click that
-                // closes the list also pressed what was under the pointer.
-                .occlude()
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.close_panel(Panel::Help);
-                    cx.notify();
-                }))
-                .child(
-                    div()
-                        .relative()
-                        .w(px(860.))
-                        .max_w_full()
-                        .rounded(px(24.))
-                        .border_1()
-                        .border_color(rgba(0xf5f5f733))
-                        .child(glass(px(24.), crate::ui::glass::POPUP_TINT))
-                        .p(px(24.))
-                        .flex()
-                        .flex_col()
-                        .gap(px(16.))
-                        .child(
-                            div()
-                                .text_size(px(20.))
-                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                .text_color(t.colors.foreground)
-                                .child("Keyboard shortcuts"),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap(px(28.))
-                                .child(column("Pages", pages))
-                                .child(column("Player", player))
-                                .child(column("Player, from Jellyfin Enhanced", rest)),
-                        ),
-                ),
-        )
+        // A click anywhere closes the list, in the card as well: it has
+        // nothing to press.
+        let card = div()
+            .relative()
+            .w(px(860.))
+            .max_w_full()
+            .rounded(px(24.))
+            .border_1()
+            .border_color(tone::EDGE)
+            .child(glass(px(24.), crate::ui::glass::POPUP_TINT))
+            .p(px(24.))
+            .flex()
+            .flex_col()
+            .gap(px(16.))
+            .child(
+                div()
+                    .text_size(px(20.))
+                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                    .text_color(t.colors.foreground)
+                    .child("Keyboard shortcuts"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(28.))
+                    .child(column("Pages", pages))
+                    .child(column("Player", player))
+                    .child(column("Player, from Jellyfin Enhanced", rest)),
+            );
+        let layer = crate::ui::dialog::layer("je.help", card, cx).on_click(cx.listener(
+            |this, _: &ClickEvent, _, cx| {
+                this.close_panel(Panel::Help);
+                cx.notify();
+            },
+        ));
+        Some(crate::ui::dialog::shown(layer, "je.help", cx))
     }
 
     /// The verbs of `je` for bookmarks, hidden content, seasons and tags. The

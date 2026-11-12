@@ -240,12 +240,6 @@ pub enum Dialog {
     Rename {
         list: Item,
     },
-    Confirm {
-        title: String,
-        message: String,
-        action: String,
-        run: Rc<dyn Fn(&mut Bloom, &mut Context<Bloom>)>,
-    },
 }
 
 pub struct State {
@@ -434,10 +428,10 @@ impl Bloom {
             items.push(MenuItem::separator());
             items.push(
                 MenuItem::new("lists.menu.delete", "Delete collection").on_click(
-                    move |_, window, cx| {
+                    move |_, _, cx| {
                         handle
                             .update(cx, |this, cx| {
-                                this.ask_delete_list(collection.clone(), window, cx)
+                                this.ask_delete_list(collection.clone(), cx)
                             })
                             .ok();
                     },
@@ -478,19 +472,13 @@ impl Bloom {
         let (value, placeholder) = match &dialog {
             Dialog::Add { kind, .. } => (String::new(), format!("New {} name", kind.noun())),
             Dialog::Rename { list } => (list.name.clone(), "Name".to_string()),
-            Dialog::Confirm { .. } => (String::new(), String::new()),
         };
         self.lists.input.update(cx, |input, cx| {
             input.set_value(value, window, cx);
             input.set_placeholder(placeholder, window, cx);
         });
-        match dialog {
-            Dialog::Confirm { .. } => window.focus(&self.lists.focus, cx),
-            _ => {
-                let focus = gpui_kit::Focusable::focus_handle(self.lists.input.read(cx), cx);
-                window.focus(&focus, cx);
-            }
-        }
+        let focus = gpui_kit::Focusable::focus_handle(self.lists.input.read(cx), cx);
+        window.focus(&focus, cx);
     }
 
     pub fn open_add_dialog(
@@ -555,10 +543,6 @@ impl Bloom {
                 }
                 self.close_lists_dialog(window, cx);
                 self.rename_playlist(list, name, cx);
-            }
-            Dialog::Confirm { run, .. } => {
-                self.close_lists_dialog(window, cx);
-                run(self, cx);
             }
         }
     }
@@ -672,7 +656,7 @@ impl Bloom {
 
     /// Asks before a playlist or a collection is deleted. Only these two
     /// kinds are offered; `delete_list` of the client checks again.
-    pub fn ask_delete_list(&mut self, list: Item, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn ask_delete_list(&mut self, list: Item, cx: &mut Context<Self>) {
         if !is_deletable_kind(&list.kind) {
             log::warn!("lists: refused to offer delete for a {}", list.kind);
             return;
@@ -680,14 +664,14 @@ impl Bloom {
         let noun = if list.kind == ItemKind::Playlist { "playlist" } else { "collection" };
         let message = format!("\"{}\" goes away. The titles in it stay in the library.", list.name);
         let target = list.clone();
-        self.open_lists_dialog(
-            Dialog::Confirm {
+        self.ask_confirm(
+            crate::admin::Confirm {
                 title: format!("Delete {noun}?"),
                 message,
                 action: "Delete".into(),
+                danger: true,
                 run: Rc::new(move |this, cx| this.delete_list(target.clone(), cx)),
             },
-            window,
             cx,
         );
     }
@@ -1004,7 +988,6 @@ impl Bloom {
                     lists.as_ref().map_or("loading".into(), |l| l.iter().map(|i| format!("{:?}", i.name)).collect::<Vec<_>>().join(","))
                 ),
                 Some(Dialog::Rename { list }) => format!("rename {:?}", list.name),
-                Some(Dialog::Confirm { title, .. }) => format!("confirm {title:?}"),
             }),
             // Picks a row of the open dialog, as a click does (from 1).
             "dialog-pick" => {
@@ -1095,12 +1078,17 @@ impl Bloom {
                     _ => return Err(anyhow!("not on a list page")),
                 };
                 ensure!(is_test_name(&list.name), "refused: not a {TEST_PREFIX} list");
-                self.ask_delete_list(list, window, cx);
+                self.ask_delete_list(list, cx);
                 Ok("dialog open; use dialog-confirm".into())
             }
             "dialog-confirm" => {
-                ensure!(matches!(self.lists.dialog, Some(Dialog::Confirm { .. })), "no question is open");
-                self.submit_lists_dialog(window, cx);
+                // Only the question `page-delete` asks: another one that is
+                // open (a user, a key) is not this verb's to run.
+                let ours = |title: &str| matches!(title, "Delete playlist?" | "Delete collection?");
+                ensure!(self.dialogs.confirm.as_ref().is_some_and(|c| ours(&c.title)), "no question is open");
+                if let Some(confirm) = self.dialogs.confirm.take() {
+                    (confirm.run)(self, cx);
+                }
                 Ok("confirmed".into())
             }
             "playall" => {

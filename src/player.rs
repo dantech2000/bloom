@@ -174,6 +174,10 @@ pub struct PlayRequest {
     pub token: u64,
     /// The play session the server gave; the worker makes one otherwise.
     pub play_session_id: Option<String>,
+    /// The server makes the stream: a transcode, or a remux, which the
+    /// reports name "DirectStream". Such a stream is ended on the server
+    /// when the item stops, and has the one audio track the server chose.
+    pub transcoding: bool,
     /// "DirectPlay", "DirectStream" or "Transcode", for the reports. A
     /// transcode is ended on the server when the item stops.
     pub play_method: String,
@@ -426,6 +430,9 @@ struct Shared {
     clock_state: AtomicPtr<pacing::ClockState>,
     /// The subtitle files on their way (see `fetch_subtitles`).
     fetching: Mutex<Vec<Fetch>>,
+    /// The factor of the group on the speed, as last asked for (the bits
+    /// of the `f64`): for `Player::sync_state`.
+    sync_speed: AtomicU64,
 }
 
 /// A subtitle file on its way: the load it is of, its server index, and
@@ -589,6 +596,7 @@ impl Default for Player {
                 clock: Mutex::new(None),
                 clock_state: AtomicPtr::new(ptr::null_mut()),
                 fetching: Mutex::new(Vec::new()),
+                sync_speed: AtomicU64::new(1f64.to_bits()),
             }),
             commands: Arc::new(Mutex::new(None)),
             queued: Arc::new(Mutex::new(Queued::default())),
@@ -757,9 +765,19 @@ impl Player {
     pub fn schedule(&self, scheduled: Option<Scheduled>) {
         self.send(Cmd::Schedule(scheduled));
     }
+    /// What a group left on the player, for a test: in a group or not,
+    /// and the factor on the speed. A new load takes the factor back to 1.
+    #[cfg(test)]
+    pub fn sync_state(&self) -> (bool, f64) {
+        (
+            self.shared.in_group.load(Ordering::Relaxed),
+            f64::from_bits(self.shared.sync_speed.load(Ordering::Relaxed)),
+        )
+    }
     /// A factor on the speed the user chose, for small corrections of the
     /// position. It does not show as the speed of the user.
     pub fn set_sync_speed(&self, factor: f64) {
+        self.shared.sync_speed.store(factor.to_bits(), Ordering::Relaxed);
         self.send(Cmd::SetSyncSpeed(factor));
     }
     /// Sends a `Position` event about ten times a second while on.
@@ -1019,7 +1037,7 @@ impl Leftover {
         Self {
             client: request.client.clone(),
             play_session_id: request.play_session_id.clone(),
-            transcode: request.play_method == "Transcode",
+            transcode: request.transcoding,
         }
     }
 
@@ -1103,6 +1121,8 @@ struct Session {
     item_id: String,
     play_session_id: String,
     play_method: String,
+    /// The server makes the stream (`PlayRequest::transcoding`).
+    transcoding: bool,
     media_source_id: String,
     last_report: Instant,
     /// Last position of this item; the shared status can already show the
@@ -1122,7 +1142,12 @@ pub(crate) struct Report {
 pub(crate) enum ReportKind {
     Start,
     Progress,
+    /// The stop. With the method "Transcode" the transcode is ended too.
     Stopped,
+    /// Ends the stream the server makes for the play session, and reports
+    /// nothing: after the stop of a remux, which the reports name
+    /// "DirectStream" (`report_stop`).
+    EndTranscode,
 }
 
 /// Sends the playback reports in the order they come. The requests block,
@@ -1159,6 +1184,7 @@ fn reporter() -> (mpsc::Sender<Report>, Option<thread::JoinHandle<()>>) {
                     ReportKind::Stopped => {
                         ("stopped", report.client.report_stopped(&report.progress))
                     }
+                    ReportKind::EndTranscode => ("end of the transcode", Ok(())),
                 };
                 if let Err(err) = &result {
                     log::warn!("report {name} failed: {err:#}");
@@ -1166,14 +1192,16 @@ fn reporter() -> (mpsc::Sender<Report>, Option<thread::JoinHandle<()>>) {
                 // A local play keeps its position on this Mac as well, under
                 // the server and user of the report; an unsent one goes at
                 // the next start of that profile with a connection.
-                if report.kind != ReportKind::Start
+                if matches!(report.kind, ReportKind::Progress | ReportKind::Stopped)
                     && let Some(who) = crate::downloads::offline::Identity::of(&report.client)
                     && crate::downloads::local_path(report.client.server_id.as_deref(), &report.progress.item_id).is_some()
                 {
                     crate::downloads::offline::note_report(&who, &report.progress, result.is_err());
                 }
                 // A transcode runs on until the server is told to end it.
-                if report.kind == ReportKind::Stopped && report.progress.play_method == "Transcode" {
+                let ends_transcode = report.kind == ReportKind::EndTranscode
+                    || (report.kind == ReportKind::Stopped && report.progress.play_method == "Transcode");
+                if ends_transcode {
                     let id = &report.progress.play_session_id;
                     match report.client.stop_encoding(id) {
                         Ok(()) => log::info!("ended the transcode of session {}", &id[..id.len().min(8)]),
@@ -1877,11 +1905,7 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>, rep
                     if let Some(active) = session.take() {
                         let _ = mpv.command("stop", &[]);
                         stale_ends += 1;
-                        let _ = worker.reports.send(Report {
-                            client: active.client.clone(),
-                            kind: ReportKind::Stopped,
-                            progress: progress_of(&active, false, &worker),
-                        });
+                        report_stop(&active, false, &worker);
                     }
                     // A failure here ends the worker; the load is answered
                     // first, as a group waits for that answer.
@@ -1899,7 +1923,7 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>, rep
                     // A transcode has the one audio track the server chose,
                     // and no subtitle in it: a track choice made for the
                     // file itself must not carry over.
-                    if req.play_method == "Transcode" {
+                    if req.transcoding {
                         let _ = mpv.set_property("aid", "auto");
                         let _ = mpv.set_property("sid", "auto");
                     }
@@ -1921,6 +1945,7 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>, rep
                     worker.forget_subtitles();
                     worker.scheduled = None;
                     worker.sync_speed = 1.;
+                    shared.sync_speed.store(1f64.to_bits(), Ordering::Relaxed);
                     worker.apply_speed(&mpv);
                     worker.stall_since = None;
                     worker.stalled = false;
@@ -1969,6 +1994,7 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>, rep
                         item_id: req.item_id,
                         play_session_id,
                         play_method: req.play_method,
+                        transcoding: req.transcoding,
                         media_source_id: req.media_source_id,
                         last_report: Instant::now(),
                         position: req.start_secs,
@@ -2643,7 +2669,7 @@ fn render_frame(renderer: &mut Renderer, shared: &Shared, skip: bool, synced: bo
         return Err(anyhow!("mpv_render_context_render failed ({code})"));
     }
     renderer.unseen = false;
-    let frame = renderer.gl.finish()?;
+    let frame = renderer.gl.finish();
     let seq = shared.publish(Some(frame), tick, vsync);
     pacing::count_rendered(synced);
     // From mpv's request to the finished frame. mpv asks early and the
@@ -2821,6 +2847,20 @@ fn progress_of(session: &Session, paused: bool, worker: &Worker) -> Progress {
     }
 }
 
+/// Reports the stop of an item, and ends the stream the server made for
+/// it. The reporter ends a transcode with the stop report, by the name of
+/// the method; a remux has the method "DirectStream" in its reports and
+/// is ended by a word of its own.
+fn report_stop(session: &Session, paused: bool, worker: &Worker) {
+    let progress = progress_of(session, paused, worker);
+    let remux = session.transcoding && progress.play_method != "Transcode";
+    let end = remux.then(|| Report { client: session.client.clone(), kind: ReportKind::EndTranscode, progress: progress.clone() });
+    let _ = worker.reports.send(Report { client: session.client.clone(), kind: ReportKind::Stopped, progress });
+    if let Some(end) = end {
+        let _ = worker.reports.send(end);
+    }
+}
+
 /// Reports the stop to Jellyfin and marks the session ended. The status
 /// is marked when it is of this item alone: while the next load waits for
 /// the server the status is of that load (`Player::prepare`), and the end
@@ -2834,11 +2874,7 @@ fn finish(shared: &Shared, session: &mut Option<Session>, worker: &mut Worker) {
         let mine = worker.owns(&status);
         (mine, status.paused, mine && status.reached_end && status.error.is_none())
     };
-    let _ = worker.reports.send(Report {
-        client: active.client.clone(),
-        kind: ReportKind::Stopped,
-        progress: progress_of(&active, paused, worker),
-    });
+    report_stop(&active, paused, worker);
     worker.scheduled = None;
     worker.item_id = None;
     worker.stall_since = None;
@@ -3005,6 +3041,7 @@ mod tests {
             token: 0,
             play_session_id: None,
             play_method: String::new(),
+            transcoding: false,
             media_source_id: String::new(),
             subtitles: Vec::new(),
         });
@@ -3182,6 +3219,7 @@ mod tests {
             token: 3,
             play_session_id: None,
             play_method: String::new(),
+            transcoding: false,
             media_source_id: String::new(),
             subtitles: Vec::new(),
         });
@@ -3261,6 +3299,7 @@ mod tests {
             token: 1,
             play_session_id: None,
             play_method: String::new(),
+            transcoding: false,
             media_source_id: String::new(),
             subtitles: Vec::new(),
         });
@@ -3328,6 +3367,7 @@ mod tests {
             token,
             play_session_id: None,
             play_method: String::new(),
+            transcoding: false,
             media_source_id: String::new(),
             subtitles: Vec::new(),
         };
@@ -3616,6 +3656,7 @@ mod tests {
             token,
             play_session_id: None,
             play_method: String::new(),
+            transcoding: false,
             media_source_id: String::new(),
             subtitles: Vec::new(),
         }
@@ -4023,6 +4064,7 @@ mod tests {
         let mut req = request("/nonexistent/clip.mp4", "Transcode", 91);
         req.client = Client::new(&format!("http://127.0.0.1:{port}"), "device-1").with_session("token", "user");
         req.play_method = "Transcode".into();
+        req.transcoding = true;
         req.play_session_id = Some("session-91".into());
         assert!(player.play_prepared(generation, req));
         assert!(comes(&player, Duration::from_secs(5), |e| *e == PlayerEvent::LoadFailed { token: 91 }), "the refused load was not answered");
@@ -4104,6 +4146,7 @@ mod tests {
             item_id: item.into(),
             play_session_id: "session".into(),
             play_method: String::new(),
+            transcoding: false,
             media_source_id: String::new(),
             last_report: Instant::now(),
             position: 0.,
@@ -4159,6 +4202,72 @@ mod tests {
         let status = player.status();
         assert!(status.state == PlayState::Ended && status.reached_end, "{status:?}");
         assert_eq!(events_of(&player), vec![PlayerEvent::Ended]);
+    }
+
+    /// A remux is a stream the server makes, as a transcode is, and its
+    /// reports name it "DirectStream": its end is told to the server by
+    /// the bool of the load, not by that name. Before, the player took a
+    /// stream for a transcode by the name alone, and the ffmpeg of a
+    /// remux ran on after the stop.
+    #[test]
+    fn the_stop_of_a_remux_ends_its_stream_on_the_server() {
+        use std::io::{Read, Write};
+        let player = Player::default();
+        let generation = player.prepare("Remux", 0., false);
+        // What the worker sends at the stop: the report, then the end.
+        let kinds = |transcoding: bool, method: &str| {
+            let (mut worker, reports) = worker_of(generation);
+            let mut session = Some(Session { transcoding, play_method: method.into(), ..session_of("remux") });
+            finish(&player.shared, &mut session, &mut worker);
+            reports.try_iter().collect::<Vec<Report>>()
+        };
+        let sent = kinds(true, "DirectStream");
+        assert!(
+            sent.len() == 2 && sent[0].kind == ReportKind::Stopped && sent[1].kind == ReportKind::EndTranscode,
+            "the stop of a remux did not end its stream"
+        );
+        assert_eq!(sent[1].progress.play_session_id, "session");
+        // A transcode is ended with its stop report, a direct play has nothing to end.
+        assert!(kinds(true, "Transcode").iter().map(|r| r.kind == ReportKind::Stopped).eq([true]));
+        assert!(kinds(false, "DirectPlay").iter().map(|r| r.kind == ReportKind::Stopped).eq([true]));
+
+        // What the reporter does with the end: one DELETE of the encoding.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (seen_tx, seen_rx) = mpsc::channel::<String>();
+        thread::spawn(move || {
+            for mut socket in listener.incoming().flatten() {
+                let _ = socket.set_read_timeout(Some(Duration::from_secs(3)));
+                let mut buffer = [0u8; 2048];
+                let n = socket.read(&mut buffer).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buffer[..n]);
+                let _ = seen_tx.send(head.lines().next().unwrap_or_default().to_string());
+                let _ = socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        let (reports, thread) = reporter();
+        let mut end = sent.into_iter().nth(1).unwrap();
+        end.client = Client::new(&format!("http://127.0.0.1:{port}"), "device-1").with_session("token", "user");
+        reports.send(end).unwrap();
+        drop(reports);
+        thread.unwrap().join().unwrap();
+        let lines: Vec<String> = seen_rx.try_iter().collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("DELETE /Videos/ActiveEncodings") && lines[0].contains("playSessionId=session"), "{lines:?}");
+    }
+
+    /// The group and its factor on the speed can be read back
+    /// (`sync_state`), and a new load starts at the factor 1.
+    #[test]
+    fn the_sync_state_is_what_the_group_set() {
+        let player = Player::default();
+        assert_eq!(player.sync_state(), (false, 1.));
+        player.set_group(true);
+        player.set_sync_speed(1.05);
+        assert_eq!(player.sync_state(), (true, 1.05));
+        player.set_group(false);
+        player.set_sync_speed(1.);
+        assert_eq!(player.sync_state(), (false, 1.));
     }
 
     /// An exact seek that comes while a load still waits for its answer

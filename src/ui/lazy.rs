@@ -75,12 +75,6 @@ impl Measured {
     }
 }
 
-/// Before the plugin editor kept its heights with the element, a closed
-/// editor had to drop them by hand. Nothing to do now: an element that is
-/// not drawn loses its state. TODO: remove with its one caller
-/// (`plugin_config.rs`).
-pub fn forget(_prefix: &str) {}
-
 pub struct Lazy {
     app: WeakEntity<Bloom>,
     id: SharedString,

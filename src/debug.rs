@@ -1049,8 +1049,14 @@ impl Bloom {
                 };
                 self.sync_user(intent, cx)
             }
-            "shuffle" => self.sync_user(Intent::Shuffle(arg.to_string()), cx),
-            "repeat" => self.sync_user(Intent::Repeat(arg.to_string()), cx),
+            "shuffle" => match crate::syncplay::protocol::ShuffleMode::parse(arg) {
+                Some(mode) => self.sync_user(Intent::Shuffle(mode), cx),
+                None => return "error: syncplay shuffle <Sorted|Shuffle>".into(),
+            },
+            "repeat" => match crate::syncplay::protocol::RepeatMode::parse(arg) {
+                Some(mode) => self.sync_user(Intent::Repeat(mode), cx),
+                None => return "error: syncplay repeat <RepeatNone|RepeatAll|RepeatOne>".into(),
+            },
             "unfollow" => self.sync_user(Intent::StopFollowing, cx),
             "follow" => self.sync_user(Intent::Follow, cx),
             _ => {
@@ -1302,6 +1308,9 @@ fn page_items(page: &Page) -> usize {
         Page::Admin(_) | Page::Settings(_) | Page::Downloads => 0,
     }
 }
+
+/// The debug command `pacing`.
+mod pacing;
 
 #[cfg(test)]
 mod tests {

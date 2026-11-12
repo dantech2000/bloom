@@ -19,6 +19,7 @@
 //! the app reads it again, changes one entry, and sends it back. It keeps the
 //! keys it does not know.
 
+use crate::ui::tone;
 use std::collections::{HashMap, HashSet};
 
 use gpui_icons::LucideIcon;
@@ -32,7 +33,7 @@ use crate::{
     app::{Bloom, Page},
     jellyfin::{Client, Item, ItemKind},
     ui::{menu::MenuItem, theme::UiTheme, tip::tip},
-    views::cards::icon,
+    icons::icon,
 };
 
 /// Where a list shows, for the filter of the plugin.
@@ -540,11 +541,11 @@ impl Bloom {
     /// has it on in the file, and has not switched it off in this app.
     pub fn hidden_on(&self) -> bool {
         self.enhanced.hidden.demo
-            || (self.enhanced_feature("hidden_content") && self.enhanced.hidden.set.settings.enabled)
+            || (self.enhanced_feature(crate::enhanced::Feature::HiddenContent) && self.enhanced.hidden.set.settings.enabled)
     }
 
     pub fn load_hidden(&mut self, cx: &mut Context<Self>) {
-        if !self.enhanced_feature("hidden_content") || self.enhanced.hidden.demo {
+        if !self.enhanced_feature(crate::enhanced::Feature::HiddenContent) || self.enhanced.hidden.demo {
             return;
         }
         let opened = self.session.as_ref().map(|s| s.user_id.clone());
@@ -739,7 +740,7 @@ impl Bloom {
 
     /// The page "Hidden content" of the settings.
     pub(crate) fn render_settings_hidden(&self, cx: &mut Context<Self>) -> Div {
-        use crate::settings::group;
+        use crate::ui::form::group;
         let t = UiTheme::read(cx).clone();
         let soft = t.colors.foreground.opacity(0.6);
         let all = self.enhanced.hidden.all();
@@ -768,7 +769,7 @@ impl Bloom {
                             .size(px(38.))
                             .flex_shrink_0()
                             .rounded_full()
-                            .bg(rgba(0xcccccf69))
+                            .bg(tone::DISC)
                             .flex()
                             .items_center()
                             .justify_center()
@@ -808,16 +809,12 @@ impl Bloom {
                             ),
                     )
                     .child(
-                        div()
-                            .id(SharedString::from(format!("hidden.unhide.{}", entry.key)))
+                        crate::ui::button::bare(SharedString::from(format!("hidden.unhide.{}", entry.key)), "Unhide")
                             .h(px(36.))
                             .px(px(14.))
                             .rounded(px(12.))
-                            .flex()
-                            .items_center()
                             .gap(px(6.))
-                            .cursor_pointer()
-                            .bg(rgba(0xffffff1f))
+                            .bg(tone::HOVER)
                             .hover(|s| s.bg(rgba(0xffffff33)))
                             .text_size(px(14.))
                             .font_weight(gpui_kit::FontWeight::MEDIUM)
@@ -855,7 +852,7 @@ impl Bloom {
         format!(
             "feature={} on={} settings(enabled={} library={} search={} nextup={} continue={}) | \
              app: {} entries: {} | server: {}",
-            self.enhanced_feature("hidden_content"),
+            self.enhanced_feature(crate::enhanced::Feature::HiddenContent),
             self.hidden_on(),
             settings.enabled,
             settings.filter_library,

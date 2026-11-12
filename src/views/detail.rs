@@ -4,6 +4,7 @@
 //! theme: a full-window backdrop, the logo, a poster that stays in place at
 //! the left, a title ribbon with the actions, then details and rows.
 
+use crate::ui::tone;
 use gpui_icons::LucideIcon;
 use gpui_kit::{
     ClickEvent, Context, Div, InteractiveElement as _, IntoElement, ObjectFit,
@@ -265,10 +266,10 @@ impl Bloom {
                 div()
                     .pl(px(l.content_left - 12.))
                     .pr(px(l.side))
-                    // Only the rows in view are built (`admin::rows`): a
+                    // Only the rows in view are built (`ui::rows`): a
                     // season of 150 episodes then costs as much per frame
                     // as one of 8.
-                    .child(crate::admin::rows::rows(
+                    .child(crate::ui::rows::rows(
                         cx,
                         data.episodes.len(),
                         EPISODE_ROW_H + EPISODE_ROW_GAP,
@@ -318,7 +319,7 @@ impl Bloom {
             .left(px(l.side))
             .top(px(vh * 0.15))
             .rounded(px(24.))
-            .shadow(UiTheme::read(cx).shadows.lg.clone())
+            .shadow(UiTheme::read(cx).shadows.lg.to_vec())
             .child(artwork(
                 item.poster_url(&client, (l.poster_w * 2.) as u32),
                 l.poster_w,
@@ -498,9 +499,9 @@ impl Bloom {
         row.child(
             round(
                 "detail.watched",
-                icon(LucideIcon::Check, 25., if played { rgb(0xf5f5f7) } else { fg }),
+                icon(LucideIcon::Check, 25., if played { tone::INK } else { fg }),
             )
-            .when(played, |el| el.bg(rgba(0xf5f5f733)))
+            .when(played, |el| el.bg(tone::EDGE))
                 .tooltip(tip(if played { "Mark unplayed" } else { "Mark played" }))
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_played(cx))),
         )
@@ -582,7 +583,7 @@ impl Bloom {
                         .pr(px(6.))
                         .relative()
                         .rounded(px(8.))
-                        .child(glass(px(8.), rgba(0xffffff1f)))
+                        .child(glass(px(8.), tone::HOVER))
                         .border_1()
                         .border_color(crate::ui::glass::ring(rgba(0xffffff33)))
                         .flex()
@@ -728,7 +729,7 @@ fn meta_line(item: &Item, cx: &Context<Bloom>) -> Div {
                 .flex()
                 .items_center()
                 .gap(px(4.))
-                .child(filled(Filled::Star, 18., rgba(0xf5f5f7cc)))
+                .child(filled(Filled::Star, 18., tone::INK_80))
                 .child(format!("{score:.1}")),
         );
     }
@@ -742,7 +743,7 @@ fn meta_line(item: &Item, cx: &Context<Bloom>) -> Div {
     // Audio languages, as the Jellyfin Enhanced plugin lists them.
     let mut languages: Vec<&'static str> = Vec::new();
     for stream in item.streams("Audio") {
-        if let Some(name) = stream.language.as_deref().and_then(language_name)
+        if let Some(name) = stream.language.as_deref().and_then(bloom_core::languages::name)
             && !languages.contains(&name)
         {
             languages.push(name);
@@ -759,32 +760,6 @@ fn meta_line(item: &Item, cx: &Context<Bloom>) -> Div {
         );
     }
     line
-}
-
-/// English name of a three-letter language code; `None` for unknown codes.
-fn language_name(code: &str) -> Option<&'static str> {
-    Some(match code {
-        "eng" => "English",
-        "spa" => "Spanish",
-        "fre" | "fra" => "French",
-        "ger" | "deu" => "German",
-        "ita" => "Italian",
-        "por" => "Portuguese",
-        "jpn" => "Japanese",
-        "kor" => "Korean",
-        "chi" | "zho" => "Chinese",
-        "rus" => "Russian",
-        "hin" => "Hindi",
-        "ara" => "Arabic",
-        "dut" | "nld" => "Dutch",
-        "swe" => "Swedish",
-        "nor" => "Norwegian",
-        "dan" => "Danish",
-        "fin" => "Finnish",
-        "pol" => "Polish",
-        "tur" => "Turkish",
-        _ => return None,
-    })
 }
 
 /// "Tags: a, b" and the external site names.

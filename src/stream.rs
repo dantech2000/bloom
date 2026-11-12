@@ -15,68 +15,19 @@ use anyhow::{Context as _, Result, anyhow};
 use gpui_kit::{
     Context, Div, ParentElement as _, SharedString, Styled, Window, div, px, rgba,
 };
-use serde::Deserialize;
 
 use crate::{
     app::Bloom,
-    jellyfin::{Client, Item, MediaSource, MediaStream, TICKS_PER_SECOND},
+    jellyfin::{Client, Item, MediaStream},
     player::{PlayRequest, PlayState, Player, PlayerStatus, SubtitleFile},
     ui::{glass::glass, menu::MenuItem},
 };
 
-// ----- the quality ladder ----------------------------------------------------
-
-/// One choice of the quality menu: bits per second, its name, and the
-/// largest picture the web client pairs with it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Rung {
-    pub bitrate: u64,
-    pub label: &'static str,
-    pub height: &'static str,
-}
-
-/// The ladder of the web client (`qualityOptions.js`), highest first.
-pub const LADDER: [Rung; 14] = [
-    Rung { bitrate: 120_000_000, label: "120 Mbps", height: "4K" },
-    Rung { bitrate: 80_000_000, label: "80 Mbps", height: "4K" },
-    Rung { bitrate: 60_000_000, label: "60 Mbps", height: "4K" },
-    Rung { bitrate: 40_000_000, label: "40 Mbps", height: "4K" },
-    Rung { bitrate: 20_000_000, label: "20 Mbps", height: "4K" },
-    Rung { bitrate: 15_000_000, label: "15 Mbps", height: "1440p" },
-    Rung { bitrate: 10_000_000, label: "10 Mbps", height: "1440p" },
-    Rung { bitrate: 8_000_000, label: "8 Mbps", height: "1080p" },
-    Rung { bitrate: 6_000_000, label: "6 Mbps", height: "1080p" },
-    Rung { bitrate: 4_000_000, label: "4 Mbps", height: "720p" },
-    Rung { bitrate: 3_000_000, label: "3 Mbps", height: "720p" },
-    Rung { bitrate: 1_500_000, label: "1.5 Mbps", height: "720p" },
-    Rung { bitrate: 720_000, label: "720 kbps", height: "480p" },
-    Rung { bitrate: 420_000, label: "420 kbps", height: "360p" },
-];
-
-/// The rungs under the bitrate of a file: a cap above it changes nothing.
-/// A file in a codec that packs more into its bits (hevc, av1, vp9) needs
-/// more bits as h264, so the web client counts it one and a half times.
-/// With no bitrate known, the whole ladder.
-pub fn ladder(source_bitrate: Option<u64>, video_codec: Option<&str>) -> Vec<Rung> {
-    let Some(bitrate) = source_bitrate.filter(|b| *b > 0) else {
-        return LADDER.to_vec();
-    };
-    let efficient = matches!(video_codec, Some("hevc" | "h265" | "av1" | "vp9"));
-    let reference = if efficient && bitrate <= 20_000_000 { bitrate * 3 / 2 } else { bitrate };
-    LADDER.iter().copied().filter(|rung| rung.bitrate < reference).collect()
-}
-
-/// "1.5 Mbps" for a bitrate; the name of the rung when it is one.
-pub fn bitrate_label(bitrate: u64) -> String {
-    if let Some(rung) = LADDER.iter().find(|r| r.bitrate == bitrate) {
-        return rung.label.to_string();
-    }
-    if bitrate >= 1_000_000 {
-        format!("{:.1} Mbps", bitrate as f64 / 1_000_000.)
-    } else {
-        format!("{} kbps", bitrate / 1000)
-    }
-}
+pub use bloom_core::bitrate::{LADDER, bitrate_label, ladder};
+pub use bloom_core::playback::{
+    Load, PlayMethod, PlaybackInfo, Target, mpv_id, stream_title,
+};
+use bloom_core::playback::{next_track, query_value, request_body, without_key};
 
 // ----- what the app holds ----------------------------------------------------
 
@@ -132,6 +83,31 @@ pub struct State {
     /// subtitle and the burn-in of `stream_reload_with`. It runs when the
     /// item plays (`stream_poll`).
     pending_reload: Option<(Option<i64>, Option<i64>, bool)>,
+    /// The user chose the audio track of the item in the player; the
+    /// choice of the server does not replace it (`load_timeline`).
+    pub explicit_audio: bool,
+    /// The same for the subtitle.
+    pub explicit_subtitle: bool,
+}
+
+/// A track the user chose, for [`State::chose`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Chosen {
+    Audio,
+    Subtitle,
+}
+
+impl State {
+    /// Notes a choice of a track for the item in the player: by the user
+    /// on a page or in a menu, by a remote control, or by a group that
+    /// keeps the track the player started with. The next item starts
+    /// with no choice (`stream_begin`).
+    pub fn chose(&mut self, track: Chosen) {
+        match track {
+            Chosen::Audio => self.explicit_audio = true,
+            Chosen::Subtitle => self.explicit_subtitle = true,
+        }
+    }
 }
 
 /// Takes the settings of the config and ends a transcode when the app
@@ -160,80 +136,6 @@ pub fn end_current() {
 }
 
 // ----- the answer of the server ------------------------------------------------
-
-/// How the item gets to the player: the file itself, or the stream the
-/// server makes of it (`TranscodingUrl`). The second is a transcode for
-/// every rule of the app, also when the server only repacks the file (a
-/// remux, see `Resolved::remux`): the server runs a job for it that must
-/// end, and the stream has the one audio track the server chose.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PlayMethod {
-    DirectPlay,
-    Transcode,
-}
-
-impl PlayMethod {
-    /// The name the server uses in playback reports.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PlayMethod::DirectPlay => "DirectPlay",
-            PlayMethod::Transcode => "Transcode",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct PlaybackInfo {
-    #[serde(default)]
-    pub media_sources: Vec<MediaSource>,
-    #[serde(default)]
-    pub play_session_id: Option<String>,
-    #[serde(default)]
-    pub error_code: Option<String>,
-}
-
-impl PlaybackInfo {
-    /// The source of the item: the one with its id, else the first.
-    fn source(&self, item_id: &str) -> Option<&MediaSource> {
-        self.media_sources
-            .iter()
-            .find(|s| s.id == item_id)
-            .or_else(|| self.media_sources.first())
-    }
-}
-
-/// The name of a stream in a menu.
-pub fn stream_title(stream: &MediaStream) -> String {
-    stream
-        .display_title
-        .clone()
-        .unwrap_or_else(|| format!("Track {}", stream.index))
-}
-
-/// mpv's id of a stream of the file, by its server index: mpv numbers the
-/// tracks of a kind ("Audio", "Subtitle") from 1 in file order, and the
-/// server numbers every stream of the source in one list. A stream in a
-/// file of its own is not in mpv's list, so it has none. Every choice of
-/// a track by its server index goes through this.
-pub fn mpv_id(streams: &[MediaStream], kind: &str, index: i64) -> Option<i64> {
-    streams
-        .iter()
-        .filter(|s| s.kind == kind && !s.is_external)
-        .position(|s| s.index == index)
-        .map(|place| place as i64 + 1)
-}
-
-/// What the server encodes to.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Target {
-    /// Video and audio together, in bits per second.
-    pub bitrate: u64,
-    pub video_codec: String,
-    pub audio_codec: String,
-    pub container: String,
-    pub protocol: String,
-}
 
 /// The decision of the server for one load.
 #[derive(Clone)]
@@ -275,6 +177,12 @@ impl Resolved {
             (PlayMethod::Transcode, true) => "Direct stream",
             (PlayMethod::Transcode, false) => "Transcoding",
         }
+    }
+
+    /// The name of the method in the playback reports: "DirectStream"
+    /// for a remux, as the server names it.
+    pub fn reported_method(&self) -> &'static str {
+        self.play_method.reported(self.remux)
     }
 
     /// The source video stream.
@@ -344,152 +252,6 @@ impl Resolved {
 
 // ----- the request -------------------------------------------------------------
 
-/// One load: the item and the choices for it.
-#[derive(Clone, Debug)]
-pub struct Load {
-    pub item_id: String,
-    pub title: String,
-    pub start_secs: f64,
-    pub paused: bool,
-    /// Comes back in the `Loaded` or `LoadFailed` event.
-    pub token: u64,
-    /// Server index of the audio stream the user chose; none leaves the
-    /// choice to the server.
-    pub audio: Option<i64>,
-    /// Server index of the subtitle; -1 for none; `None` leaves it to the
-    /// server.
-    pub subtitle: Option<i64>,
-    /// The subtitle is burned into the transcode, whatever the profile
-    /// says: after its file did not come (`subtitle_file_failed`).
-    pub burn_in: bool,
-}
-
-/// The limit sent for "Auto": above every file. The server still applies
-/// its own limit for a client outside its network.
-const NO_LIMIT: u64 = 1_000_000_000;
-
-/// What mpv plays: every container and codec (the profile names none, so
-/// the server matches them all), and for a transcode HEVC or H.264 with
-/// aac, ac3 or eac3 in fragmented MP4 segments over HLS. HEVC first: a
-/// file the server must transcode (over its limit for a remote client)
-/// keeps its codec, which gives more picture for the same bitrate, and the
-/// server's QSV encoder makes both. Measured on 2026-10-20 with Jellyfin
-/// 12.1.0: a Dolby Vision file (The Agency, 4K at 25.8 Mbps over a 25 Mbps
-/// limit) came as HEVC instead of H.264, but still tone mapped to SDR
-/// (bt.709) with the HDR ranges declared below; the server tone maps a
-/// Dolby Vision source whatever the client says. Text subtitles come as
-/// files, and so do PGS and VobSub tracks (`GRAPHICAL`): the server
-/// extracts an embedded one to a `.sup` or an `.mks` and serves the file,
-/// which mpv takes on the side, so an image track on a transcode is not
-/// burned in and a switch of it does not load the item again. The server
-/// burns in the rest (DVB, teletext, an external `.idx/.sub` pair).
-pub fn device_profile(max_bitrate: Option<u64>) -> serde_json::Value {
-    const TEXT: [&str; 4] = ["srt", "ass", "ssa", "vtt"];
-    // The server names the two image formats so; "vobsub" needs the
-    // container, since ffmpeg cannot write an `.idx/.sub` pair (the
-    // web client's profile has the same two entries).
-    const GRAPHICAL: [(&str, Option<&str>); 2] = [("pgssub", None), ("vobsub", Some("mks"))];
-    const EMBEDDED: [&str; 24] = [
-        "srt", "subrip", "ass", "ssa", "vtt", "webvtt", "mov_text", "text", "ttml", "sami",
-        "microdvd", "subviewer", "eia_608", "dvb_teletext", "pgssub", "pgs",
-        "hdmv_pgs_subtitle", "dvdsub", "dvd_subtitle", "dvbsub", "dvb_subtitle", "vobsub",
-        "xsub", "arib_caption",
-    ];
-    let mut subtitles: Vec<serde_json::Value> = EMBEDDED
-        .iter()
-        .map(|format| serde_json::json!({ "Format": format, "Method": "Embed" }))
-        .collect();
-    subtitles.extend(
-        TEXT.iter()
-            .map(|format| serde_json::json!({ "Format": format, "Method": "External" })),
-    );
-    subtitles.extend(GRAPHICAL.iter().map(|(format, container)| {
-        let mut entry = serde_json::json!({ "Format": format, "Method": "External" });
-        if let Some(container) = container {
-            entry["Container"] = serde_json::Value::from(*container);
-        }
-        entry
-    }));
-    let mut profile = serde_json::json!({
-        "Name": crate::config::APP_NAME,
-        "MaxStaticBitrate": 120_000_000u64,
-        "MusicStreamingTranscodingBitrate": 384_000u64,
-        "DirectPlayProfiles": [
-            { "Type": "Video" },
-            { "Type": "Audio" }
-        ],
-        "TranscodingProfiles": [{
-            "Container": "mp4",
-            "Type": "Video",
-            "VideoCodec": "hevc,h264",
-            "AudioCodec": "aac,ac3,eac3,mp3",
-            "Context": "Streaming",
-            "Protocol": "hls",
-            "MaxAudioChannels": "6",
-            "MinSegments": "2",
-            "BreakOnNonKeyFrames": true,
-            // A transcode is at most 1080p. The server tone maps it to
-            // 8-bit SDR in any case, and on the screens of a Mac a 1080p
-            // HEVC picture at the same bitrate is as good as a 4K one
-            // while the encoder does a quarter of the work and the stream
-            // is easier on a weak link. A direct play is not touched.
-            // Measured 2026-10-20: the server answers with MaxWidth=1920
-            // and scales (scale_vaapi 1920x802 for a 3832x1600 source); the
-            // bitrate stays at the cap asked for.
-            "Conditions": [
-                { "Condition": "LessThanEqual", "Property": "Width", "Value": "1920", "IsRequired": false },
-                { "Condition": "LessThanEqual", "Property": "Height", "Value": "1080", "IsRequired": false }
-            ]
-        }],
-        // The HDR ranges the client plays, for an HEVC transcode: a server
-        // tone maps to SDR what the client does not name. Every type the
-        // server knows is here, so a direct play is judged as before. (The
-        // server of 2026-10-20 tone mapped its Dolby Vision sources all the
-        // same; see `device_profile`.)
-        "CodecProfiles": [{
-            "Type": "Video",
-            "Codec": "hevc",
-            "Conditions": [{
-                "Condition": "EqualsAny",
-                "Property": "VideoRangeType",
-                "Value": "SDR|HDR10|HLG|HDR10Plus|DOVI|DOVIWithHDR10|DOVIWithHDR10Plus|DOVIWithHLG|DOVIWithSDR|DOVIWithEL|DOVIWithELHDR10|DOVIInvalid",
-                "IsRequired": false
-            }]
-        }],
-        "ContainerProfiles": [],
-        "SubtitleProfiles": subtitles,
-    });
-    // "Auto" must name a limit too: without one the server takes 8 Mbps,
-    // and every file above that is transcoded.
-    profile["MaxStreamingBitrate"] = serde_json::Value::from(max_bitrate.unwrap_or(NO_LIMIT));
-    profile
-}
-
-/// The body of the `PlaybackInfo` request.
-fn request_body(client: &Client, load: &Load, max_bitrate: Option<u64>) -> serde_json::Value {
-    let mut body = serde_json::json!({
-        "UserId": client.user_id.as_deref().unwrap_or_default(),
-        "DeviceProfile": device_profile(max_bitrate),
-        "StartTimeTicks": (load.start_secs.max(0.) * TICKS_PER_SECOND as f64) as i64,
-        "MediaSourceId": load.item_id,
-        "EnableDirectPlay": true,
-        "EnableDirectStream": true,
-        "EnableTranscoding": true,
-        "AllowVideoStreamCopy": true,
-        "AllowAudioStreamCopy": true,
-        "AutoOpenLiveStream": true,
-        "AlwaysBurnInSubtitleWhenTranscoding": load.burn_in,
-    });
-    body["MaxStreamingBitrate"] = serde_json::Value::from(max_bitrate.unwrap_or(NO_LIMIT));
-    if let Some(audio) = load.audio {
-        body["AudioStreamIndex"] = serde_json::Value::from(audio);
-    }
-    if let Some(subtitle) = load.subtitle {
-        body["SubtitleStreamIndex"] = serde_json::Value::from(subtitle);
-    }
-    body
-}
-
 #[easy_ext::ext(StreamApi)]
 pub(crate) impl Client {
     /// Asks the server how to play an item.
@@ -510,16 +272,6 @@ pub(crate) impl Client {
             ],
         )
     }
-}
-
-/// The value of one name in the query of a URL.
-fn query_value<'a>(url: &'a str, name: &str) -> Option<&'a str> {
-    let (_, query) = url.split_once('?')?;
-    query
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value)
 }
 
 /// Turns the answer of the server into what the player loads. `wanted`
@@ -693,21 +445,6 @@ pub fn negotiate(client: &Client, load: &Load) -> Result<Resolved> {
     Ok(resolved)
 }
 
-/// A URL path without its `ApiKey` (or `api_key`) query value.
-fn without_key(path: &str) -> String {
-    let Some((head, query)) = path.split_once('?') else {
-        return path.to_string();
-    };
-    let kept: Vec<&str> = query
-        .split('&')
-        .filter(|pair| {
-            let name = pair.split('=').next().unwrap_or_default();
-            !name.eq_ignore_ascii_case("ApiKey") && !name.eq_ignore_ascii_case("api_key")
-        })
-        .collect();
-    format!("{head}?{}", kept.join("&"))
-}
-
 /// Starts an item in the player: the player shows it as opening at once,
 /// the server is asked on a thread of its own, and the player loads what
 /// the server answered. A load that comes later wins over this one.
@@ -729,6 +466,7 @@ pub fn start(player: &Player, client: Client, load: Load) {
                 token: load.token,
                 play_session_id: None,
                 play_method: PlayMethod::DirectPlay.as_str().to_string(),
+                transcoding: false,
                 media_source_id: String::new(),
                 subtitles: Vec::new(),
             },
@@ -757,7 +495,8 @@ pub fn start(player: &Player, client: Client, load: Load) {
                     paused: load.paused,
                     token: load.token,
                     play_session_id: Some(resolved.play_session_id.clone()),
-                    play_method: resolved.play_method.as_str().to_string(),
+                    play_method: resolved.reported_method().to_string(),
+                    transcoding: resolved.play_method == PlayMethod::Transcode,
                     media_source_id: resolved.media_source_id.clone(),
                     subtitles,
                 };
@@ -805,14 +544,6 @@ fn item_streams(item: &Item) -> &[MediaStream] {
         .map_or(&item.media_streams, |source| &source.media_streams)
 }
 
-/// The track after `now` in a list, round and round; none when that is
-/// `now` itself or the list is empty.
-fn next_track(tracks: &[i64], now: Option<i64>) -> Option<i64> {
-    let place = now.and_then(|now| tracks.iter().position(|t| *t == now));
-    let next = *tracks.get(place.map_or(0, |p| (p + 1) % tracks.len()))?;
-    (Some(next) != now).then_some(next)
-}
-
 // ----- the app ---------------------------------------------------------------------
 
 impl Bloom {
@@ -828,6 +559,8 @@ impl Bloom {
         let Some(session) = &self.session else { return };
         self.stream.failed_files.clear();
         self.stream.pending_reload = None;
+        self.stream.explicit_audio = false;
+        self.stream.explicit_subtitle = false;
         start(
             &self.player,
             session.client.clone(),
@@ -875,13 +608,13 @@ impl Bloom {
     fn stream_choice_to_player(&mut self, item: &Item, audio: Option<i64>, subtitle: Option<i64>) {
         let streams = item_streams(item);
         if let Some(index) = audio {
-            self.queue.explicit_audio = true;
+            self.stream.chose(Chosen::Audio);
             if let Some(aid) = mpv_id(streams, "Audio", index) {
                 self.player.set_audio(Some(aid));
             }
         }
         if let Some(index) = subtitle {
-            self.queue.explicit_subtitle = true;
+            self.stream.chose(Chosen::Subtitle);
             if index < 0 {
                 self.player.set_subtitle(None);
             } else if let Some(sid) = mpv_id(streams, "Subtitle", index) {
@@ -1144,7 +877,7 @@ impl Bloom {
             log::debug!("no audio track for stream {index}");
             return;
         };
-        self.queue.explicit_audio = true;
+        self.stream.chose(Chosen::Audio);
         if !transcode {
             self.player.set_audio(Some(aid));
         } else if resolved.is_some_and(|r| r.audio_index != Some(index)) {
@@ -1164,7 +897,7 @@ impl Bloom {
             // file are mpv's.
             let sid = mpv_id(item_streams(item), "Subtitle", index);
             if index < 0 || sid.is_some() {
-                self.queue.explicit_subtitle = true;
+                self.stream.chose(Chosen::Subtitle);
                 self.player.set_subtitle(sid);
             }
             return;
@@ -1173,7 +906,7 @@ impl Bloom {
             log::debug!("no subtitle for stream {index}");
             return;
         }
-        self.queue.explicit_subtitle = true;
+        self.stream.chose(Chosen::Subtitle);
         let burned = resolved.burned_subtitle.is_some();
         if index < 0 {
             if burned {
@@ -1216,8 +949,8 @@ impl Bloom {
     pub fn stream_cycle(&mut self, kind: &str) {
         let Some(resolved) = self.stream_resolved().filter(|r| r.play_method == PlayMethod::Transcode) else {
             match kind {
-                "audio" => self.queue.explicit_audio = true,
-                _ => self.queue.explicit_subtitle = true,
+                "audio" => self.stream.chose(Chosen::Audio),
+                _ => self.stream.chose(Chosen::Subtitle),
             }
             self.player.command("cycle", &[kind]);
             return;
@@ -1401,66 +1134,6 @@ mod tests {
     }
 
     #[test]
-    fn ladder_stops_under_the_source_bitrate() {
-        let rungs = ladder(Some(3_794_694), Some("h264"));
-        assert_eq!(rungs.len(), 4);
-        assert_eq!(rungs[0].label, "3 Mbps");
-        assert_eq!(rungs[3].label, "420 kbps");
-        assert_eq!(rungs[0].height, "720p");
-        // An efficient codec counts one and a half times.
-        let rungs = ladder(Some(3_000_000), Some("hevc"));
-        assert_eq!(rungs[0].label, "4 Mbps");
-        assert_eq!(ladder(None, None).len(), 14);
-        assert_eq!(ladder(Some(0), None).len(), 14);
-        assert_eq!(bitrate_label(1_500_000), "1.5 Mbps");
-        assert_eq!(bitrate_label(3_794_694), "3.8 Mbps");
-        assert_eq!(bitrate_label(640_000), "640 kbps");
-    }
-
-    #[test]
-    fn profile_describes_mpv() {
-        let profile = device_profile(Some(1_500_000));
-        assert_eq!(profile["MaxStreamingBitrate"], 1_500_000);
-        assert_eq!(profile["DirectPlayProfiles"][0]["Type"], "Video");
-        let hls = &profile["TranscodingProfiles"][0];
-        assert_eq!(hls["Protocol"], "hls");
-        assert_eq!(hls["VideoCodec"], "hevc,h264");
-        assert_eq!(hls["Container"], "mp4");
-        assert_eq!(hls["BreakOnNonKeyFrames"], true);
-        assert_eq!(hls["Conditions"][0]["Property"], "Width");
-        assert_eq!(hls["Conditions"][0]["Value"], "1920");
-        let hdr = &profile["CodecProfiles"][0];
-        assert_eq!(hdr["Codec"], "hevc");
-        assert_eq!(hdr["Conditions"][0]["Property"], "VideoRangeType");
-        assert!(hdr["Conditions"][0]["Value"].as_str().unwrap().contains("DOVIWithHDR10Plus"));
-        let subtitles = profile["SubtitleProfiles"].as_array().unwrap();
-        let has = |format: &str, method: &str| subtitles.iter().any(|p| p["Format"] == format && p["Method"] == method);
-        assert!(has("pgssub", "Embed"));
-        // An image track comes as a file too: PGS as it is, VobSub in an
-        // `.mks` (the container is the server's condition for that).
-        assert!(has("pgssub", "External"));
-        let vobsub = subtitles.iter().find(|p| p["Format"] == "vobsub" && p["Method"] == "External").unwrap();
-        assert_eq!(vobsub["Container"], "mks");
-        assert!(has("srt", "External"));
-        assert_eq!(device_profile(None)["MaxStreamingBitrate"], NO_LIMIT);
-        let load = Load {
-            item_id: ITEM.into(),
-            title: String::new(),
-            start_secs: 90.,
-            paused: false,
-            token: 0,
-            burn_in: false,
-            audio: Some(1),
-            subtitle: None,
-        };
-        let body = request_body(&client(), &load, None);
-        assert_eq!(body["StartTimeTicks"], 900_000_000);
-        assert_eq!(body["AudioStreamIndex"], 1);
-        assert!(body.get("SubtitleStreamIndex").is_none());
-        assert_eq!(body["UserId"], "user-1");
-    }
-
-    #[test]
     fn direct_play_keeps_the_static_url() {
         let info: PlaybackInfo = serde_json::from_str(DIRECT).unwrap();
         let resolved = resolve(&client(), ITEM, &info, None).unwrap();
@@ -1599,6 +1272,7 @@ mod tests {
             token: 1,
             play_session_id: Some(resolved.play_session_id.clone()),
             play_method: "Transcode".into(),
+            transcoding: true,
             media_source_id: ITEM.into(),
             subtitles: Vec::new(),
         };
@@ -1630,6 +1304,8 @@ mod tests {
         assert!(resolved.remux);
         assert_eq!(resolved.label(), "Direct stream");
         assert_eq!(resolved.play_method.as_str(), "Transcode");
+        // The reports keep the name of the server for it.
+        assert_eq!(resolved.reported_method(), "DirectStream");
         assert!(resolved.target.is_some());
         assert_eq!(resolved.audio_index, Some(1));
         let plain: PlaybackInfo = serde_json::from_str(TRANSCODE).unwrap();
@@ -1663,42 +1339,6 @@ mod tests {
         resolved.burn_in = false;
         resolved.play_method = PlayMethod::DirectPlay;
         assert!(!resolved.burns_in_instead(2), "the server burns nothing into the file itself");
-    }
-
-    #[test]
-    fn a_server_index_maps_to_the_track_of_mpv() {
-        let stream = |kind: &str, index, is_external| MediaStream {
-            kind: kind.into(),
-            index,
-            is_external,
-            ..Default::default()
-        };
-        // The external subtitle comes first in the list of the server.
-        let streams = [
-            stream("Subtitle", 0, true),
-            stream("Video", 1, false),
-            stream("Audio", 2, false),
-            stream("Audio", 3, false),
-            stream("Subtitle", 4, false),
-            stream("Subtitle", 5, false),
-        ];
-        assert_eq!(mpv_id(&streams, "Audio", 2), Some(1));
-        assert_eq!(mpv_id(&streams, "Audio", 3), Some(2));
-        assert_eq!(mpv_id(&streams, "Subtitle", 4), Some(1));
-        assert_eq!(mpv_id(&streams, "Subtitle", 5), Some(2));
-        assert_eq!(mpv_id(&streams, "Subtitle", 0), None, "a file of its own is not a track of the file");
-        assert_eq!(mpv_id(&streams, "Audio", 9), None);
-        assert_eq!(mpv_id(&streams, "Subtitle", -1), None);
-    }
-
-    #[test]
-    fn the_next_track_goes_round() {
-        assert_eq!(next_track(&[-1, 2, 3], Some(-1)), Some(2));
-        assert_eq!(next_track(&[-1, 2, 3], Some(3)), Some(-1));
-        assert_eq!(next_track(&[1, 2], None), Some(1));
-        assert_eq!(next_track(&[1, 2], Some(9)), Some(1));
-        assert_eq!(next_track(&[1], Some(1)), None);
-        assert_eq!(next_track(&[], None), None);
     }
 
     #[test]
