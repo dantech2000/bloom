@@ -36,7 +36,7 @@ const LETTERS: [&str; 27] = [
 
 impl Bloom {
     pub fn render_library(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let Page::Library(data) = &self.page else {
+        let Page::Library(data) = &self.nav.page else {
             unreachable!()
         };
         let Some(client) = self.session.as_ref().map(|s| s.client.clone()) else {
@@ -125,7 +125,7 @@ impl Bloom {
                 // title stood twice, 2026-10-23), or nothing without views.
                 if compact {
                     if views {
-                        Menu::new(&self.show_menu, "View")
+                        Menu::new(&self.popups.show_menu, "View")
                             .trigger(
                                 div()
                                     .id("library.view")
@@ -158,7 +158,7 @@ impl Bloom {
                         .text_color(soft)
                         .child(data.show.label(&data.title));
                     if views {
-                        Menu::new(&self.show_menu, "View")
+                        Menu::new(&self.popups.show_menu, "View")
                             .trigger(title.child(filled(Filled::DropDown, 24., soft)))
                             .into_any_element()
                     } else {
@@ -194,7 +194,7 @@ impl Bloom {
                     // The page of a collection has a menu of its own.
                     .when(data.view.kind == ItemKind::BoxSet, |el| {
                         el.child(icon_menu(
-                            &self.more_menu,
+                            &self.popups.more_menu,
                             "library.more",
                             "More",
                             filled(Filled::More, 22., fg),
@@ -203,13 +203,13 @@ impl Bloom {
                         ))
                     })
                     .child(menu(
-                        &self.filter_menu,
+                        &self.popups.filter_menu,
                         "Filter",
                         LucideIcon::Funnel,
                         data.filter.is_some(),
                     ))
                     .child(menu(
-                        &self.sort_menu,
+                        &self.popups.sort_menu,
                         "Sort",
                         LucideIcon::ArrowDownAZ,
                         data.sort != "SortName" || data.descending,
@@ -331,7 +331,7 @@ impl Bloom {
             .size_full()
             .child(
                 ScrollArea::new("library.scroll")
-                    .track(&self.page_scroll)
+                    .track(&self.nav.scroll)
                     .size_full()
                     .child(
                         div()
@@ -345,5 +345,153 @@ impl Bloom {
                     ),
             )
             .children(picker)
+    }
+}
+
+use crate::{
+    app::{LIBRARY_FILTERS, LIBRARY_SORTS, LibraryData, library_query},
+    ui::menu::MenuItem,
+};
+use gpui_kit::Window;
+
+// The menus of the toolbar, and Play of the library.
+impl Bloom {
+    /// Changes the library view (sort, filter, letter or page) and reloads it.
+    pub(crate) fn update_library(&mut self, change: impl FnOnce(&mut LibraryData), cx: &mut Context<Self>) {
+        if let Page::Library(data) = &mut self.nav.page {
+            let start = data.start;
+            change(data);
+            // A new sort, filter or letter starts again at the first page.
+            if data.start == start {
+                data.start = 0;
+            }
+            self.nav.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+            self.rebuild_library_menus(cx);
+            self.load_page(cx);
+            cx.notify();
+        }
+    }
+
+    /// Rebuilds the sort and filter dropdowns of the library toolbar.
+    pub(crate) fn rebuild_library_menus(&mut self, cx: &mut Context<Self>) {
+        let Page::Library(data) = &self.nav.page else {
+            return;
+        };
+        let this = cx.weak_entity();
+        let mut sorts: Vec<MenuItem> = LIBRARY_SORTS
+            .iter()
+            .map(|(label, key)| {
+                let handle = this.clone();
+                let key: &'static str = key;
+                MenuItem::new(SharedString::from(format!("library.sort.{key}")), *label)
+                    .radio(data.sort == key)
+                    .on_click(move |_, _, cx| {
+                        handle
+                            .update(cx, |this, cx| this.update_library(|d| d.sort = key, cx))
+                            .ok();
+                    })
+            })
+            .collect();
+        sorts.push(MenuItem::separator());
+        for (label, descending) in [("Ascending", false), ("Descending", true)] {
+            let handle = this.clone();
+            sorts.push(
+                MenuItem::new(SharedString::from(format!("library.order.{label}")), label)
+                    .radio(data.descending == descending)
+                    .on_click(move |_, _, cx| {
+                        handle
+                            .update(cx, |this, cx| {
+                                this.update_library(|d| d.descending = descending, cx)
+                            })
+                            .ok();
+                    }),
+            );
+        }
+        let mut filters: Vec<MenuItem> = vec![{
+            let handle = this.clone();
+            MenuItem::new("library.filter.none", "All")
+                .radio(data.filter.is_none())
+                .on_click(move |_, _, cx| {
+                    handle
+                        .update(cx, |this, cx| this.update_library(|d| d.filter = None, cx))
+                        .ok();
+                })
+        }];
+        for (label, key) in LIBRARY_FILTERS {
+            let handle = this.clone();
+            filters.push(
+                MenuItem::new(SharedString::from(format!("library.filter.{key}")), label)
+                    .radio(data.filter == Some(key))
+                    .on_click(move |_, _, cx| {
+                        handle
+                            .update(cx, |this, cx| {
+                                this.update_library(|d| d.filter = Some(key), cx)
+                            })
+                            .ok();
+                    }),
+            );
+        }
+        let library = data.title.clone();
+        let shows: Vec<MenuItem> = LibraryShow::of(data.view.collection_type.as_deref())
+            .iter()
+            .map(|show| {
+                let (show, handle) = (*show, this.clone());
+                MenuItem::new(
+                    SharedString::from(format!("library.show.{show:?}")),
+                    show.label(&library),
+                )
+                .radio(data.show == show)
+                .on_click(move |_, _, cx| {
+                    handle
+                        .update(cx, |this, cx| this.update_library(|d| d.show = show, cx))
+                        .ok();
+                })
+            })
+            .collect();
+        self.popups.show_menu.update(cx, |menu, cx| menu.set_items(shows, cx));
+        self.popups.sort_menu.update(cx, |menu, cx| menu.set_items(sorts, cx));
+        self.popups.filter_menu
+            .update(cx, |menu, cx| menu.set_items(filters, cx));
+        self.rebuild_collection_menu(cx);
+    }
+
+    /// Plays the first item of the current library view, or a random one.
+    pub(crate) fn play_library(&mut self, shuffle: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Page::Library(data) = &self.nav.page else {
+            return;
+        };
+        let mut query = library_query(data);
+        query.start = Some(0);
+        // The first item plays; the others wait in the queue.
+        query.limit = Some(30);
+        if shuffle {
+            query.sort_by = Some("Random".to_string());
+        }
+        let generation = self.nav.generation;
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(client) = this.read_with(cx, |this, _| {
+                this.session.as_ref().map(|s| s.client.clone())
+            }) else {
+                return;
+            };
+            let Some(client) = client else { return };
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.items(&query) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                if this.nav.generation != generation {
+                    return;
+                }
+                match result {
+                    // A series in the queue plays its episodes when its turn
+                    // comes; see `expand_series`.
+                    Ok(page) => this.start_queue(page.items, window, cx),
+                    Err(err) => this.toast("Could not start playback", format!("{err:#}"), cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 }

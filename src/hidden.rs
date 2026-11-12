@@ -680,8 +680,8 @@ impl Bloom {
             return;
         }
         // The pages Back returns to lose them as well.
-        filter_page(&mut self.page, set);
-        for page in &mut self.history {
+        filter_page(&mut self.nav.page, set);
+        for (page, _) in &mut self.nav.history {
             filter_page(page, set);
         }
     }

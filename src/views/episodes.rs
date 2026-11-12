@@ -81,7 +81,7 @@ impl EpisodePicker {
 impl Bloom {
     /// True when the item in the player belongs to a series.
     pub fn can_pick_episode(&self) -> bool {
-        self.playing
+        self.playback.playing
             .as_ref()
             .is_some_and(|item| item.kind == ItemKind::Episode && item.series_id.is_some())
     }
@@ -89,7 +89,7 @@ impl Bloom {
     /// Opens or closes the episode list. It opens at the season of the
     /// episode that plays.
     pub fn toggle_episode_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let series = self.playing.as_ref().and_then(|item| Some((item.series_id.clone()?, item.season_id.clone())));
+        let series = self.playback.playing.as_ref().and_then(|item| Some((item.series_id.clone()?, item.season_id.clone())));
         let Some((series_id, season_id)) = series else {
             // Nothing to list: whatever is open closes, as before.
             self.close_popups(None, window, cx);
@@ -104,7 +104,7 @@ impl Bloom {
 
     /// Shows the episodes of another season.
     fn pick_season(&mut self, season_id: String, cx: &mut Context<Self>) {
-        let Some(series_id) = self.playing.as_ref().and_then(|i| i.series_id.clone()) else {
+        let Some(series_id) = self.playback.playing.as_ref().and_then(|i| i.series_id.clone()) else {
             return;
         };
         self.episode_picker.season = Some(season_id);
@@ -139,7 +139,7 @@ impl Bloom {
                     Some(err) => this.toast("Could not load the episodes", format!("{err:#}"), cx),
                     None => {
                         // The list opens at the episode that plays.
-                        let current = this.playing.as_ref().map(|i| i.id.as_str());
+                        let current = this.playback.playing.as_ref().map(|i| i.id.as_str());
                         let row = this
                             .episode_picker
                             .episodes
@@ -165,7 +165,7 @@ impl Bloom {
     /// Plays an episode of the list; the episodes after it follow.
     fn pick_episode(&mut self, episode: Item, cx: &mut Context<Self>) {
         self.close_panel(Panel::Episodes);
-        if self.playing.as_ref().is_some_and(|i| i.id == episode.id) {
+        if self.playback.playing.as_ref().is_some_and(|i| i.id == episode.id) {
             cx.notify();
             return;
         }
@@ -186,7 +186,7 @@ impl Bloom {
             return None;
         }
         self.session.as_ref()?;
-        let playing = self.playing.as_ref()?;
+        let playing = self.playback.playing.as_ref()?;
         let colors = UiTheme::read(cx).colors;
         let soft = rgba(SOFT);
         // A phone in landscape has little height: the picker is a sheet at
@@ -246,7 +246,7 @@ impl Bloom {
                 let Some(client) = this.session.as_ref().map(|s| s.client.clone()) else {
                     return Vec::new();
                 };
-                let playing = this.playing.as_ref().map(|item| item.id.as_str());
+                let playing = this.playback.playing.as_ref().map(|item| item.id.as_str());
                 let episodes = &this.episode_picker.episodes;
                 episodes[range.start.min(episodes.len())..range.end.min(episodes.len())]
                     .iter()

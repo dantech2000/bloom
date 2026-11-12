@@ -83,7 +83,7 @@ pub fn load(client: &Client, previous: &[Library]) -> Result<Data> {
         total_record_count: u64,
     }
     let idle = |library: &Library| library.refresh_status.as_deref().unwrap_or("Idle") == "Idle";
-    let mut libraries: Vec<Library> = client.get("/Library/VirtualFolders", &[])?;
+    let mut libraries: Vec<Library> = client.virtual_folders()?;
     // The counts are asked for together; one that fails is left out.
     std::thread::scope(|scope| {
         for library in &mut libraries {
@@ -208,7 +208,7 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                 .child(icon(LucideIcon::RotateCw, 16., t.colors.primary_foreground))
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.admin_action("Library scan started", cx, |client| {
-                        client.call("POST", "/Library/Refresh", &[])
+                        client.scan_libraries()
                     })
                 })),
         );
@@ -352,9 +352,8 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                                     move |this, _: &ClickEvent, _, cx| {
                                         let item_id = item_id.clone();
                                         this.admin_action("Scan started", cx, move |client| {
-                                            client.call(
-                                                "POST",
-                                                &format!("/Items/{item_id}/Refresh"),
+                                            client.refresh_item(
+                                                &item_id,
                                                 &[
                                                     ("Recursive", "true".to_string()),
                                                     ("ImageRefreshMode", "Default".to_string()),

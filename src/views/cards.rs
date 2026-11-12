@@ -905,7 +905,7 @@ pub fn grid(
     let stride = (m.grid_w * 1.5).round() + CARD_TEXT_H + ROW_GAP;
     let gap = m.gap;
     let rows = items.len().div_ceil(columns);
-    let scrolled = -f32::from(this.page_scroll.offset().y) - top;
+    let scrolled = -f32::from(this.nav.scroll.offset().y) - top;
     let first = ((scrolled / stride).floor() - 1.).max(0.) as usize;
     let last = ((((scrolled + this.viewport_h) / stride).ceil() + 1.).max(0.) as usize).min(rows);
     let first = first.min(last);
@@ -990,6 +990,208 @@ pub fn empty_state(title: &str, hint: &str, cx: &Context<Bloom>) -> Div {
 /// the window (2 on a Mac, 3 on a phone), so a poster is sharp on both.
 fn image_px(w: f32) -> u32 {
     (w * crate::views::shell::scale_now().max(2.)).round() as u32
+}
+
+use crate::{jellyfin::SeerrItem, ui::menu::MenuItem};
+
+// The context menus of the cards.
+impl Bloom {
+    /// Opens the context menu of a card at the pointer. `row` names the home
+    /// row of the card when the item can be removed from it.
+    pub(crate) fn open_card_menu(
+        &mut self,
+        item: &Item,
+        row: CardRow,
+        position: gpui_kit::Point<gpui_kit::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.weak_entity();
+        let mut items = Vec::new();
+        if item.is_playable() || item.is_series() {
+            let (handle, target) = (this.clone(), item.clone());
+            items.push(
+                MenuItem::new("card.menu.play", "Play").on_click(move |_, window, cx| {
+                    handle
+                        .update(cx, |this, cx| this.play_item(&target, window, cx))
+                        .ok();
+                }),
+            );
+        }
+        // In a SyncPlay group an item can go to the queue of the group.
+        if self.sync.in_group() && item.is_playable() {
+            for (id, label, next) in [
+                ("card.menu.group-next", "Play next in the group", true),
+                ("card.menu.group-queue", "Add to the group queue", false),
+            ] {
+                let (handle, item_id) = (this.clone(), item.id.clone());
+                items.push(MenuItem::new(id, label).on_click(move |_, _, cx| {
+                    handle
+                        .update(cx, |this, cx| {
+                            let intent = crate::syncplay::core::Intent::Enqueue {
+                                item_ids: vec![item_id.clone()],
+                                next,
+                            };
+                            this.sync_user(intent, cx);
+                            this.toast("SyncPlay", "Added to the queue of the group.", cx);
+                        })
+                        .ok();
+                }));
+            }
+        }
+        let played = item.user_data.played;
+        let (handle, target) = (this.clone(), item.clone());
+        items.push(
+            MenuItem::new(
+                "card.menu.played",
+                if played {
+                    "Mark unplayed"
+                } else {
+                    "Mark played"
+                },
+            )
+            .on_click(move |_, _, cx| {
+                handle
+                    .update(cx, |this, cx| this.set_item_played(&target, !played, cx))
+                    .ok();
+            }),
+        );
+        let favorite = item.user_data.is_favorite;
+        let (handle, target) = (this.clone(), item.clone());
+        items.push(
+            MenuItem::new(
+                "card.menu.favorite",
+                if favorite {
+                    "Remove from favorites"
+                } else {
+                    "Add to favorites"
+                },
+            )
+            .on_click(move |_, _, cx| {
+                handle
+                    .update(cx, |this, cx| {
+                        this.set_item_favorite(&target, !favorite, cx)
+                    })
+                    .ok();
+            }),
+        );
+        if row != CardRow::None {
+            let next_up = row == CardRow::NextUp;
+            let (handle, item_id) = (this.clone(), item.id.clone());
+            items.push(MenuItem::separator());
+            items.push(
+                MenuItem::new(
+                    "card.menu.hide",
+                    if next_up {
+                        "Remove from Next Up"
+                    } else {
+                        "Remove from Continue Watching"
+                    },
+                )
+                .on_click(move |_, _, cx| {
+                    let item_id = item_id.clone();
+                    handle
+                        .update(cx, |this, cx| {
+                            this.fetch(
+                                cx,
+                                move |client| client.hide_from_row(next_up, &item_id),
+                                |this, result, cx| match result {
+                                    Ok(()) => this.load_page(cx),
+                                    Err(err) => {
+                                        this.toast("Could not remove the item", format!("{err:#}"), cx)
+                                    }
+                                },
+                            )
+                        })
+                        .ok();
+                }),
+            );
+        }
+        let list_items = self.list_menu_items(item, cx);
+        let in_collection = self.collection_card_items(item, cx);
+        if !list_items.is_empty() || !in_collection.is_empty() {
+            items.push(MenuItem::separator());
+            items.extend(list_items);
+            items.extend(in_collection);
+        }
+        items.extend(self.cast_menu_items(item, cx));
+        items.extend(self.download_menu_items(item, cx));
+        items.extend(self.hide_menu_items(item, false, cx));
+        items.extend(self.metadata_menu_items(&item.id, &item.name, item.kind.name(), cx));
+        if let Some(url) = self.session.as_ref().map(|s| s.client.web_url(&item.id)) {
+            items.push(MenuItem::separator());
+            items.push(
+                MenuItem::new("card.menu.web", "Open in Jellyfin Web")
+                    .on_click(move |_, _, cx| cx.open_url(&url)),
+            );
+        }
+        self.popups.card_menu.update(cx, |menu, cx| {
+            menu.set_items(items, cx);
+            menu.open_at(Some(position), window, cx);
+        });
+    }
+
+    /// Menu of a Seerr card for a title that is not in the library.
+    pub(crate) fn open_seerr_menu(
+        &mut self,
+        item: &SeerrItem,
+        position: gpui_kit::Point<gpui_kit::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.weak_entity();
+        let mut items = Vec::new();
+        let label = match item.status() {
+            Some(2) => Some("Pending approval"),
+            Some(3) => Some("Requested"),
+            Some(5) => Some("Available"),
+            _ => None,
+        };
+        match label {
+            Some(text) => items.push(MenuItem::new("seerr.status", text).disabled(true)),
+            None => {
+                let (handle, target) = (this.clone(), item.clone());
+                let text = if item.media_type == "tv" {
+                    "Request all seasons"
+                } else {
+                    "Request"
+                };
+                items.push(MenuItem::new("seerr.request", text).on_click(move |_, _, cx| {
+                    let target = target.clone();
+                    handle
+                        .update(cx, |this, cx| {
+                            let name = target.display_name();
+                            this.fetch(
+                                cx,
+                                move |client| client.seerr_request(&target),
+                                move |this, result, cx| match result {
+                                    Ok(()) => {
+                                        this.toast("Requested", name.clone(), cx);
+                                        this.load_page(cx);
+                                    }
+                                    Err(err) => {
+                                        this.toast("Request failed", format!("{err:#}"), cx)
+                                    }
+                                },
+                            )
+                        })
+                        .ok();
+                }));
+            }
+        }
+        let url = format!(
+            "https://www.themoviedb.org/{}/{}",
+            item.media_type, item.id
+        );
+        items.push(MenuItem::separator());
+        items.push(
+            MenuItem::new("seerr.tmdb", "Open on TMDB").on_click(move |_, _, cx| cx.open_url(&url)),
+        );
+        self.popups.card_menu.update(cx, |menu, cx| {
+            menu.set_items(items, cx);
+            menu.open_at(Some(position), window, cx);
+        });
+    }
 }
 
 #[cfg(test)]

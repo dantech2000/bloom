@@ -31,7 +31,7 @@ fn back_restores_a_library_page_whose_load_was_thrown_away(cx: &mut TestAppConte
     assert_eq!(server.count("GET", "/Items?"), 1, "the library asked once");
     bloom.update(cx, |this, cx| this.back(cx));
     cx.run_until_parked();
-    bloom.read_with(cx, |this, _| match &this.page {
+    bloom.read_with(cx, |this, _| match &this.nav.page {
         Page::Library(data) => {
             assert!(
                 !data.loading || server.count("GET", "/Items?") > 1,
@@ -62,7 +62,7 @@ fn the_answer_of_a_library_the_user_left_stays_out_of_the_next_one(cx: &mut Test
         this.open_library(item("lib2", "Two", "CollectionFolder"), cx);
     });
     cx.run_until_parked();
-    bloom.read_with(cx, |this, _| match &this.page {
+    bloom.read_with(cx, |this, _| match &this.nav.page {
         Page::Library(data) => {
             let ids: Vec<&str> = data.items.iter().map(|i| i.id.as_str()).collect();
             assert_eq!(ids, ["b1"], "library two shows the titles of library one");
@@ -97,7 +97,7 @@ fn two_servers(this: &mut super::Bloom, one: &MockServer, two: &MockServer) {
 }
 
 fn catalog_ids(this: &super::Bloom) -> Vec<String> {
-    this.catalog.iter().map(|i| i.id.clone()).collect()
+    this.search.catalog.items().iter().map(|i| i.id.clone()).collect()
 }
 
 #[gpui_kit::test]
@@ -119,7 +119,7 @@ fn the_title_index_of_the_last_session_lands_in_the_new_one(cx: &mut TestAppCont
         this.refresh_catalog(cx);
         // ...when the user picks the profile on server two.
         assert!(this.open_session("two", "u2", cx));
-        assert!(this.catalog.is_empty());
+        assert!(this.search.catalog.is_empty());
     });
     cx.run_until_parked();
     bloom.read_with(cx, |this, _| {
@@ -217,8 +217,8 @@ fn open_pilot(bloom: &gpui_kit::Entity<super::Bloom>, cx: &mut gpui_kit::VisualT
         this.session = Some(session(&server.url, "u1"));
         this.screen = Screen::Main;
         // The title index knows movies and series, not episodes.
-        this.catalog = vec![item("m1", "Mayday", "Movie")];
-        this.catalog_loaded = Some(std::time::Instant::now());
+        this.search.catalog = crate::search_index::Index::new(vec![item("m1", "Mayday", "Movie")]);
+        this.search.loaded = Some(std::time::Instant::now());
         this.open_search("pilot".into(), cx);
     });
 }
@@ -235,7 +235,7 @@ fn back_to_pilot(bloom: &gpui_kit::Entity<super::Bloom>, cx: &mut gpui_kit::Visu
         this.search_titles("pilot".into(), cx);
     });
     cx.run_until_parked();
-    bloom.read_with(cx, |this, _| match &this.page {
+    bloom.read_with(cx, |this, _| match &this.nav.page {
         Page::Search(data) => {
             assert_eq!(data.query, data.typed.as_str(), "the debounce would skip this text");
             assert!(
@@ -254,7 +254,7 @@ fn typing_the_last_search_text_again_leaves_the_page_loading(cx: &mut TestAppCon
     let (bloom, cx) = app(cx);
     open_pilot(&bloom, cx, &server);
     cx.run_until_parked();
-    bloom.read_with(cx, |this, _| match &this.page {
+    bloom.read_with(cx, |this, _| match &this.nav.page {
         Page::Search(data) => {
             assert!(!data.loading);
             assert_eq!(data.results.len(), 2);
@@ -262,7 +262,7 @@ fn typing_the_last_search_text_again_leaves_the_page_loading(cx: &mut TestAppCon
         _ => panic!("not the search page"),
     });
     back_to_pilot(&bloom, cx, &server);
-    bloom.read_with(cx, |this, _| match &this.page {
+    bloom.read_with(cx, |this, _| match &this.nav.page {
         Page::Search(data) => assert_eq!(data.results.len(), 2, "the answer of the server is gone"),
         _ => panic!("not the search page"),
     });
@@ -277,13 +277,13 @@ fn an_answer_that_came_while_typing_shows_on_the_return_to_its_text(cx: &mut Tes
     bloom.update(cx, |this, cx| this.search_titles("pilots".into(), cx));
     cx.run_until_parked();
     assert_eq!(server.count("GET", "searchTerm=pilot"), 1);
-    bloom.read_with(cx, |this, _| match &this.page {
+    bloom.read_with(cx, |this, _| match &this.nav.page {
         Page::Search(data) => assert!(data.results.is_empty(), "the answer for 'pilot' shows for 'pilots'"),
         _ => panic!("not the search page"),
     });
     bloom.update(cx, |this, cx| this.search_titles("pilot".into(), cx));
     cx.run_until_parked();
-    bloom.read_with(cx, |this, _| match &this.page {
+    bloom.read_with(cx, |this, _| match &this.nav.page {
         Page::Search(data) => {
             assert!(!data.loading, "the page waits for an answer that already came");
             assert_eq!(data.results.len(), 2);
@@ -300,13 +300,13 @@ fn a_return_to_a_text_whose_search_failed_asks_again(cx: &mut TestAppContext) {
     open_pilot(&bloom, cx, &server);
     cx.run_until_parked();
     assert_eq!(server.count("GET", "searchTerm=pilot"), 1);
-    bloom.read_with(cx, |this, _| match &this.page {
+    bloom.read_with(cx, |this, _| match &this.nav.page {
         Page::Search(data) => assert!(!data.loading),
         _ => panic!("not the search page"),
     });
     back_to_pilot(&bloom, cx, &server);
     assert_eq!(server.count("GET", "searchTerm=pilot"), 2, "the search was not asked again");
-    bloom.read_with(cx, |this, _| match &this.page {
+    bloom.read_with(cx, |this, _| match &this.nav.page {
         Page::Search(data) => assert!(!data.loading, "the page waits after the second failure"),
         _ => panic!("not the search page"),
     });
@@ -342,19 +342,19 @@ fn back_to_a_detail_page_brings_its_own_menus(cx: &mut TestAppContext) {
     bloom.update(cx, |this, cx| {
         this.session = Some(session(&server.url, "u1"));
         this.screen = Screen::Main;
-        this.page = detail(item_with_audio("a", "Track of A"));
+        this.nav.page = detail(item_with_audio("a", "Track of A"));
         this.rebuild_detail_menus(cx);
-        assert_eq!(this.detail_audio_menu.read(cx).labels(), ["Track of A"]);
+        assert_eq!(this.popups.detail_audio_menu.read(cx).labels(), ["Track of A"]);
         this.navigate(detail(item_with_audio("b", "")), cx);
     });
     cx.run_until_parked();
     bloom.update(cx, |this, cx| {
-        assert_eq!(this.detail_audio_menu.read(cx).labels(), ["Track of B"]);
+        assert_eq!(this.popups.detail_audio_menu.read(cx).labels(), ["Track of B"]);
         this.back(cx);
     });
     cx.run_until_parked();
     bloom.read_with(cx, |this, cx| {
-        assert_eq!(this.detail_audio_menu.read(cx).labels(), ["Track of A"], "the menu of the page is the one of the item after it");
+        assert_eq!(this.popups.detail_audio_menu.read(cx).labels(), ["Track of A"], "the menu of the page is the one of the item after it");
     });
 }
 
@@ -423,7 +423,7 @@ fn the_user_is_asked_for_once_for_those_who_ask_together(_cx: &mut TestAppContex
         assert_eq!(client.me().unwrap()["Policy"]["IsAdministrator"], true);
     }
     assert_eq!(server.count("GET", "/Users/Me"), 1);
-    let other = crate::jellyfin::Client::new(&server.url, "device").with_token("another-token", "u2");
+    let other = crate::jellyfin::Client::new(&server.url, "device").with_session("another-token", "u2");
     other.me().unwrap();
     assert_eq!(server.count("GET", "/Users/Me"), 2, "another session got the user of the first");
 }
@@ -441,7 +441,7 @@ fn a_reload_of_the_detail_page_keeps_the_picked_tracks(cx: &mut TestAppContext) 
     bloom.update(cx, |this, cx| {
         this.session = Some(session(&server.url, "u1"));
         this.screen = Screen::Main;
-        this.page = Page::Detail(super::DetailData {
+        this.nav.page = Page::Detail(super::DetailData {
             item: item_with_audio("a", "Track of A"),
             audio: Some(0),
             subtitle: Some(None),
@@ -450,7 +450,7 @@ fn a_reload_of_the_detail_page_keeps_the_picked_tracks(cx: &mut TestAppContext) 
         this.load_page(cx);
     });
     cx.run_until_parked();
-    bloom.read_with(cx, |this, _| match &this.page {
+    bloom.read_with(cx, |this, _| match &this.nav.page {
         Page::Detail(data) => {
             assert!(!data.loading);
             assert_eq!((data.audio, data.subtitle), (Some(0), Some(None)), "the reload dropped the picked tracks");
@@ -477,7 +477,7 @@ fn an_answer_for_the_session_before_opens_no_page(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     bloom.read_with(cx, |this, _| {
-        assert!(matches!(this.page, Page::Home(_)), "the random title of the session before opened");
+        assert!(matches!(this.nav.page, Page::Home(_)), "the random title of the session before opened");
     });
 }
 
@@ -498,7 +498,7 @@ fn the_user_is_asked_for_once_by_callers_at_the_same_time() {
         ("GET", p) if p.starts_with("/Users/Me") => (200, r#"{"Name":"fast"}"#.into()),
         _ => plain(method, path),
     });
-    let client = crate::jellyfin::Client::new(&slow.url, "device").with_token("token-of-the-slow-one", "u1");
+    let client = crate::jellyfin::Client::new(&slow.url, "device").with_session("token-of-the-slow-one", "u1");
     let callers: Vec<_> = (0..4)
         .map(|_| {
             let client = client.clone();
@@ -507,7 +507,7 @@ fn the_user_is_asked_for_once_by_callers_at_the_same_time() {
         .collect();
     // While the slow server still works on its answer.
     thread::sleep(Duration::from_millis(100));
-    let other = crate::jellyfin::Client::new(&fast.url, "device").with_token("token-of-the-fast-one", "u2");
+    let other = crate::jellyfin::Client::new(&fast.url, "device").with_session("token-of-the-fast-one", "u2");
     let started = Instant::now();
     assert_eq!(other.me().unwrap()["Name"], "fast");
     assert!(started.elapsed() < Duration::from_millis(250), "the slow server held up the other: {:?}", started.elapsed());
@@ -576,8 +576,8 @@ fn a_queued_episode_the_server_lost_plays_as_its_replacement(cx: &mut TestAppCon
     cx.executor().advance_clock(std::time::Duration::from_millis(50));
     cx.run_until_parked();
     bloom.read_with(cx, |this, _| {
-        assert!(this.player_open, "the player closed instead of looking for the replacement");
-        assert_eq!(this.playing.as_ref().map(|i| i.id.as_str()), Some("new2"), "the replacement does not play");
+        assert!(this.playback.open, "the player closed instead of looking for the replacement");
+        assert_eq!(this.playback.playing.as_ref().map(|i| i.id.as_str()), Some("new2"), "the replacement does not play");
         let upcoming: Vec<&str> = this.queue.upcoming.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(upcoming, ["new3"], "the queue is not the episodes after the replacement");
     });
@@ -587,7 +587,7 @@ fn a_queued_episode_the_server_lost_plays_as_its_replacement(cx: &mut TestAppCon
     assert_eq!(server.count("POST", "/Items/new2/PlaybackInfo"), 1);
     cx.executor().advance_clock(std::time::Duration::from_millis(50));
     cx.run_until_parked();
-    bloom.read_with(cx, |this, _| assert!(!this.player_open, "the player stays open with nothing to play"));
+    bloom.read_with(cx, |this, _| assert!(!this.playback.open, "the player stays open with nothing to play"));
     assert_eq!(server.count("GET", "season=2"), 1, "the replacement was looked for again");
 }
 
@@ -606,7 +606,7 @@ fn the_home_of_a_session_that_ended_stays_empty(cx: &mut TestAppContext) {
     bloom.update(cx, |this, cx| {
         add_server(this, "one", &server.url, "u1");
         assert!(this.open_session("one", "u1", cx));
-        this.drop_session();
+        this.drop_session(cx);
     });
     cx.run_until_parked();
     assert_eq!(server.count("GET", "/UserViews"), 1, "the home page did not ask");

@@ -20,7 +20,7 @@ use gpui_kit::{
 use serde_json::{Value, json};
 
 use crate::{
-    app::{Bloom, Page},
+    app::{Bloom, Page, Panel},
     icons::icon,
     jellyfin::Client,
     ui::{
@@ -263,7 +263,6 @@ pub struct SeasonsState {
     /// Series page whose seasons were checked: item id and data.
     pub probe: Option<(String, Data)>,
     probing: Option<String>,
-    pub open: bool,
     pub loading: bool,
     pub series_id: String,
     pub data: Option<Data>,
@@ -286,7 +285,7 @@ impl Bloom {
         if !self.request_more_on() {
             return;
         }
-        let Page::Detail(data) = &self.page else {
+        let Page::Detail(data) = &self.nav.page else {
             return;
         };
         if !data.item.is_series() {
@@ -337,10 +336,9 @@ impl Bloom {
         if !self.request_more_on() {
             return;
         }
-        // One popup at a time: a panel does not stay beside the dialog.
-        self.close_panels();
+        // One popup at a time: the dialog is the open panel.
+        self.replace_panel(Panel::Seasons, cx);
         let state = &mut self.enhanced.seasons;
-        state.open = true;
         state.loading = true;
         state.series_id = series_id.clone();
         state.error = None;
@@ -374,7 +372,7 @@ impl Bloom {
     }
 
     pub fn close_seasons_dialog(&mut self, cx: &mut Context<Self>) {
-        self.enhanced.seasons.open = false;
+        self.close_panel(Panel::Seasons);
         cx.notify();
     }
 
@@ -399,12 +397,12 @@ impl Bloom {
                 this.enhanced.seasons.sending = None;
                 // The dialog may show another series by now (closed and
                 // opened again): the answer does not close or mark that one.
-                let shown = this.enhanced.seasons.open && this.enhanced.seasons.series_id == series_id;
+                let shown = this.panel_is(Panel::Seasons) && this.enhanced.seasons.series_id == series_id;
                 match result {
                     Ok(()) => {
                         this.toast("Requested", format!("{title}: {count} season(s)"), cx);
                         if shown {
-                            this.enhanced.seasons.open = false;
+                            this.close_panel(Panel::Seasons);
                         }
                         // The page and the dialog show the new status.
                         this.enhanced.seasons.probe = None;
@@ -420,10 +418,10 @@ impl Bloom {
 
     /// The dialog over the page.
     pub fn render_seasons_dialog(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
-        let state = &self.enhanced.seasons;
-        if !state.open {
+        if !self.panel_is(Panel::Seasons) {
             return None;
         }
+        let state = &self.enhanced.seasons;
         let t = UiTheme::read(cx).clone();
         let soft = tone::INK_70;
         let mut list = div().flex().flex_col().gap(px(2.));
@@ -632,7 +630,7 @@ impl Bloom {
         selected.sort_unstable();
         format!(
             "open={} loading={} sending={} selected={selected:?} error={:?} rows={}",
-            s.open,
+            self.panel_is(Panel::Seasons),
             s.loading,
             s.sending.is_some(),
             s.error,
@@ -770,8 +768,8 @@ mod race_tests {
             this.enhanced.settings = session.client.enhanced_settings().expect("the plugin's settings");
             this.session = Some(session);
             assert!(this.request_more_on());
+            this.replace_panel(crate::app::Panel::Seasons, cx);
             let state = &mut this.enhanced.seasons;
-            state.open = true;
             state.series_id = "a".into();
             state.data = Some(Data {
                 tmdb_id: 7,
@@ -791,7 +789,7 @@ mod race_tests {
         assert_eq!(server.count("POST", "/JellyfinEnhanced/jellyseerr/request"), 1);
         bloom.read_with(cx, |this, _| {
             let state = &this.enhanced.seasons;
-            assert!(state.open, "the answer for series A closed the dialog of series B");
+            assert!(this.panel_is(crate::app::Panel::Seasons), "the answer for series A closed the dialog of series B");
             assert_eq!(state.series_id, "b");
             assert!(state.sending.is_none());
         });

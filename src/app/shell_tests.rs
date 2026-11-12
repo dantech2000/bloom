@@ -16,27 +16,27 @@ fn forward_returns_to_the_page_back_left_until_a_new_page_opens(cx: &mut TestApp
         this.navigate(Page::Downloads, cx);
         this.navigate(Page::Settings(crate::settings::Section::About), cx);
         this.back(cx);
-        assert!(matches!(this.page, Page::Downloads));
-        assert_eq!((this.history.len(), this.forward.len()), (1, 1));
+        assert!(matches!(this.nav.page, Page::Downloads));
+        assert_eq!((this.nav.history.len(), this.nav.forward.len()), (1, 1));
         this.forward(cx);
-        assert!(matches!(this.page, Page::Settings(crate::settings::Section::About)));
-        assert_eq!((this.history.len(), this.forward.len()), (2, 0));
+        assert!(matches!(this.nav.page, Page::Settings(crate::settings::Section::About)));
+        assert_eq!((this.nav.history.len(), this.nav.forward.len()), (2, 0));
         this.forward(cx);
-        assert!(matches!(this.page, Page::Settings(_)), "Forward with nothing ahead stays");
+        assert!(matches!(this.nav.page, Page::Settings(_)), "Forward with nothing ahead stays");
         this.back(cx);
         this.back(cx);
-        assert!(matches!(this.page, Page::Home(_)));
-        assert_eq!((this.history.len(), this.forward.len()), (0, 2));
+        assert!(matches!(this.nav.page, Page::Home(_)));
+        assert_eq!((this.nav.history.len(), this.nav.forward.len()), (0, 2));
         this.forward(cx);
-        assert!(matches!(this.page, Page::Downloads));
+        assert!(matches!(this.nav.page, Page::Downloads));
         // A new page forgets what was ahead.
         this.navigate(Page::Settings(crate::settings::Section::Profile), cx);
-        assert_eq!(this.forward.len(), 0);
+        assert_eq!(this.nav.forward.len(), 0);
         this.forward(cx);
-        assert!(matches!(this.page, Page::Settings(crate::settings::Section::Profile)));
+        assert!(matches!(this.nav.page, Page::Settings(crate::settings::Section::Profile)));
         // Home starts over.
         this.open_home(cx);
-        assert_eq!((this.history.len(), this.forward.len()), (0, 0));
+        assert_eq!((this.nav.history.len(), this.nav.forward.len()), (0, 0));
     });
 }
 
@@ -52,7 +52,7 @@ fn the_screen_takes_the_focus_back_when_the_search_field_leaves_the_page(cx: &mu
     cx.run_until_parked();
     cx.update(|window, cx| {
         bloom.update(cx, |this, cx| {
-            let field = this.search_input.read(cx).focus_handle(cx);
+            let field = this.search.input.read(cx).focus_handle(cx);
             window.focus(&field, cx);
         });
     });
@@ -60,23 +60,23 @@ fn the_screen_takes_the_focus_back_when_the_search_field_leaves_the_page(cx: &mu
     // draws only when asked.
     cx.update(|window, cx| {
         window.draw(cx).clear(cx);
-        assert!(bloom.read(cx).search_input.read(cx).focus_handle(cx).is_focused(window), "the field has the focus");
+        assert!(bloom.read(cx).search.input.read(cx).focus_handle(cx).is_focused(window), "the field has the focus");
     });
     // Typing lands in the field: it is in the frame.
     cx.simulate_input("x");
-    assert_eq!(bloom.read_with(cx, |this, cx| this.search_input.read(cx).value().to_string()), "x");
+    assert_eq!(bloom.read_with(cx, |this, cx| this.search.input.read(cx).value().to_string()), "x");
     // The user opens a result: the search page, with its field, is gone.
     bloom.update(cx, |this, cx| this.open_item(item("m9", "Nine", "Movie"), cx));
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
     cx.update(|window, cx| {
         let this = bloom.read(cx);
-        assert!(!this.search_input.read(cx).focus_handle(cx).is_focused(window), "the field kept the focus");
+        assert!(!this.search.input.read(cx).focus_handle(cx).is_focused(window), "the field kept the focus");
         assert!(this.app_focus.is_focused(window), "the screen did not take the focus back");
     });
     // So Back by its key reaches the screen.
     cx.simulate_keystrokes("cmd-[");
-    bloom.read_with(cx, |this, _| assert!(matches!(this.page, Page::Search(_)), "cmd-[ did not go back"));
+    bloom.read_with(cx, |this, _| assert!(matches!(this.nav.page, Page::Search(_)), "cmd-[ did not go back"));
 }
 
 #[gpui_kit::test]
@@ -97,19 +97,19 @@ fn escape_closes_an_open_panel_before_it_goes_back(cx: &mut TestAppContext) {
     });
     for cast in [false, true] {
         bloom.update(cx, |this, cx| {
-            this.panel = Some(if cast { Panel::Cast } else { Panel::SyncPlay });
+            this.popups.panel = Some(if cast { Panel::Cast } else { Panel::SyncPlay });
             cx.notify();
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
         cx.simulate_keystrokes("escape");
         bloom.read_with(cx, |this, _| {
-            assert!(this.panel.is_none(), "Escape left the panel open");
-            assert!(matches!(this.page, Page::Detail(_)), "Escape went back with a panel open");
+            assert!(this.popups.panel.is_none(), "Escape left the panel open");
+            assert!(matches!(this.nav.page, Page::Detail(_)), "Escape went back with a panel open");
         });
     }
     // With no panel open Escape goes back, as before.
     cx.simulate_keystrokes("escape");
-    bloom.read_with(cx, |this, _| assert!(matches!(this.page, Page::Search(_)), "Escape did not go back"));
+    bloom.read_with(cx, |this, _| assert!(matches!(this.nav.page, Page::Search(_)), "Escape did not go back"));
 }
 
 /// The debug channel answers a question only when a debug command opened
@@ -131,7 +131,7 @@ fn the_debug_channel_knows_its_own_question(cx: &mut TestAppContext) {
         assert!(!this.debug_opened_confirm());
         // A debug command opened this one, and the channel noted it.
         let own = question();
-        this.debug_dialogs.0 = Some(std::rc::Rc::downgrade(&own.run));
+        this.debug.dialogs.0 = Some(std::rc::Rc::downgrade(&own.run));
         this.dialogs.confirm = Some(own);
         assert!(this.debug_opened_confirm());
         // It is closed, and a person opens another: not the channel's.
@@ -147,12 +147,12 @@ fn the_debug_channel_knows_its_own_question(cx: &mut TestAppContext) {
 fn the_keys_list_and_the_panels_close_together(cx: &mut TestAppContext) {
     let (bloom, cx) = app(cx);
     bloom.update(cx, |this, cx| {
-        this.panel = Some(Panel::Help);
+        this.popups.panel = Some(Panel::Help);
         assert!(this.panel_open());
         assert!(this.close_panels());
         assert!(!this.panel_open());
         assert!(!this.close_panels());
-        this.panel = Some(Panel::Cast);
+        this.popups.panel = Some(Panel::Cast);
         this.ask_confirm(
             crate::admin::Confirm {
                 title: String::new(),
@@ -163,7 +163,7 @@ fn the_keys_list_and_the_panels_close_together(cx: &mut TestAppContext) {
             },
             cx,
         );
-        assert!(this.panel.is_none(), "a panel stays open beside the question");
+        assert!(this.popups.panel.is_none(), "a panel stays open beside the question");
     });
 }
 
@@ -172,7 +172,7 @@ fn the_keys_list_and_the_panels_close_together(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn a_panel_and_a_menu_are_never_open_together(cx: &mut TestAppContext) {
     let (bloom, cx) = app(cx);
-    let menu = bloom.read_with(cx, |this, _| this.profile_menu.clone());
+    let menu = bloom.read_with(cx, |this, _| this.popups.profile_menu.clone());
     cx.update(|window, cx| {
         menu.update(cx, |menu, cx| {
             menu.set_items([crate::ui::menu::MenuItem::new("one", "One")], cx);
@@ -183,7 +183,7 @@ fn a_panel_and_a_menu_are_never_open_together(cx: &mut TestAppContext) {
     cx.update(|window, cx| {
         bloom.update(cx, |this, cx| {
             assert!(this.toggle_panel(Panel::SyncPlay, window, cx));
-            assert!(!this.profile_menu.read(cx).is_open(), "the menu stays open beside the panel");
+            assert!(!this.popups.profile_menu.read(cx).is_open(), "the menu stays open beside the panel");
             this.open_panel(Panel::Cast, window, cx);
             assert!(this.panel_is(Panel::Cast) && !this.panel_is(Panel::SyncPlay));
         });
@@ -191,7 +191,7 @@ fn a_panel_and_a_menu_are_never_open_together(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     bloom.read_with(cx, |this, cx| {
-        assert!(this.profile_menu.read(cx).is_open());
+        assert!(this.popups.profile_menu.read(cx).is_open());
         assert!(!this.panel_open(), "the panel stays open beside the menu");
     });
 }
@@ -339,4 +339,24 @@ fn a_saved_window_place_does_not_wait_to_be_saved_again(cx: &mut TestAppContext)
     bloom.update(cx, |this, cx| {
         assert!(!this.flush_config_save(cx), "a save that went out still counts as waiting");
     });
+}
+
+/// The card under the pointer is a card of the page: a page that opens,
+/// and Back, start with no card hovered.
+#[gpui_kit::test]
+fn no_card_stays_hovered_over_a_change_of_the_page(cx: &mut TestAppContext) {
+    use crate::views::cards::HoveredCard;
+    let (bloom, cx) = app(cx);
+    let hovered = |cx: &mut gpui_kit::VisualTestContext| cx.update(|_, cx| cx.try_global::<HoveredCard>().and_then(|h| h.0.clone()));
+    bloom.update(cx, |this, cx| {
+        this.screen = Screen::Main;
+        cx.set_global(HoveredCard(Some("poster.m1".into())));
+        this.navigate(Page::Downloads, cx);
+    });
+    assert_eq!(hovered(cx), None, "the card of the page before is still hovered");
+    bloom.update(cx, |this, cx| {
+        cx.set_global(HoveredCard(Some("poster.m2".into())));
+        this.back(cx);
+    });
+    assert_eq!(hovered(cx), None, "Back kept the hovered card");
 }

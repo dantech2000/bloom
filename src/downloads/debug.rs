@@ -10,7 +10,7 @@ impl Bloom {
     /// Where the player got its item: the local file or the stream, and
     /// the path mpv reports. For the debug channel.
     pub fn downloads_source_label(&self) -> String {
-        let Some(playing) = self.playing.as_ref() else {
+        let Some(playing) = self.playback.playing.as_ref() else {
             return "none".to_string();
         };
         let server = self.session.as_ref().and_then(|s| s.client.server_id.clone());
@@ -18,7 +18,7 @@ impl Bloom {
             Some(path) => format!("local:{}", path.display()),
             None => "stream".to_string(),
         };
-        format!("{source} mpv_path={:?}", self.player_status.path)
+        format!("{source} mpv_path={:?}", self.playback.status.path)
     }
 
     /// The debug channel: `downloads list|add <id>|cancel <id>|resume <id>|
@@ -93,7 +93,7 @@ impl Bloom {
                 _ => return "error: downloads offline on|off".into(),
             },
             "play" => {
-                self.muted = true;
+                self.playback.muted = true;
                 self.play_download(None, arg, window, cx);
             }
             "state" | "" => {}
@@ -115,7 +115,7 @@ impl Bloom {
             engine.free_bytes().map_or("?".to_string(), format_bytes),
             engine.dir().display(),
             self.downloads_source_label(),
-            self.segments
+            self.playback.segments
                 .iter()
                 .map(|s| format!("{} {:.1}-{:.1}", s.kind, s.start_secs(), s.end_secs()))
                 .collect::<Vec<_>>()

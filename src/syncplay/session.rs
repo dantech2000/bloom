@@ -386,10 +386,7 @@ fn spawn_requests(client: Client, failed: async_channel::Sender<Background>) -> 
                 if batch[n + 1..].iter().any(|later| later.replaces(request)) {
                     continue;
                 }
-                let result = match request.body() {
-                    Some(body) => client.post(request.path(), &body).map(drop),
-                    None => client.call("POST", request.path(), &[]),
-                };
+                let result = client.syncplay_request(request.path(), request.body().as_ref());
                 if let Err(err) = result {
                     log::warn!("syncplay: {} failed: {err:#}", request.path());
                     if let Some(what) = request.asked() {
@@ -423,7 +420,7 @@ fn spawn_clock(
             // must not mix two origins.
             let clock = *local.read().unwrap();
             let sent = clock.now();
-            let answer = client.get::<UtcTime>("/GetUtcTime", &[]);
+            let answer = client.utc_time::<UtcTime>();
             let received = clock.now();
             let asked = Instant::now();
             match answer {

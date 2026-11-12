@@ -214,9 +214,7 @@ pub fn flush(client: &Client) -> Result<usize> {
 /// the newer one, and when the server does not say: the position then
 /// goes to the server as before.
 fn newer_on_server(client: &Client, who: &Identity, item_id: &str, at: i64) -> Option<i64> {
-    let data: serde_json::Value = client
-        .get(&format!("/UserItems/{item_id}/UserData"), &[("userId", who.user_id.clone())])
-        .ok()?;
+    let data = client.user_data_json(item_id, &who.user_id).ok()?;
     let played = crate::syncplay::protocol::parse_time(data.get("LastPlayedDate")?.as_str()?)? / 1000.;
     // `at` is in whole seconds, cut off: a play of the server counts as
     // newer from the next second on.
@@ -256,9 +254,7 @@ fn flush_in(dir: &Path, client: &Client, no_report: bool) -> Result<usize> {
             continue;
         }
         let body = serde_json::json!({ "PlaybackPositionTicks": ticks });
-        let result = client
-            .post(&format!("/UserItems/{item_id}/UserData?userId={}", who.user_id), &body)
-            .map(drop);
+        let result = client.save_user_data(&item_id, &who.user_id, &body);
         match result {
             Ok(()) => {
                 sent += 1;

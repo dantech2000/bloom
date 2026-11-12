@@ -25,7 +25,7 @@ use crate::{
 
 impl Bloom {
     pub fn render_search(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let Page::Search(data) = &self.page else {
+        let Page::Search(data) = &self.nav.page else {
             unreachable!()
         };
         let Some(client) = self.session.as_ref().map(|s| s.client.clone()) else {
@@ -120,7 +120,7 @@ impl Bloom {
 
         div().size_full().child(
             ScrollArea::new("search.scroll")
-                .track(&self.page_scroll)
+                .track(&self.nav.scroll)
                 .size_full()
                 .child(
                     div()
@@ -131,7 +131,7 @@ impl Bloom {
                         .pb(px(72.))
                         .child(
                             div().px(px(m.side)).flex().justify_center().child(
-                                Input::new(&self.search_input)
+                                Input::new(&self.search.input)
                                     .keyboard(crate::ui::input::Keyboard::search())
                                     .aria_label("Search")
                                     .w(px(640.))

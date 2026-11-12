@@ -299,7 +299,7 @@ impl Bloom {
 
     /// Opens the editor of the task with this name. For the debug channel.
     pub fn triggers_open_named(&mut self, name: &str, cx: &mut Context<Self>) -> bool {
-        let Page::Admin(admin) = &self.page else {
+        let Page::Admin(admin) = &self.nav.page else {
             return false;
         };
         let found = admin.tasks.as_ref().and_then(|data| {
@@ -365,7 +365,7 @@ impl Bloom {
                         None => bail!("the trigger is not on the server any more"),
                     },
                 }
-                client.post(&format!("/ScheduledTasks/{work_id}/Triggers"), &list)?;
+                client.set_task_triggers(&work_id, &list)?;
                 read_triggers(&client, &work_id)
             },
             move |this, result, cx| {
@@ -380,7 +380,7 @@ impl Bloom {
                     }
                 }
                 // The task list behind shows the new schedule.
-                if matches!(this.page, Page::Admin(_)) {
+                if matches!(this.nav.page, Page::Admin(_)) {
                     this.load_page(cx);
                 }
                 cx.notify();
@@ -524,7 +524,7 @@ fn hours_text(minutes: i64) -> String {
 }
 
 fn read_triggers(client: &crate::jellyfin::Client, id: &str) -> Result<Vec<Value>> {
-    let task: Value = client.get(&format!("/ScheduledTasks/{id}"), &[])?;
+    let task = client.scheduled_task(id)?;
     Ok(task.get("Triggers").and_then(Value::as_array).cloned().unwrap_or_default())
 }
 
@@ -792,7 +792,7 @@ mod race_tests {
             this.screen = Screen::Main;
             let mut admin = AdminData::new(Section::Tasks);
             admin.loading = false;
-            this.page = Page::Admin(admin);
+            this.nav.page = Page::Admin(admin);
             this.triggers_open("t1", "Scan", "", cx);
         });
         cx.run_until_parked();

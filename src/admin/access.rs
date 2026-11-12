@@ -341,7 +341,7 @@ impl Bloom {
             draft: Draft::default(),
         };
         let id = user.id.clone();
-        if let Page::Admin(admin) = &mut self.page {
+        if let Page::Admin(admin) = &mut self.nav.page {
             admin.access = Some(editor);
         }
         cx.notify();
@@ -350,12 +350,12 @@ impl Bloom {
             {
                 let id = id.clone();
                 move |client| -> Result<(Value, Vec<(String, String)>)> {
-                    let user: Value = client.get(&format!("/Users/{id}"), &[])?;
+                    let user = client.user_json(&id)?;
                     let policy = user.get("Policy").cloned().unwrap_or(Value::Null);
                     if !policy.is_object() {
                         bail!("the server sent no policy for this user");
                     }
-                    let folders: Value = client.get("/Library/MediaFolders", &[])?;
+                    let folders = client.media_folders()?;
                     let folders = folders
                         .get("Items")
                         .and_then(Value::as_array)
@@ -606,8 +606,7 @@ impl Bloom {
         self.fetch(
             cx,
             move |client| -> Result<Value> {
-                let path = format!("/Users/{work_id}");
-                let user: Value = client.get(&path, &[])?;
+                let user = client.user_json(&work_id)?;
                 let fresh = user.get("Policy").cloned().unwrap_or(Value::Null);
                 // The server refuses a policy without these two.
                 for key in ["AuthenticationProviderId", "PasswordResetProviderId"] {
@@ -616,8 +615,8 @@ impl Bloom {
                     }
                 }
                 let policy = merge_policy(&fresh, &sent.original, &sent.edited, &locked);
-                client.post(&format!("{path}/Policy"), &policy)?;
-                let user: Value = client.get(&path, &[])?;
+                client.set_user_policy(&work_id, &policy)?;
+                let user = client.user_json(&work_id)?;
                 Ok(user.get("Policy").cloned().unwrap_or(Value::Null))
             },
             move |this, result, cx| {
@@ -634,7 +633,7 @@ impl Bloom {
                     }
                 }
                 // The Users page behind shows the new badges.
-                if matches!(this.page, Page::Admin(_)) {
+                if matches!(this.nav.page, Page::Admin(_)) {
                     this.load_page(cx);
                 }
                 cx.notify();
@@ -675,19 +674,14 @@ impl Bloom {
         )
     }
 
-    /// The debug commands `access ...` and `triggers ...`; one entry in
-    /// `src/debug.rs`. Opening and saving run on a background thread: read
-    /// the result with `access state` or `triggers list`.
+    /// The debug command `access ...` (`src/debug.rs`). Opening and saving
+    /// run on a background thread: read the result with `access state`.
     pub fn debug_access(
         &mut self,
-        command: &str,
         rest: &str,
         _window: &mut gpui_kit::Window,
         cx: &mut Context<Self>,
     ) -> String {
-        if command == "triggers" {
-            return self.debug_triggers(rest, cx);
-        }
         let (verb, arg) = rest.split_once(' ').unwrap_or((rest, ""));
         let arg = arg.trim();
         match verb {
@@ -721,7 +715,7 @@ impl Bloom {
     /// The bar with Save and Discard, while the editor has changes.
     pub fn render_access_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
         let editor = self.access()?;
-        if !editor.dirty() || !matches!(&self.page, Page::Admin(admin) if admin.section == super::Section::Users) {
+        if !editor.dirty() || !matches!(&self.nav.page, Page::Admin(admin) if admin.section == super::Section::Users) {
             return None;
         }
         Some(bar_shell(
@@ -987,7 +981,7 @@ mod race_tests {
             this.screen = Screen::Main;
             let mut admin = AdminData::new(Section::Users);
             admin.loading = false;
-            this.page = Page::Admin(admin);
+            this.nav.page = Page::Admin(admin);
             let user: User = serde_json::from_value(json!({ "Id": "u9", "Name": "jellyui-test-nine" })).expect("user");
             this.access_open(&user, cx);
         });

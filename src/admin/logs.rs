@@ -25,6 +25,10 @@ use crate::{
 
 /// Lines of the log that the page keeps and shows.
 const TAIL_LINES: usize = 300;
+/// The most of a log file that is read, from its end. A log of a busy day
+/// at the debug level is hundreds of megabytes; the page shows its last
+/// lines.
+const READ_BYTES: usize = 16 * 1024 * 1024;
 /// A longer line is cut here; the page shows one row for each line.
 const LINE_CHARS: usize = 400;
 /// Height of a line of the viewer.
@@ -66,8 +70,10 @@ pub struct Data {
     /// Name of the file the lines come from.
     pub open: Option<String>,
     pub lines: Vec<Line>,
-    /// Lines in the whole file.
+    /// Lines in the whole file; in the part that was read when `cut`.
     pub total_lines: usize,
+    /// The file is larger than [`READ_BYTES`]: its end alone was read.
+    pub cut: bool,
     /// Whether any line has a time and a level: the viewer keeps a column
     /// for them then. An FFmpeg log has none.
     pub timed: bool,
@@ -76,7 +82,7 @@ pub struct Data {
 /// `wanted` is the file the user chose; without one, the page opens the
 /// newest server log.
 pub fn load(client: &Client, wanted: Option<&str>) -> Result<Data> {
-    let mut files: Vec<LogFile> = client.get("/System/Logs", &[])?;
+    let mut files: Vec<LogFile> = client.log_files()?;
     files.sort_by(|a, b| b.date_modified.cmp(&a.date_modified));
     // The server log is the one to read; plugins and FFmpeg write others.
     let open = files
@@ -85,12 +91,13 @@ pub fn load(client: &Client, wanted: Option<&str>) -> Result<Data> {
         .or(files.iter().find(|f| f.name.starts_with("log_")))
         .or(files.first())
         .map(|f| f.name.clone());
-    let (lines, total_lines) = match &open {
+    let (lines, total_lines, cut) = match &open {
         Some(name) => {
-            let text = client.get_text("/System/Logs/Log", &[("name", name.clone())])?;
-            tail(&text)
+            let (text, cut) = client.log_tail(name, READ_BYTES)?;
+            let (lines, total) = tail(&text);
+            (lines, total, cut)
         }
-        None => (Vec::new(), 0),
+        None => (Vec::new(), 0, false),
     };
     let timed = lines.iter().any(|line| !line.time.is_empty());
     Ok(Data {
@@ -98,6 +105,7 @@ pub fn load(client: &Client, wanted: Option<&str>) -> Result<Data> {
         open,
         lines,
         total_lines,
+        cut,
         timed,
     })
 }
@@ -424,10 +432,10 @@ fn file_row(
             el.child(icon(LucideIcon::ChevronRight, 16., t.colors.foreground.opacity(0.35)))
         })
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-            if let Page::Admin(data) = &mut this.page {
+            if let Page::Admin(data) = &mut this.nav.page {
                 data.log_open = Some(name.clone());
             }
-            this.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+            this.nav.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
             this.load_page(cx);
         }))
 }
@@ -475,7 +483,12 @@ fn viewer(data: &Data, compact: bool, cx: &mut Context<Bloom>) -> Div {
         .gap(px(10.))
         .text_size(px(14.))
         .text_color(t.colors.muted_foreground)
-        .child(format!("Last {} of {} lines", data.lines.len(), data.total_lines));
+        .child(if data.cut {
+            // The start of a large file was not read: its lines are not counted.
+            format!("Last {} lines of a large log (its last {} MB were read)", data.lines.len(), READ_BYTES >> 20)
+        } else {
+            format!("Last {} of {} lines", data.lines.len(), data.total_lines)
+        });
     if warnings > 0 {
         heading = heading.child(badge(
             format!("{warnings} {}", if warnings == 1 { "warning" } else { "warnings" }),

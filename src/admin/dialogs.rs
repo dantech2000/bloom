@@ -391,7 +391,7 @@ mod tests {
     fn a_question_on_the_downloads_page_is_an_open_dialog(cx: &mut TestAppContext) {
         let (bloom, cx) = app(cx);
         bloom.update(cx, |this, cx| {
-            this.page = Page::Downloads;
+            this.nav.page = Page::Downloads;
             assert!(!this.admin_dialog_open());
             this.ask_confirm(
                 crate::admin::Confirm {

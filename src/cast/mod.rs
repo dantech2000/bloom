@@ -257,7 +257,7 @@ impl Bloom {
         let body = protocol::capabilities(control);
         self.fetch(
             cx,
-            move |client| client.post("/Sessions/Capabilities/Full", &body).map(drop),
+            move |client| client.post_capabilities(&body),
             move |this, result, _| match result {
                 Ok(()) => {
                     log::info!("remote control: capabilities posted (control={control})");
@@ -321,10 +321,10 @@ impl Bloom {
             return;
         }
         let local = Local {
-            player_open: self.player_open,
-            paused: self.player_status.paused,
-            volume: self.volume,
-            muted: self.muted,
+            player_open: self.playback.open,
+            paused: self.playback.status.paused,
+            volume: self.playback.volume,
+            muted: self.playback.muted,
         };
         match protocol::plan(&command, local) {
             Action::TogglePause => self.request_toggle_pause(cx),
@@ -341,7 +341,7 @@ impl Bloom {
                 self.cast.pending.push(Pending::Volume(volume));
             }
             Action::SetMuted(muted) => {
-                if self.muted != muted {
+                if self.playback.muted != muted {
                     self.toggle_mute(cx);
                 }
             }
@@ -380,7 +380,7 @@ impl Bloom {
         if items.is_empty() {
             return;
         }
-        let playing = self.player_open && self.playing.is_some();
+        let playing = self.playback.open && self.playback.playing.is_some();
         match command {
             PlayCommand::PlayNext if playing => {
                 self.queue.upcoming.splice(0..0, items);
@@ -438,7 +438,7 @@ impl Bloom {
         for pending in std::mem::take(&mut self.cast.pending) {
             match pending {
                 Pending::Volume(volume) => self
-                    .volume_slider
+                    .playback.volume_slider
                     .update(cx, |slider, cx| slider.set_value(volume, window, cx)),
                 Pending::Fullscreen => window.toggle_fullscreen(),
             }
@@ -556,14 +556,14 @@ impl Bloom {
                 self.watch_airplay(cx);
                 // The engine may hold an item already (the debug channel
                 // sends one): it is the one the app plays.
-                let remote = AirPlayRemote::new(self.airplay.clone(), self.playing.clone());
+                let remote = AirPlayRemote::new(self.airplay.clone(), self.playback.playing.clone());
                 self.cast.remote = Some(Remote::AirPlay(remote));
             }
         }
         if self.cast.active() {
             self.start_cast_tick(cx);
         }
-        if self.cast.active() && self.player_open {
+        if self.cast.active() && self.playback.open {
             self.player.stop();
             self.close_player_view(cx);
         }
@@ -579,7 +579,7 @@ impl Bloom {
             self.cast_effect(effect, cx);
         }
         if self.cast.subscribed {
-            self.sync.socket_send("SessionsStop", None);
+            self.socket.send("SessionsStop", None);
             self.cast.subscribed = false;
         }
         cx.notify();
@@ -640,8 +640,7 @@ impl Bloom {
         self.fetch(
             cx,
             move |client| {
-                let sessions: Vec<SessionInfo> =
-                    client.get("/Sessions", &[("controllableByUserId", user_id)])?;
+                let sessions: Vec<SessionInfo> = client.sessions(&[("controllableByUserId", user_id)])?;
                 Ok(protocol::controllable(sessions, &device_id))
             },
             move |this, result, cx| {
@@ -710,7 +709,7 @@ impl Bloom {
 
     /// Asks the server to push the sessions over the socket.
     fn cast_subscribe(&mut self) {
-        if self.sync.socket_send("SessionsStart", Some(Value::String(SUBSCRIPTION.into()))) {
+        if self.socket.send("SessionsStart", Some(Value::String(SUBSCRIPTION.into()))) {
             self.cast.subscribed = true;
         }
     }
@@ -788,7 +787,7 @@ impl Bloom {
     /// of that shows as a toast.
     fn cast_effect(&mut self, effect: Effect, cx: &mut Context<Self>) {
         if let Some(item) = effect.playing {
-            self.playing = Some(item);
+            self.playback.playing = Some(item);
         }
         if let Some(text) = effect.toast {
             self.toast("Play On", text, cx);

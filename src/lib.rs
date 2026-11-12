@@ -3,7 +3,7 @@
 //! Bloom, the app: its modules, and the start of it for the Mac binary
 //! (`src/main.rs`) and the iOS library (`ios/`).
 // The parts with no window live in `bloom-core`; they keep their names here.
-pub(crate) use bloom_core::{brand, config, jellyfin, news, options, realtime, search_index};
+pub(crate) use bloom_core::{brand, config, jellyfin, news, options, pages, realtime, search_index};
 
 mod adaptive;
 mod admin;

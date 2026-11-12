@@ -341,14 +341,14 @@ impl Bloom {
 
     /// The state of the admin page while it is open.
     pub fn admin_data(&self) -> Option<&AdminData> {
-        match &self.page {
+        match &self.nav.page {
             Page::Admin(data) => Some(data),
             _ => None,
         }
     }
 
     pub fn admin_data_mut(&mut self) -> Option<&mut AdminData> {
-        match &mut self.page {
+        match &mut self.nav.page {
             Page::Admin(data) => Some(data),
             _ => None,
         }
@@ -359,9 +359,8 @@ impl Bloom {
     /// an editor on a page the user left kept "Saving…" for good when its
     /// answer looked at the page on show alone.
     pub(crate) fn admin_pages_mut(&mut self) -> impl Iterator<Item = &mut AdminData> {
-        std::iter::once(&mut self.page)
-            .chain(self.history.iter_mut())
-            .chain(self.forward.iter_mut())
+        self.nav
+            .pages_mut()
             .filter_map(|page| match page {
                 Page::Admin(data) => Some(data),
                 _ => None,
@@ -372,7 +371,7 @@ impl Bloom {
         if !self.is_admin() {
             return;
         }
-        match &mut self.page {
+        match &mut self.nav.page {
             // Inside the dashboard a section change keeps the loaded data.
             Page::Admin(data) => {
                 data.section = section;
@@ -391,7 +390,7 @@ impl Bloom {
                     data.plugin_editor = None;
                     data.plugin_open = None;
                 }
-                self.page_scroll
+                self.nav.scroll
                     .set_offset(gpui_kit::point(px(0.), px(0.)));
                 self.load_page(cx);
                 cx.notify();
@@ -411,7 +410,7 @@ impl Bloom {
         if !self.compact_w() {
             return false;
         }
-        let Page::Admin(data) = &mut self.page else {
+        let Page::Admin(data) = &mut self.nav.page else {
             return false;
         };
         if data.list {
@@ -421,24 +420,24 @@ impl Bloom {
         // it has nothing to save), then the page of a user.
         if data.access.as_ref().is_some_and(|editor| !editor.dirty()) {
             data.access = None;
-            self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+            self.nav.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
             cx.notify();
             return true;
         }
         if data.user_open.is_some() {
             data.user_open = None;
-            self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+            self.nav.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
             cx.notify();
             return true;
         }
         if data.section == Section::Logs && data.log_open.is_some() {
             data.log_open = None;
-            self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+            self.nav.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
             cx.notify();
             return true;
         }
         data.list = true;
-        self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+        self.nav.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
         cx.notify();
         true
     }
@@ -453,7 +452,7 @@ impl Bloom {
         window: &mut gpui_kit::Window,
         cx: &mut Context<Self>,
     ) {
-        self.admin_menu.update(cx, |menu, cx| {
+        self.popups.admin_menu.update(cx, |menu, cx| {
             menu.set_items(items, cx);
             menu.open_at(Some(position), window, cx);
         });
@@ -461,18 +460,18 @@ impl Bloom {
 
     /// Opens the page of a user on the Users section.
     pub fn admin_open_user(&mut self, id: String, cx: &mut Context<Self>) {
-        if let Page::Admin(data) = &mut self.page {
+        if let Page::Admin(data) = &mut self.nav.page {
             data.user_open = Some(id);
-            self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+            self.nav.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
             cx.notify();
         }
     }
 
     /// Back from the page of a user to the list.
     pub fn admin_close_user(&mut self, cx: &mut Context<Self>) {
-        if let Page::Admin(data) = &mut self.page {
+        if let Page::Admin(data) = &mut self.nav.page {
             data.user_open = None;
-            self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+            self.nav.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
             cx.notify();
         }
     }
@@ -499,7 +498,7 @@ impl Bloom {
 
     /// Loads the data of the open section. `load_page` calls this.
     pub fn load_admin(&mut self, cx: &mut Context<Self>) {
-        let Page::Admin(data) = &mut self.page else {
+        let Page::Admin(data) = &mut self.nav.page else {
             return;
         };
         data.loading = true;
@@ -524,7 +523,7 @@ impl Bloom {
                 })
             },
             move |this, result, cx| {
-                if let Page::Admin(data) = &mut this.page {
+                if let Page::Admin(data) = &mut this.nav.page {
                     data.loading = false;
                     match result {
                         Ok(loaded) => {
@@ -566,8 +565,8 @@ impl Bloom {
             loop {
                 cx.background_executor().timer(LIVE_INTERVAL).await;
                 let open = this.update(cx, |this, cx| {
-                    let open = matches!(this.page, Page::Admin(_));
-                    if open && this.playing.is_none() {
+                    let open = matches!(this.nav.page, Page::Admin(_));
+                    if open && this.playback.playing.is_none() {
                         this.refresh_admin(cx);
                     } else if !open {
                         this.admin_live.tick = None;
@@ -584,7 +583,7 @@ impl Bloom {
     /// Loads the live part of the dashboard again. The page does not show
     /// that it loads, and an error keeps the data of the last load.
     fn refresh_admin(&mut self, cx: &mut Context<Self>) {
-        let Page::Admin(data) = &self.page else {
+        let Page::Admin(data) = &self.nav.page else {
             return;
         };
         // The poll waits while the server is offline; recovery loads the page.
@@ -639,15 +638,15 @@ impl Bloom {
     ) {
         self.admin_live.busy = true;
         self.admin_live.load += 1;
-        let (load, generation) = (self.admin_live.load, self.generation);
+        let (load, generation) = (self.admin_live.load, self.nav.generation);
         self.fetch(cx, work, move |this, result, cx| {
             if this.admin_live.load == load {
                 this.admin_live.busy = false;
             }
             // A load that brings the same data back causes no redraw; see
             // `AdminData::redraw_due`.
-            if let (Page::Admin(data), Ok(value)) = (&mut this.page, result)
-                && this.generation == generation
+            if let (Page::Admin(data), Ok(value)) = (&mut this.nav.page, result)
+                && this.nav.generation == generation
             {
                 let changed = take(data, value);
                 if data.redraw_due(changed) {
@@ -706,7 +705,7 @@ impl Bloom {
                 Ok(()) => this.toast(done, "", cx),
                 Err(err) => this.toast("The server refused the change", format!("{err:#}"), cx),
             }
-            if matches!(this.page, Page::Admin(_)) {
+            if matches!(this.nav.page, Page::Admin(_)) {
                 this.load_page(cx);
             }
             cx.notify();
@@ -714,7 +713,7 @@ impl Bloom {
     }
 
     pub fn render_admin(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let Page::Admin(data) = &self.page else {
+        let Page::Admin(data) = &self.nav.page else {
             unreachable!()
         };
         let t = UiTheme::read(cx).clone();
@@ -825,7 +824,7 @@ impl Bloom {
                 el.child(
                     div().flex_1().min_w_0().h_full().child(
                         ScrollArea::new("admin.scroll")
-                            .track(&self.page_scroll)
+                            .track(&self.nav.scroll)
                             .size_full()
                             .child(
                                 div()
@@ -939,7 +938,7 @@ fn section_page<D>(
                 div().flex().child(
                     button("admin.retry", "Try again", ButtonKind::Primary, cx)
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            if let Page::Admin(data) = &mut this.page {
+                            if let Page::Admin(data) = &mut this.nav.page {
                                 data.error = None;
                             }
                             this.load_page(cx);
@@ -1323,7 +1322,7 @@ mod live_tests {
             this.session = Some(session(&server.url, "u1"));
             let mut admin = AdminData::new(Section::Tasks);
             admin.loading = false;
-            this.page = Page::Admin(admin);
+            this.nav.page = Page::Admin(admin);
             // Three ticks before the first answer.
             this.refresh_admin(cx);
             this.refresh_admin(cx);

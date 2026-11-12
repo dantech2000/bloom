@@ -190,7 +190,7 @@ fn playlist_row(
 
 impl Bloom {
     pub fn render_playlist(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let Page::Playlist(data) = &self.page else {
+        let Page::Playlist(data) = &self.nav.page else {
             unreachable!()
         };
         if self.session.is_none() {
@@ -286,7 +286,7 @@ impl Bloom {
                 total,
                 ROW_H + ROW_GAP,
                 |this, range, cx| {
-                    let (Page::Playlist(data), Some(session)) = (&this.page, &this.session) else {
+                    let (Page::Playlist(data), Some(session)) = (&this.nav.page, &this.session) else {
                         return Vec::new();
                     };
                     let total = data.entries.len();
@@ -302,7 +302,7 @@ impl Bloom {
 
         div().relative().size_full().child(
             ScrollArea::new("playlist.scroll")
-                .track(&self.page_scroll)
+                .track(&self.nav.scroll)
                 .size_full()
                 .child(
                     div()
@@ -318,12 +318,7 @@ impl Bloom {
 
     /// The dialog of the lists over the page.
     pub fn render_lists_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        // The question of the app ("Delete playlist?", "Delete user?")
-        // draws here as well: this is the place the root render has for
-        // a dialog over any page, and one of the two shows at a time.
-        let Some(dialog) = self.lists.dialog.as_ref() else {
-            return self.render_confirm(cx);
-        };
+        let dialog = self.lists.dialog.as_ref()?;
         let fg = UiTheme::read(cx).colors.foreground;
         let soft = tone::INK_70;
 

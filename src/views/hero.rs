@@ -107,6 +107,9 @@ pub struct HeroVideo {
     play_inactive: bool,
     /// Device pixels per point of the window.
     scale: f32,
+    /// The size the trailer player was last told, in device pixels: it
+    /// hears of a new one, not of each render.
+    target: std::cell::Cell<(u32, u32)>,
     last_redraw: Instant,
     _activation: Option<Subscription>,
 }
@@ -125,6 +128,7 @@ impl Default for HeroVideo {
             held: false,
             play_inactive: crate::options::options().hero_play_inactive,
             scale: 2.,
+            target: Default::default(),
             last_redraw: Instant::now(),
             _activation: None,
         }
@@ -212,15 +216,6 @@ impl Bloom {
         self.hero.video.player.set_muted(self.hero.video.muted);
     }
 
-    /// Liquid glass or the frosted glass of before, for every panel.
-    pub fn toggle_liquid_glass(&mut self, cx: &mut Context<Self>) {
-        let on = !self.config.liquid_glass.unwrap_or(true);
-        self.config.liquid_glass = Some(on);
-        self.save_config(cx);
-        crate::ui::glass::set_liquid(on);
-        cx.refresh_windows();
-    }
-
     /// Turns trailer backdrops on or off and keeps the choice.
     pub fn toggle_hero_video(&mut self, cx: &mut Context<Self>) {
         let enabled = !self.config.hero_video.unwrap_or(true);
@@ -242,11 +237,11 @@ impl Bloom {
     fn hero_visible(&self) -> bool {
         // Not behind the sign-in page: the home page is still the page
         // under it, and its trailer would play there.
-        matches!(self.page, Page::Home(_))
+        matches!(self.nav.page, Page::Home(_))
             && self.screen == crate::app::Screen::Main
-            && !self.player_open
+            && !self.playback.open
             && !self.hero.slides.is_empty()
-            && -f32::from(self.page_scroll.offset().y) < self.hero_height()
+            && -f32::from(self.nav.scroll.offset().y) < self.hero_height()
     }
 
     /// Requests the trailer of the current slide, if it has one.
@@ -434,9 +429,10 @@ impl Bloom {
         let soft = rgba(0xffffffd9);
 
         let video = &self.hero.video;
-        video
-            .player
-            .set_target_size((vw * video.scale) as u32, (height * video.scale) as u32);
+        let target = ((vw * video.scale) as u32, (height * video.scale) as u32);
+        if video.target.replace(target) != target {
+            video.player.set_target_size(target.0, target.1);
+        }
         let playing = video.phase == Phase::Playing;
         let frame = video
             .frame
@@ -871,11 +867,6 @@ fn slide_shown(elapsed: Duration, trailer_loads: bool) -> Duration {
     } else {
         elapsed
     }
-}
-
-/// A hero item is usable only with a backdrop to show.
-pub fn usable(item: &Item) -> bool {
-    !item.backdrop_image_tags.is_empty()
 }
 
 #[cfg(test)]

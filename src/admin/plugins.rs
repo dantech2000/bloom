@@ -85,7 +85,7 @@ impl Probed {
 }
 
 pub fn load(client: &Client) -> Result<Data> {
-    let mut plugins: Vec<Plugin> = client.get("/Plugins", &[])?;
+    let mut plugins: Vec<Plugin> = client.plugins()?;
     plugins.sort_by_key(|p| p.name.to_lowercase());
     let server = client.url("", &[]);
     let now = Instant::now();
@@ -105,8 +105,8 @@ pub fn load(client: &Client) -> Result<Data> {
             .map(|p| (p.id.clone(), p.version.clone()))
             .filter(|key| !known.contains_key(key))
             .map(|key| {
-                let path = format!("/Plugins/{}/Configuration", key.0);
-                (key, scope.spawn(move || client.get::<serde_json::Value>(&path, &[])))
+                let id = key.0.clone();
+                (key, scope.spawn(move || client.plugin_configuration(&id)))
             })
             .collect();
         asks.into_iter()
@@ -216,7 +216,7 @@ impl MenuPlugin {
                     let (id, version) = (id.clone(), version.clone());
                     let done = if verb == "Enable" { "Plugin enabled" } else { "Plugin disabled" };
                     this.admin_action(done, cx, move |client| {
-                        client.call("POST", &format!("/Plugins/{id}/{version}/{verb}"), &[])
+                        client.set_plugin_enabled(&id, &version, verb == "Enable")
                     })
                 }),
             },
@@ -238,7 +238,7 @@ impl MenuPlugin {
                 run: Rc::new(move |this, cx| {
                     let (id, version) = (id.clone(), version.clone());
                     this.admin_action("Plugin uninstalled", cx, move |client| {
-                        client.call("DELETE", &format!("/Plugins/{id}/{version}"), &[])
+                        client.uninstall_plugin(&id, &version)
                     })
                 }),
             },

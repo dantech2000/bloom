@@ -91,7 +91,7 @@ pub fn load(client: &Client) -> Result<Data> {
         #[serde(default)]
         items: Vec<Device>,
     }
-    let mut devices = client.get::<Page>("/Devices", &[])?.items;
+    let mut devices = client.devices::<Page>()?.items;
     // Server dates sort as text.
     devices.sort_by(|a, b| b.date_last_activity.cmp(&a.date_last_activity));
     Ok(Data { devices })
@@ -334,7 +334,7 @@ fn ask_delete(app: &mut Bloom, device: &Device, cx: &mut Context<Bloom>) {
         run: Rc::new(move |this, cx| {
             let id = id.clone();
             this.admin_action("Device deleted", cx, move |client| {
-                client.call("DELETE", "/Devices", &[("id", id)])
+                client.delete_device(&id)
             });
         }),
     };

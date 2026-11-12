@@ -48,6 +48,12 @@ struct Layout {
 }
 
 impl Bloom {
+    /// The step from one episode card of a detail row to the next: the
+    /// row of the season starts at the episode of the page by it.
+    pub(crate) fn detail_episode_step(&self) -> f32 {
+        self.detail_layout().episode_w + self.metrics().gap
+    }
+
     fn detail_layout(&self) -> Layout {
         let (vw, vh) = (self.viewport_w, self.viewport_h);
         // A phone: one column the width of the page, and no poster beside
@@ -83,7 +89,7 @@ impl Bloom {
     }
 
     pub fn render_detail(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let Page::Detail(data) = &self.page else {
+        let Page::Detail(data) = &self.nav.page else {
             unreachable!()
         };
         let Some(client) = self.session.as_ref().map(|s| s.client.clone()) else {
@@ -274,7 +280,7 @@ impl Bloom {
                         data.episodes.len(),
                         EPISODE_ROW_H + EPISODE_ROW_GAP,
                         |this, range, cx| {
-                            let (Page::Detail(data), Some(session)) = (&this.page, &this.session)
+                            let (Page::Detail(data), Some(session)) = (&this.nav.page, &this.session)
                             else {
                                 return Vec::new();
                             };
@@ -335,7 +341,7 @@ impl Bloom {
             .children(backdrop)
             .child(
                 ScrollArea::new("detail.scroll")
-                    .track(&self.page_scroll)
+                    .track(&self.nav.scroll)
                     .size_full()
                     .child(
                         div()
@@ -519,7 +525,7 @@ impl Bloom {
         )
         .child(
             icon_menu(
-                &self.more_menu,
+                &self.popups.more_menu,
                 "detail.more",
                 "More",
                 filled(Filled::More, 25., fg),
@@ -608,7 +614,7 @@ impl Bloom {
                 .unwrap_or(0);
             rows = rows.child(if audio.len() > 1 {
                 row("Audio").child(select(
-                    &self.detail_audio_menu,
+                    &self.popups.detail_audio_menu,
                     "Audio",
                     title(&audio, current),
                     longest(&audio),
@@ -629,7 +635,7 @@ impl Bloom {
                 None => "Off".to_string(),
             };
             rows = rows.child(row("Subtitles").child(select(
-                &self.detail_subtitle_menu,
+                &self.popups.detail_subtitle_menu,
                 "Subtitles",
                 text,
                 longest(&subtitles),
@@ -657,7 +663,7 @@ impl Bloom {
             ("detail.cast", "Cast & Crew", false),
             ("detail.guests", "Guest Stars", true),
         ] {
-            let people = merged_people(&data.item.people, guests);
+            let people = if guests { &data.guests } else { &data.cast };
             let cards = Cards::new(w, people.len(), |i, cx| {
                 let (person, role) = &people[i];
                 person_card(person, role, client, w, h, cx)
@@ -885,34 +891,6 @@ fn plain_section(
         )
 }
 
-/// Cast in credit order. The crew roles of one person join into one card.
-fn merged_people(people: &[Person], guests: bool) -> Vec<(&Person, String)> {
-    let mut out: Vec<(&Person, String)> = Vec::new();
-    for person in people {
-        if (person.kind == "GuestStar") != guests {
-            continue;
-        }
-        let role = match person.kind.as_str() {
-            "Actor" | "GuestStar" => person
-                .role
-                .clone()
-                .filter(|r| !r.is_empty())
-                .map(|r| format!("as {r}"))
-                .unwrap_or_default(),
-            other => other.to_string(),
-        };
-        match out.iter_mut().find(|(p, _)| p.id == person.id) {
-            Some((_, roles)) if !role.is_empty() && !roles.contains(&role) => {
-                roles.push_str(" / ");
-                roles.push_str(&role);
-            }
-            Some(_) => {}
-            None => out.push((person, role)),
-        }
-    }
-    out
-}
-
 fn person_card(
     person: &Person,
     role: &str,
@@ -1063,3 +1041,136 @@ fn episode_row(ep: &Item, client: &Client, vw: f32, cx: &mut Context<Bloom>) -> 
         )
 }
 
+use crate::ui::menu::MenuItem;
+use gpui_kit::Window;
+
+// The menus of the page, and Play with the tracks picked on it.
+impl Bloom {
+    /// Rebuilds the track menus and the "more" menu of the detail page.
+    pub(crate) fn rebuild_detail_menus(&mut self, cx: &mut Context<Self>) {
+        self.subs_load_rights(cx);
+        let Page::Detail(data) = &self.nav.page else {
+            return;
+        };
+        let this = cx.weak_entity();
+        let title = |stream: &crate::jellyfin::MediaStream, n: usize| {
+            stream
+                .display_title
+                .clone()
+                .unwrap_or_else(|| format!("Track {}", n + 1))
+        };
+
+        let audio_streams = data.item.streams("Audio");
+        let current_audio = data
+            .audio
+            .or_else(|| audio_streams.iter().position(|s| s.is_default))
+            .unwrap_or(0);
+        let audio: Vec<MenuItem> = audio_streams
+            .iter()
+            .enumerate()
+            .map(|(n, stream)| {
+                let handle = this.clone();
+                MenuItem::new(SharedString::from(format!("detail.audio.{n}")), title(stream, n))
+                    .radio(n == current_audio)
+                    .on_click(move |_, _, cx| {
+                        handle
+                            .update(cx, |this, cx| {
+                                if let Page::Detail(data) = &mut this.nav.page {
+                                    data.audio = Some(n);
+                                }
+                                this.rebuild_detail_menus(cx);
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+            })
+            .collect();
+
+        let subtitle_streams = data.item.streams("Subtitle");
+        let current_subtitle = data
+            .subtitle
+            .unwrap_or_else(|| subtitle_streams.iter().position(|s| s.is_default));
+        let pick_subtitle = |choice: Option<usize>, label: String| {
+            let handle = this.clone();
+            let id = match choice {
+                Some(n) => format!("detail.subtitle.{n}"),
+                None => "detail.subtitle.off".to_string(),
+            };
+            MenuItem::new(SharedString::from(id), label)
+                .radio(choice == current_subtitle)
+                .on_click(move |_, _, cx| {
+                    handle
+                        .update(cx, |this, cx| {
+                            if let Page::Detail(data) = &mut this.nav.page {
+                                data.subtitle = Some(choice);
+                            }
+                            this.rebuild_detail_menus(cx);
+                            cx.notify();
+                        })
+                        .ok();
+                })
+        };
+        let mut subtitles = vec![pick_subtitle(None, "Off".to_string())];
+        subtitles.extend(
+            subtitle_streams
+                .iter()
+                .enumerate()
+                .map(|(n, stream)| pick_subtitle(Some(n), title(stream, n))),
+        );
+
+        if let Some(search) = self.subs_search_item(&data.item.id, &data.item.display_title(), cx) {
+            subtitles.push(MenuItem::separator());
+            subtitles.push(search);
+        }
+
+        let web = self
+            .session
+            .as_ref()
+            .map(|s| s.client.web_url(&data.item.id));
+        let handle = this.clone();
+        let mut more = vec![MenuItem::new("detail.refresh", "Refresh").on_click(
+            move |_, _, cx| {
+                handle.update(cx, |this, cx| this.load_page(cx)).ok();
+            },
+        )];
+        if let Some(url) = web {
+            more.push(
+                MenuItem::new("detail.web", "Open in Jellyfin Web")
+                    .on_click(move |_, _, cx| cx.open_url(&url)),
+            );
+        }
+
+        let item = data.item.clone();
+        let list_items = self.list_menu_items(&item, cx);
+        if !list_items.is_empty() {
+            more.push(MenuItem::separator());
+            more.extend(list_items);
+        }
+        more.extend(self.hide_menu_items(&item, true, cx));
+        more.extend(self.metadata_menu_items(&item.id, &item.name, item.kind.name(), cx));
+
+        self.popups.detail_audio_menu
+            .update(cx, |menu, cx| menu.set_items(audio, cx));
+        self.popups.detail_subtitle_menu
+            .update(cx, |menu, cx| menu.set_items(subtitles, cx));
+        self.popups.more_menu.update(cx, |menu, cx| menu.set_items(more, cx));
+    }
+
+    /// Plays the detail page item with the tracks picked on the page.
+    pub(crate) fn play_detail(&mut self, resume: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Page::Detail(data) = &self.nav.page else {
+            return;
+        };
+        let (item, audio, subtitle) = (data.item.clone(), data.audio, data.subtitle);
+        if item.is_series() {
+            self.play_series(&item, window, cx);
+            return;
+        }
+        // The load takes the choice: the server gets it, for a transcode,
+        // and mpv, for the file itself (`stream_begin`).
+        self.stream.wanted_audio = audio;
+        self.stream.wanted_subtitle = subtitle;
+        self.play(&item, resume, window, cx);
+        self.stream_choice_left(&item);
+    }
+}

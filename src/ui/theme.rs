@@ -74,10 +74,6 @@ pub struct UiColors {
     pub background: Rgba,
     /// Default foreground.
     pub foreground: Rgba,
-    /// Card background.
-    pub card: Rgba,
-    /// Card foreground.
-    pub card_foreground: Rgba,
     /// Popover background.
     pub popover: Rgba,
     /// Popover foreground.
@@ -86,18 +82,10 @@ pub struct UiColors {
     pub primary: Rgba,
     /// Primary control foreground.
     pub primary_foreground: Rgba,
-    /// Secondary control background.
-    pub secondary: Rgba,
-    /// Secondary control foreground.
-    pub secondary_foreground: Rgba,
     /// Muted background.
     pub muted: Rgba,
     /// Muted foreground.
     pub muted_foreground: Rgba,
-    /// Accent background.
-    pub accent: Rgba,
-    /// Accent foreground.
-    pub accent_foreground: Rgba,
     /// Destructive action color.
     pub destructive: Rgba,
     /// Default border.
@@ -106,22 +94,6 @@ pub struct UiColors {
     pub input: Rgba,
     /// Focus ring.
     pub ring: Rgba,
-    /// Sidebar background.
-    pub sidebar: Rgba,
-    /// Sidebar foreground.
-    pub sidebar_foreground: Rgba,
-    /// Sidebar primary background.
-    pub sidebar_primary: Rgba,
-    /// Sidebar primary foreground.
-    pub sidebar_primary_foreground: Rgba,
-    /// Sidebar accent background.
-    pub sidebar_accent: Rgba,
-    /// Sidebar accent foreground.
-    pub sidebar_accent_foreground: Rgba,
-    /// Sidebar border.
-    pub sidebar_border: Rgba,
-    /// Sidebar focus border color.
-    pub sidebar_ring: Rgba,
 }
 
 /// Theme font family names. Applications own font loading.
@@ -364,30 +336,16 @@ fn neutral_light_colors() -> UiColors {
     UiColors {
         background: neutral(1.0),
         foreground: neutral(0.145),
-        card: neutral(1.0),
-        card_foreground: neutral(0.145),
         popover: neutral(1.0),
         popover_foreground: neutral(0.145),
         primary: neutral(0.205),
         primary_foreground: neutral(0.985),
-        secondary: neutral(0.97),
-        secondary_foreground: neutral(0.205),
         muted: neutral(0.97),
         muted_foreground: neutral(0.556),
-        accent: neutral(0.97),
-        accent_foreground: neutral(0.205),
         destructive: srgb(0xdc, 0x26, 0x26),
         border: neutral(0.922),
         input: neutral(0.922),
         ring: neutral(0.708),
-        sidebar: neutral(0.985),
-        sidebar_foreground: neutral(0.145),
-        sidebar_primary: neutral(0.205),
-        sidebar_primary_foreground: neutral(0.985),
-        sidebar_accent: neutral(0.97),
-        sidebar_accent_foreground: neutral(0.205),
-        sidebar_border: neutral(0.922),
-        sidebar_ring: neutral(0.708),
     }
 }
 
@@ -395,30 +353,16 @@ fn neutral_dark_colors() -> UiColors {
     UiColors {
         background: neutral(0.145),
         foreground: neutral(0.985),
-        card: neutral(0.205),
-        card_foreground: neutral(0.985),
         popover: neutral(0.205),
         popover_foreground: neutral(0.985),
         primary: neutral(0.922),
         primary_foreground: neutral(0.205),
-        secondary: neutral(0.269),
-        secondary_foreground: neutral(0.985),
         muted: neutral(0.269),
         muted_foreground: neutral(0.708),
-        accent: neutral(0.269),
-        accent_foreground: neutral(0.985),
         destructive: srgb(0xff, 0x64, 0x67),
         border: neutral_alpha(1.0, 0.10),
         input: neutral_alpha(1.0, 0.15),
         ring: neutral(0.556),
-        sidebar: neutral(0.205),
-        sidebar_foreground: neutral(0.985),
-        sidebar_primary: srgb(0x14, 0x47, 0xe6),
-        sidebar_primary_foreground: neutral(0.985),
-        sidebar_accent: neutral(0.269),
-        sidebar_accent_foreground: neutral(0.985),
-        sidebar_border: neutral_alpha(1.0, 0.10),
-        sidebar_ring: neutral(0.556),
     }
 }
 
@@ -481,10 +425,6 @@ mod tests {
 
         assert_eq!(neutral_light_colors().destructive, srgb(0xdc, 0x26, 0x26));
         assert_eq!(neutral_dark_colors().destructive, srgb(0xff, 0x64, 0x67));
-        assert_eq!(
-            neutral_dark_colors().sidebar_primary,
-            srgb(0x14, 0x47, 0xe6)
-        );
     }
 
     #[test]
@@ -492,7 +432,6 @@ mod tests {
         let dark = neutral_dark_colors();
         assert_eq!(dark.border.a, 0.10);
         assert_eq!(dark.input.a, 0.15);
-        assert_eq!(dark.sidebar_border.a, 0.10);
         assert!((dark.input.opacity(0.30).a - 0.045).abs() < f32::EPSILON);
     }
 

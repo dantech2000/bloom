@@ -34,11 +34,11 @@ impl Bloom {
         cx: &mut Context<Self>,
     ) -> Option<u64> {
         let client = self.session.as_ref()?.client.clone();
-        if self.player_open {
+        if self.playback.open {
             self.player.stop();
             self.close_player_view(cx);
         }
-        self.playing = Some(item.clone());
+        self.playback.playing = Some(item.clone());
         // With AirPlay as the target, the panel shows this item.
         if let Some(Remote::AirPlay(remote)) = &mut self.cast.remote {
             remote.item = Some(item.clone());

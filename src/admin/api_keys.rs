@@ -49,7 +49,7 @@ pub fn load(client: &Client) -> Result<Data> {
         #[serde(default)]
         items: Vec<Key>,
     }
-    let mut keys = client.get::<Page>("/Auth/Keys", &[])?.items;
+    let mut keys = client.api_keys::<Page>()?.items;
     keys.sort_by(|a, b| b.date_created.cmp(&a.date_created));
     Ok(Data { keys })
 }
@@ -206,10 +206,7 @@ fn ask_revoke(app: &mut Bloom, key: &Key, cx: &mut Context<Bloom>) {
         run: Rc::new(move |this, cx| {
             let token = token.clone();
             this.admin_action("API key revoked", cx, move |client| {
-                // The error text of `call` holds the path, and so the key.
-                client
-                    .call("DELETE", &format!("/Auth/Keys/{token}"), &[])
-                    .map_err(|_| anyhow::anyhow!("the key was not revoked"))
+                client.revoke_api_key(&token)
             });
         }),
     };
@@ -218,7 +215,7 @@ fn ask_revoke(app: &mut Bloom, key: &Key, cx: &mut Context<Bloom>) {
 
 /// Asks to revoke the key of a program, by its name. For the debug channel.
 pub(crate) fn ask_revoke_named(app: &mut Bloom, name: &str, cx: &mut Context<Bloom>) -> bool {
-    let crate::app::Page::Admin(data) = &app.page else {
+    let crate::app::Page::Admin(data) = &app.nav.page else {
         return false;
     };
     let key = data
@@ -279,7 +276,7 @@ fn create(app: &mut Bloom, name: String, cx: &mut Context<Bloom>) {
                 .into_iter()
                 .map(|k| k.access_token)
                 .collect();
-            client.call("POST", "/Auth/Keys", &[("app", name.clone())])?;
+            client.create_api_key(&name)?;
             let after = load(&client)?;
             Ok((new_key(&before, &after.keys, &name), after))
         },
@@ -288,7 +285,7 @@ fn create(app: &mut Bloom, name: String, cx: &mut Context<Bloom>) {
                 Ok((key, keys)) => {
                     // The list read after the change is the page's list
                     // now: no third request for it.
-                    let on_page = match &mut this.page {
+                    let on_page = match &mut this.nav.page {
                         crate::app::Page::Admin(data) => {
                             data.api_keys = Some(keys);
                             true
@@ -310,7 +307,7 @@ fn create(app: &mut Bloom, name: String, cx: &mut Context<Bloom>) {
                 }
                 Err(err) => {
                     this.toast("The server refused the change", format!("{err:#}"), cx);
-                    if matches!(this.page, crate::app::Page::Admin(_)) {
+                    if matches!(this.nav.page, crate::app::Page::Admin(_)) {
                         this.load_page(cx);
                     }
                 }

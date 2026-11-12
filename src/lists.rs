@@ -3,6 +3,7 @@
 //! "Add to" dialog, the actions of the playlist page, and the `lists` debug
 //! command. The dialog and the page are drawn in `views/playlist.rs`.
 
+use crate::jellyfin::Method;
 use std::rc::Rc;
 
 use anyhow::{Result, anyhow, ensure};
@@ -20,7 +21,7 @@ use crate::{
 };
 
 /// Id and collection type of the library page that lists the playlists.
-pub const PLAYLISTS_ID: &str = "playlists";
+pub use crate::pages::PLAYLISTS_ID;
 /// A debug command changes only lists whose name starts with this.
 pub const TEST_PREFIX: &str = "jellyui-test-";
 
@@ -160,15 +161,15 @@ pub(crate) impl Client {
 
     fn add_to_playlist(&self, list: &str, ids: &[String]) -> Result<()> {
         let user = self.user()?.to_string();
-        self.call("POST", &format!("/Playlists/{list}/Items"), &[("ids", ids.join(",")), ("userId", user)])
+        self.call(Method::Post, &format!("/Playlists/{list}/Items"), &[("ids", ids.join(",")), ("userId", user)])
     }
 
     fn remove_from_playlist(&self, list: &str, entry_ids: &[String]) -> Result<()> {
-        self.call("DELETE", &format!("/Playlists/{list}/Items"), &[("entryIds", entry_ids.join(","))])
+        self.call(Method::Delete, &format!("/Playlists/{list}/Items"), &[("entryIds", entry_ids.join(","))])
     }
 
     fn move_in_playlist(&self, list: &str, entry_id: &str, new_index: usize) -> Result<()> {
-        self.call("POST", &format!("/Playlists/{list}/Items/{entry_id}/Move/{new_index}"), &[])
+        self.call(Method::Post, &format!("/Playlists/{list}/Items/{entry_id}/Move/{new_index}"), &[])
     }
 
     fn rename_playlist(&self, list: &str, name: &str) -> Result<()> {
@@ -178,17 +179,17 @@ pub(crate) impl Client {
 
     fn create_collection(&self, name: &str, ids: &[String]) -> Result<String> {
         let created: Created =
-            self.send("POST", "/Collections", &[("name", name.to_string()), ("ids", ids.join(","))])?;
+            self.send(Method::Post, "/Collections", &[("name", name.to_string()), ("ids", ids.join(","))])?;
         ensure!(!created.id.is_empty(), "the server sent no id for the collection");
         Ok(created.id)
     }
 
     fn add_to_collection(&self, list: &str, ids: &[String]) -> Result<()> {
-        self.call("POST", &format!("/Collections/{list}/Items"), &[("ids", ids.join(","))])
+        self.call(Method::Post, &format!("/Collections/{list}/Items"), &[("ids", ids.join(","))])
     }
 
     fn remove_from_collection(&self, list: &str, ids: &[String]) -> Result<()> {
-        self.call("DELETE", &format!("/Collections/{list}/Items"), &[("ids", ids.join(","))])
+        self.call(Method::Delete, &format!("/Collections/{list}/Items"), &[("ids", ids.join(","))])
     }
 
     /// Deletes a playlist or a collection, and nothing else. The server
@@ -201,7 +202,7 @@ pub(crate) impl Client {
             item.name,
             item.kind
         );
-        self.call("DELETE", &format!("/Items/{id}"), &[])
+        self.call(Method::Delete, &format!("/Items/{id}"), &[])
     }
 
     /// Whether the user may make collections.
@@ -332,7 +333,7 @@ impl Bloom {
 
     /// Loads the entries of the playlist on the page.
     pub fn load_playlist(&mut self, cx: &mut Context<Self>) {
-        let Page::Playlist(data) = &mut self.page else {
+        let Page::Playlist(data) = &mut self.nav.page else {
             return;
         };
         data.loading = true;
@@ -341,7 +342,7 @@ impl Bloom {
             cx,
             move |client| Ok((client.item(&id)?, client.playlist_entries(&id)?)),
             move |this, result, cx| {
-                if let Page::Playlist(data) = &mut this.page {
+                if let Page::Playlist(data) = &mut this.nav.page {
                     data.loading = false;
                     match result {
                         Ok((list, entries)) => {
@@ -388,7 +389,7 @@ impl Bloom {
 
     /// "Remove from collection" for a card on the page of a collection.
     pub fn collection_card_items(&self, item: &Item, cx: &mut Context<Self>) -> Vec<MenuItem> {
-        let Page::Library(data) = &self.page else {
+        let Page::Library(data) = &self.nav.page else {
             return Vec::new();
         };
         if data.view.kind != ItemKind::BoxSet || !self.lists.can_collect {
@@ -411,7 +412,7 @@ impl Bloom {
     /// The menu of the page of a collection: delete it. Empty for any
     /// other page.
     pub fn rebuild_collection_menu(&mut self, cx: &mut Context<Self>) {
-        let Page::Library(data) = &self.page else {
+        let Page::Library(data) = &self.nav.page else {
             return;
         };
         if data.view.kind != ItemKind::BoxSet {
@@ -438,7 +439,7 @@ impl Bloom {
                 ),
             );
         }
-        self.more_menu.update(cx, |menu, cx| menu.set_items(items, cx));
+        self.popups.more_menu.update(cx, |menu, cx| menu.set_items(items, cx));
     }
 
     // ----- The dialog -------------------------------------------------------
@@ -571,7 +572,7 @@ impl Bloom {
             // once): it loads again and shows what the server has.
             Err(err) => {
                 this.toast(failed, format!("{err:#}"), cx);
-                if matches!(this.page, Page::Playlist(_)) {
+                if matches!(this.nav.page, Page::Playlist(_)) {
                     this.load_page(cx);
                 }
             }
@@ -583,7 +584,7 @@ impl Bloom {
     /// not: it holds movies and series, and no list is in it.
     pub fn after_list_change(&mut self, cx: &mut Context<Self>) {
         self.load_lists(cx);
-        if matches!(self.page, Page::Library(_) | Page::Playlist(_)) {
+        if matches!(self.nav.page, Page::Library(_) | Page::Playlist(_)) {
             self.load_page(cx);
         }
         cx.notify();
@@ -647,7 +648,7 @@ impl Bloom {
     }
 
     pub fn ask_rename_playlist(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Page::Playlist(data) = &self.page else {
+        let Page::Playlist(data) = &self.nav.page else {
             return;
         };
         let list = data.list.clone();
@@ -699,7 +700,7 @@ impl Bloom {
 
     /// True when the page is the one of this playlist or collection.
     fn on_page_of_list(&self, id: &str) -> bool {
-        match &self.page {
+        match &self.nav.page {
             Page::Playlist(data) => data.list.id == id,
             Page::Library(data) => data.view.id == id,
             _ => false,
@@ -709,7 +710,7 @@ impl Bloom {
     /// The page of a list is gone with the list: the page before it
     /// shows, loaded again, or the home when there is none.
     fn leave_deleted_list(&mut self, cx: &mut Context<Self>) {
-        if self.history.is_empty() {
+        if self.nav.history.is_empty() {
             self.open_home(cx);
         } else {
             self.back(cx);
@@ -731,7 +732,7 @@ impl Bloom {
 
     /// Takes the entry at a place (from 0) out of the playlist on the page.
     pub fn playlist_remove(&mut self, place: usize, cx: &mut Context<Self>) {
-        let Page::Playlist(data) = &self.page else {
+        let Page::Playlist(data) = &self.nav.page else {
             return;
         };
         let Some(entry) = data.entries.get(place) else {
@@ -749,7 +750,7 @@ impl Bloom {
 
     /// Moves the entry at a place (from 0) to a new place.
     pub fn playlist_move(&mut self, place: usize, to: usize, cx: &mut Context<Self>) {
-        let Page::Playlist(data) = &mut self.page else {
+        let Page::Playlist(data) = &mut self.nav.page else {
             return;
         };
         let Some(entry) = data.entries.get(place) else {
@@ -772,7 +773,7 @@ impl Bloom {
             |this, result, cx| {
                 if let Err(err) = result {
                     this.toast("Could not move the entry", format!("{err:#}"), cx);
-                    if matches!(this.page, Page::Playlist(_)) {
+                    if matches!(this.nav.page, Page::Playlist(_)) {
                         this.load_page(cx);
                     }
                 }
@@ -783,7 +784,7 @@ impl Bloom {
     /// Plays the playlist on the page from an entry (from 0), or all of it
     /// in random order.
     pub fn play_playlist(&mut self, from: usize, shuffle: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Page::Playlist(data) = &self.page else {
+        let Page::Playlist(data) = &self.nav.page else {
             return;
         };
         let mut items: Vec<Item> = data.entries.iter().skip(from).map(|e| e.item.clone()).collect();
@@ -1012,7 +1013,7 @@ impl Bloom {
                 Ok("closed".into())
             }
             // The buttons of the playlist page (a place counts from 1).
-            "page-state" => Ok(match &self.page {
+            "page-state" => Ok(match &self.nav.page {
                 Page::Playlist(d) => format!(
                     "playlist {:?} loading={} entries={}",
                     d.list.name,
@@ -1023,7 +1024,7 @@ impl Bloom {
                 _ => "other page".into(),
             }),
             "page-up" | "page-down" => {
-                let Page::Playlist(data) = &self.page else {
+                let Page::Playlist(data) = &self.nav.page else {
                     return Err(anyhow!("not on a playlist page"));
                 };
                 ensure!(is_test_name(&data.list.name), "refused: not a {TEST_PREFIX} list");
@@ -1035,7 +1036,7 @@ impl Bloom {
             }
             "page-remove" => {
                 let n = place(args.first())?;
-                match &self.page {
+                match &self.nav.page {
                     Page::Playlist(data) => {
                         ensure!(is_test_name(&data.list.name), "refused: not a {TEST_PREFIX} list");
                         self.playlist_remove(n, cx);
@@ -1053,7 +1054,7 @@ impl Bloom {
             }
             // Opens the menu of a card of the library page, at the top left.
             "card-menu" => {
-                let Page::Library(data) = &self.page else {
+                let Page::Library(data) = &self.nav.page else {
                     return Err(anyhow!("not on a library page"));
                 };
                 let item = data.items.get(place(args.first())?).ok_or_else(|| anyhow!("no item at that place"))?.clone();
@@ -1062,7 +1063,7 @@ impl Bloom {
                 Ok("opened".into())
             }
             "menu-more" => {
-                let menu = self.more_menu.clone();
+                let menu = self.popups.more_menu.clone();
                 menu.update(cx, |menu, cx| menu.open(window, cx));
                 Ok("opened".into())
             }
@@ -1072,7 +1073,7 @@ impl Bloom {
             }
             // Opens the delete question of the page; `dialog-confirm` runs it.
             "page-delete" => {
-                let list = match &self.page {
+                let list = match &self.nav.page {
                     Page::Playlist(d) => d.list.clone(),
                     Page::Library(d) => d.view.clone(),
                     _ => return Err(anyhow!("not on a list page")),
@@ -1093,7 +1094,7 @@ impl Bloom {
             }
             "playall" => {
                 // A test never plays aloud.
-                self.muted = true;
+                self.playback.muted = true;
                 self.play_playlist(0, args.first() == Some(&"shuffle"), window, cx);
                 Ok("playing".into())
             }

@@ -366,7 +366,7 @@ impl Bloom {
     pub fn update_status_changed(&mut self, cx: &mut Context<Self>) {
         if let Status::Ready(version) = status()
             && self.update_said.as_deref() != Some(version.as_str())
-            && !self.player_open
+            && !self.playback.open
         {
             self.update_said = Some(version.clone());
             self.toast(

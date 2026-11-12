@@ -151,7 +151,7 @@ impl Bloom {
         let mut text = plain_words(why);
         if self.has_downloads() {
             text.push_str(&format!(" Your downloads play from {}.", crate::brand::THIS_DEVICE));
-            if !matches!(self.page, Page::Downloads) {
+            if !matches!(self.nav.page, Page::Downloads) {
                 self.connection.sent_to_downloads = true;
                 self.navigate(Page::Downloads, cx);
             }
@@ -183,7 +183,7 @@ impl Bloom {
         self.load_download_policy(cx);
         self.toast(format!("{server} is back"), "The server answers again.", cx);
         let home = std::mem::take(&mut self.connection.sent_to_downloads)
-            && matches!(self.page, Page::Downloads);
+            && matches!(self.nav.page, Page::Downloads);
         if home {
             self.open_home(cx);
         } else {

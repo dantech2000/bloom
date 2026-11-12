@@ -6,6 +6,7 @@
 //! tracks of the server to the tracks of mpv while a transcode plays, ends
 //! a transcode that is not needed any more, and shows what plays.
 
+use crate::jellyfin::Method;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -264,7 +265,7 @@ pub(crate) impl Client {
     /// Ends the transcode of a play session on the server.
     fn stop_encoding(&self, play_session_id: &str) -> Result<()> {
         self.call(
-            "DELETE",
+            Method::Delete,
             "/Videos/ActiveEncodings",
             &[
                 ("deviceId", self.device_id.to_string()),
@@ -549,7 +550,7 @@ fn item_streams(item: &Item) -> &[MediaStream] {
 impl Bloom {
     /// The answer of the server for the item in the player.
     fn stream_resolved(&self) -> Option<Arc<Resolved>> {
-        current_of(&self.playing.as_ref()?.id)
+        current_of(&self.playback.playing.as_ref()?.id)
     }
 
     /// Starts an item for the app: with the tracks the detail page chose,
@@ -651,10 +652,10 @@ impl Bloom {
     }
 
     fn stream_reload_with(&mut self, audio: Option<i64>, subtitle: Option<i64>, burn_in: bool) {
-        let (Some(item), Some(session)) = (self.playing.as_ref(), self.session.as_ref()) else {
+        let (Some(item), Some(session)) = (self.playback.playing.as_ref(), self.session.as_ref()) else {
             return;
         };
-        match self.player_status.state {
+        match self.playback.status.state {
             PlayState::Playing => {}
             // A load is on its way, and it took the settings as they
             // were: this one follows it (`stream_poll`).
@@ -667,7 +668,7 @@ impl Bloom {
             _ => return,
         }
         let Some(resolved) = current_of(&item.id) else { return };
-        let status = &self.player_status;
+        let status = &self.playback.status;
         let selected = |kind: &str| status.tracks.iter().find(|t| t.kind == kind && t.selected);
         let audio = audio.or_else(|| match resolved.play_method {
             PlayMethod::Transcode => resolved.audio_index,
@@ -700,7 +701,7 @@ impl Bloom {
         if self.stream.pending_reload.is_none() {
             return;
         }
-        match self.player_status.state {
+        match self.playback.status.state {
             PlayState::Starting => {}
             PlayState::Playing => {
                 if let Some((audio, subtitle, burn_in)) = self.stream.pending_reload.take() {
@@ -721,7 +722,7 @@ impl Bloom {
         self.config.max_bitrate = bitrate;
         MAX_BITRATE.store(bitrate.unwrap_or(0), Ordering::Relaxed);
         self.save_config(cx);
-        if self.player_open {
+        if self.playback.open {
             self.stream_reload(None, None);
         }
         self.rebuild_track_menus(cx);
@@ -806,7 +807,7 @@ impl Bloom {
                 );
             }
         } else {
-            let status = &self.player_status;
+            let status = &self.playback.status;
             let shown = self.shown_subtitle(&resolved);
             let handle = this.clone();
             items.push(
@@ -852,7 +853,7 @@ impl Bloom {
     /// The subtitle on the picture, by server index: the one mpv shows,
     /// else the one burned in.
     fn shown_subtitle(&self, resolved: &Resolved) -> Option<i64> {
-        let status = &self.player_status;
+        let status = &self.playback.status;
         status
             .tracks
             .iter()
@@ -867,7 +868,7 @@ impl Bloom {
     /// is the one way to a track by its server index: the menus, a remote
     /// control and the keys come here.
     pub fn stream_audio(&mut self, index: i64) {
-        let Some(item) = self.playing.as_ref() else { return };
+        let Some(item) = self.playback.playing.as_ref() else { return };
         let resolved = current_of(&item.id);
         let transcode = resolved.as_ref().is_some_and(|r| r.play_method == PlayMethod::Transcode);
         // With no answer of the server (a downloaded item, or a load on
@@ -891,7 +892,7 @@ impl Bloom {
     /// mpv's own track, and any other one is burned in by the server, so
     /// the item loads again.
     pub fn stream_subtitle(&mut self, index: i64) {
-        let Some(item) = self.playing.as_ref() else { return };
+        let Some(item) = self.playback.playing.as_ref() else { return };
         let Some(resolved) = current_of(&item.id) else {
             // A downloaded item, or a load on its way: the tracks of the
             // file are mpv's.
@@ -973,12 +974,12 @@ impl Bloom {
 
     /// The card of the "Playback info" overlay: how the item plays.
     pub fn render_stream_info(&self, _cx: &mut Context<Self>) -> Option<Div> {
-        if !self.playback_info || !self.player_open {
+        if !self.playback.info || !self.playback.open {
             return None;
         }
         let resolved = self.stream_resolved();
-        let ink = rgba(0xf5f5f7ff);
-        let quiet = rgba(0xf5f5f7b3);
+        let ink = crate::ui::tone::INK;
+        let quiet = crate::ui::tone::INK_70;
         let line = |text: String| div().text_size(px(12.)).text_color(quiet).child(text);
         let mut lines: Vec<Div> = Vec::new();
         let title = match &resolved {
@@ -1013,7 +1014,7 @@ impl Bloom {
                 )));
             }
         }
-        let status = &self.player_status;
+        let status = &self.playback.status;
         if status.video_w > 0 && status.video_h > 0 {
             lines.push(line(format!("Decoding: {}×{}", status.video_w, status.video_h)));
         }
@@ -1040,7 +1041,7 @@ impl Bloom {
                 .p(px(14.))
                 .rounded(px(16.))
                 .border_1()
-                .border_color(rgba(0xf5f5f733))
+                .border_color(crate::ui::tone::EDGE)
                 .child(glass(px(16.), rgba(0x1c1c1cd9)))
                 .flex()
                 .flex_col()
@@ -1062,7 +1063,7 @@ impl Bloom {
         let (verb, arg) = rest.split_once(' ').unwrap_or((rest, ""));
         match verb {
             "" | "state" => {
-                let status = &self.player_status;
+                let status = &self.playback.status;
                 let cap = max_bitrate().map_or("auto".to_string(), |b| (b / 1000).to_string());
                 let link = crate::adaptive::describe(self.sync.in_group());
                 match current() {
@@ -1099,13 +1100,13 @@ impl Bloom {
             }
             "menu" => {
                 self.rebuild_track_menus(cx);
-                self.settings_menu
+                self.playback.settings_menu
                     .update(cx, |menu, cx| menu.open_submenu("Quality", window, cx));
                 "menu".into()
             }
             "info" => {
                 self.toggle_playback_info(cx);
-                format!("info={}", self.playback_info)
+                format!("info={}", self.playback.info)
             }
             // Quits the app as the Quit menu does, for a test of the end
             // of a transcode at quit.

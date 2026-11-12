@@ -72,7 +72,7 @@ impl Bloom {
         };
         div().size_full().child(
             ScrollArea::new("home.scroll")
-                .track(&self.page_scroll)
+                .track(&self.nav.scroll)
                 .size_full()
                 .children(hero)
                 .child(div().relative().mt(px(-overlap)).child(rows)),
@@ -107,7 +107,7 @@ impl Bloom {
 
     /// Height of the home rows when it is known without a layout pass.
     fn home_rows_height(&self) -> Option<f32> {
-        let Page::Home(data) = &self.page else {
+        let Page::Home(data) = &self.nav.page else {
             return None;
         };
         if data.loading || self.session.is_none() {
@@ -124,7 +124,7 @@ impl Bloom {
 
     /// The rows under the hero. [`HomeRows`] calls this for its render.
     pub fn render_home_rows(&self, cx: &mut Context<Self>) -> gpui_kit::Div {
-        let Page::Home(data) = &self.page else {
+        let Page::Home(data) = &self.nav.page else {
             return div();
         };
         let Some(client) = self.session.as_ref().map(|s| s.client.clone()) else {
@@ -163,7 +163,7 @@ impl Bloom {
             };
             // A row outside the window, and 200 points around it, becomes
             // empty space of its height.
-            let scrolled = -f32::from(self.page_scroll.offset().y);
+            let scrolled = -f32::from(self.nav.scroll.offset().y);
             let (view_top, view_bottom) = (scrolled - 200., scrolled + self.viewport_h + 200.);
             for (section, row_h) in self.home_sections(data) {
                 let height = section_height(row_h);

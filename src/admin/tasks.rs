@@ -76,8 +76,7 @@ pub struct Data {
 }
 
 pub fn load(client: &Client) -> Result<Data> {
-    let mut tasks: Vec<Task> =
-        client.get("/ScheduledTasks", &[("IsHidden", "false".to_string())])?;
+    let mut tasks: Vec<Task> = client.scheduled_tasks()?;
     tasks.sort_by(|a, b| {
         (a.category.to_lowercase(), a.name.to_lowercase())
             .cmp(&(b.category.to_lowercase(), b.name.to_lowercase()))
@@ -359,17 +358,17 @@ fn row(
 
     // Stop for a task that runs, Run for one that does not.
     let id = task.id.clone();
-    let (verb, label, kind, glyph, ink, method, done) = if busy {
-        ("stop", "Stop", ButtonKind::Danger, LucideIcon::Square, rgb(0xffffff), "DELETE", "Task stopped")
+    let (verb, label, kind, glyph, ink, done) = if busy {
+        ("stop", "Stop", ButtonKind::Danger, LucideIcon::Square, rgb(0xffffff), "Task stopped")
     } else {
-        ("run", "Run", ButtonKind::Plain, LucideIcon::Play, colors.foreground, "POST", "Task started")
+        ("run", "Run", ButtonKind::Plain, LucideIcon::Play, colors.foreground, "Task started")
     };
     let action = button(SharedString::from(format!("admin.tasks.{verb}.{}", task.id)), label, kind, cx)
         .child(icon(glyph, 13., ink))
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
             let id = id.clone();
             this.admin_action(done, cx, move |client| {
-                client.call(method, &format!("/ScheduledTasks/Running/{id}"), &[])
+                if busy { client.stop_task(&id) } else { client.start_task(&id) }
             })
         }));
 

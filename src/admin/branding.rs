@@ -151,7 +151,7 @@ impl Bloom {
                 let size = std::fs::metadata(&path)?.len();
                 anyhow::ensure!(size <= MAX_BYTES as u64, "the image is larger than 10 MB");
                 let bytes = std::fs::read(&path)?;
-                client.post_image("/Branding/Splashscreen", &bytes, mime)
+                client.upload_splashscreen(&bytes, mime)
             },
         );
     }
@@ -173,7 +173,7 @@ impl Bloom {
 
     pub fn remove_splash(&mut self, cx: &mut Context<Self>) {
         self.splash_change("The splash screen is removed.", cx, |client| {
-            client.call("DELETE", "/Branding/Splashscreen", &[])
+            client.delete_splashscreen()
         });
     }
 
@@ -193,7 +193,7 @@ impl Bloom {
             move |client| -> Result<Value> {
                 work(&client)?;
                 REV.fetch_add(1, Ordering::Relaxed);
-                client.get::<Value>("/System/Configuration/branding", &[])
+                client.configuration("branding")
             },
             move |this, result, cx| {
                 match result {
@@ -256,7 +256,7 @@ impl Bloom {
 
     /// The Branding page in a line.
     fn branding_state(&self, cx: &gpui_kit::App) -> String {
-        let Page::Admin(admin) = &self.page else {
+        let Page::Admin(admin) = &self.nav.page else {
             return "no admin page".into();
         };
         let page = self.config_state();

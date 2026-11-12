@@ -131,7 +131,7 @@ impl Bloom {
         }
         let t = UiTheme::read(cx).clone();
         let fg = t.colors.foreground;
-        let soft = rgba(0xf5f5f7b3);
+        let soft = crate::ui::tone::INK_70;
 
         fn swallow(_: &mut Bloom, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Bloom>) {
             cx.stop_propagation();
@@ -147,7 +147,7 @@ impl Bloom {
                 .items_center()
                 .gap(px(12.))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgba(0xffffff1f)))
+                .hover(|s| s.bg(crate::ui::tone::HOVER))
         };
         let label = |title: String, detail: String| {
             div()
@@ -189,7 +189,7 @@ impl Bloom {
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
-                .hover(|s| s.bg(rgba(0xffffff1f)))
+                .hover(|s| s.bg(crate::ui::tone::HOVER))
                 .tooltip(tip(label))
                 .child(glyph)
         };
@@ -322,7 +322,7 @@ impl Bloom {
                                 .relative()
                                 .size(px(PICKER_SIZE))
                                 .rounded_full()
-                                .bg(rgba(0xffffff1f))
+                                .bg(crate::ui::tone::HOVER)
                                 .child(
                                     canvas(
                                         move |painted, window, _| {
@@ -511,7 +511,7 @@ impl Bloom {
             .w(px(PANEL_W.min(self.viewport_w - 48.)))
             .rounded(px(24.))
             .border_1()
-            .border_color(rgba(0xf5f5f733))
+            .border_color(crate::ui::tone::EDGE)
             .on_mouse_down(MouseButton::Left, cx.listener(swallow))
             // A click anywhere else closes the panel, as it closes a menu.
             .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {

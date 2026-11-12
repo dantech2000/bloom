@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{APP_NAME, APP_VERSION, Token};
 
+mod server;
+
 pub const TICKS_PER_SECOND: i64 = 10_000_000;
 
 /// The most bytes of a JSON or text answer. The HTTP client stops at 10 MB
@@ -29,6 +31,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The answer of `/Users/Me` or its error, with the time it came. Clones
 /// of a client share it.
 type KeptMe = Arc<Mutex<Option<(Instant, Result<serde_json::Value, RequestError>)>>>;
+
+/// The method of a request with no body ([`Client::send`], [`Client::call`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Method {
+    Get,
+    Post,
+    Delete,
+}
 
 #[derive(Clone)]
 pub struct Client {
@@ -60,22 +70,24 @@ impl Client {
         }
     }
 
-    pub fn with_session(self, token: &str, user_id: &str) -> Self {
-        let client = self.with_token(token, user_id);
-        // The image loader sends this header to this server only.
-        register_image_auth(&client.base, client.auth_header());
-        client
-    }
-
-    /// A client of a token that is not the open session's: one request for
-    /// another profile (its sign-out), or a stand-in. The image loader
-    /// keeps the header of the session that is open; `with_session` would
-    /// put this token in its place for the whole server.
-    pub fn with_token(mut self, token: &str, user_id: &str) -> Self {
+    /// The client with the token and the user of a session. Nothing else
+    /// changes: a client for one request of another profile (its sign-out)
+    /// or a stand-in is made the same way. See [`Self::opened`].
+    pub fn with_session(mut self, token: &str, user_id: &str) -> Self {
         self.token = Some(token.into());
         self.user_id = Some(user_id.into());
         // Another user: the answer kept for the one before is not theirs.
         self.me = KeptMe::default();
+        self
+    }
+
+    /// Makes this client's session the open one of its server: the image
+    /// loader sends this header with the images of this server, and of no
+    /// other, and tries the images that failed once more. The app calls it
+    /// for the session it opens; a client made for another purpose must
+    /// not take the place of that session's header.
+    pub fn opened(self) -> Self {
+        register_image_auth(&self.base, self.auth_header());
         self
     }
 
@@ -163,15 +175,7 @@ impl Client {
         path: &str,
         query: &[(&str, String)],
     ) -> Result<T> {
-        let url = self.url(path, query);
-        let response = self
-            .agent
-            .get(&url)
-            .header("Authorization", self.auth_header())
-            .header("Accept", "application/json")
-            .call()
-            .map_err(|e| map_err(e, path))?;
-        json(response, path)
+        json(self.empty(Method::Get, path, query)?, path)
     }
 
     /// POST with a JSON body; the answer as it is.
@@ -194,33 +198,49 @@ impl Client {
         json(self.post_response(path, body)?, path)
     }
 
-    /// A request with no body: "DELETE" is a DELETE, any other method a POST.
-    fn empty(&self, method: &str, path: &str, query: &[(&str, String)]) -> Result<Answer> {
+    /// A request with no body.
+    fn empty(&self, method: Method, path: &str, query: &[(&str, String)]) -> Result<Answer> {
         let url = self.url(path, query);
-        let request = match method {
-            "DELETE" => self.agent.delete(&url).force_send_body(),
-            _ => self.agent.post(&url),
+        let (auth, json) = (self.auth_header(), "application/json");
+        let answer = match method {
+            Method::Get => self.agent.get(&url).header("Authorization", auth).header("Accept", json).call(),
+            Method::Post => self.agent.post(&url).header("Authorization", auth).header("Accept", json).send_empty(),
+            Method::Delete => self
+                .agent
+                .delete(&url)
+                .force_send_body()
+                .header("Authorization", auth)
+                .header("Accept", json)
+                .send_empty(),
         };
-        request
-            .header("Authorization", self.auth_header())
-            .header("Accept", "application/json")
-            .send_empty()
-            .map_err(|e| map_err(e, path))
+        answer.map_err(|e| map_err(e, path))
     }
 
-    /// Body-less request (POST/DELETE) that decodes a JSON response.
+    /// Request with no body that decodes a JSON response.
     pub fn send<T: serde::de::DeserializeOwned>(
         &self,
-        method: &str,
+        method: Method,
         path: &str,
         query: &[(&str, String)],
     ) -> Result<T> {
         json(self.empty(method, path, query)?, path)
     }
 
-    /// POST or DELETE with no body, for calls whose answer is empty.
-    pub fn call(&self, method: &str, path: &str, query: &[(&str, String)]) -> Result<()> {
+    /// Request with no body, for calls whose answer is empty.
+    pub fn call(&self, method: Method, path: &str, query: &[(&str, String)]) -> Result<()> {
         self.empty(method, path, query).map(drop)
+    }
+
+    /// GET that returns the end of a text body: at most the last `max`
+    /// bytes, from the start of a line, and whether text before them was
+    /// left out. The body is read as it comes and only its end is kept, so
+    /// a file of any size takes `max` bytes of memory.
+    pub fn get_text_tail(&self, path: &str, query: &[(&str, String)], max: usize) -> Result<(String, bool)> {
+        let mut answer = self.empty(Method::Get, path, query)?;
+        let reader = answer.body_mut().with_config().limit(u64::MAX).reader();
+        let (bytes, cut) = tail_of(reader, max)
+            .map_err(|e| map_body_err(ureq::Error::Io(e), "read", path))?;
+        Ok((String::from_utf8_lossy(&bytes).into_owned(), cut))
     }
 
     /// GET that returns the body as text (log files).
@@ -287,9 +307,9 @@ impl Client {
         let user = self.user()?.to_string();
         // The old address only when the server does not know the new one:
         // a server that is away would be waited for twice.
-        match self.call("DELETE", "/UserImage", &[("userId", user.clone())]) {
+        match self.call(Method::Delete, "/UserImage", &[("userId", user.clone())]) {
             Err(err) if not_this_address(&err) => {
-                self.call("DELETE", &format!("/Users/{user}/Images/Primary"), &[])
+                self.call(Method::Delete, &format!("/Users/{user}/Images/Primary"), &[])
             }
             answer => answer,
         }
@@ -512,7 +532,7 @@ impl Client {
     /// to its played state. This needs the Jellyfin Enhanced server plugin.
     pub fn hide_from_row(&self, next_up: bool, item_id: &str) -> Result<()> {
         let row = if next_up { "next-up" } else { "continue-watching" };
-        self.call("POST", &format!("/JellyfinEnhanced/{row}/hide/{item_id}"), &[])
+        self.call(Method::Post, &format!("/JellyfinEnhanced/{row}/hide/{item_id}"), &[])
     }
 
     /// Intro, credits and similar ranges of an item. The Intro Skipper plugin
@@ -581,7 +601,7 @@ impl Client {
 
     pub fn set_played(&self, item_id: &str, played: bool) -> Result<UserData> {
         let user = self.user()?.to_string();
-        let method = if played { "POST" } else { "DELETE" };
+        let method = if played { Method::Post } else { Method::Delete };
         self.send(
             method,
             &format!("/UserPlayedItems/{item_id}"),
@@ -591,7 +611,7 @@ impl Client {
 
     pub fn set_favorite(&self, item_id: &str, favorite: bool) -> Result<UserData> {
         let user = self.user()?.to_string();
-        let method = if favorite { "POST" } else { "DELETE" };
+        let method = if favorite { Method::Post } else { Method::Delete };
         self.send(
             method,
             &format!("/UserFavoriteItems/{item_id}"),
@@ -682,7 +702,7 @@ impl Client {
     /// Starts a Quick Connect sign-in: the server gives a code to show and a
     /// secret to ask with.
     pub fn quick_connect_initiate(&self) -> Result<QuickConnect> {
-        self.send("POST", "/QuickConnect/Initiate", &[])
+        self.send(Method::Post, "/QuickConnect/Initiate", &[])
     }
 
     /// State of a sign-in that `quick_connect_initiate` started.
@@ -703,7 +723,7 @@ impl Client {
     /// Lets the device that shows `code` sign in as this user.
     pub fn quick_connect_authorize(&self, code: &str) -> Result<()> {
         self.call(
-            "POST",
+            Method::Post,
             "/QuickConnect/Authorize",
             &[("code", code.to_string()), ("userId", self.user()?.to_string())],
         )
@@ -711,7 +731,7 @@ impl Client {
 
     /// Ends this session on the server; its token stops working.
     pub fn logout(&self) -> Result<()> {
-        self.call("POST", "/Sessions/Logout", &[])
+        self.call(Method::Post, "/Sessions/Logout", &[])
     }
 }
 
@@ -797,6 +817,39 @@ fn not_this_address(err: &anyhow::Error) -> bool {
     matches!(status_of(err), Some(404 | 405))
 }
 
+/// The last `max` bytes of what a reader gives, from the start of a line
+/// when bytes before them were dropped, and whether any were.
+fn tail_of(mut reader: impl std::io::Read, max: usize) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut kept: Vec<u8> = Vec::new();
+    let mut cut = false;
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let read = match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        kept.extend_from_slice(&chunk[..read]);
+        // Twice the room before the front goes: one move for each `max`
+        // bytes read, not one for each chunk.
+        if kept.len() > max.saturating_mul(2) {
+            kept.drain(..kept.len() - max);
+            cut = true;
+        }
+    }
+    if kept.len() > max {
+        kept.drain(..kept.len() - max);
+        cut = true;
+    }
+    if cut {
+        // The first line is the rest of a line: it goes.
+        let line = kept.iter().position(|byte| *byte == b'\n').map_or(kept.len(), |end| end + 1);
+        kept.drain(..line);
+    }
+    Ok((kept, cut))
+}
+
 /// The answer of the server to a request.
 type Answer = ureq::http::Response<ureq::Body>;
 
@@ -840,11 +893,6 @@ pub const DEFAULT_HOME_SECTIONS: [&str; 7] = [
 const ITEM_FIELDS: &str =
     "Overview,PrimaryImageAspectRatio,ProductionYear,Genres,ParentId,DateCreated,Status,EndDate";
 
-/// The fields of a title in the index of the search ([`ItemQuery::fields`]):
-/// what the search reads and a card of a result shows. The index holds every
-/// title of the library; the overview and the streams of each would make
-/// its answer many times as large.
-pub const CATALOG_FIELDS: &str = "OriginalTitle,PrimaryImageAspectRatio,ProductionYear,Status,EndDate";
 
 /// Quality tags on poster cards, as bits: on, resolution tag, range tag.
 static QUALITY_TAGS: AtomicU8 = AtomicU8::new(0);
@@ -873,6 +921,13 @@ fn item_fields() -> String {
     } else {
         ITEM_FIELDS.to_string()
     }
+}
+
+/// The fields of a title in the index of the search ([`ItemQuery::fields`]):
+/// those of a list, as a result shows on a card with its overview and its
+/// quality tags, and the original title, which the search reads too.
+pub fn catalog_fields() -> String {
+    format!("{},OriginalTitle", item_fields())
 }
 
 /// A failed request. Its text is as before ("HTTP 530 at /Items"); the
@@ -1076,7 +1131,7 @@ pub struct ItemQuery {
     /// Only the items with these ids, in one request.
     pub ids: Vec<String>,
     /// The fields of each item, as the server names them; none for the
-    /// fields of a list. [`CATALOG_FIELDS`] for a query of every title.
+    /// fields of a list. [`catalog_fields`] for the index of the search.
     pub fields: Option<String>,
     pub limit: Option<usize>,
     pub start: Option<usize>,
@@ -1941,16 +1996,16 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n",
             "{\"Id\":\"u1\"}",
         );
-        let client = server.client().with_token("t", "u1");
+        let client = server.client().with_session("t", "u1");
         let clone = client.clone();
         assert_eq!(client.me().unwrap()["Id"], "u1");
         assert_eq!(clone.me().unwrap()["Id"], "u1");
         assert_eq!(server.requests(), 1);
-        client.with_token("other", "u2").me().unwrap();
+        client.with_session("other", "u2").me().unwrap();
         assert_eq!(server.requests(), 2);
 
         let down = Sender::start("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", "");
-        let client = down.client().with_token("t", "u1");
+        let client = down.client().with_session("t", "u1");
         let first = client.me().unwrap_err();
         let second = client.clone().me().unwrap_err();
         assert_eq!(down.requests(), 1, "each caller waited for an answer of its own");
@@ -1964,11 +2019,11 @@ mod tests {
     #[test]
     fn the_picture_is_removed_at_the_old_address_only_when_the_new_one_is_unknown() {
         let broken = Sender::start("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", "");
-        let err = broken.client().with_token("t", "u1").delete_user_image().unwrap_err();
+        let err = broken.client().with_session("t", "u1").delete_user_image().unwrap_err();
         assert_eq!(status_of(&err), Some(500));
         assert_eq!(broken.requests(), 1, "a failure that is not \"no such address\" was tried twice");
         let old = Sender::start("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", "");
-        let _ = old.client().with_token("t", "u1").delete_user_image();
+        let _ = old.client().with_session("t", "u1").delete_user_image();
         assert_eq!(old.requests(), 2);
     }
 
@@ -1998,6 +2053,31 @@ mod tests {
         assert_eq!(item(1).stream_title("Audio").as_deref(), Some("a1"));
         assert_eq!(item(9).stream_title("Audio").as_deref(), Some("a0"), "with no default stream: the first");
         assert_eq!(item(0).stream_title("Video"), None);
+    }
+
+    /// The end of a text of any size, in the memory of its end alone.
+    #[test]
+    fn the_tail_of_a_text_starts_at_a_line() {
+        let text: String = (0..1000).map(|n| format!("line {n}\n")).collect();
+        let (all, cut) = tail_of(text.as_bytes(), 1 << 20).unwrap();
+        assert_eq!((all.len(), cut), (text.len(), false));
+        let (tail, cut) = tail_of(text.as_bytes(), 100).unwrap();
+        assert!(cut);
+        let tail = String::from_utf8(tail).unwrap();
+        assert!(tail.len() <= 100 && tail.starts_with("line 9") && tail.ends_with("line 999\n"), "{tail:?}");
+        assert!(text.ends_with(&tail));
+        // A reader that gives a few bytes at a time ends at the same place.
+        struct Slow<'a>(&'a [u8]);
+        impl std::io::Read for Slow<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.len().min(7).min(buffer.len());
+                buffer[..n].copy_from_slice(&self.0[..n]);
+                self.0 = &self.0[n..];
+                Ok(n)
+            }
+        }
+        assert_eq!(String::from_utf8(tail_of(Slow(text.as_bytes()), 100).unwrap().0).unwrap(), tail);
+        assert_eq!(tail_of(&b""[..], 100).unwrap(), (Vec::new(), false));
     }
 
     #[test]
@@ -2049,7 +2129,7 @@ mod tests {
         );
         let err = server.client().get::<serde_json::Value>("/Items", &[]).unwrap_err();
         assert_eq!(classify(&err), Verdict::Answered, "{err:#}");
-        let err = server.client().send::<serde_json::Value>("POST", "/Items", &[]).unwrap_err();
+        let err = server.client().send::<serde_json::Value>(Method::Post, "/Items", &[]).unwrap_err();
         assert_eq!(classify(&err), Verdict::Answered, "{err:#}");
     }
 
@@ -2088,7 +2168,7 @@ mod tests {
 
     #[test]
     fn image_header_goes_to_the_servers_origin_only() {
-        let client = Client::new("https://media.example.com/", "dev-1").with_session("tok", "u");
+        let client = Client::new("https://media.example.com/", "dev-1").with_session("tok", "u").opened();
         let all: ImageAuth = vec![(origin_of(&client.base).unwrap(), client.auth_header())];
         let sent = header_for(&all, "https://MEDIA.example.com:443/Items/1/Images/Primary?tag=x");
         assert_eq!(sent, Some(client.auth_header().as_str()));
@@ -2107,6 +2187,14 @@ mod tests {
         // The real registry holds the same entry.
         assert!(image_auth_header("https://media.example.com/x").is_some());
         assert!(image_auth_header("https://other.example.com/x").is_none());
+        // A client with a session that the app did not open sends nothing
+        // with the images, and takes no header's place.
+        let stand_in = Client::new("https://stand-in.example.com", "dev-1").with_session("tok2", "u2");
+        assert!(image_auth_header("https://stand-in.example.com/x").is_none());
+        let _ = Client::new("https://media.example.com", "dev-1").with_session("another", "u3");
+        assert!(image_auth_header("https://media.example.com/x").is_some_and(|header| header.contains("Token=\"tok\"")));
+        stand_in.opened();
+        assert!(image_auth_header("https://stand-in.example.com/x").is_some());
     }
 
     #[test]

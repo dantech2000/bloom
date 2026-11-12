@@ -517,12 +517,12 @@ impl Bloom {
     /// on from the rate.
     pub fn nowplaying_update(&mut self, cx: &mut Context<Self>) {
         // Scalars only: this runs at every change of the status.
-        let status = &self.player_status;
+        let status = &self.playback.status;
         let (state, position, buffering) = (status.state, status.position, status.buffering);
         let active = matches!(state, PlayState::Starting | PlayState::Playing)
             && status.error.is_none()
             && self.cast.kind() == Kind::Local;
-        let Some(item) = self.playing.as_ref().filter(|_| active) else {
+        let Some(item) = self.playback.playing.as_ref().filter(|_| active) else {
             if self.nowplaying.published.take().is_some() {
                 clear();
                 self.nowplaying.retire_artwork();
@@ -532,7 +532,7 @@ impl Bloom {
         };
         let paused = status.paused || state == PlayState::Starting;
         // The user's speed; a SyncPlay correction is not a speed to show.
-        let rate = if paused || buffering { 0. } else { self.speed };
+        let rate = if paused || buffering { 0. } else { self.playback.speed };
         let duration = if status.duration > 0. {
             status.duration
         } else {
@@ -609,13 +609,13 @@ impl Bloom {
                     return;
                 };
                 let still = this.nowplaying.published.as_ref().is_some_and(|p| p.item_id == item.id)
-                    && this.playing.as_ref().is_some_and(|i| i.id == item.id);
+                    && this.playback.playing.as_ref().is_some_and(|i| i.id == item.id);
                 if !still {
                     return;
                 }
                 // The same info again, with the picture and the position now.
                 let mut published = this.nowplaying.published.clone().unwrap();
-                published.elapsed = this.player_status.position;
+                published.elapsed = this.playback.status.position;
                 published.at = Instant::now();
                 publish(&item, &published, Some(&artwork));
                 this.nowplaying.published = Some(published);
@@ -644,18 +644,18 @@ impl Bloom {
             }
             return;
         }
-        if self.playing.is_none() {
+        if self.playback.playing.is_none() {
             log::info!("now playing: {command:?} with nothing in the player");
             return;
         }
         match command {
             Command::Play => {
-                if self.player_status.paused {
+                if self.playback.status.paused {
                     self.request_toggle_pause(cx);
                 }
             }
             Command::Pause => {
-                if !self.player_status.paused {
+                if !self.playback.status.paused {
                     self.request_toggle_pause(cx);
                 }
             }
@@ -700,9 +700,9 @@ impl Bloom {
                 format!(
                     "system: {}\npublished: {ours}\nplayer: state={:?} paused={} pos={:.1}\ncommands: {}",
                     describe(),
-                    self.player_status.state,
-                    self.player_status.paused,
-                    self.player_status.position,
+                    self.playback.status.state,
+                    self.playback.status.paused,
+                    self.playback.status.position,
                     describe_commands()
                 )
             }

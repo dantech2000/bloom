@@ -242,6 +242,19 @@ fn set_from_x(state: &Entity<SliderState>, x: Pixels, release: bool, window: &mu
         }
     });
 }
+
+/// Sets a slider from 0 to `max` in whole steps at `value`, with no window
+/// and no event: for a slider that follows something (the seek slider and
+/// the position). The state is changed in place: a fresh state has no
+/// bounds, and a click before the next paint would divide by zero.
+pub fn set_range_and_value(state: &mut SliderState, max: f32, value: f32) {
+    *state = std::mem::replace(state, SliderState::new())
+        .min(0.)
+        .max(max)
+        .step(1.)
+        .default_value(value.clamp(0., max));
+}
+
 fn update_value(state: &Entity<SliderState>, value: f32, window: &mut Window, cx: &mut App) {
     if !value.is_finite() {
         return;

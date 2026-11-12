@@ -1136,18 +1136,17 @@ pub(crate) struct Report {
     pub(crate) client: Client,
     pub(crate) kind: ReportKind,
     pub(crate) progress: Progress,
+    /// The server makes the stream of the play session (a transcode, or a
+    /// remux, which the reports name "DirectStream"): the stop ends it.
+    pub(crate) transcoding: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReportKind {
     Start,
     Progress,
-    /// The stop. With the method "Transcode" the transcode is ended too.
+    /// The stop. It ends the stream of a report with `transcoding` too.
     Stopped,
-    /// Ends the stream the server makes for the play session, and reports
-    /// nothing: after the stop of a remux, which the reports name
-    /// "DirectStream" (`report_stop`).
-    EndTranscode,
 }
 
 /// Sends the playback reports in the order they come. The requests block,
@@ -1184,7 +1183,6 @@ fn reporter() -> (mpsc::Sender<Report>, Option<thread::JoinHandle<()>>) {
                     ReportKind::Stopped => {
                         ("stopped", report.client.report_stopped(&report.progress))
                     }
-                    ReportKind::EndTranscode => ("end of the transcode", Ok(())),
                 };
                 if let Err(err) = &result {
                     log::warn!("report {name} failed: {err:#}");
@@ -1198,10 +1196,9 @@ fn reporter() -> (mpsc::Sender<Report>, Option<thread::JoinHandle<()>>) {
                 {
                     crate::downloads::offline::note_report(&who, &report.progress, result.is_err());
                 }
-                // A transcode runs on until the server is told to end it.
-                let ends_transcode = report.kind == ReportKind::EndTranscode
-                    || (report.kind == ReportKind::Stopped && report.progress.play_method == "Transcode");
-                if ends_transcode {
+                // A stream the server makes runs on until the server is
+                // told to end it.
+                if report.kind == ReportKind::Stopped && report.transcoding {
                     let id = &report.progress.play_session_id;
                     match report.client.stop_encoding(id) {
                         Ok(()) => log::info!("ended the transcode of session {}", &id[..id.len().min(8)]),
@@ -1988,6 +1985,7 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>, rep
                         client: req.client.clone(),
                         kind: ReportKind::Start,
                         progress,
+                        transcoding: req.transcoding,
                     });
                     session = Some(Session {
                         client: req.client,
@@ -2250,6 +2248,7 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>, rep
                     client: active.client.clone(),
                     kind: ReportKind::Progress,
                     progress: progress_of(active, paused, &worker),
+                    transcoding: active.transcoding,
                 });
             }
         } else if session.is_none() {
@@ -2847,18 +2846,16 @@ fn progress_of(session: &Session, paused: bool, worker: &Worker) -> Progress {
     }
 }
 
-/// Reports the stop of an item, and ends the stream the server made for
-/// it. The reporter ends a transcode with the stop report, by the name of
-/// the method; a remux has the method "DirectStream" in its reports and
-/// is ended by a word of its own.
+/// Reports the stop of an item. The reporter ends the stream the server
+/// made for it with the report, by the bool of the load: a remux has the
+/// method "DirectStream" in its reports, so the name does not tell.
 fn report_stop(session: &Session, paused: bool, worker: &Worker) {
-    let progress = progress_of(session, paused, worker);
-    let remux = session.transcoding && progress.play_method != "Transcode";
-    let end = remux.then(|| Report { client: session.client.clone(), kind: ReportKind::EndTranscode, progress: progress.clone() });
-    let _ = worker.reports.send(Report { client: session.client.clone(), kind: ReportKind::Stopped, progress });
-    if let Some(end) = end {
-        let _ = worker.reports.send(end);
-    }
+    let _ = worker.reports.send(Report {
+        client: session.client.clone(),
+        kind: ReportKind::Stopped,
+        progress: progress_of(session, paused, worker),
+        transcoding: session.transcoding,
+    });
 }
 
 /// Reports the stop to Jellyfin and marks the session ended. The status
@@ -4214,24 +4211,24 @@ mod tests {
         use std::io::{Read, Write};
         let player = Player::default();
         let generation = player.prepare("Remux", 0., false);
-        // What the worker sends at the stop: the report, then the end.
+        // What the worker sends at the stop: one report, with the bool.
         let kinds = |transcoding: bool, method: &str| {
             let (mut worker, reports) = worker_of(generation);
             let mut session = Some(Session { transcoding, play_method: method.into(), ..session_of("remux") });
             finish(&player.shared, &mut session, &mut worker);
             reports.try_iter().collect::<Vec<Report>>()
         };
+        let ends = |sent: &[Report]| sent.iter().map(|r| (r.kind == ReportKind::Stopped, r.transcoding)).collect::<Vec<_>>();
         let sent = kinds(true, "DirectStream");
-        assert!(
-            sent.len() == 2 && sent[0].kind == ReportKind::Stopped && sent[1].kind == ReportKind::EndTranscode,
-            "the stop of a remux did not end its stream"
-        );
-        assert_eq!(sent[1].progress.play_session_id, "session");
-        // A transcode is ended with its stop report, a direct play has nothing to end.
-        assert!(kinds(true, "Transcode").iter().map(|r| r.kind == ReportKind::Stopped).eq([true]));
-        assert!(kinds(false, "DirectPlay").iter().map(|r| r.kind == ReportKind::Stopped).eq([true]));
+        assert_eq!(ends(&sent), [(true, true)], "the stop of a remux does not end its stream");
+        assert_eq!(sent[0].progress.play_session_id, "session");
+        // A transcode is ended the same way, a direct play has nothing to end.
+        assert_eq!(ends(&kinds(true, "Transcode")), [(true, true)]);
+        assert_eq!(ends(&kinds(false, "DirectPlay")), [(true, false)]);
 
-        // What the reporter does with the end: one DELETE of the encoding.
+        // What the reporter does with the stop of the remux: the report,
+        // then one DELETE of the encoding. A stop with no stream of the
+        // server is the report alone.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (seen_tx, seen_rx) = mpsc::channel::<String>();
@@ -4245,13 +4242,15 @@ mod tests {
                 let _ = socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             }
         });
+        let client = Client::new(&format!("http://127.0.0.1:{port}"), "device-1").with_session("token", "user");
         let (reports, thread) = reporter();
-        let mut end = sent.into_iter().nth(1).unwrap();
-        end.client = Client::new(&format!("http://127.0.0.1:{port}"), "device-1").with_session("token", "user");
-        reports.send(end).unwrap();
+        for mut stop in sent.into_iter().chain(kinds(false, "DirectPlay")) {
+            stop.client = client.clone();
+            reports.send(stop).unwrap();
+        }
         drop(reports);
         thread.unwrap().join().unwrap();
-        let lines: Vec<String> = seen_rx.try_iter().collect();
+        let lines: Vec<String> = seen_rx.try_iter().filter(|line| !line.contains("/Sessions/Playing/Stopped")).collect();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].starts_with("DELETE /Videos/ActiveEncodings") && lines[0].contains("playSessionId=session"), "{lines:?}");
     }

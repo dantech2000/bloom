@@ -178,11 +178,8 @@ pub fn load(client: &Client) -> Result<Data> {
     }
     // The two requests run at the same time.
     let (page, users) = std::thread::scope(|scope| {
-        let names = scope.spawn(|| client.get::<Vec<Name>>("/Users", &[]));
-        let page: Result<Page> = client.get(
-            "/System/ActivityLog/Entries",
-            &[("Limit", LIMIT.to_string())],
-        );
+        let names = scope.spawn(|| client.users::<Vec<Name>>());
+        let page: Result<Page> = client.activity_log(&[("Limit", LIMIT.to_string())]);
         (page, names.join().expect("names thread"))
     });
     let page = page?;

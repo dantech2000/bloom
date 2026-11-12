@@ -111,13 +111,6 @@ fn sources(section: Section) -> Vec<&'static str> {
     }
 }
 
-fn endpoint(source: &str) -> String {
-    match source {
-        "" => "/System/Configuration".to_string(),
-        name => format!("/System/Configuration/{name}"),
-    }
-}
-
 fn at<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
     path.iter().fold(value, |value, key| &value[*key])
 }
@@ -146,14 +139,12 @@ fn list(value: &Value) -> Vec<String> {
 pub fn load(client: &Client, section: Section) -> Result<Data> {
     let drafts = sources(section)
         .into_iter()
-        .map(|source| client.get::<Value>(&endpoint(source), &[]).map(Draft::new))
+        .map(|source| client.configuration(source).map(Draft::new))
         .collect::<Result<Vec<_>>>()?;
     // The lists are a help, not a need: a field shows its raw value
     // without them.
-    let pairs = |path: &str, value: &str, name: &str| -> Vec<(String, String)> {
-        client
-            .get::<Vec<Value>>(path, &[])
-            .unwrap_or_default()
+    let pairs = |list: Result<Vec<Value>>, value: &str, name: &str| -> Vec<(String, String)> {
+        list.unwrap_or_default()
             .iter()
             .map(|entry| (text_of(&entry[value]), text_of(&entry[name])))
             .filter(|(value, _)| !value.is_empty())
@@ -161,18 +152,18 @@ pub fn load(client: &Client, section: Section) -> Result<Data> {
     };
     let mut options = Options::default();
     match section {
-        Section::General => options.ui_languages = pairs("/Localization/Options", "Value", "Name"),
+        Section::General => options.ui_languages = pairs(client.localization("Options"), "Value", "Name"),
         Section::LibraryMetadata => {
             options.metadata_languages =
-                pairs("/Localization/Cultures", "TwoLetterISOLanguageName", "DisplayName");
+                pairs(client.localization("Cultures"), "TwoLetterISOLanguageName", "DisplayName");
             options.countries =
-                pairs("/Localization/Countries", "TwoLetterISORegionName", "DisplayName");
+                pairs(client.localization("Countries"), "TwoLetterISORegionName", "DisplayName");
         }
-        Section::Nfo => options.users = pairs("/Users", "Id", "Name"),
+        Section::Nfo => options.users = pairs(client.users(), "Id", "Name"),
         _ => {}
     }
     let splash_preview = match section {
-        Section::Branding => client.url("/Branding/Splashscreen", &[]),
+        Section::Branding => client.splashscreen_file_url(),
         _ => String::new(),
     };
     Ok(Data { drafts, spec: Arc::new(spec(section, &options)), splash_preview })
@@ -781,7 +772,7 @@ impl Bloom {
         for (n, source) in sources(section).into_iter().enumerate() {
             if data.drafts[n].dirty() {
                 data.drafts[n].saving = true;
-                posts.push((n, endpoint(source), data.drafts[n].clone()));
+                posts.push((n, source.to_string(), data.drafts[n].clone()));
             }
         }
         if posts.is_empty() {
@@ -798,10 +789,10 @@ impl Bloom {
             move |client| -> Result<Vec<(usize, Value, Result<Value>)>> {
                 Ok(posts
                     .into_iter()
-                    .map(|(n, path, draft)| {
-                        let result = client.get::<Value>(&path, &[]).and_then(|fresh| {
+                    .map(|(n, source, draft)| {
+                        let result = client.configuration(&source).and_then(|fresh| {
                             let body = draft.body(&fresh);
-                            client.post(&path, &body).map(|_| body)
+                            client.save_configuration(&source, &body).map(|_| body)
                         });
                         (n, draft.edited, result)
                     })
@@ -830,7 +821,7 @@ impl Bloom {
                 }
                 // The load after the save brings what the server has now; a
                 // page with edits left keeps them (`load_admin`).
-                if matches!(this.page, Page::Admin(_)) {
+                if matches!(this.nav.page, Page::Admin(_)) {
                     this.load_page(cx);
                 }
                 cx.notify();
@@ -1280,7 +1271,7 @@ mod race_tests {
         assert_eq!(server.count("POST", "/System/Configuration"), 2, "both objects go to the server");
         bloom.read_with(cx, |this, _| {
             assert!(this.config_state().contains("1 changed"), "{}", this.config_state());
-            let Page::Admin(admin) = &this.page else { panic!("not the dashboard") };
+            let Page::Admin(admin) = &this.nav.page else { panic!("not the dashboard") };
             let data = &admin.config[&Section::LibraryDisplay];
             assert!(!data.drafts[0].dirty(), "the object the server took is still dirty");
             assert_eq!(data.drafts[0].original["EnableFolderView"], json!(true), "the taken object is not the baseline");

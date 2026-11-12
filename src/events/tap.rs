@@ -115,11 +115,11 @@ impl Bloom {
     }
 
     fn events_snapshot(&self) -> Snapshot {
-        let status = &self.player_status;
-        let active = self.player_open && status.state == PlayState::Playing;
+        let status = &self.playback.status;
+        let active = self.playback.open && status.state == PlayState::Playing;
         Snapshot {
             active,
-            item: self.playing.as_ref().filter(|_| active).map(|item| match &self.events.last.item {
+            item: self.playback.playing.as_ref().filter(|_| active).map(|item| match &self.events.last.item {
                 // The item of the last look: its texts are not made again
                 // at each look, some times a second.
                 Some(last) if last.id == item.id => last.clone(),
@@ -137,12 +137,12 @@ impl Bloom {
             buffering: status.buffering,
             position: status.position,
             duration: status.duration,
-            rate: self.speed as f64,
+            rate: self.playback.speed as f64,
             reached_end: status.reached_end,
             failed: status.error.is_some(),
             segment: self.current_segment().filter(|_| active).map(|segment| segment.kind.clone()),
             fullscreen: self.events_fullscreen(),
-            pip: self.pip.is_some(),
+            pip: self.playback.pip.is_some(),
         }
     }
 
@@ -193,7 +193,7 @@ impl Bloom {
     /// tells its colour (`artwork.colour`). A light can take the colour.
     fn events_artwork(&mut self, cx: &mut Context<Self>) {
         self.events.colour = None;
-        let Some(item) = self.playing.clone() else { return };
+        let Some(item) = self.playback.playing.clone() else { return };
         let session = self.events.session;
         let ask = next_ask();
         self.events.artwork_ask = ask;
@@ -226,7 +226,7 @@ impl Bloom {
     pub(crate) fn events_page(&mut self, cx: &mut Context<Self>) {
         self.lights_check(cx);
         let on = hub().on() && self.config.events_colours == Some(true);
-        let item = match &self.page {
+        let item = match &self.nav.page {
             crate::app::Page::Detail(detail) if on => Some(detail.item.clone()),
             _ => None,
         };

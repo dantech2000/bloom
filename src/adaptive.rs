@@ -327,7 +327,7 @@ impl Bloom {
         self.save_config(cx);
         STATE.lock().unwrap().enabled = on;
         // Auto with the switch off is the file as it is: load it again.
-        if self.player_open && stream::max_bitrate().is_none() {
+        if self.playback.open && stream::max_bitrate().is_none() {
             self.stream_reload(None, None);
         }
         cx.notify();
@@ -391,8 +391,8 @@ impl Bloom {
         // A reload that waited for a load runs first (`stream`).
         self.stream_poll();
         let now = Instant::now();
-        let status = &self.player_status;
-        let playing = self.player_open && status.state == PlayState::Playing;
+        let status = &self.playback.status;
+        let playing = self.playback.open && status.state == PlayState::Playing;
         let in_group = self.sync.in_group();
         let manual = stream::max_bitrate().is_some();
         let mut state = STATE.lock().unwrap();
@@ -402,7 +402,7 @@ impl Bloom {
             state.buffering_since = None;
             state.wanted = None;
             state.clock = None;
-            state.was_open = self.player_open;
+            state.was_open = self.playback.open;
             return;
         }
 
@@ -437,7 +437,7 @@ impl Bloom {
 
         // Stalls count for Auto alone, and for the item that plays now: a
         // stall under a manual limit must not step Auto down later.
-        let item = self.playing.as_ref().map_or("", |i| i.id.as_str());
+        let item = self.playback.playing.as_ref().map_or("", |i| i.id.as_str());
         if state.item != item {
             state.item = item.to_string();
             state.stepper.clear();
@@ -447,8 +447,8 @@ impl Bloom {
         }
 
         let mut reload: Option<String> = None;
-        if playing && !self.scrubbing && !manual && !status.buffering {
-            let resolved = self.playing.as_ref().and_then(|item| stream::current_of(&item.id));
+        if playing && !self.playback.scrubbing && !manual && !status.buffering {
+            let resolved = self.playback.playing.as_ref().and_then(|item| stream::current_of(&item.id));
             let playing_bps = resolved
                 .as_ref()
                 .and_then(|r| r.target.as_ref().map(|t| t.bitrate).or(r.source_bitrate));
@@ -491,9 +491,9 @@ impl Bloom {
 
         // A measurement needs the link for itself: never while the video
         // plays. Between items, a stale value is renewed for the next one.
-        let closed_now = state.was_open && !self.player_open;
-        state.was_open = self.player_open;
-        let free = !self.player_open || (status.paused && !status.buffering);
+        let closed_now = state.was_open && !self.playback.open;
+        state.was_open = self.playback.open;
+        let free = !self.playback.open || (status.paused && !status.buffering);
         let stale = state.link.is_none_or(|link| link.at.elapsed() > FRESH);
         let due = match state.wanted {
             Some(_) => free,
@@ -562,25 +562,7 @@ impl Bloom {
                 }
                 format!("adaptive={on}")
             }
-            // For a screenshot of a test instance that sits under other
-            // windows: brings its window over them without taking the
-            // focus, and puts it back.
-            "window-front" | "window-back" => {
-                use crate::macos::{Id, class, send};
-                let app = send!(Id, class(c"NSApplication"), c"sharedApplication");
-                let windows = send!(Id, app, c"windows");
-                let count = send!(usize, windows, c"count");
-                for i in 0..count {
-                    let window = send!(Id, windows, c"objectAtIndex:", i => usize);
-                    if verb == "window-front" {
-                        send!((), window, c"orderFront:", std::ptr::null_mut() => Id);
-                    } else {
-                        send!((), window, c"orderBack:", std::ptr::null_mut() => Id);
-                    }
-                }
-                verb.to_string()
-            }
-            _ => "error: quality state|set <kbps|auto>|menu|info|quit|measure|fake-speed <kbps|off>|fake-stall <n>|adaptive <on|off>|window-front|window-back".into(),
+            _ => "error: quality state|set <kbps|auto>|menu|info|quit|measure|fake-speed <kbps|off>|fake-stall <n>|adaptive <on|off>".into(),
         }
     }
 }

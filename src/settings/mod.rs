@@ -438,7 +438,7 @@ impl Bloom {
                     // of the failure. It asks again when it opens next.
                     Err(err) => {
                         log::warn!("user settings failed: {err:#}");
-                        if matches!(this.page, Page::Settings(_)) {
+                        if matches!(this.nav.page, Page::Settings(_)) {
                             this.toast("Could not load your settings", format!("{err:#}"), cx);
                         }
                     }
@@ -452,12 +452,12 @@ impl Bloom {
         if self.session.is_none() {
             return;
         }
-        match &mut self.page {
+        match &mut self.nav.page {
             Page::Settings(open) => {
                 *open = section;
                 self.settings_list = false;
                 self.forget_admin_dialogs();
-                self.page_scroll
+                self.nav.scroll
                     .set_offset(gpui_kit::point(px(0.), px(0.)));
                 cx.notify();
             }
@@ -472,18 +472,18 @@ impl Bloom {
     /// On a phone, with a section open: back to the list of sections.
     /// False when the back arrow has to leave the page instead.
     pub fn settings_back_to_list(&mut self, cx: &mut Context<Self>) -> bool {
-        if !self.compact_w() || !matches!(self.page, Page::Settings(_)) || self.settings_list {
+        if !self.compact_w() || !matches!(self.nav.page, Page::Settings(_)) || self.settings_list {
             return false;
         }
         self.settings_list = true;
-        self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+        self.nav.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
         cx.notify();
         true
     }
 
     /// Changes one field of the user's configuration on the server. The page
     /// shows the new value at once; a failed save puts the old one back.
-    pub fn set_user_config(&mut self, key: &'static str, value: Value, cx: &mut Context<Self>) {
+    pub fn set_user_config(&mut self, key: &str, value: Value, cx: &mut Context<Self>) {
         if !self.prefs.loaded || !self.prefs.configuration.is_object() {
             return;
         }
@@ -678,14 +678,14 @@ impl Bloom {
                     })
             })
             .collect();
-        self.card_menu.update(cx, |menu, cx| {
+        self.popups.card_menu.update(cx, |menu, cx| {
             menu.set_items(items, cx);
             menu.open_at(Some(position), window, cx);
         });
     }
 
     pub fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let Page::Settings(open) = &self.page else {
+        let Page::Settings(open) = &self.nav.page else {
             unreachable!()
         };
         let open = *open;
@@ -751,7 +751,7 @@ impl Bloom {
         let page_w = px((self.viewport_w - NAV_W).max(0.));
         let content = div().flex_1().min_w_0().when(!narrow, |el| el.min_w(page_w).max_w(page_w)).h_full().child(
             ScrollArea::new("settings.scroll")
-                .track(&self.page_scroll)
+                .track(&self.nav.scroll)
                 .size_full()
                 .child(
                     div()
@@ -901,6 +901,18 @@ impl Bloom {
         self.rebuild_menu(cx);
         self.toast("Profile picture", done, cx);
         cx.notify();
+    }
+}
+
+// The glass of the panels (Settings > Display).
+impl Bloom {
+    /// Liquid glass or the frosted glass of before, for every panel.
+    pub(crate) fn toggle_liquid_glass(&mut self, cx: &mut Context<Self>) {
+        let on = !self.config.liquid_glass.unwrap_or(true);
+        self.config.liquid_glass = Some(on);
+        self.save_config(cx);
+        crate::ui::glass::set_liquid(on);
+        cx.refresh_windows();
     }
 }
 

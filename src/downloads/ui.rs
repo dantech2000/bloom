@@ -223,7 +223,7 @@ impl Bloom {
         };
         let engine = engine();
         if item.kind == ItemKind::Season {
-            let episodes: Vec<Item> = match &self.page {
+            let episodes: Vec<Item> = match &self.nav.page {
                 Page::Detail(data) => data.episodes.iter().filter(|e| e.is_playable()).cloned().collect(),
                 _ => Vec::new(),
             };
@@ -592,7 +592,7 @@ impl Bloom {
             .size_full()
             .child(
                 ScrollArea::new("downloads.scroll")
-                    .track(&self.page_scroll)
+                    .track(&self.nav.scroll)
                     .size_full()
                     .child(page),
             )

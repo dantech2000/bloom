@@ -20,7 +20,6 @@ use super::{
 use crate::{
     app::{Bloom, Panel},
     jellyfin::{Item, ItemKind, ItemQuery},
-    socket::ServerSocket,
     ui::{glass::glass, scroll_area::ScrollArea, theme::UiTheme, tip::tip},
     views::cards::icon,
 };
@@ -47,7 +46,7 @@ fn queue_button(
         .justify_center()
         .hover(|s| s.bg(rgba(0xffffff29)))
         .tooltip(tip(hint))
-        .child(icon(glyph, 15., rgba(0xf5f5f7b3)))
+        .child(icon(glyph, 15., crate::ui::tone::INK_70))
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
             cx.stop_propagation();
             this.sync_user(intent.clone(), cx)
@@ -58,9 +57,6 @@ fn queue_button(
 #[derive(Default)]
 pub struct SyncState {
     pub session: Option<Session>,
-    /// The socket of the server. It is here for the callers that reach it
-    /// through `sync`; its code is `crate::socket`.
-    pub socket: ServerSocket,
     tasks: Vec<Task<()>>,
     /// What the server lets this user do: "CreateAndJoinGroups",
     /// "JoinGroups" or "None".
@@ -96,12 +92,6 @@ impl SyncState {
 
     pub fn allowed(&self) -> bool {
         matches!(self.access.as_str(), "CreateAndJoinGroups" | "JoinGroups")
-    }
-
-    /// Sends a message over the socket of the server, such as a
-    /// subscription. False without a socket.
-    pub fn socket_send(&self, kind: &str, data: Option<serde_json::Value>) -> bool {
-        self.socket.send(kind, data)
     }
 }
 
@@ -174,7 +164,7 @@ impl Bloom {
             session.end();
             if in_group {
                 // The group played at one speed.
-                self.player.set_speed(self.speed as f64);
+                self.player.set_speed(self.playback.speed as f64);
             }
         }
         self.sync.tasks.clear();
@@ -221,7 +211,7 @@ impl Bloom {
                 self.load_groups(cx);
             }
             Notice::Left => {
-                self.player.set_speed(self.speed as f64);
+                self.player.set_speed(self.playback.speed as f64);
                 self.toast("SyncPlay", "You left the group.", cx);
                 self.load_groups(cx);
             }
@@ -252,20 +242,20 @@ impl Bloom {
     /// The group loads an item into the player: show the player, and get
     /// what the screen needs of the item.
     fn sync_now_playing(&mut self, item_id: String, cx: &mut Context<Self>) {
-        self.player.set_volume(self.volume as f64);
-        self.player.set_muted(self.muted);
+        self.player.set_volume(self.playback.volume as f64);
+        self.player.set_muted(self.playback.muted);
         self.player.set_speed(1.);
         self.apply_subtitle_style();
         // The audio track stays as the player chose it: a change after the
         // start would move the position.
         self.stream.chose(crate::stream::Chosen::Audio);
-        self.segments.clear();
+        self.playback.segments.clear();
         self.close_panel(Panel::Episodes);
         // The item of the player is not known until the server answers; a
         // local play meanwhile sets its own (`begin`).
-        self.playing = None;
-        self.player_status = self.player.status();
-        self.player_open = true;
+        self.playback.playing = None;
+        self.playback.status = self.player.status();
+        self.playback.open = true;
         self.sync.focus_player = true;
         self.show_controls();
         self.start_player_poll(cx);
@@ -284,13 +274,13 @@ impl Bloom {
             move |this, result, cx| {
                 if let Ok((item, segments)) = result {
                     this.sync.titles.insert(wanted.clone(), item.display_title());
-                    if this.sync.now_playing_load != load || !this.player_open || this.playing.is_some() {
+                    if this.sync.now_playing_load != load || !this.playback.open || this.playback.playing.is_some() {
                         return;
                     }
-                    this.playing = Some(item);
-                    this.segments = segments;
+                    this.playback.playing = Some(item);
+                    this.playback.segments = segments;
                     this.load_timeline(wanted, cx);
-                    this.tracks_version = 0;
+                    this.playback.tracks_version = 0;
                     this.rebuild_track_menus(cx);
                     cx.notify();
                 }
@@ -367,7 +357,7 @@ impl Bloom {
         self.sync.groups_loading = true;
         self.fetch(
             cx,
-            |client| client.get::<Vec<GroupInfo>>("/SyncPlay/List", &[]),
+            |client| client.syncplay_groups::<Vec<GroupInfo>>(),
             |this, result, cx| {
                 this.sync.groups_loading = false;
                 match result {
@@ -471,7 +461,7 @@ impl Bloom {
             return None;
         }
         let t = UiTheme::read(cx).clone();
-        let soft = rgba(0xf5f5f7b3);
+        let soft = crate::ui::tone::INK_70;
         let session = self.sync.session.as_ref()?;
 
         fn swallow(_: &mut Bloom, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Bloom>) {
@@ -488,7 +478,7 @@ impl Bloom {
                 .items_center()
                 .gap(px(12.))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgba(0xffffff1f)))
+                .hover(|s| s.bg(crate::ui::tone::HOVER))
         };
         let label = |title: String, detail: String| {
             div()
@@ -592,7 +582,7 @@ impl Bloom {
                         let moved = |new_index| Intent::Move { playlist_item_id: id.clone(), new_index };
                         list = list.child(
                             row(SharedString::from(format!("sync.queue.{id}")))
-                                .when(playing, |el| el.bg(rgba(0xffffff1f)))
+                                .when(playing, |el| el.bg(crate::ui::tone::HOVER))
                                 .child(
                                     div()
                                         .w(px(18.))
@@ -710,7 +700,7 @@ impl Bloom {
             .w(px(PANEL_W.min(self.viewport_w - 48.)))
             .rounded(px(24.))
             .border_1()
-            .border_color(rgba(0xf5f5f733))
+            .border_color(crate::ui::tone::EDGE)
             .on_mouse_down(MouseButton::Left, cx.listener(swallow))
             // A click anywhere else closes the panel, as it closes a menu.
             .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -772,8 +762,8 @@ mod race_tests {
         bloom.update(cx, |this, cx| this.close_player_view(cx));
         cx.run_until_parked();
         bloom.read_with(cx, |this, _| {
-            assert!(!this.player_open);
-            assert!(this.playing.is_none(), "the closed player got the item of the group");
+            assert!(!this.playback.open);
+            assert!(this.playback.playing.is_none(), "the closed player got the item of the group");
             assert_eq!(this.sync.titles.get("x").map(String::as_str), Some("Title x"), "the title is not cached");
         });
     }
@@ -791,9 +781,9 @@ mod race_tests {
         });
         cx.run_until_parked();
         bloom.read_with(cx, |this, _| {
-            assert!(this.player_open);
+            assert!(this.playback.open);
             assert_eq!(
-                this.playing.as_ref().map(|i| i.id.as_str()),
+                this.playback.playing.as_ref().map(|i| i.id.as_str()),
                 Some("y"),
                 "the player shows the item the group loaded first"
             );

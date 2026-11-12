@@ -66,7 +66,7 @@ pub(crate) fn editor_style(t: &UiTheme) -> InputEditorStyle {
 impl Bloom {
     /// The open dialog.
     fn text_editor(&self) -> Option<&TextEditor> {
-        match &self.page {
+        match &self.nav.page {
             Page::Admin(admin) => admin.text_editor.as_ref(),
             _ => None,
         }
@@ -78,7 +78,7 @@ impl Bloom {
 
     /// Opens the dialog with the text in the field and the focus in it.
     pub fn open_text_editor(&mut self, spec: TextEdit, window: &mut Window, cx: &mut Context<Self>) {
-        let Page::Admin(admin) = &mut self.page else {
+        let Page::Admin(admin) = &mut self.nav.page else {
             return;
         };
         let state = cx.new(|cx| {
@@ -101,7 +101,7 @@ impl Bloom {
 
     /// Closes the dialog without an edit.
     pub fn close_text_editor(&mut self) {
-        if let Page::Admin(admin) = &mut self.page {
+        if let Page::Admin(admin) = &mut self.nav.page {
             admin.text_editor = None;
         }
     }
@@ -138,7 +138,7 @@ impl Bloom {
         let Some(value) = self.text_editor_value(cx) else {
             return;
         };
-        let Page::Admin(admin) = &mut self.page else {
+        let Page::Admin(admin) = &mut self.nav.page else {
             return;
         };
         let Some(editor) = admin.text_editor.take() else {

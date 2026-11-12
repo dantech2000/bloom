@@ -17,6 +17,7 @@
 //! the last call is for the debug channel (`subs remove`), which puts a
 //! test download away again.
 
+use crate::jellyfin::Method;
 use std::{collections::HashMap, time::Duration};
 
 use anyhow::{Result, anyhow};
@@ -107,7 +108,7 @@ pub(crate) impl Client {
     /// None when the stream did not appear in time.
     fn download_subtitle(&self, item_id: &str, subtitle_id: &str) -> Result<Option<MediaStream>> {
         let before = self.subtitle_streams(item_id)?;
-        self.call("POST", &remote_search_path(item_id, subtitle_id), &[])?;
+        self.call(Method::Post, &remote_search_path(item_id, subtitle_id), &[])?;
         for _ in 0..16 {
             std::thread::sleep(Duration::from_millis(1500));
             let after = self.subtitle_streams(item_id)?;
@@ -129,7 +130,7 @@ pub(crate) impl Client {
             }
             Some(_) => {}
         }
-        self.call("DELETE", &remove_path(item_id, index), &[])
+        self.call(Method::Delete, &remove_path(item_id, index), &[])
     }
 }
 
@@ -196,7 +197,7 @@ impl State {
 impl Bloom {
     /// True while the item that plays has a subtitle burned in.
     fn subs_burned(&self) -> bool {
-        self.playing
+        self.playback.playing
             .as_ref()
             .and_then(|item| crate::stream::current_of(&item.id))
             .is_some_and(|r| r.burned_subtitle.is_some())
@@ -221,7 +222,7 @@ impl Bloom {
                     Ok(rights) => {
                         this.subs.rights = Some(rights);
                         this.rebuild_track_menus(cx);
-                        if matches!(this.page, crate::app::Page::Detail(_)) {
+                        if matches!(this.nav.page, crate::app::Page::Detail(_)) {
                             this.rebuild_detail_menus(cx);
                         }
                         cx.notify();
@@ -279,15 +280,15 @@ impl Bloom {
     /// The delay mpv reports, in seconds.
     fn delay_now(&self, delay: Delay) -> f64 {
         match delay {
-            Delay::Subtitle => self.player_status.sub_delay,
-            Delay::Audio => self.player_status.audio_delay,
+            Delay::Subtitle => self.playback.status.sub_delay,
+            Delay::Audio => self.playback.status.audio_delay,
         }
     }
 
     /// Sets a delay in seconds and shows it. Returns false when it cannot
     /// change (the debug command says why).
     pub fn subs_set_delay(&mut self, delay: Delay, secs: f64, cx: &mut Context<Self>) -> bool {
-        if !self.player_open {
+        if !self.playback.open {
             return false;
         }
         if let Some(reason) = blocked(delay, self.subs_burned()) {
@@ -331,7 +332,7 @@ impl Bloom {
 
     /// Called after each status poll: the menus show the delay mpv reports.
     pub fn subs_status_changed(&mut self, cx: &mut Context<Self>) {
-        let seen = (self.player_status.sub_delay, self.player_status.audio_delay);
+        let seen = (self.playback.status.sub_delay, self.playback.status.audio_delay);
         if seen != self.subs.seen {
             self.subs.seen = seen;
             self.rebuild_track_menus(cx);
@@ -360,7 +361,7 @@ impl Bloom {
 
     /// The id and title of the item that plays.
     pub fn subs_playing(&self) -> Option<(String, String)> {
-        self.playing.as_ref().map(|i| (i.id.clone(), i.display_title()))
+        self.playback.playing.as_ref().map(|i| (i.id.clone(), i.display_title()))
     }
 
     pub fn open_subs_panel(&mut self, item_id: &str, title: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -455,12 +456,12 @@ impl Bloom {
             .filter(|title| !title.is_empty())
             .unwrap_or_else(|| language_name(found.language.as_deref().unwrap_or_default()));
         self.toast("Subtitle added", name, cx);
-        let on_page = matches!(&self.page, crate::app::Page::Detail(d) if d.item.id == item_id);
+        let on_page = matches!(&self.nav.page, crate::app::Page::Detail(d) if d.item.id == item_id);
         if on_page {
             self.load_page(cx);
         }
-        let playing = self.playing.as_ref().is_some_and(|i| i.id == item_id);
-        if self.player_open && playing {
+        let playing = self.playback.playing.as_ref().is_some_and(|i| i.id == item_id);
+        if self.playback.open && playing {
             self.stream_reload(None, Some(found.index));
         }
     }
@@ -471,7 +472,7 @@ impl Bloom {
             return None;
         }
         let t = UiTheme::read(cx).clone();
-        let soft = rgba(0xf5f5f7b3);
+        let soft = crate::ui::tone::INK_70;
         fn swallow(_: &mut Bloom, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Bloom>) {
             cx.stop_propagation();
         }
@@ -481,7 +482,7 @@ impl Bloom {
                 .px(px(8.))
                 .py(px(1.))
                 .rounded(px(8.))
-                .bg(rgba(0xffffff1f))
+                .bg(crate::ui::tone::HOVER)
                 .text_size(px(11.))
                 .text_color(soft)
                 .child(text)
@@ -506,7 +507,7 @@ impl Bloom {
                         el.bg(rgba(0xf5f5f7e6)).text_color(rgba(0x1c1c1eff))
                     })
                     .when(!selected, |el| {
-                        el.bg(rgba(0xffffff1f)).text_color(t.colors.foreground).hover(|s| s.bg(rgba(0xffffff33)))
+                        el.bg(crate::ui::tone::HOVER).text_color(t.colors.foreground).hover(|s| s.bg(rgba(0xffffff33)))
                     })
                     .child(language_name(&code))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -557,7 +558,7 @@ impl Bloom {
                     .flex()
                     .items_center()
                     .gap(px(12.))
-                    .hover(|s| s.bg(rgba(0xffffff1f)))
+                    .hover(|s| s.bg(crate::ui::tone::HOVER))
                     .child(
                         div()
                             .flex_1()
@@ -610,7 +611,7 @@ impl Bloom {
             .w(px(PANEL_W.min(self.viewport_w - 48.)))
             .rounded(px(24.))
             .border_1()
-            .border_color(rgba(0xf5f5f733))
+            .border_color(crate::ui::tone::EDGE)
             .on_mouse_down(MouseButton::Left, cx.listener(swallow))
             .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
                 if this.close_panel(Panel::Subtitles) {
@@ -771,7 +772,7 @@ impl Bloom {
     }
 
     fn subs_describe(&self) -> String {
-        let status = &self.player_status;
+        let status = &self.playback.status;
         let selected = status
             .tracks
             .iter()

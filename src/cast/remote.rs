@@ -185,7 +185,7 @@ impl JellyfinRemote {
             PlayCommand::PlayNext => format!("Plays next on {name}."),
             PlayCommand::PlayLast => format!("Added to the queue of {name}."),
         };
-        Effect::request(move |client| client.call("POST", &format!("/Sessions/{id}/Playing"), &query), Some(what))
+        Effect::request(move |client| client.session_play(&id, &query), Some(what))
     }
 
     /// A playstate command: Pause, Unpause, PlayPause, Stop, NextTrack,
@@ -209,8 +209,8 @@ impl JellyfinRemote {
         if let Some(secs) = seek_secs.filter(|_| command == "Seek") {
             query.push(("seekPositionTicks", protocol::secs_to_ticks(secs).to_string()));
         }
-        let path = format!("/Sessions/{}/Playing/{command}", self.session.id);
-        Effect::request(move |client| client.call("POST", &path, &query), None)
+        let (id, command) = (self.session.id.clone(), command.to_string());
+        Effect::request(move |client| client.session_playstate(&id, &command, &query), None)
     }
 
     /// A general command, with its arguments.
@@ -229,8 +229,8 @@ impl JellyfinRemote {
             _ => {}
         }
         let body = protocol::general_command(name, arguments);
-        let path = format!("/Sessions/{}/Command", self.session.id);
-        Effect::request(move |client| client.post(&path, &body).map(drop), None)
+        let id = self.session.id.clone();
+        Effect::request(move |client| client.session_command(&id, &body), None)
     }
 }
 

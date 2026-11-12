@@ -36,7 +36,7 @@ impl Bloom {
     /// Seeks by a number of seconds from the position now.
     pub fn request_seek_by(&mut self, secs: f64, cx: &mut Context<Self>) {
         // A group takes a position, not a step.
-        let target = (self.player_status.position + secs).max(0.);
+        let target = (self.playback.status.position + secs).max(0.);
         if !self.sync_intent(Intent::Seek(target * 1000.), cx) {
             self.player.seek_relative(secs);
         }

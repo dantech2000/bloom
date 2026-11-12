@@ -303,21 +303,12 @@ impl Bloom {
     }
 
     pub fn open_downloads(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.page, Page::Downloads) {
-            self.page_scroll.set_offset(gpui_kit::point(gpui_kit::px(0.), gpui_kit::px(0.)));
+        if matches!(self.nav.page, Page::Downloads) {
+            self.nav.scroll.set_offset(gpui_kit::point(gpui_kit::px(0.), gpui_kit::px(0.)));
             cx.notify();
             return;
         }
         self.navigate(Page::Downloads, cx);
-    }
-
-    /// A page could not load. When nothing reached the server
-    /// (`connection::classify`), a probe decides whether the app is
-    /// offline; then the Downloads page opens when there are downloads,
-    /// and the pages stop asking the server. True when the error is of
-    /// that kind: the page shows no raw text for it.
-    pub fn downloads_server_failed(&mut self, err: &anyhow::Error, cx: &mut Context<Self>) -> bool {
-        self.request_failed(err, cx)
     }
 
     /// Tries the server again now. A test that pointed the session at a
@@ -369,10 +360,10 @@ impl Bloom {
         if !self.downloads.offline {
             return false;
         }
-        match &mut self.page {
+        match &mut self.nav.page {
             Page::Detail(data) => {
                 if let Some(item) = engine().item(&data.item.id) {
-                    data.item = item;
+                    data.set_item(item);
                 }
                 data.loading = false;
                 self.rebuild_detail_menus(cx);

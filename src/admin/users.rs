@@ -78,7 +78,7 @@ pub struct Data {
 }
 
 pub fn load(client: &Client) -> Result<Data> {
-    let mut users: Vec<User> = client.get("/Users", &[])?;
+    let mut users: Vec<User> = client.users()?;
     users.sort_by_key(|u| u.name.to_lowercase());
     Ok(Data { users: users.into_iter().map(Arc::new).collect() })
 }
@@ -514,15 +514,13 @@ fn ask_set_disabled(app: &mut Bloom, user: &User, disable: bool, cx: &mut Contex
                 // The policy the server has now, with the one key changed:
                 // the list of the users can be older than a change of the
                 // access of this user, and its policy would put that back.
-                let user: Value = client.get(&format!("/Users/{id}"), &[])?;
+                let user = client.user_json(&id)?;
                 let mut policy = user.get("Policy").cloned().unwrap_or(Value::Null);
                 let Some(fields) = policy.as_object_mut() else {
                     anyhow::bail!("the server sent no policy for this user");
                 };
                 fields.insert("IsDisabled".to_string(), Value::Bool(disable));
-                client
-                    .post(&format!("/Users/{id}/Policy"), &policy)
-                    .map(|_| ())
+                client.set_user_policy(&id, &policy)
             });
         }),
     };
@@ -586,7 +584,7 @@ pub(crate) fn ask_new(app: &mut Bloom, cx: &mut Context<Bloom>) {
                 "Password": values.next().unwrap_or_default(),
             });
             this.admin_action("User created", cx, move |client| {
-                client.post("/Users/New", &body).map(|_| ())
+                client.create_user(&body)
             });
         }),
     };
@@ -610,9 +608,7 @@ fn ask_password(app: &mut Bloom, user: &User, cx: &mut Context<Bloom>) {
             let id = id.clone();
             let body = serde_json::json!({ "NewPw": values.into_iter().next().unwrap_or_default() });
             this.admin_action("Password changed", cx, move |client| {
-                // The id is a hex number, so it needs no escape.
-                let path = format!("/Users/Password?userId={id}");
-                client.post(&path, &body).map(|_| ())
+                client.set_user_password(&id, &body)
             });
         }),
     };
@@ -632,7 +628,7 @@ fn ask_delete(app: &mut Bloom, user: &User, cx: &mut Context<Bloom>) {
         run: Rc::new(move |this, cx| {
             let id = id.clone();
             this.admin_action("User deleted", cx, move |client| {
-                client.call("DELETE", &format!("/Users/{id}"), &[])
+                client.delete_user(&id)
             });
         }),
     };

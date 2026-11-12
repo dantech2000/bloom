@@ -67,11 +67,11 @@ struct PlayerMetrics {
 
 impl Bloom {
     pub fn render_player(&self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
-        if self.pip.is_some() {
+        if self.playback.pip.is_some() {
             return self.render_pip(window, cx);
         }
         let fade = UiTheme::read(cx).motion.normal;
-        let s = &self.player_status;
+        let s = &self.playback.status;
         let white = rgb(0xffffff);
         let soft = rgba(0xffffffb3);
         let starting = s.state == PlayState::Starting;
@@ -80,7 +80,7 @@ impl Bloom {
         // A popup from the bar on a phone opens above the bar, where the
         // episode picker sits (`ui::menu`, `touch_bottom`).
         let menu_bottom = m.phone.then(|| self.viewport_h - m.corner.1);
-        for menu in [&self.subtitle_menu, &self.settings_menu] {
+        for menu in [&self.playback.subtitle_menu, &self.playback.settings_menu] {
             if menu.read(cx).touch_bottom != menu_bottom {
                 menu.update(cx, |menu, _| menu.touch_bottom = menu_bottom);
             }
@@ -102,8 +102,8 @@ impl Bloom {
                 if this.close_panels() {
                     cx.notify();
                 } else if cfg!(target_os = "ios") {
-                    if this.controls_visible {
-                        this.controls_visible = false;
+                    if this.playback.controls_visible {
+                        this.playback.controls_visible = false;
                     } else {
                         this.show_controls();
                     }
@@ -112,7 +112,7 @@ impl Bloom {
                     this.request_toggle_pause(cx)
                 }
             }))
-            .when_some(self.current_frame.clone(), |el, frame| {
+            .when_some(self.playback.frame.clone(), |el, frame| {
                 #[cfg(target_os = "macos")]
                 {
                     el.child(
@@ -129,7 +129,7 @@ impl Bloom {
             })
             .when(
                 // iOS draws the video under the page: no frame comes here.
-                (cfg!(target_os = "macos") && self.current_frame.is_none()) || starting || s.buffering,
+                (cfg!(target_os = "macos") && self.playback.frame.is_none()) || starting || s.buffering,
                 |el| {
                     el.child(
                         div()
@@ -162,7 +162,7 @@ impl Bloom {
         // Controls overlay the video and fade with pointer activity.
         let visibility = crate::ui::theme::transition_value(
             "player.controls-opacity",
-            if self.controls_visible { 1. } else { 0. },
+            if self.playback.controls_visible { 1. } else { 0. },
             fade,
             window,
             cx,
@@ -170,7 +170,7 @@ impl Bloom {
         // The header and the panel are built only while they show or fade.
         // A video frame redraws the whole player; hidden controls must not
         // cost a build on each one.
-        let chrome = (self.controls_visible || visibility > 0.).then(|| {
+        let chrome = (self.playback.controls_visible || visibility > 0.).then(|| {
             let remaining = (s.duration - s.position).max(0.);
             let label = |text: String| {
                 div()
@@ -201,16 +201,16 @@ impl Bloom {
             // the title alone.
             let header_rating = self.enhanced_player_rating().filter(|_| m.extras);
             let rating = self
-                .playing
+                .playback.playing
                 .as_ref()
                 .and_then(|item| item.community_rating)
                 .filter(|_| m.extras && header_rating.is_none());
             let favorite = self
-                .playing
+                .playback.playing
                 .as_ref()
                 .is_some_and(|item| item.user_data.is_favorite);
             let has_subs = s.tracks.iter().any(|track| track.kind == "sub");
-            let silent = self.muted || self.volume == 0.;
+            let silent = self.playback.muted || self.playback.volume == 0.;
 
             let has_previous = !self.queue.history.is_empty();
             let has_next = !self.queue.upcoming.is_empty();
@@ -317,7 +317,7 @@ impl Bloom {
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_playing_favorite(cx))),
                 ))
                 .child(menu_button(
-                    &self.subtitle_menu,
+                    &self.playback.subtitle_menu,
                     "Subtitles",
                     filled(Filled::Captions, 24., if has_subs { white } else { soft }),
                 ))
@@ -341,7 +341,7 @@ impl Bloom {
                 .when(m.extras, |el| {
                     el.child(
                         div().w(px(120.)).mr(px(8.)).child(
-                            Slider::new(&self.volume_slider)
+                            Slider::new(&self.playback.volume_slider)
                                 .aria_label("Volume")
                                 .w_full(),
                         ),
@@ -360,7 +360,7 @@ impl Bloom {
                     )
                 })
                 .child(menu_button(
-                    &self.settings_menu,
+                    &self.playback.settings_menu,
                     "Settings",
                     filled(Filled::Settings, 24., white),
                 ))
@@ -547,7 +547,7 @@ impl Bloom {
 
         div()
             .id("player.root")
-            .track_focus(&self.player_focus)
+            .track_focus(&self.playback.focus)
             .relative()
             .size_full()
             // On iOS the page is a hole over the video layer of the window.
@@ -594,17 +594,17 @@ impl Bloom {
                 }),
             )
             .on_click(cx.listener(|this, _, window, cx| {
-                window.focus(&this.player_focus, cx);
+                window.focus(&this.playback.focus, cx);
             }))
             .on_mouse_move(cx.listener(|this, _, _, cx| {
-                let was_hidden = !this.controls_visible;
+                let was_hidden = !this.playback.controls_visible;
                 this.show_controls();
                 if was_hidden {
                     cx.notify();
                 }
             }))
             .child(video)
-            .when(!self.pause_screen, |el| {
+            .when(!self.playback.pause_screen, |el| {
                 el.children(skip)
                     .children(up_next)
                     .when_some(chrome, |el, (header, panel)| el.child(header).child(panel))
@@ -615,7 +615,7 @@ impl Bloom {
                     .children(self.render_subs_panel(None, cx))
                     .children(self.render_stream_info(cx))
             })
-            .when(self.pause_screen, |el| {
+            .when(self.playback.pause_screen, |el| {
                 el.children(self.render_pause_screen(window, cx))
             })
     }
@@ -677,18 +677,18 @@ impl Bloom {
 
     /// "Ends at 21:40": the time the item ends at the speed it plays.
     fn ends_at_label(&self) -> String {
-        let s = &self.player_status;
+        let s = &self.playback.status;
         let remaining = (s.duration - s.position).max(0.);
         format!(
             "Ends at {}",
-            crate::macos::ends_at((remaining / self.speed.max(0.25) as f64) as i64)
+            crate::macos::ends_at((remaining / self.playback.speed.max(0.25) as f64) as i64)
         )
     }
 
     /// The seek slider with its chapter marks, and over it the preview of
     /// the time under the pointer.
     fn render_timeline(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let duration = self.player_status.duration;
+        let duration = self.playback.status.duration;
         let bounds = self.queue.timeline_bounds.clone();
         let measure = canvas(move |painted, _, _| bounds.set(painted), |_, _, _, _| {})
             .absolute()
@@ -784,7 +784,7 @@ impl Bloom {
             .flex_1()
             .min_w_0()
             .child(measure)
-            .child(Slider::new(&self.seek_slider).aria_label("Seek").w_full())
+            .child(Slider::new(&self.playback.seek_slider).aria_label("Seek").w_full())
             .children(marks)
             .children(self.bookmark_marks())
             .children(preview)
@@ -877,7 +877,7 @@ impl Bloom {
                                     // The series is the one that plays now.
                                     Some(code)
                                         if next.series_id.is_some()
-                                            && self.playing.as_ref().map(|i| &i.series_id)
+                                            && self.playback.playing.as_ref().map(|i| &i.series_id)
                                                 == Some(&next.series_id) =>
                                     {
                                         format!("{code} · {}", next.name)
@@ -911,18 +911,18 @@ impl Bloom {
     /// by a drag anywhere on the video.
     fn render_pip(&self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let fade = UiTheme::read(cx).motion.normal;
-        let s = &self.player_status;
+        let s = &self.playback.status;
         let white = rgb(0xffffff);
         let measure = self.video_measure(window);
         let visibility = crate::ui::theme::transition_value(
             "player.pip-opacity",
-            if self.controls_visible { 1. } else { 0. },
+            if self.playback.controls_visible { 1. } else { 0. },
             fade,
             window,
             cx,
         );
         // No tooltip comes up over hidden controls.
-        let shown = self.controls_visible;
+        let shown = self.playback.controls_visible;
         let button = |id: &'static str, glyph: Svg, size: f32| {
             div()
                 .id(id)
@@ -1027,12 +1027,12 @@ impl Bloom {
                     .right(px(12.))
                     .bottom(px(4.))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::swallow_to_player))
-                    .child(Slider::new(&self.seek_slider).aria_label("Seek").w_full()),
+                    .child(Slider::new(&self.playback.seek_slider).aria_label("Seek").w_full()),
             );
 
         div()
             .id("player.root")
-            .track_focus(&self.player_focus)
+            .track_focus(&self.playback.focus)
             .relative()
             .size_full()
             // On iOS the page is a hole over the video layer of the window.
@@ -1053,7 +1053,7 @@ impl Bloom {
                 }),
             )
             .on_mouse_move(cx.listener(|this, _, _, cx| {
-                let was_hidden = !this.controls_visible;
+                let was_hidden = !this.playback.controls_visible;
                 this.show_controls();
                 if was_hidden {
                     cx.notify();
@@ -1062,7 +1062,7 @@ impl Bloom {
             // A drag anywhere on the picture moves the window.
             .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
             .child(measure)
-            .when_some(self.current_frame.clone(), |el, frame| {
+            .when_some(self.playback.frame.clone(), |el, frame| {
                 #[cfg(target_os = "macos")]
                 {
                     el.child(
@@ -1079,7 +1079,7 @@ impl Bloom {
                     el
                 }
             })
-            .when(self.controls_visible || visibility > 0., |el| {
+            .when(self.playback.controls_visible || visibility > 0., |el| {
                 el.child(controls)
             })
     }
@@ -1091,9 +1091,9 @@ impl Bloom {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Stateful<Div>> {
-        let item = self.playing.as_ref()?;
+        let item = self.playback.playing.as_ref()?;
         let client = &self.session.as_ref()?.client;
-        let s = &self.player_status;
+        let s = &self.playback.status;
         let size = window.viewport_size();
         let (vw, vh) = (f32::from(size.width), f32::from(size.height));
         let left = vw * 0.08;
@@ -1212,7 +1212,7 @@ impl Bloom {
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, window, cx| {
                         // A click resumes playback, as on the web.
-                        window.focus(&this.player_focus, cx);
+                        window.focus(&this.playback.focus, cx);
                         this.request_toggle_pause(cx);
                         this.show_controls();
                         cx.stop_propagation();
@@ -1253,4 +1253,133 @@ fn preview_image(
         },
     )
     .size_full()
+}
+
+use crate::{player::Player, ui::menu::MenuItem};
+
+// The track menus and the gear menu.
+impl Bloom {
+    /// Rebuilds the audio and subtitle menus from the current track list.
+    pub(crate) fn rebuild_track_menus(&mut self, cx: &mut Context<Self>) {
+        let this = cx.weak_entity();
+        let status = &self.playback.status;
+        let build = |kind: &str, none_label: &str, set: fn(&Player, Option<i64>)| {
+            let mut items = Vec::new();
+            let tracks: Vec<&crate::player::Track> =
+                status.tracks.iter().filter(|t| t.kind == kind).collect();
+            let any_selected = tracks.iter().any(|t| t.selected);
+            if kind == "sub" {
+                let handle = this.clone();
+                items.push(
+                    MenuItem::new(
+                        gpui_kit::SharedString::from(format!("track.{kind}.none")),
+                        none_label,
+                    )
+                    .radio(!any_selected)
+                    .on_click(move |_, _, cx| {
+                        handle.update(cx, |t, _| set(&t.player, None)).ok();
+                    }),
+                );
+            }
+            for track in tracks {
+                let id = track.id;
+                let handle = this.clone();
+                items.push(
+                    MenuItem::new(
+                        gpui_kit::SharedString::from(format!("track.{kind}.{id}")),
+                        track.label(),
+                    )
+                    .radio(track.selected)
+                    .on_click(move |_, _, cx| {
+                        handle.update(cx, |t, _| set(&t.player, Some(id))).ok();
+                    }),
+                );
+            }
+            // The subtitle files the server offers that mpv does not have
+            // yet: an image track comes when it is chosen.
+            if kind == "sub" && let Some(resolved) = crate::stream::current() {
+                for sub in &resolved.external_subs {
+                    if resolved.sid_of_external(sub.index, status).is_some() {
+                        continue;
+                    }
+                    let (index, handle) = (sub.index, this.clone());
+                    let detail = if status.pending_subs.contains(&index) { "Loading…" } else { "" };
+                    items.push(
+                        MenuItem::new(
+                            gpui_kit::SharedString::from(format!("track.sub.file.{index}")),
+                            sub.title.clone(),
+                        )
+                        .detail(detail)
+                        .radio(false)
+                        .on_click(move |_, _, cx| {
+                            handle.update(cx, |t, _| t.stream_subtitle(index)).ok();
+                        }),
+                    );
+                }
+            }
+            if items.is_empty() {
+                items.push(
+                    MenuItem::new(
+                        gpui_kit::SharedString::from(format!("track.{kind}.empty")),
+                        "No tracks",
+                    )
+                    .disabled(true),
+                );
+            }
+            items
+        };
+        // While a transcode plays, the server picks the tracks.
+        let audio = self
+            .stream_track_items("audio", cx)
+            .unwrap_or_else(|| build("audio", "", |p, id| p.set_audio(id)));
+        let subs = self
+            .stream_track_items("sub", cx)
+            .unwrap_or_else(|| build("sub", "Off", |p, id| p.set_subtitle(id)));
+        let mut audio = audio;
+        audio.push(MenuItem::separator());
+        audio.push(self.timing_menu_item(crate::subtitles::Delay::Audio, cx));
+        let mut subs = subs;
+        subs.push(MenuItem::separator());
+        subs.push(self.timing_menu_item(crate::subtitles::Delay::Subtitle, cx));
+        if let Some((id, title)) = self.subs_playing()
+            && let Some(search) = self.subs_search_item(&id, &title, cx)
+        {
+            subs.push(search);
+        }
+        self.subs_load_rights(cx);
+        let mut settings = vec![MenuItem::label("settings.audio", "Audio")];
+        settings.extend(audio.clone());
+        settings.push(MenuItem::separator());
+        settings.push(self.quality_menu_item(cx));
+        settings.push(MenuItem::separator());
+        settings.push(MenuItem::label("settings.speed", "Playback speed"));
+        for speed in [0.5_f32, 0.75, 1., 1.25, 1.5, 2.] {
+            let handle = this.clone();
+            settings.push(
+                MenuItem::new(
+                    gpui_kit::SharedString::from(format!("settings.speed.{speed}")),
+                    format!("{speed}x"),
+                )
+                .radio(self.playback.speed == speed)
+                .on_click(move |_, _, cx| {
+                    handle.update(cx, |t, cx| t.set_speed(speed, cx)).ok();
+                }),
+            );
+        }
+        settings.push(MenuItem::separator());
+        let handle = this.clone();
+        settings.push(
+            MenuItem::new("settings.info", "Playback info")
+                .checked(self.playback.info)
+                .on_click(move |_, _, cx| {
+                    handle.update(cx, |t, cx| t.toggle_playback_info(cx)).ok();
+                }),
+        );
+        self.playback.settings_menu
+            .update(cx, |menu, cx| menu.set_items(settings, cx));
+        self.playback.audio_menu
+            .update(cx, |menu, cx| menu.set_items(audio, cx));
+        self.playback.subtitle_menu
+            .update(cx, |menu, cx| menu.set_items(subs, cx));
+    }
 }

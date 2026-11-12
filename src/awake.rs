@@ -264,9 +264,9 @@ impl Bloom {
     /// The facts of the player right now.
     fn awake_facts(&self) -> Facts {
         Facts {
-            state: self.player_status.state,
-            paused: self.player_status.paused,
-            error: self.player_status.error.is_some(),
+            state: self.playback.status.state,
+            paused: self.playback.status.paused,
+            error: self.playback.status.error.is_some(),
             local: self.cast.kind() == Kind::Local,
             group: self.sync.holds_player(),
         }

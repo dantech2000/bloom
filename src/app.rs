@@ -15,7 +15,6 @@ use crate::{
     config::{Config, Profile},
     jellyfin::{Client, Item, ItemKind, ItemQuery, SeerrItem, MediaSegment},
     player::{PlayState, Player, PlayerStatus},
-    ui::menu::MenuItem,
     ui::{
         input::InputState,
         menu::MenuState,
@@ -27,13 +26,14 @@ use crate::{
     views::{cards::Metrics, connect::ConnectState},
 };
 
-pub const PAGE_SIZE: usize = 100;
-/// Slides in the home hero.
-pub const HERO_ITEMS: usize = 20;
+// The data of the pages and their loading have no window: `bloom_core::pages`.
+pub use crate::pages::{
+    DetailData, FAVORITES_ID, HomeData, LIBRARY_FILTERS, LIBRARY_SORTS, LibraryData,
+    LibraryShow, PAGE_SIZE, PERSON_VIEW, home_libraries, library_query,
+};
+
 /// Time one hero slide stays on screen.
 pub const HERO_SLIDE: Duration = Duration::from_millis(7000);
-/// Id of the synthetic library that lists the user's favourites.
-pub const FAVORITES_ID: &str = "favorites";
 /// Pointer idle time before the player controls fade out.
 const CONTROLS_HIDE_AFTER: Duration = Duration::from_millis(2500);
 /// Time a paused player waits with no input before the pause screen shows.
@@ -47,34 +47,20 @@ pub fn theme(dark: bool) -> UiTheme {
     } else {
         UiTheme::neutral_light()
     };
-    let accent = rgb(0xf5f5f7);
-    let ink = rgb(0x121212);
+    let accent = crate::ui::tone::INK;
+    let ink = crate::ui::tone::ON_ACCENT;
     if dark {
         t.colors.background = rgb(0x101010);
         t.colors.foreground = rgba(0xffffffde);
-        t.colors.card = rgb(0x1a1a1a);
-        t.colors.card_foreground = rgba(0xffffffde);
         t.colors.popover = rgb(0x2a2a2a);
         t.colors.popover_foreground = accent;
-        t.colors.secondary = rgba(0xffffff1f);
-        t.colors.secondary_foreground = accent;
         t.colors.muted = rgb(0x1c1c1c);
         t.colors.muted_foreground = rgba(0xffffff99);
-        t.colors.accent = rgba(0xf5f5f71f);
-        t.colors.accent_foreground = accent;
         t.colors.border = rgba(0xf5f5f729);
         t.colors.input = rgba(0xffffff17);
-        t.colors.sidebar = rgb(0x101010);
-        t.colors.sidebar_foreground = accent;
-        t.colors.sidebar_accent = rgba(0xf5f5f71f);
-        t.colors.sidebar_accent_foreground = accent;
-        t.colors.sidebar_border = rgba(0xf5f5f729);
         t.colors.primary = accent;
         t.colors.primary_foreground = ink;
-        t.colors.ring = rgba(0xf5f5f799);
-        t.colors.sidebar_primary = accent;
-        t.colors.sidebar_primary_foreground = ink;
-        t.colors.sidebar_ring = rgba(0xf5f5f799);
+        t.colors.ring = crate::ui::tone::INK_60;
         t.colors.destructive = rgb(0xf92672);
     } else {
         t.colors.background = rgb(0xfafafa);
@@ -82,7 +68,6 @@ pub fn theme(dark: bool) -> UiTheme {
         if let Some(ground) = crate::ui::glass::ground() {
             t.colors.background = ground;
         }
-        t.colors.sidebar = rgb(0xf3f3f6);
         t.colors.primary = ink;
         t.colors.primary_foreground = accent;
         t.colors.ring = ink;
@@ -134,134 +119,6 @@ pub enum Screen {
     Main,
 }
 
-#[derive(Default)]
-pub struct HomeData {
-    pub loading: bool,
-    /// Section kinds in display order (`homesection0..`).
-    pub order: Vec<String>,
-    /// Items of the hero slideshow at the top of the page.
-    pub hero: Vec<Item>,
-    pub resume: Vec<Item>,
-    pub next_up: Vec<Item>,
-    pub latest: Vec<(Item, Vec<Item>)>,
-}
-
-pub struct LibraryData {
-    pub view: Item,
-    pub title: String,
-    pub loading: bool,
-    /// The items of the current page.
-    pub items: Vec<Item>,
-    pub total: usize,
-    /// Index of the first item of the current page.
-    pub start: usize,
-    pub sort: &'static str,
-    pub descending: bool,
-    /// One of the server's item filters, such as "IsUnplayed".
-    pub filter: Option<&'static str>,
-    /// Letter picked at the right edge; '#' stands for names before "A".
-    pub letter: Option<char>,
-    /// What of the library shows; picked in the menu of the title.
-    pub show: LibraryShow,
-}
-
-/// The views of a library, as in the title menu of the web client.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum LibraryShow {
-    /// The movies or the shows of the library.
-    #[default]
-    All,
-    Favorites,
-    /// The collections of the server (in a movie library).
-    Collections,
-    /// All episodes (in a show library).
-    Episodes,
-}
-
-impl LibraryShow {
-    pub fn label(self, library: &str) -> String {
-        match self {
-            LibraryShow::All => library.to_string(),
-            LibraryShow::Favorites => "Favorites".to_string(),
-            LibraryShow::Collections => "Collections".to_string(),
-            LibraryShow::Episodes => "Episodes".to_string(),
-        }
-    }
-
-    /// The views a library of this collection type has.
-    pub fn of(collection_type: Option<&str>) -> &'static [LibraryShow] {
-        match collection_type {
-            Some("movies") => &[
-                LibraryShow::All,
-                LibraryShow::Favorites,
-                LibraryShow::Collections,
-            ],
-            Some("tvshows") => &[
-                LibraryShow::All,
-                LibraryShow::Favorites,
-                LibraryShow::Episodes,
-            ],
-            _ => &[],
-        }
-    }
-}
-
-impl LibraryData {
-    pub fn new(view: Item) -> Self {
-        Self {
-            title: view.name.clone(),
-            view,
-            loading: true,
-            items: Vec::new(),
-            total: 0,
-            start: 0,
-            sort: "SortName",
-            descending: false,
-            filter: None,
-            letter: None,
-            show: LibraryShow::All,
-        }
-    }
-}
-
-/// Sort keys of the library toolbar: label and the server's `sortBy` value.
-pub const LIBRARY_SORTS: [(&str, &str); 8] = [
-    ("Name", "SortName"),
-    ("Random", "Random"),
-    ("Community Rating", "CommunityRating,SortName"),
-    ("Critic Rating", "CriticRating,SortName"),
-    ("Date Added", "DateCreated,SortName"),
-    ("Date Played", "DatePlayed,SortName"),
-    ("Release Date", "ProductionYear,PremiereDate,SortName"),
-    ("Runtime", "Runtime,SortName"),
-];
-
-/// Filters of the library toolbar: label and the server's `filters` value.
-pub const LIBRARY_FILTERS: [(&str, &str); 4] = [
-    ("Unplayed", "IsUnplayed"),
-    ("Played", "IsPlayed"),
-    ("Favorites", "IsFavorite"),
-    ("Resumable", "IsResumable"),
-];
-
-#[derive(Default)]
-pub struct DetailData {
-    pub item: Item,
-    pub loading: bool,
-    /// Seasons of a series.
-    pub seasons: Vec<Item>,
-    /// Episodes of a season.
-    pub episodes: Vec<Item>,
-    /// Next episode to watch of a series.
-    pub next_up: Option<Item>,
-    /// "More Like This" for a movie or a series.
-    pub similar: Vec<Item>,
-    /// Audio track picked on the page: its place among the audio streams.
-    pub audio: Option<usize>,
-    /// Subtitle picked on the page: `Some(None)` is "Off".
-    pub subtitle: Option<Option<usize>>,
-}
-
 /// The home row a card sits in, for the "remove from row" menu entry.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CardRow {
@@ -277,8 +134,6 @@ enum Mark {
     Favorite,
 }
 
-/// Id prefix of the synthetic library that lists a person's titles.
-pub const PERSON_VIEW: &str = "person";
 
 #[derive(Default)]
 pub struct SearchData {
@@ -326,206 +181,229 @@ pub enum Panel {
     /// Search for subtitles.
     Subtitles,
     Bookmarks,
+    /// The dialog of "Request more seasons" (src/seasons.rs).
+    Seasons,
+}
+
+/// The player as the window holds it.
+pub struct PlayerUi {
+    pub(crate) status: PlayerStatus,
+    pub(crate) poll: Option<Task<()>>,
+    /// Whether the embedded video view covers the content area.
+    pub(crate) open: bool,
+    /// `open` at the frame before, and whether the window was full
+    /// screen when the player opened: full screen that began with the
+    /// player ends with it (`follow_player_fullscreen`).
+    pub(crate) was_open: bool,
+    pub(crate) fullscreen_before: bool,
+    pub(crate) frame: Option<VideoFrame>,
+    pub(crate) frame_seq: u64,
+    /// When the frames task last woke, and when the last draw ran (pacing
+    /// trace).
+    pub(crate) frame_wake_ns: u64,
+    pub(crate) last_draw_ns: u64,
+    /// The position the seek slider was last set to by the frames task.
+    pub(crate) slider_pos: f64,
+    /// The newest frame whose wait was measured (`dev/jctl pacing`).
+    pub(crate) noticed_frame_seq: u64,
+    pub(crate) seek_slider: Entity<SliderState>,
+    pub(crate) scrubbing: bool,
+    pub(crate) audio_menu: Entity<MenuState>,
+    /// Gear menu of the player: audio track and playback speed.
+    pub(crate) settings_menu: Entity<MenuState>,
+    pub(crate) subtitle_menu: Entity<MenuState>,
+    pub(crate) volume_slider: Entity<SliderState>,
+    /// Player volume from 0 to 100.
+    pub(crate) volume: f32,
+    pub(crate) muted: bool,
+    pub(crate) speed: f32,
+    /// The item in the player, for its rating, end time and favourite state.
+    pub(crate) playing: Option<Item>,
+    /// Intro and credits ranges of the item in the player.
+    pub(crate) segments: Vec<MediaSegment>,
+    pub(crate) tracks_version: u64,
+    pub(crate) focus: FocusHandle,
+    /// The player shows its data about the video: codecs, bitrates,
+    /// dropped frames, cache.
+    pub(crate) info: bool,
+    /// Whether the player overlay controls are shown; hidden after pointer idle.
+    pub(crate) controls_visible: bool,
+    /// The close, minimise and zoom buttons are hidden (see the root render).
+    pub(crate) window_buttons_hidden: bool,
+    /// The pointer is hidden with the controls of the player.
+    pub(crate) pointer_hidden: bool,
+    /// The paused player shows the item's details in place of the controls.
+    pub(crate) pause_screen: bool,
+    /// Frame of the normal window while the player is in picture in
+    /// picture; `None` when it is not.
+    pub(crate) pip: Option<crate::pip::Frame>,
+    pub(crate) last_activity: std::time::Instant,
+}
+
+/// The page on show, the pages Back and Forward return to, and the scroll places.
+pub struct Navigation {
+    pub(crate) page: Page,
+    /// The pages Back returns to, nearest last, each with its scroll place.
+    pub(crate) history: Vec<(Page, gpui_kit::Point<gpui_kit::Pixels>)>,
+    /// The pages Back left, nearest last, for Forward; a new page empties it.
+    pub(crate) forward: Vec<(Page, gpui_kit::Point<gpui_kit::Pixels>)>,
+    /// True when the page came from Back: it fades in on a phone instead
+    /// of sliding in from the right (`ui::motion`, The Quiet Return Rule).
+    pub(crate) back: bool,
+    /// Scroll position of the current page.
+    pub(crate) scroll: ScrollHandle,
+    pub(crate) generation: u64,
+    /// Scroll positions of the horizontal rows, by row id.
+    pub(crate) rows: RefCell<HashMap<SharedString, ScrollHandle>>,
+}
+
+impl Navigation {
+    /// The page on show and every page Back and Forward return to.
+    pub(crate) fn pages_mut(&mut self) -> impl Iterator<Item = &mut Page> {
+        std::iter::once(&mut self.page)
+            .chain(self.history.iter_mut().map(|(page, _)| page))
+            .chain(self.forward.iter_mut().map(|(page, _)| page))
+    }
+}
+
+/// The search field and the title index that answers it with no request.
+pub struct TitleSearch {
+    pub(crate) input: Entity<InputState>,
+    /// Pending search for the text in the search field.
+    pub(crate) debounce: Option<Task<()>>,
+    /// Titles of the movies and shows of the server, for a search with no
+    /// request, and the time they were loaded.
+    pub(crate) catalog: crate::search_index::Index,
+    pub(crate) loaded: Option<std::time::Instant>,
+    /// The request of the title index whose answer is wanted.
+    pub(crate) request: Revision,
+}
+
+/// The menus of the pages and the one open panel: one popup at a time.
+pub struct Popups {
+    pub(crate) profile_menu: Entity<MenuState>,
+    pub(crate) sort_menu: Entity<MenuState>,
+    /// Views of the library, under its title.
+    pub(crate) show_menu: Entity<MenuState>,
+    pub(crate) filter_menu: Entity<MenuState>,
+    pub(crate) detail_audio_menu: Entity<MenuState>,
+    pub(crate) detail_subtitle_menu: Entity<MenuState>,
+    pub(crate) more_menu: Entity<MenuState>,
+    /// Context menu of the card under the pointer.
+    pub(crate) card_menu: Entity<MenuState>,
+    /// The "…" menu of a row or a card of the dashboard (`open_admin_menu`).
+    pub(crate) admin_menu: Entity<MenuState>,
+    /// The open panel that is not a menu; see [`Panel`]. `open_panel` sets
+    /// it and nothing else does, so a panel never opens next to a menu.
+    pub(crate) panel: Option<Panel>,
+    /// The panel a click outside of it closed, and when (`toggle_panel`).
+    pub(crate) panel_dismissed: Option<(Panel, std::time::Instant)>,
 }
 
 pub struct Bloom {
-    pub config: Config,
-    pub screen: Screen,
-    pub session: Option<Session>,
-    pub toasts: Entity<ToastState>,
-    pub player: Player,
-    pub player_status: PlayerStatus,
-    player_poll: Option<Task<()>>,
+    pub(crate) config: Config,
+    pub(crate) screen: Screen,
+    pub(crate) session: Option<Session>,
+    pub(crate) toasts: Entity<ToastState>,
+    pub(crate) player: Player,
     /// The display-sleep assertion while a video plays (src/awake.rs).
-    pub awake: crate::awake::Awake,
+    pub(crate) awake: crate::awake::Awake,
     /// The Now Playing tile and the media keys (src/nowplaying.rs).
-    pub nowplaying: crate::nowplaying::State,
+    pub(crate) nowplaying: crate::nowplaying::State,
     /// The AirPlay sender; idle until an item is sent.
-    pub airplay: crate::airplay::AirPlay,
-    pub connect: ConnectState,
+    pub(crate) airplay: crate::airplay::AirPlay,
+    pub(crate) connect: ConnectState,
     /// The splash at the start (src/views/splash.rs).
-    pub splash: crate::views::splash::Splash,
-    pub views: Vec<Item>,
-    pub page: Page,
-    pub history: Vec<Page>,
-    /// True when the page came from Back: it fades in on a phone instead
-    /// of sliding in from the right (`ui::motion`, The Quiet Return Rule).
-    pub nav_back: bool,
-    /// Scroll position of each page in `history`.
-    history_scroll: Vec<gpui_kit::Point<gpui_kit::Pixels>>,
-    /// The pages Back left, nearest last, for Forward; a new page empties it.
-    pub forward: Vec<Page>,
-    forward_scroll: Vec<gpui_kit::Point<gpui_kit::Pixels>>,
+    pub(crate) splash: crate::views::splash::Splash,
+    pub(crate) views: Vec<Item>,
     /// Whether the menu bar reads "Exit Full Screen" now.
     menus_fullscreen: bool,
     /// Focus of the main screen, so its keyboard shortcuts work.
-    pub app_focus: FocusHandle,
-    pub profile_menu: Entity<MenuState>,
-    /// The open panel that is not a menu; see [`Panel`]. `open_panel` sets
-    /// it and nothing else does, so a panel never opens next to a menu.
-    panel: Option<Panel>,
-    /// The panel a click outside of it closed, and when (`toggle_panel`).
-    panel_dismissed: Option<(Panel, std::time::Instant)>,
-    pub search_input: Entity<InputState>,
+    pub(crate) app_focus: FocusHandle,
     /// The field that narrows the Users section of the dashboard by name.
-    pub admin_users_filter: Entity<InputState>,
+    pub(crate) admin_users_filter: Entity<InputState>,
     /// The fields that find a task and a log file on their sections.
-    pub admin_tasks_filter: Entity<InputState>,
-    pub admin_logs_filter: Entity<InputState>,
-    /// Scroll position of the current page.
-    pub page_scroll: ScrollHandle,
+    pub(crate) admin_tasks_filter: Entity<InputState>,
+    pub(crate) admin_logs_filter: Entity<InputState>,
     /// A phone shows the Settings page as a list of its sections first;
     /// a row opens the section, and the back arrow returns to the list.
-    pub settings_list: bool,
+    pub(crate) settings_list: bool,
     /// The copy of the video frame the glass last drew (`video_backdrop_version`).
-    pub backdrop_seen: u64,
-    /// Scroll positions of the horizontal rows, by row id.
-    row_scrolls: RefCell<HashMap<SharedString, ScrollHandle>>,
+    pub(crate) backdrop_seen: u64,
     /// Window width at the last render; card sizes follow it.
-    pub viewport_w: f32,
-    pub viewport_h: f32,
+    pub(crate) viewport_w: f32,
+    pub(crate) viewport_h: f32,
     /// The hero of the home page: its slides, the one on show and its
     /// trailer. Kept for the session, so it survives navigation.
-    pub hero: crate::views::hero::Hero,
+    pub(crate) hero: crate::views::hero::Hero,
     /// How often a save of the config was asked for; a test reads it (a
     /// test writes no config file).
     pub(crate) config_saves: std::cell::Cell<u64>,
     /// Pending write of the window place to the config file.
     window_save: Option<Task<()>>,
-    /// Pending search for the text in the search field.
-    search_debounce: Option<Task<()>>,
-    /// Titles of the movies and shows of the server, for a search with no
-    /// request, and the time they were loaded.
-    pub catalog: Vec<Item>,
-    catalog_loaded: Option<std::time::Instant>,
-    /// The request of the title index whose answer is wanted.
-    catalog_request: Revision,
     /// The home rows as a view GPUI can cache between frames.
-    pub rows_view: Entity<crate::views::home::HomeRows>,
+    pub(crate) rows_view: Entity<crate::views::home::HomeRows>,
     /// True when something other than the hero asked for a redraw since the
     /// last render.
     content_dirty: bool,
-    /// Whether the embedded video view covers the content area.
-    pub player_open: bool,
-    /// `player_open` at the frame before, and whether the window was full
-    /// screen when the player opened: full screen that began with the
-    /// player ends with it (`follow_player_fullscreen`).
-    player_was_open: bool,
-    fullscreen_before_player: bool,
-    pub current_frame: Option<VideoFrame>,
-    frame_seq: u64,
-    /// When the frames task last woke, and when the last draw ran (pacing
-    /// trace).
-    frame_wake_ns: u64,
-    last_draw_ns: u64,
-    /// The position the seek slider was last set to by the frames task.
-    slider_pos: f64,
-    /// The newest frame whose wait was measured (`dev/jctl pacing`).
-    noticed_frame_seq: u64,
-    pub seek_slider: Entity<SliderState>,
-    pub scrubbing: bool,
-    pub audio_menu: Entity<MenuState>,
-    /// Gear menu of the player: audio track and playback speed.
-    pub settings_menu: Entity<MenuState>,
-    pub volume_slider: Entity<SliderState>,
-    /// Player volume from 0 to 100.
-    pub volume: f32,
-    pub muted: bool,
-    pub speed: f32,
-    /// The item in the player, for its rating, end time and favourite state.
-    pub playing: Option<Item>,
-    /// Intro and credits ranges of the item in the player.
-    pub segments: Vec<MediaSegment>,
     /// Items that follow in the player, and its chapters and previews.
-    pub queue: crate::queue::PlayQueue,
-    pub sort_menu: Entity<MenuState>,
-    /// Views of the library, under its title.
-    pub show_menu: Entity<MenuState>,
-    pub filter_menu: Entity<MenuState>,
-    pub detail_audio_menu: Entity<MenuState>,
-    pub detail_subtitle_menu: Entity<MenuState>,
-    pub more_menu: Entity<MenuState>,
-    /// Context menu of the card under the pointer.
-    pub card_menu: Entity<MenuState>,
-    /// The "…" menu of a row or a card of the dashboard (`open_admin_menu`).
-    pub admin_menu: Entity<MenuState>,
+    pub(crate) queue: crate::queue::PlayQueue,
     /// Quality tag settings of the user in Jellyfin Enhanced: on, resolution
     /// tag, dynamic range tag.
-    pub je_quality_tags: (bool, bool, bool),
+    pub(crate) je_quality_tags: (bool, bool, bool),
     /// The question, the form and the value shown once that wait for the
     /// user. The dashboard, the settings and the downloads open them.
-    pub dialogs: crate::admin::dialogs::Dialogs,
+    pub(crate) dialogs: crate::admin::dialogs::Dialogs,
     /// The loads of the live part of the dashboard, and their timer.
     pub(crate) admin_live: crate::admin::Live,
     /// SyncPlay: the session with the server and the panel of the groups.
-    pub sync: crate::syncplay::ui::SyncState,
+    pub(crate) sync: crate::syncplay::ui::SyncState,
+    /// The socket of the server and its news (src/socket.rs).
+    pub(crate) socket: crate::socket::ServerSocket,
     /// Remote control of and by other devices ("Play On").
-    pub cast: crate::cast::CastState,
+    pub(crate) cast: crate::cast::CastState,
     /// Metadata manager: its dialog and the editing state of its fields.
-    pub metadata: crate::metadata::State,
+    pub(crate) metadata: crate::metadata::State,
     /// Playlists and collections: the dialog and the playlists of the user.
-    pub lists: crate::lists::State,
+    pub(crate) lists: crate::lists::State,
     /// Features of the Jellyfin Enhanced plugin.
-    pub enhanced: crate::enhanced::State,
+    pub(crate) enhanced: crate::enhanced::State,
     /// Playback negotiation: the tracks chosen for the next item.
-    pub stream: crate::stream::State,
+    pub(crate) stream: crate::stream::State,
     /// Google Cast: the devices and the one connection.
-    pub chromecast: crate::chromecast::State,
+    pub(crate) chromecast: crate::chromecast::State,
     /// Downloads for offline use and the offline mode.
-    pub downloads: crate::downloads::DownloadsState,
+    pub(crate) downloads: crate::downloads::DownloadsState,
     /// Events for other programs (src/events.rs).
-    pub events: crate::events::State,
+    pub(crate) events: crate::events::State,
     /// Whether the server answers (src/connection.rs).
-    pub connection: crate::connection::ConnectionState,
-    pub subtitle_menu: Entity<MenuState>,
+    pub(crate) connection: crate::connection::ConnectionState,
     /// Search for subtitles and the timing offsets (`subtitles.rs`).
-    pub subs: crate::subtitles::State,
-    pub(crate) tracks_version: u64,
-    pub player_focus: FocusHandle,
-    /// The player shows its data about the video: codecs, bitrates,
-    /// dropped frames, cache.
-    pub playback_info: bool,
+    pub(crate) subs: crate::subtitles::State,
     /// What the server keeps for the user: configuration and display
     /// preferences. Playback follows some of them.
-    pub prefs: crate::settings::Prefs,
+    pub(crate) prefs: crate::settings::Prefs,
     /// The saves of settings on their way; they outlive a session.
     pub(crate) pref_lanes: crate::settings::SaveLanes,
     /// Episode list of the player.
-    pub episode_picker: crate::views::episodes::EpisodePicker,
-    /// Whether the player overlay controls are shown; hidden after pointer idle.
-    pub controls_visible: bool,
-    /// The close, minimise and zoom buttons are hidden (see the root render).
-    window_buttons_hidden: bool,
-    /// The pointer is hidden with the controls of the player.
-    pointer_hidden: bool,
+    pub(crate) episode_picker: crate::views::episodes::EpisodePicker,
     /// The version the "update is ready" toast was shown for.
-    pub update_said: Option<String>,
-    /// The debug channel: where its listeners send the commands, and the
-    /// listener that the setting turned on.
-    pub debug_requests: Option<async_channel::Sender<crate::debug::Request>>,
-    pub debug_listener: Option<crate::debug::Listener>,
-    /// The listener on the socket of `BLOOM_DEBUG_SOCK`, kept so it ends
-    /// with the window.
-    pub(crate) debug_env_listener: Option<crate::debug::Listener>,
-    /// The question and the form a debug command opened, by the address
-    /// of their action; 0 for none. `write confirm` and `write submit`
-    /// run these only, never a dialog a person opened.
-    pub(crate) debug_dialogs: (
-        Option<std::rc::Weak<dyn Fn(&mut Bloom, &mut Context<Bloom>)>>,
-        Option<std::rc::Weak<dyn Fn(&mut Bloom, Vec<String>, &mut Context<Bloom>)>>,
-    ),
-    /// The paused player shows the item's details in place of the controls.
-    pub pause_screen: bool,
-    /// Frame of the normal window while the player is in picture in
-    /// picture; `None` when it is not.
-    pub pip: Option<crate::pip::Frame>,
-    last_pointer_activity: std::time::Instant,
-    pub(crate) generation: u64,
+    pub(crate) update_said: Option<String>,
     /// See [`SessionEpoch`].
     pub(crate) session_epoch: SessionEpoch,
     /// The last revision given out by `next_revision`.
     revisions: Revision,
     _subscriptions: Vec<gpui_kit::Subscription>,
+    /// The player as the window holds it.
+    pub(crate) playback: PlayerUi,
+    /// The page on show, the pages Back and Forward return to, and the scroll places.
+    pub(crate) nav: Navigation,
+    /// The search field and the title index that answers it with no request.
+    pub(crate) search: TitleSearch,
+    /// The menus of the pages and the one open panel: one popup at a time.
+    pub(crate) popups: Popups,
+    /// The debug channel (src/debug.rs).
+    pub(crate) debug: crate::debug::Channel,
 }
 
 impl Bloom {
@@ -565,22 +443,22 @@ impl Bloom {
             cx.subscribe_in(&search_input, window, |this, _, event, _, cx| {
                 match event {
                     crate::ui::input::InputEvent::PressEnter { .. } => {
-                        this.search_debounce = None;
-                        let query = this.search_input.read(cx).value().to_string();
+                        this.search.debounce = None;
+                        let query = this.search.input.read(cx).value().to_string();
                         this.open_search(query, cx);
                     }
                     // The title index answers each keystroke; the server
                     // search follows once the typing rests.
                     crate::ui::input::InputEvent::Change => {
-                        let typed = this.search_input.read(cx).value().to_string();
+                        let typed = this.search.input.read(cx).value().to_string();
                         this.search_titles(typed, cx);
-                        this.search_debounce = Some(cx.spawn(async move |this, cx| {
+                        this.search.debounce = Some(cx.spawn(async move |this, cx| {
                             cx.background_executor()
                                 .timer(Duration::from_millis(150))
                                 .await;
                             this.update(cx, |this, cx| {
-                                let query = this.search_input.read(cx).value().to_string();
-                                let shown = match &this.page {
+                                let query = this.search.input.read(cx).value().to_string();
+                                let shown = match &this.nav.page {
                                     Page::Search(data) => data.query.clone(),
                                     _ => return,
                                 };
@@ -622,7 +500,7 @@ impl Bloom {
             if window.is_fullscreen() {
                 return;
             }
-            if this.pip.is_some() {
+            if this.playback.pip.is_some() {
                 // The small window has its own saved place.
                 let place = crate::pip::frame(window);
                 if place.is_some() && this.config.pip_window != place {
@@ -657,13 +535,13 @@ impl Bloom {
             |this, _, event: &SliderEvent, cx| match event {
                 SliderEvent::Change(value) => {
                     log::debug!("seek slider change: {}", value.end());
-                    this.scrubbing = true;
+                    this.playback.scrubbing = true;
                     // The preview over the timeline follows the thumb.
                     cx.notify();
                 }
                 SliderEvent::Release(value) => {
                     log::debug!("seek slider release: {}", value.end());
-                    this.scrubbing = false;
+                    this.playback.scrubbing = false;
                     this.request_seek_to(value.end() as f64, cx);
                     cx.notify();
                 }
@@ -695,10 +573,10 @@ impl Bloom {
                 let wait = this
                     .update(cx, |this, _| {
                         let (seq, tick) = this.player.frame_timing();
-                        if seq == this.frame_seq {
+                        if seq == this.playback.frame_seq {
                             return None;
                         }
-                        this.frame_wake_ns = crate::player::clock_ns();
+                        this.playback.frame_wake_ns = crate::player::clock_ns();
                         this.note_frame_wait();
                         let (now, period) = this.player.clock_time();
                         let phased = tick != 0 && this.player.display_pacing();
@@ -746,77 +624,32 @@ impl Bloom {
             session: None,
             toasts,
             player,
-            player_status: PlayerStatus::default(),
-            player_poll: None,
             awake: Default::default(),
             nowplaying: Default::default(),
             airplay: Default::default(),
             connect,
             splash: Default::default(),
             views: Vec::new(),
-            page: Page::Home(HomeData::default()),
-            history: Vec::new(),
-            nav_back: false,
-            history_scroll: Vec::new(),
-            forward: Vec::new(),
-            forward_scroll: Vec::new(),
             menus_fullscreen: false,
             app_focus: cx.focus_handle(),
-            profile_menu,
-            panel: None,
-            panel_dismissed: None,
-            search_input,
             admin_users_filter,
             admin_tasks_filter,
             admin_logs_filter,
-            page_scroll: ScrollHandle::new(),
             settings_list: false,
             backdrop_seen: 0,
-            row_scrolls: RefCell::new(HashMap::new()),
             viewport_w: 1280.,
             viewport_h: 820.,
             hero: crate::views::hero::Hero::new(),
             config_saves: std::cell::Cell::new(0),
             window_save: None,
-            search_debounce: None,
-            catalog: Vec::new(),
-            catalog_loaded: None,
-            catalog_request: Revision::default(),
             rows_view,
             content_dirty: true,
-            player_open: false,
-            player_was_open: false,
-            fullscreen_before_player: false,
-            current_frame: None,
-            frame_seq: 0,
-            frame_wake_ns: 0,
-            last_draw_ns: 0,
-            slider_pos: -1.,
-            noticed_frame_seq: 0,
-            seek_slider,
-            scrubbing: false,
-            audio_menu,
-            settings_menu,
-            volume_slider,
-            volume: 100.,
-            // A test instance never makes a sound (`dev/run-test` sets this).
-            muted: crate::options::options().muted,
-            speed: 1.,
-            playing: None,
-            segments: Vec::new(),
             queue: Default::default(),
-            sort_menu,
-            show_menu,
-            filter_menu,
-            detail_audio_menu,
-            detail_subtitle_menu,
-            more_menu,
-            card_menu,
-            admin_menu,
             je_quality_tags: (false, true, true),
             dialogs: crate::admin::dialogs::Dialogs::new(admin_inputs),
             admin_live: crate::admin::Live::default(),
             sync: Default::default(),
+            socket: Default::default(),
             cast: Default::default(),
             metadata: crate::metadata::State::new(window, cx),
             lists: crate::lists::State::new(window, cx),
@@ -826,29 +659,83 @@ impl Bloom {
             downloads: Default::default(),
             events: Default::default(),
             connection: Default::default(),
-            subtitle_menu,
             subs: Default::default(),
-            tracks_version: 0,
-            player_focus: cx.focus_handle(),
-            playback_info: false,
             prefs: Default::default(),
             pref_lanes: Default::default(),
             episode_picker: Default::default(),
-            controls_visible: true,
-            window_buttons_hidden: false,
-            pointer_hidden: false,
             update_said: None,
-            debug_requests: None,
-            debug_listener: None,
-            debug_env_listener: None,
-            debug_dialogs: (None, None),
-            pause_screen: false,
-            pip: None,
-            last_pointer_activity: std::time::Instant::now(),
-            generation: 0,
             session_epoch: SessionEpoch::default(),
             revisions: Revision::default(),
             _subscriptions: subscriptions,
+            playback: PlayerUi {
+                status: PlayerStatus::default(),
+                poll: None,
+                open: false,
+                was_open: false,
+                fullscreen_before: false,
+                frame: None,
+                frame_seq: 0,
+                frame_wake_ns: 0,
+                last_draw_ns: 0,
+                slider_pos: -1.,
+                noticed_frame_seq: 0,
+                seek_slider,
+                scrubbing: false,
+                audio_menu,
+                settings_menu,
+                subtitle_menu,
+                volume_slider,
+                volume: 100.,
+                // A test instance never makes a sound (`dev/run-test` sets this).
+                muted: crate::options::options().muted,
+                speed: 1.,
+                playing: None,
+                segments: Vec::new(),
+                tracks_version: 0,
+                focus: cx.focus_handle(),
+                info: false,
+                controls_visible: true,
+                window_buttons_hidden: false,
+                pointer_hidden: false,
+                pause_screen: false,
+                pip: None,
+                last_activity: std::time::Instant::now(),
+            },
+            nav: Navigation {
+                page: Page::Home(HomeData::default()),
+                history: Vec::new(),
+                forward: Vec::new(),
+                back: false,
+                scroll: ScrollHandle::new(),
+                generation: 0,
+                rows: RefCell::new(HashMap::new()),
+            },
+            search: TitleSearch {
+                input: search_input,
+                debounce: None,
+                catalog: Default::default(),
+                loaded: None,
+                request: Revision::default(),
+            },
+            popups: Popups {
+                profile_menu,
+                sort_menu,
+                show_menu,
+                filter_menu,
+                detail_audio_menu,
+                detail_subtitle_menu,
+                more_menu,
+                card_menu,
+                admin_menu,
+                panel: None,
+                panel_dismissed: None,
+            },
+            debug: crate::debug::Channel {
+                requests: None,
+                listener: None,
+                env_listener: None,
+                dialogs: (None, None),
+            },
         };
 
         if let Some((server_id, user_id)) = this.config.active.clone() {
@@ -901,7 +788,7 @@ impl Bloom {
         // back the moment the field goes.
         this._subscriptions.push(cx.on_focus_lost(window, |this, window, cx| {
             if this.screen == Screen::Main {
-                let target = if this.player_open { &this.player_focus } else { &this.app_focus };
+                let target = if this.playback.open { &this.playback.focus } else { &this.app_focus };
                 window.focus(target, cx);
             }
         }));
@@ -1025,17 +912,17 @@ impl Bloom {
         W: FnOnce(Client) -> Result<T> + Send + 'static,
         D: FnOnce(&mut Self, Result<T>, &mut Context<Self>) + 'static,
     {
-        let generation = self.generation;
+        let generation = self.nav.generation;
         self.fetch(cx, work, move |this, result, cx| {
-            if this.generation == generation {
+            if this.nav.generation == generation {
                 done(this, result, cx);
             }
         });
     }
 
     fn next_generation(&mut self) -> u64 {
-        self.generation += 1;
-        self.generation
+        self.nav.generation += 1;
+        self.nav.generation
     }
 
     /// A new revision, larger than every one before it.
@@ -1069,7 +956,10 @@ impl Bloom {
     /// Ends the session in the app (the server and the config are the
     /// caller's business), so that what the old session asked for is
     /// dropped when it answers.
-    pub fn drop_session(&mut self) {
+    pub fn drop_session(&mut self, cx: &mut Context<Self>) {
+        // What plays on another device for this session stops, while the
+        // session can still say so.
+        self.cast_off(cx);
         self.session = None;
         self.next_session_epoch();
     }
@@ -1086,7 +976,8 @@ impl Bloom {
         let url = crate::options::options().server_url.as_deref().unwrap_or(&server.url);
         let client = Client::new(url, &self.config.device_id)
             .with_server(&server.id)
-            .with_session(&profile.token, &profile.user_id);
+            .with_session(&profile.token, &profile.user_id)
+            .opened();
         let (id, server_name, profile) = (server.id.clone(), server.name.clone(), profile.clone());
         // What plays on another device for the session before stops, while
         // that session can still say so.
@@ -1113,8 +1004,8 @@ impl Bloom {
         self.load_prefs(cx);
         // The title index of the search loads a moment after the home page,
         // so it does not slow the first content.
-        self.catalog.clear();
-        self.catalog_loaded = None;
+        self.search.catalog = Default::default();
+        self.search.loaded = None;
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_secs(2)).await;
             this.update(cx, |this, cx| this.refresh_catalog(cx)).ok();
@@ -1175,7 +1066,7 @@ impl Bloom {
         self.screen = Screen::Main;
         self.clear_history();
         self.views.clear();
-        self.page = Page::Home(HomeData::default());
+        self.nav.page = Page::Home(HomeData::default());
         // The home page loads the libraries with its own data.
         self.load_page(cx);
         self.events_page(cx);
@@ -1188,7 +1079,6 @@ impl Bloom {
     /// the sign-in page of that server.
     pub fn sign_out(&mut self, cx: &mut Context<Self>) {
         self.stop_sync();
-        self.cast_off(cx);
         self.config.active = None;
         match self.session.as_ref().map(|s| (s.server_id.clone(), s.user_id.clone())) {
             // `forget_profile` drops the session, and with it what it asked
@@ -1202,7 +1092,7 @@ impl Bloom {
         // The pages of the user who left must not show again.
         self.clear_history();
         self.views.clear();
-        self.page = Page::Home(HomeData::default());
+        self.nav.page = Page::Home(HomeData::default());
         self.events_page(cx);
         self.screen = Screen::Connect;
         self.rebuild_menu(cx);
@@ -1263,7 +1153,7 @@ impl Bloom {
 
     /// Scroll state of every row, for the debug channel.
     pub fn debug_rows(&self) -> String {
-        self.row_scrolls
+        self.nav.rows
             .borrow()
             .iter()
             .map(|(id, handle)| {
@@ -1280,7 +1170,7 @@ impl Bloom {
 
     /// The scroll handle of a horizontal row, created on first use.
     pub fn row_scroll(&self, id: &SharedString) -> ScrollHandle {
-        self.row_scrolls
+        self.nav.rows
             .borrow_mut()
             .entry(id.clone())
             .or_default()
@@ -1300,7 +1190,7 @@ impl Bloom {
         cx: &mut Context<Self>,
         done: impl FnOnce(&mut Self, crate::jellyfin::UserData, &mut Context<Self>) + 'static,
     ) {
-        let (item_id, generation) = (item_id.to_string(), self.generation);
+        let (item_id, generation) = (item_id.to_string(), self.nav.generation);
         self.fetch(
             cx,
             move |client| match mark {
@@ -1308,7 +1198,7 @@ impl Bloom {
                 Mark::Favorite => client.set_favorite(&item_id, on),
             },
             move |this, result, cx| {
-                if for_page && this.generation != generation {
+                if for_page && this.nav.generation != generation {
                     return;
                 }
                 match result {
@@ -1365,44 +1255,46 @@ impl Bloom {
 
     pub fn navigate(&mut self, page: Page, cx: &mut Context<Self>) {
         self.forget_admin_dialogs();
+        self.leave_page(cx);
         // The rows of a detail page have one name on every detail page:
         // the next one starts at the left, not where the last one was.
-        self.row_scrolls.borrow_mut().retain(|id, _| !id.starts_with("detail."));
+        self.nav.rows.borrow_mut().retain(|id, _| !id.starts_with("detail."));
         // Keep the place in the page, so Back returns to it.
-        self.history_scroll.push(self.page_scroll.offset());
-        self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
-        let previous = std::mem::replace(&mut self.page, page);
-        self.history.push(previous);
-        self.nav_back = false;
-        if self.history.len() > 40 {
-            self.history.remove(0);
-            self.history_scroll.remove(0);
+        let place = self.nav.scroll.offset();
+        self.nav.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+        let previous = std::mem::replace(&mut self.nav.page, page);
+        self.nav.history.push((previous, place));
+        self.nav.back = false;
+        if self.nav.history.len() > 40 {
+            self.nav.history.remove(0);
         }
-        self.forward.clear();
-        self.forward_scroll.clear();
+        self.nav.forward.clear();
         self.load_page(cx);
         self.events_page(cx);
         cx.notify();
     }
 
+    /// What goes with the page that leaves: the card under the pointer is
+    /// a card of that page, and the pointer may never leave it (the page
+    /// changed under it), so its hover layer would show on the way back.
+    fn leave_page(&mut self, cx: &mut Context<Self>) {
+        cx.set_global(crate::views::cards::HoveredCard(None));
+    }
+
     pub fn back(&mut self, cx: &mut Context<Self>) {
-        if let Some(page) = self.history.pop() {
-            let offset = self.history_scroll.pop().unwrap_or_default();
-            self.nav_back = true;
-            let (page, offset) = self.swap_page(page, offset, cx);
-            self.forward.push(page);
-            self.forward_scroll.push(offset);
+        if let Some((page, offset)) = self.nav.history.pop() {
+            self.nav.back = true;
+            let left = self.swap_page(page, offset, cx);
+            self.nav.forward.push(left);
         }
     }
 
     /// Returns to the page Back left, as cmd-] and the forward button do.
     pub fn forward(&mut self, cx: &mut Context<Self>) {
-        if let Some(page) = self.forward.pop() {
-            let offset = self.forward_scroll.pop().unwrap_or_default();
-            self.nav_back = false;
-            let (page, offset) = self.swap_page(page, offset, cx);
-            self.history.push(page);
-            self.history_scroll.push(offset);
+        if let Some((page, offset)) = self.nav.forward.pop() {
+            self.nav.back = false;
+            let left = self.swap_page(page, offset, cx);
+            self.nav.history.push(left);
         }
     }
 
@@ -1415,18 +1307,19 @@ impl Bloom {
         cx: &mut Context<Self>,
     ) -> (Page, gpui_kit::Point<gpui_kit::Pixels>) {
         self.forget_admin_dialogs();
-        let left_offset = self.page_scroll.offset();
-        self.page_scroll.set_offset(offset);
-        let left = std::mem::replace(&mut self.page, page);
-        if matches!(self.page, Page::Library(_)) {
+        self.leave_page(cx);
+        let left_offset = self.nav.scroll.offset();
+        self.nav.scroll.set_offset(offset);
+        let left = std::mem::replace(&mut self.nav.page, page);
+        if matches!(self.nav.page, Page::Library(_)) {
             self.rebuild_library_menus(cx);
         }
-        if matches!(self.page, Page::Admin(_)) {
+        if matches!(self.nav.page, Page::Admin(_)) {
             self.start_admin_tick(cx);
         }
         // The menus of the detail page are those of the item shown last;
         // a page that comes back with its data is not loaded again.
-        if matches!(self.page, Page::Detail(_)) {
+        if matches!(self.nav.page, Page::Detail(_)) {
             self.rebuild_detail_menus(cx);
         }
         if self.page_loading() {
@@ -1443,7 +1336,7 @@ impl Bloom {
 
     /// True while the current page waits for its data.
     fn page_loading(&self) -> bool {
-        match &self.page {
+        match &self.nav.page {
             Page::Home(d) => d.loading,
             Page::Library(d) => d.loading,
             Page::Detail(d) => d.loading,
@@ -1461,10 +1354,10 @@ impl Bloom {
     /// Shows a page of the top bar: the page starts at its top, and Back
     /// and Forward have nothing to return to.
     fn open_root(&mut self, page: Page, cx: &mut Context<Self>) {
-        self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+        self.nav.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
         self.forget_admin_dialogs();
         self.clear_history();
-        self.page = page;
+        self.nav.page = page;
         self.events_page(cx);
         self.rebuild_library_menus(cx);
         self.load_page(cx);
@@ -1473,10 +1366,8 @@ impl Bloom {
 
     /// Forgets the pages Back and Forward would show.
     fn clear_history(&mut self) {
-        self.history.clear();
-        self.history_scroll.clear();
-        self.forward.clear();
-        self.forward_scroll.clear();
+        self.nav.history.clear();
+        self.nav.forward.clear();
     }
 
     pub fn open_library(&mut self, view: Item, cx: &mut Context<Self>) {
@@ -1518,210 +1409,6 @@ impl Bloom {
         );
     }
 
-    /// Opens the context menu of a card at the pointer. `row` names the home
-    /// row of the card when the item can be removed from it.
-    pub fn open_card_menu(
-        &mut self,
-        item: &Item,
-        row: CardRow,
-        position: gpui_kit::Point<gpui_kit::Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let this = cx.weak_entity();
-        let mut items = Vec::new();
-        if item.is_playable() || item.is_series() {
-            let (handle, target) = (this.clone(), item.clone());
-            items.push(
-                MenuItem::new("card.menu.play", "Play").on_click(move |_, window, cx| {
-                    handle
-                        .update(cx, |this, cx| {
-                            if target.is_series() {
-                                this.play_series(&target, window, cx);
-                            } else {
-                                let resume = target.resume_secs() > 0;
-                                this.play(&target, resume, window, cx);
-                            }
-                        })
-                        .ok();
-                }),
-            );
-        }
-        // In a SyncPlay group an item can go to the queue of the group.
-        if self.sync.in_group() && item.is_playable() {
-            for (id, label, next) in [
-                ("card.menu.group-next", "Play next in the group", true),
-                ("card.menu.group-queue", "Add to the group queue", false),
-            ] {
-                let (handle, item_id) = (this.clone(), item.id.clone());
-                items.push(MenuItem::new(id, label).on_click(move |_, _, cx| {
-                    handle
-                        .update(cx, |this, cx| {
-                            let intent = crate::syncplay::core::Intent::Enqueue {
-                                item_ids: vec![item_id.clone()],
-                                next,
-                            };
-                            this.sync_user(intent, cx);
-                            this.toast("SyncPlay", "Added to the queue of the group.", cx);
-                        })
-                        .ok();
-                }));
-            }
-        }
-        let played = item.user_data.played;
-        let (handle, target) = (this.clone(), item.clone());
-        items.push(
-            MenuItem::new(
-                "card.menu.played",
-                if played {
-                    "Mark unplayed"
-                } else {
-                    "Mark played"
-                },
-            )
-            .on_click(move |_, _, cx| {
-                handle
-                    .update(cx, |this, cx| this.set_item_played(&target, !played, cx))
-                    .ok();
-            }),
-        );
-        let favorite = item.user_data.is_favorite;
-        let (handle, target) = (this.clone(), item.clone());
-        items.push(
-            MenuItem::new(
-                "card.menu.favorite",
-                if favorite {
-                    "Remove from favorites"
-                } else {
-                    "Add to favorites"
-                },
-            )
-            .on_click(move |_, _, cx| {
-                handle
-                    .update(cx, |this, cx| {
-                        this.set_item_favorite(&target, !favorite, cx)
-                    })
-                    .ok();
-            }),
-        );
-        if row != CardRow::None {
-            let next_up = row == CardRow::NextUp;
-            let (handle, item_id) = (this.clone(), item.id.clone());
-            items.push(MenuItem::separator());
-            items.push(
-                MenuItem::new(
-                    "card.menu.hide",
-                    if next_up {
-                        "Remove from Next Up"
-                    } else {
-                        "Remove from Continue Watching"
-                    },
-                )
-                .on_click(move |_, _, cx| {
-                    let item_id = item_id.clone();
-                    handle
-                        .update(cx, |this, cx| {
-                            this.fetch(
-                                cx,
-                                move |client| client.hide_from_row(next_up, &item_id),
-                                |this, result, cx| match result {
-                                    Ok(()) => this.load_page(cx),
-                                    Err(err) => {
-                                        this.toast("Could not remove the item", format!("{err:#}"), cx)
-                                    }
-                                },
-                            )
-                        })
-                        .ok();
-                }),
-            );
-        }
-        let list_items = self.list_menu_items(item, cx);
-        let in_collection = self.collection_card_items(item, cx);
-        if !list_items.is_empty() || !in_collection.is_empty() {
-            items.push(MenuItem::separator());
-            items.extend(list_items);
-            items.extend(in_collection);
-        }
-        items.extend(self.cast_menu_items(item, cx));
-        items.extend(self.download_menu_items(item, cx));
-        items.extend(self.hide_menu_items(item, false, cx));
-        items.extend(self.metadata_menu_items(&item.id, &item.name, item.kind.name(), cx));
-        if let Some(url) = self.session.as_ref().map(|s| s.client.web_url(&item.id)) {
-            items.push(MenuItem::separator());
-            items.push(
-                MenuItem::new("card.menu.web", "Open in Jellyfin Web")
-                    .on_click(move |_, _, cx| cx.open_url(&url)),
-            );
-        }
-        self.card_menu.update(cx, |menu, cx| {
-            menu.set_items(items, cx);
-            menu.open_at(Some(position), window, cx);
-        });
-    }
-
-    /// Menu of a Seerr card for a title that is not in the library.
-    pub fn open_seerr_menu(
-        &mut self,
-        item: &SeerrItem,
-        position: gpui_kit::Point<gpui_kit::Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let this = cx.weak_entity();
-        let mut items = Vec::new();
-        let label = match item.status() {
-            Some(2) => Some("Pending approval"),
-            Some(3) => Some("Requested"),
-            Some(5) => Some("Available"),
-            _ => None,
-        };
-        match label {
-            Some(text) => items.push(MenuItem::new("seerr.status", text).disabled(true)),
-            None => {
-                let (handle, target) = (this.clone(), item.clone());
-                let text = if item.media_type == "tv" {
-                    "Request all seasons"
-                } else {
-                    "Request"
-                };
-                items.push(MenuItem::new("seerr.request", text).on_click(move |_, _, cx| {
-                    let target = target.clone();
-                    handle
-                        .update(cx, |this, cx| {
-                            let name = target.display_name();
-                            this.fetch(
-                                cx,
-                                move |client| client.seerr_request(&target),
-                                move |this, result, cx| match result {
-                                    Ok(()) => {
-                                        this.toast("Requested", name.clone(), cx);
-                                        this.load_page(cx);
-                                    }
-                                    Err(err) => {
-                                        this.toast("Request failed", format!("{err:#}"), cx)
-                                    }
-                                },
-                            )
-                        })
-                        .ok();
-                }));
-            }
-        }
-        let url = format!(
-            "https://www.themoviedb.org/{}/{}",
-            item.media_type, item.id
-        );
-        items.push(MenuItem::separator());
-        items.push(
-            MenuItem::new("seerr.tmdb", "Open on TMDB").on_click(move |_, _, cx| cx.open_url(&url)),
-        );
-        self.card_menu.update(cx, |menu, cx| {
-            menu.set_items(items, cx);
-            menu.open_at(Some(position), window, cx);
-        });
-    }
-
     /// Opens the library item of an id (used by Seerr cards in the library).
     pub fn open_item_id(&mut self, id: &str, cx: &mut Context<Self>) {
         let id = id.to_string();
@@ -1748,134 +1435,6 @@ impl Bloom {
         );
     }
 
-    /// Rebuilds the track menus and the "more" menu of the detail page.
-    pub fn rebuild_detail_menus(&mut self, cx: &mut Context<Self>) {
-        self.subs_load_rights(cx);
-        let Page::Detail(data) = &self.page else {
-            return;
-        };
-        let this = cx.weak_entity();
-        let title = |stream: &crate::jellyfin::MediaStream, n: usize| {
-            stream
-                .display_title
-                .clone()
-                .unwrap_or_else(|| format!("Track {}", n + 1))
-        };
-
-        let audio_streams = data.item.streams("Audio");
-        let current_audio = data
-            .audio
-            .or_else(|| audio_streams.iter().position(|s| s.is_default))
-            .unwrap_or(0);
-        let audio: Vec<MenuItem> = audio_streams
-            .iter()
-            .enumerate()
-            .map(|(n, stream)| {
-                let handle = this.clone();
-                MenuItem::new(SharedString::from(format!("detail.audio.{n}")), title(stream, n))
-                    .radio(n == current_audio)
-                    .on_click(move |_, _, cx| {
-                        handle
-                            .update(cx, |this, cx| {
-                                if let Page::Detail(data) = &mut this.page {
-                                    data.audio = Some(n);
-                                }
-                                this.rebuild_detail_menus(cx);
-                                cx.notify();
-                            })
-                            .ok();
-                    })
-            })
-            .collect();
-
-        let subtitle_streams = data.item.streams("Subtitle");
-        let current_subtitle = data
-            .subtitle
-            .unwrap_or_else(|| subtitle_streams.iter().position(|s| s.is_default));
-        let pick_subtitle = |choice: Option<usize>, label: String| {
-            let handle = this.clone();
-            let id = match choice {
-                Some(n) => format!("detail.subtitle.{n}"),
-                None => "detail.subtitle.off".to_string(),
-            };
-            MenuItem::new(SharedString::from(id), label)
-                .radio(choice == current_subtitle)
-                .on_click(move |_, _, cx| {
-                    handle
-                        .update(cx, |this, cx| {
-                            if let Page::Detail(data) = &mut this.page {
-                                data.subtitle = Some(choice);
-                            }
-                            this.rebuild_detail_menus(cx);
-                            cx.notify();
-                        })
-                        .ok();
-                })
-        };
-        let mut subtitles = vec![pick_subtitle(None, "Off".to_string())];
-        subtitles.extend(
-            subtitle_streams
-                .iter()
-                .enumerate()
-                .map(|(n, stream)| pick_subtitle(Some(n), title(stream, n))),
-        );
-
-        if let Some(search) = self.subs_search_item(&data.item.id, &data.item.display_title(), cx) {
-            subtitles.push(MenuItem::separator());
-            subtitles.push(search);
-        }
-
-        let web = self
-            .session
-            .as_ref()
-            .map(|s| s.client.web_url(&data.item.id));
-        let handle = this.clone();
-        let mut more = vec![MenuItem::new("detail.refresh", "Refresh").on_click(
-            move |_, _, cx| {
-                handle.update(cx, |this, cx| this.load_page(cx)).ok();
-            },
-        )];
-        if let Some(url) = web {
-            more.push(
-                MenuItem::new("detail.web", "Open in Jellyfin Web")
-                    .on_click(move |_, _, cx| cx.open_url(&url)),
-            );
-        }
-
-        let item = data.item.clone();
-        let list_items = self.list_menu_items(&item, cx);
-        if !list_items.is_empty() {
-            more.push(MenuItem::separator());
-            more.extend(list_items);
-        }
-        more.extend(self.hide_menu_items(&item, true, cx));
-        more.extend(self.metadata_menu_items(&item.id, &item.name, item.kind.name(), cx));
-
-        self.detail_audio_menu
-            .update(cx, |menu, cx| menu.set_items(audio, cx));
-        self.detail_subtitle_menu
-            .update(cx, |menu, cx| menu.set_items(subtitles, cx));
-        self.more_menu.update(cx, |menu, cx| menu.set_items(more, cx));
-    }
-
-    /// Plays the detail page item with the tracks picked on the page.
-    pub fn play_detail(&mut self, resume: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Page::Detail(data) = &self.page else {
-            return;
-        };
-        let (item, audio, subtitle) = (data.item.clone(), data.audio, data.subtitle);
-        if item.is_series() {
-            self.play_series(&item, window, cx);
-            return;
-        }
-        // The load takes the choice: the server gets it, for a transcode,
-        // and mpv, for the file itself (`stream_begin`).
-        self.stream.wanted_audio = audio;
-        self.stream.wanted_subtitle = subtitle;
-        self.play(&item, resume, window, cx);
-        self.stream_choice_left(&item);
-    }
-
     pub fn open_folder(&mut self, folder: Item, cx: &mut Context<Self>) {
         self.navigate(Page::Library(LibraryData::new(folder)), cx);
         self.rebuild_library_menus(cx);
@@ -1900,7 +1459,7 @@ impl Bloom {
 
     pub fn open_search(&mut self, query: String, cx: &mut Context<Self>) {
         let query = query.trim().to_string();
-        if let Page::Search(data) = &mut self.page {
+        if let Page::Search(data) = &mut self.nav.page {
             data.typed = query.clone();
             data.query = query;
         } else {
@@ -1926,8 +1485,8 @@ impl Bloom {
             return;
         }
         self.refresh_catalog(cx);
-        let results = crate::search_index::search(&self.catalog, &typed);
-        match &mut self.page {
+        let results = self.search.catalog.search(&typed);
+        match &mut self.nav.page {
             Page::Search(data) => {
                 if data.typed == typed {
                     return;
@@ -1944,7 +1503,7 @@ impl Bloom {
                     _ => None,
                 };
                 data.typed = typed.clone();
-                self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+                self.nav.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
                 if let Some((items, seerr)) = answered {
                     data.results = items;
                     data.seerr = seerr;
@@ -1954,7 +1513,7 @@ impl Bloom {
                 }
                 data.loading = !typed.is_empty();
                 // Without an index the old results stay until the server answers.
-                if !self.catalog.is_empty() || typed.is_empty() {
+                if !self.search.catalog.is_empty() || typed.is_empty() {
                     data.results = results;
                     data.seerr.clear();
                 }
@@ -1980,18 +1539,18 @@ impl Bloom {
     /// else: the observers of `Bloom::new` and `close_popups` read it.
     fn menus(&self) -> [&Entity<MenuState>; 12] {
         [
-            &self.admin_menu,
-            &self.profile_menu,
-            &self.audio_menu,
-            &self.settings_menu,
-            &self.sort_menu,
-            &self.show_menu,
-            &self.filter_menu,
-            &self.detail_audio_menu,
-            &self.detail_subtitle_menu,
-            &self.more_menu,
-            &self.card_menu,
-            &self.subtitle_menu,
+            &self.popups.admin_menu,
+            &self.popups.profile_menu,
+            &self.playback.audio_menu,
+            &self.playback.settings_menu,
+            &self.popups.sort_menu,
+            &self.popups.show_menu,
+            &self.popups.filter_menu,
+            &self.popups.detail_audio_menu,
+            &self.popups.detail_subtitle_menu,
+            &self.popups.more_menu,
+            &self.popups.card_menu,
+            &self.playback.subtitle_menu,
         ]
     }
 
@@ -2019,18 +1578,25 @@ impl Bloom {
 
     /// True while a panel that is not a menu is open.
     pub fn panel_open(&self) -> bool {
-        self.panel.is_some()
+        self.popups.panel.is_some()
     }
 
     /// True while this panel is the open one.
     pub fn panel_is(&self, panel: Panel) -> bool {
-        self.panel == Some(panel)
+        self.popups.panel == Some(panel)
     }
 
     /// Opens a panel in the place of whatever popup is open.
     pub fn open_panel(&mut self, panel: Panel, window: &mut Window, cx: &mut Context<Self>) {
         self.close_popups(None, window, cx);
-        self.panel = Some(panel);
+        self.popups.panel = Some(panel);
+        cx.notify();
+    }
+
+    /// Shows a panel in the place of the open one, for an opener with no
+    /// window at hand. The menu whose entry opened it has closed itself.
+    pub(crate) fn replace_panel(&mut self, panel: Panel, cx: &mut Context<Self>) {
+        self.popups.panel = Some(panel);
         cx.notify();
     }
 
@@ -2043,7 +1609,7 @@ impl Bloom {
         // A click on the button while the panel is open closed it a moment
         // ago, as a click outside of it; that click must not open it again.
         let dismissed = self
-            .panel_dismissed
+            .popups.panel_dismissed
             .take()
             .is_some_and(|(which, at)| which == panel && at.elapsed() < Duration::from_millis(250));
         if was_open || dismissed {
@@ -2057,14 +1623,14 @@ impl Bloom {
     /// A click outside of a panel: closes it when it is the open one.
     pub fn dismiss_panel(&mut self, panel: Panel, cx: &mut Context<Self>) {
         if self.close_panel(panel) {
-            self.panel_dismissed = Some((panel, std::time::Instant::now()));
+            self.popups.panel_dismissed = Some((panel, std::time::Instant::now()));
             cx.notify();
         }
     }
 
     /// Closes the open panel, whichever it is; true when one was open.
     pub fn close_panels(&mut self) -> bool {
-        self.panel.take().is_some()
+        self.popups.panel.take().is_some()
     }
 
     /// Closes this panel; true when it was the open one.
@@ -2074,7 +1640,7 @@ impl Bloom {
 
     /// Loads the title index again now: the server said the library changed.
     pub fn reload_catalog(&mut self, cx: &mut Context<Self>) {
-        self.catalog_loaded = None;
+        self.search.loaded = None;
         self.refresh_catalog(cx);
     }
 
@@ -2082,26 +1648,21 @@ impl Bloom {
     /// minutes, and fetches the posters of its titles to the disk.
     pub fn refresh_catalog(&mut self, cx: &mut Context<Self>) {
         const MAX_AGE: Duration = Duration::from_secs(600);
-        if self.catalog_loaded.is_some_and(|at| at.elapsed() < MAX_AGE) {
+        if self.search.loaded.is_some_and(|at| at.elapsed() < MAX_AGE) {
             return;
         }
         if self.session.is_none() {
             return;
         }
-        self.catalog_loaded = Some(std::time::Instant::now());
+        self.search.loaded = Some(std::time::Instant::now());
         // The answer is for the session that asked and for the newest
         // request: another profile or server may be open by then with an
         // index of its own, or the library changed and a newer request is
         // on its way. An older answer is dropped, posters and all.
         let epoch = self.session_epoch;
         let request = self.next_revision();
-        self.catalog_request = request;
-        let query = ItemQuery {
-            include_types: vec!["Movie".into(), "Series".into()],
-            recursive: Some(true),
-            sort_by: Some("SortName".into()),
-            ..Default::default()
-        };
+        self.search.request = request;
+        let query = crate::pages::catalog_query();
         self.fetch(
             cx,
             move |client| {
@@ -2115,7 +1676,7 @@ impl Bloom {
                 Ok(page.items)
             },
             move |this, result, cx| {
-                if this.session_epoch != epoch || this.catalog_request != request {
+                if this.session_epoch != epoch || this.search.request != request {
                     return;
                 }
                 match result {
@@ -2128,155 +1689,17 @@ impl Bloom {
                                 .collect();
                             crate::images::prewarm(posters, cx);
                         }
-                        this.catalog = items;
+                        // The titles are folded once here, not at each key.
+                        this.search.catalog = crate::search_index::Index::new(items);
                     }
                     // The next search tries again.
                     Err(err) => {
                         log::warn!("title index failed: {err:#}");
-                        this.catalog_loaded = None;
+                        this.search.loaded = None;
                     }
                 }
             },
         );
-    }
-
-    /// Changes the library view (sort, filter, letter or page) and reloads it.
-    pub fn update_library(&mut self, change: impl FnOnce(&mut LibraryData), cx: &mut Context<Self>) {
-        if let Page::Library(data) = &mut self.page {
-            let start = data.start;
-            change(data);
-            // A new sort, filter or letter starts again at the first page.
-            if data.start == start {
-                data.start = 0;
-            }
-            self.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
-            self.rebuild_library_menus(cx);
-            self.load_page(cx);
-            cx.notify();
-        }
-    }
-
-    /// Rebuilds the sort and filter dropdowns of the library toolbar.
-    pub fn rebuild_library_menus(&mut self, cx: &mut Context<Self>) {
-        let Page::Library(data) = &self.page else {
-            return;
-        };
-        let this = cx.weak_entity();
-        let mut sorts: Vec<MenuItem> = LIBRARY_SORTS
-            .iter()
-            .map(|(label, key)| {
-                let handle = this.clone();
-                let key: &'static str = key;
-                MenuItem::new(SharedString::from(format!("library.sort.{key}")), *label)
-                    .radio(data.sort == key)
-                    .on_click(move |_, _, cx| {
-                        handle
-                            .update(cx, |this, cx| this.update_library(|d| d.sort = key, cx))
-                            .ok();
-                    })
-            })
-            .collect();
-        sorts.push(MenuItem::separator());
-        for (label, descending) in [("Ascending", false), ("Descending", true)] {
-            let handle = this.clone();
-            sorts.push(
-                MenuItem::new(SharedString::from(format!("library.order.{label}")), label)
-                    .radio(data.descending == descending)
-                    .on_click(move |_, _, cx| {
-                        handle
-                            .update(cx, |this, cx| {
-                                this.update_library(|d| d.descending = descending, cx)
-                            })
-                            .ok();
-                    }),
-            );
-        }
-        let mut filters: Vec<MenuItem> = vec![{
-            let handle = this.clone();
-            MenuItem::new("library.filter.none", "All")
-                .radio(data.filter.is_none())
-                .on_click(move |_, _, cx| {
-                    handle
-                        .update(cx, |this, cx| this.update_library(|d| d.filter = None, cx))
-                        .ok();
-                })
-        }];
-        for (label, key) in LIBRARY_FILTERS {
-            let handle = this.clone();
-            filters.push(
-                MenuItem::new(SharedString::from(format!("library.filter.{key}")), label)
-                    .radio(data.filter == Some(key))
-                    .on_click(move |_, _, cx| {
-                        handle
-                            .update(cx, |this, cx| {
-                                this.update_library(|d| d.filter = Some(key), cx)
-                            })
-                            .ok();
-                    }),
-            );
-        }
-        let library = data.title.clone();
-        let shows: Vec<MenuItem> = LibraryShow::of(data.view.collection_type.as_deref())
-            .iter()
-            .map(|show| {
-                let (show, handle) = (*show, this.clone());
-                MenuItem::new(
-                    SharedString::from(format!("library.show.{show:?}")),
-                    show.label(&library),
-                )
-                .radio(data.show == show)
-                .on_click(move |_, _, cx| {
-                    handle
-                        .update(cx, |this, cx| this.update_library(|d| d.show = show, cx))
-                        .ok();
-                })
-            })
-            .collect();
-        self.show_menu.update(cx, |menu, cx| menu.set_items(shows, cx));
-        self.sort_menu.update(cx, |menu, cx| menu.set_items(sorts, cx));
-        self.filter_menu
-            .update(cx, |menu, cx| menu.set_items(filters, cx));
-        self.rebuild_collection_menu(cx);
-    }
-
-    /// Plays the first item of the current library view, or a random one.
-    pub fn play_library(&mut self, shuffle: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Page::Library(data) = &self.page else {
-            return;
-        };
-        let mut query = library_query(data);
-        query.start = Some(0);
-        // The first item plays; the others wait in the queue.
-        query.limit = Some(30);
-        if shuffle {
-            query.sort_by = Some("Random".to_string());
-        }
-        let generation = self.generation;
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(client) = this.read_with(cx, |this, _| {
-                this.session.as_ref().map(|s| s.client.clone())
-            }) else {
-                return;
-            };
-            let Some(client) = client else { return };
-            let result = cx
-                .background_executor()
-                .spawn(async move { client.items(&query) })
-                .await;
-            this.update_in(cx, |this, window, cx| {
-                if this.generation != generation {
-                    return;
-                }
-                match result {
-                    // A series in the queue plays its episodes when its turn
-                    // comes; see `expand_series`.
-                    Ok(page) => this.start_queue(page.items, window, cx),
-                    Err(err) => this.toast("Could not start playback", format!("{err:#}"), cx),
-                }
-            })
-            .ok();
-        })
-        .detach();
     }
 
     /// (Re)loads the data for the current page.
@@ -2286,7 +1709,7 @@ impl Bloom {
         if self.offline_load_page(cx) {
             return;
         }
-        match &self.page {
+        match &self.nav.page {
             Page::Home(_) => self.load_home(cx),
             Page::Library(_) => self.load_library(cx),
             Page::Detail(_) => self.load_detail(cx),
@@ -2306,7 +1729,7 @@ impl Bloom {
 
     /// Loads the rows of the home page and, at sign-in, the libraries. `load_page` calls this.
     fn load_home(&mut self, cx: &mut Context<Self>) {
-        let Page::Home(data) = &mut self.page else {
+        let Page::Home(data) = &mut self.nav.page else {
             return;
         };
         data.loading = true;
@@ -2320,93 +1743,16 @@ impl Bloom {
             cx,
             move |client| {
                 let started = std::time::Instant::now();
-                // The requests do not depend on each other, so they
-                // run at the same time; the page waits for the slowest
-                // one and not for their sum.
-                let loaded = std::thread::scope(|scope| {
-                    let views = scope.spawn(|| {
-                        if need_views {
-                            client.views().map(library_views)
-                        } else {
-                            Ok(Vec::new())
-                        }
-                    });
-                    let order = scope.spawn(|| client.home_sections());
-                    let resume = scope.spawn(|| client.resume(12));
-                    let next_up = scope.spawn(|| client.next_up(24));
-                    let hero = scope.spawn(|| {
-                        if !need_hero {
-                            return Vec::new();
-                        }
-                        // The hero is optional; the page loads without it.
-                        let mut items =
-                            client.hero_items(HERO_ITEMS * 2).unwrap_or_default();
-                        items.retain(crate::views::hero::usable);
-                        items.truncate(HERO_ITEMS);
-                        items
-                    });
-                    let join = |what: &str| anyhow::anyhow!("{what} request stopped");
-                    // The latest rows need the libraries; they start
-                    // as soon as those are in, while the rest runs.
-                    let views = views.join().map_err(|_| join("libraries"))??;
-                    let libraries = if need_views {
-                        home_libraries(&views)
-                    } else {
-                        libraries
-                    };
-                    let latest = std::thread::scope(|scope| {
-                        let latest: Vec<_> = libraries
-                            .iter()
-                            .map(|library| scope.spawn(|| client.latest(&library.id, 16)))
-                            .collect();
-                        latest
-                            .into_iter()
-                            .map(|handle| handle.join().map_err(|_| join("latest"))?)
-                            .collect::<Result<Vec<_>>>()
-                    })?;
-                    let latest: Vec<(Item, Vec<Item>)> = libraries
-                        .into_iter()
-                        .zip(latest)
-                        .filter(|(_, items)| !items.is_empty())
-                        .collect();
-                    anyhow::Ok((
-                        views,
-                        // A failed settings read falls back to the web defaults.
-                        order
-                            .join()
-                            .map_err(|_| join("settings"))?
-                            .unwrap_or_else(|_| {
-                                crate::jellyfin::DEFAULT_HOME_SECTIONS
-                                    .iter()
-                                    .map(|s| s.to_string())
-                                    .collect()
-                            }),
-                        resume.join().map_err(|_| join("resume"))??,
-                        next_up.join().map_err(|_| join("next up"))??,
-                        latest,
-                        hero.join().map_err(|_| join("hero"))?,
-                    ))
-                })?;
-                let (views, order, resume, next_up, latest, hero) = loaded;
+                let loaded = crate::pages::load_home(&client, libraries, need_views, need_hero)?;
                 log::info!(
                     "home data loaded in {} ms ({} ms after start)",
                     started.elapsed().as_millis(),
                     crate::perf::since_start_ms()
                 );
-                Ok((
-                    views,
-                    HomeData {
-                        loading: false,
-                        order,
-                        hero,
-                        resume,
-                        next_up,
-                        latest,
-                    },
-                ))
+                Ok(loaded)
             },
             move |this, result, cx| {
-                if let Page::Home(data) = &mut this.page {
+                if let Page::Home(data) = &mut this.nav.page {
                     match result {
                         Ok((views, mut fresh)) => {
                             if !views.is_empty() {
@@ -2422,7 +1768,7 @@ impl Bloom {
                         Err(err) => {
                             data.loading = false;
                             // No server at all: the offline state takes over.
-                            if !this.downloads_server_failed(&err, cx) {
+                            if !this.request_failed(&err, cx) {
                                 this.toast("Could not load home", format!("{err:#}"), cx);
                             }
                         }
@@ -2435,7 +1781,7 @@ impl Bloom {
 
     /// Loads the first page of the library on show. `load_page` calls this.
     fn load_library(&mut self, cx: &mut Context<Self>) {
-        let Page::Library(data) = &mut self.page else {
+        let Page::Library(data) = &mut self.nav.page else {
             return;
         };
         data.loading = true;
@@ -2453,7 +1799,7 @@ impl Bloom {
                 Ok(page)
             },
             move |this, result, cx| {
-                if let Page::Library(data) = &mut this.page {
+                if let Page::Library(data) = &mut this.nav.page {
                     data.loading = false;
                     match result {
                         Ok(page) => {
@@ -2474,104 +1820,29 @@ impl Bloom {
 
     /// Loads the item of the detail page and the rows under it. `load_page` calls this.
     fn load_detail(&mut self, cx: &mut Context<Self>) {
-        let Page::Detail(data) = &mut self.page else {
+        let Page::Detail(data) = &mut self.nav.page else {
             return;
         };
         data.loading = true;
-        let item_id = data.item.id.clone();
         // The card already says what kind of item this is, so the
         // requests for its rows start with the item request.
-        let kind = data.item.kind.clone();
-        let series_id = data.item.series_id.clone();
-        let season_id = data.item.season_id.clone();
+        let known = Item {
+            id: data.item.id.clone(),
+            kind: data.item.kind.clone(),
+            series_id: data.item.series_id.clone(),
+            season_id: data.item.season_id.clone(),
+            ..Default::default()
+        };
         self.fetch_for_page(
             cx,
             move |client| {
                 let started = std::time::Instant::now();
-                let is = |wanted: ItemKind| kind == wanted;
-                let (item, seasons, next_up, episodes, similar) =
-                    std::thread::scope(|scope| {
-                        let item = scope.spawn(|| client.item(&item_id));
-                        let seasons =
-                            scope.spawn(|| match is(ItemKind::Series) {
-                                true => client.seasons(&item_id),
-                                false => Ok(Vec::new()),
-                            });
-                        let next_up = scope.spawn(|| match is(ItemKind::Series) {
-                            true => client.series_next_up(&item_id).unwrap_or(None),
-                            false => None,
-                        });
-                        // A season shows its episodes; an episode
-                        // shows the others of its season.
-                        let episodes = scope.spawn(|| match (&series_id, &season_id) {
-                            (Some(series), _) if is(ItemKind::Season) => {
-                                client.episodes(series, &item_id)
-                            }
-                            (Some(series), Some(season)) if is(ItemKind::Episode) => {
-                                Ok(client.episodes(series, season).unwrap_or_default())
-                            }
-                            _ => Ok(Vec::new()),
-                        });
-                        // The row is optional; the page loads without it.
-                        let similar = scope.spawn(|| {
-                            if is(ItemKind::Movie) || is(ItemKind::Series) {
-                                client.similar(&item_id, 12).unwrap_or_default()
-                            } else {
-                                Vec::new()
-                            }
-                        });
-                        let stopped = || anyhow::anyhow!("detail request stopped");
-                        anyhow::Ok((
-                            item.join().map_err(|_| stopped())??,
-                            seasons.join().map_err(|_| stopped())??,
-                            next_up.join().map_err(|_| stopped())?,
-                            episodes.join().map_err(|_| stopped())??,
-                            similar.join().map_err(|_| stopped())?,
-                        ))
-                    })?;
-                let mut fresh = DetailData {
-                    seasons,
-                    next_up,
-                    episodes,
-                    similar,
-                    ..Default::default()
-                };
-                // An item opened by id alone has no kind until now.
-                if kind.is_unknown() {
-                    match item.kind {
-                        ItemKind::Series => {
-                            fresh.seasons = client.seasons(&item_id)?;
-                            fresh.next_up =
-                                client.series_next_up(&item_id).unwrap_or(None);
-                        }
-                        ItemKind::Season => {
-                            if let Some(series) = &item.series_id {
-                                fresh.episodes = client.episodes(series, &item_id)?;
-                            }
-                        }
-                        _ => {}
-                    }
-                    if matches!(item.kind, ItemKind::Movie | ItemKind::Series) {
-                        fresh.similar = client.similar(&item_id, 12).unwrap_or_default();
-                    }
-                }
-                // The card that opened an episode page does not
-                // always carry the season id; the item does.
-                if item.kind == ItemKind::Episode
-                    && fresh.episodes.is_empty()
-                    && let (Some(series), Some(season)) = (&item.series_id, &item.season_id)
-                {
-                    fresh.episodes = client.episodes(series, season).unwrap_or_default();
-                }
-                log::info!(
-                    "detail data loaded in {} ms",
-                    started.elapsed().as_millis()
-                );
-                fresh.item = item;
+                let fresh = crate::pages::load_detail(&client, &known)?;
+                log::info!("detail data loaded in {} ms", started.elapsed().as_millis());
                 Ok(fresh)
             },
             move |this, result, cx| {
-                if let Page::Detail(data) = &mut this.page {
+                if let Page::Detail(data) = &mut this.nav.page {
                     match result {
                         Ok(mut fresh) => {
                             // A reload of the same item keeps the
@@ -2589,9 +1860,7 @@ impl Bloom {
                                     .iter()
                                     .position(|ep| ep.id == data.item.id)
                                     .unwrap_or(0);
-                                let step = (this.viewport_w * 0.173).round()
-                                    + this.metrics().gap;
-                                let offset = at as f32 * step;
+                                let offset = at as f32 * this.detail_episode_step();
                                 this.row_scroll(&"detail.season-episodes".into())
                                     .set_offset(gpui_kit::point(px(-offset), px(0.)));
                             }
@@ -2613,7 +1882,7 @@ impl Bloom {
 
     /// Runs the search of the page on the server. `load_page` calls this.
     fn load_search(&mut self, cx: &mut Context<Self>) {
-        let Page::Search(data) = &mut self.page else {
+        let Page::Search(data) = &mut self.nav.page else {
             return;
         };
         if data.query.is_empty() {
@@ -2627,42 +1896,18 @@ impl Bloom {
         }
         data.loading = true;
         data.pending = Some(data.query.clone());
-        let query = ItemQuery {
-            search: Some(data.query.clone()),
-            include_types: vec!["Movie".into(), "Series".into(), "Episode".into()],
-            recursive: Some(true),
-            limit: Some(100),
-            ..Default::default()
-        };
         let text = data.query.clone();
         let asked = text.clone();
         self.fetch_for_page(
             cx,
             move |client| {
                 let started = std::time::Instant::now();
-                // The library and Seerr requests do not depend on each
-                // other, so they run at the same time.
-                let (page, seerr) = std::thread::scope(|scope| {
-                    let page = scope.spawn(|| client.items(&query));
-                    // Seerr is optional; the library results still show.
-                    let seerr = scope.spawn(|| {
-                        if client.seerr_active() {
-                            client.seerr_search(&text).unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        }
-                    });
-                    let stopped = || anyhow::anyhow!("search request stopped");
-                    anyhow::Ok((
-                        page.join().map_err(|_| stopped())??,
-                        seerr.join().map_err(|_| stopped())?,
-                    ))
-                })?;
+                let found = crate::pages::load_search(&client, &text)?;
                 log::info!("search data loaded in {} ms", started.elapsed().as_millis());
-                Ok((page.items, seerr))
+                Ok(found)
             },
             move |this, result, cx| {
-                if let Page::Search(data) = &mut this.page {
+                if let Page::Search(data) = &mut this.nav.page {
                     if data.pending.as_deref() == Some(asked.as_str()) {
                         data.pending = None;
                     }
@@ -2699,12 +1944,12 @@ impl Bloom {
 
     /// Flips the watched state of the item shown on the detail page.
     pub fn toggle_played(&mut self, cx: &mut Context<Self>) {
-        let Page::Detail(data) = &self.page else {
+        let Page::Detail(data) = &self.nav.page else {
             return;
         };
         let (item_id, played) = (data.item.id.clone(), !data.item.user_data.played);
         self.set_user_data(&item_id, Mark::Played, played, true, cx, |this, user_data, cx| {
-            if let Page::Detail(data) = &mut this.page {
+            if let Page::Detail(data) = &mut this.nav.page {
                 data.item.user_data = user_data;
                 if data.item.is_series() {
                     // Episodes and season counts changed server-side too.
@@ -2716,12 +1961,12 @@ impl Bloom {
 
     /// Flips the favorite state of the item shown on the detail page.
     pub fn toggle_favorite(&mut self, cx: &mut Context<Self>) {
-        let Page::Detail(data) = &self.page else {
+        let Page::Detail(data) = &self.nav.page else {
             return;
         };
         let (item_id, favorite) = (data.item.id.clone(), !data.item.user_data.is_favorite);
         self.set_user_data(&item_id, Mark::Favorite, favorite, true, cx, |this, user_data, _| {
-            if let Page::Detail(data) = &mut this.page {
+            if let Page::Detail(data) = &mut this.nav.page {
                 data.item.user_data = user_data;
             }
         });
@@ -2736,7 +1981,7 @@ impl Bloom {
             return;
         };
         let series_id = series.id.clone();
-        let generation = self.generation;
+        let generation = self.nav.generation;
         cx.spawn_in(window, async move |this, cx| {
             let result: Result<Option<Item>> = cx
                 .background_executor()
@@ -2757,7 +2002,7 @@ impl Bloom {
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {
-                if this.generation != generation {
+                if this.nav.generation != generation {
                     return;
                 }
                 match result {
@@ -2783,7 +2028,7 @@ impl Bloom {
         }
         self.clear_queue();
         self.begin(item, resume, cx);
-        window.focus(&self.player_focus, cx);
+        window.focus(&self.playback.focus, cx);
         self.start_player_poll(cx);
         self.queue_followers(item, cx);
     }
@@ -2804,13 +2049,13 @@ impl Bloom {
         // A downloaded item plays from its file on this Mac; otherwise the
         // server says how the item plays (the file, or a transcode).
         self.stream_begin(item, start_secs as f64);
-        self.player.set_volume(self.volume as f64);
-        self.player.set_muted(self.muted);
-        self.player.set_speed(self.speed as f64);
+        self.player.set_volume(self.playback.volume as f64);
+        self.player.set_muted(self.playback.muted);
+        self.player.set_speed(self.playback.speed as f64);
         self.apply_subtitle_style();
-        self.playing = Some(item.clone());
+        self.playback.playing = Some(item.clone());
         self.close_panel(Panel::Episodes);
-        self.segments.clear();
+        self.playback.segments.clear();
         let item_id = item.id.clone();
         self.fetch(
             cx,
@@ -2826,57 +2071,57 @@ impl Bloom {
             },
             move |this, result, cx| {
                 if let Ok(segments) = result
-                    && this.playing.as_ref().is_some_and(|i| i.id == item_id)
+                    && this.playback.playing.as_ref().is_some_and(|i| i.id == item_id)
                 {
-                    this.segments = segments;
+                    this.playback.segments = segments;
                     cx.notify();
                 }
             },
         );
         self.load_timeline(item.id.clone(), cx);
-        self.player_status = self.player.status();
-        self.player_open = true;
+        self.playback.status = self.player.status();
+        self.playback.open = true;
         // A phone turns for the video; an iPad keeps the orientation it has.
         if self.phone() {
             crate::set_landscape(true);
         }
         self.show_controls();
-        self.tracks_version = 0;
+        self.playback.tracks_version = 0;
         self.rebuild_track_menus(cx);
         cx.notify();
     }
 
     /// When the last local input happened.
     pub fn last_activity(&self) -> std::time::Instant {
-        self.last_pointer_activity
+        self.playback.last_activity
     }
 
     /// Called on pointer activity over the video; controls hide again after a delay.
     pub fn show_controls(&mut self) {
-        self.last_pointer_activity = std::time::Instant::now();
-        self.controls_visible = true;
+        self.playback.last_activity = std::time::Instant::now();
+        self.playback.controls_visible = true;
     }
 
     /// Controls stay while paused, buffering, scrubbing, or when a track menu is open.
     fn controls_pinned(&self, cx: &App) -> bool {
-        self.player_status.paused
-            || self.player_status.state != PlayState::Playing
-            || self.scrubbing
-            || self.audio_menu.read(cx).is_open()
-            || self.subtitle_menu.read(cx).is_open()
-            || self.settings_menu.read(cx).is_open()
+        self.playback.status.paused
+            || self.playback.status.state != PlayState::Playing
+            || self.playback.scrubbing
+            || self.playback.audio_menu.read(cx).is_open()
+            || self.playback.subtitle_menu.read(cx).is_open()
+            || self.playback.settings_menu.read(cx).is_open()
             || self.panel_open()
     }
 
     /// Switches the player between the full window and picture in picture.
     pub fn toggle_pip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.pip.take() {
+        match self.playback.pip.take() {
             Some(normal) => crate::pip::leave(window, normal),
             None => {
                 if window.is_fullscreen() {
                     window.toggle_fullscreen();
                 }
-                self.pip = crate::pip::enter(window, self.config.pip_window);
+                self.playback.pip = crate::pip::enter(window, self.config.pip_window);
             }
         }
         self.show_controls();
@@ -2885,16 +2130,16 @@ impl Bloom {
 
     /// Ends picture in picture when the player goes away.
     pub fn leave_pip(&mut self, window: &mut Window) {
-        if let Some(normal) = self.pip.take() {
+        if let Some(normal) = self.playback.pip.take() {
             crate::pip::leave(window, normal);
         }
     }
 
     pub fn set_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
-        self.volume = volume.clamp(0., 100.);
-        self.player.set_volume(self.volume as f64);
-        if self.muted && self.volume > 0. {
-            self.muted = false;
+        self.playback.volume = volume.clamp(0., 100.);
+        self.player.set_volume(self.playback.volume as f64);
+        if self.playback.muted && self.playback.volume > 0. {
+            self.playback.muted = false;
             self.player.set_muted(false);
         }
         cx.notify();
@@ -2902,15 +2147,15 @@ impl Bloom {
 
     /// Changes the volume by a step and moves the slider with it.
     pub fn nudge_volume(&mut self, step: f32, window: &mut Window, cx: &mut Context<Self>) {
-        let volume = (self.volume + step).clamp(0., 100.);
-        self.volume_slider
+        let volume = (self.playback.volume + step).clamp(0., 100.);
+        self.playback.volume_slider
             .update(cx, |slider, cx| slider.set_value(volume, window, cx));
         self.set_volume(volume, cx);
     }
 
     pub fn toggle_mute(&mut self, cx: &mut Context<Self>) {
-        self.muted = !self.muted;
-        self.player.set_muted(self.muted);
+        self.playback.muted = !self.playback.muted;
+        self.player.set_muted(self.playback.muted);
         cx.notify();
     }
 
@@ -2920,7 +2165,7 @@ impl Bloom {
             self.toast("SyncPlay", "The speed stays at 1x while you play with a group.", cx);
             return;
         }
-        self.speed = speed;
+        self.playback.speed = speed;
         self.player.set_speed(speed as f64);
         self.rebuild_track_menus(cx);
         cx.notify();
@@ -2928,12 +2173,12 @@ impl Bloom {
 
     /// Favourite toggle for the item in the player.
     pub fn toggle_playing_favorite(&mut self, cx: &mut Context<Self>) {
-        let Some(item) = &self.playing else {
+        let Some(item) = &self.playback.playing else {
             return;
         };
         let (item_id, favorite) = (item.id.clone(), !item.user_data.is_favorite);
         self.set_user_data(&item_id.clone(), Mark::Favorite, favorite, false, cx, move |this, user_data, _| {
-            if let Some(item) = this.playing.as_mut().filter(|i| i.id == item_id) {
+            if let Some(item) = this.playback.playing.as_mut().filter(|i| i.id == item_id) {
                 item.user_data = user_data;
             }
         });
@@ -2941,8 +2186,8 @@ impl Bloom {
 
     /// The marked range the playback position is in, if any.
     pub fn current_segment(&self) -> Option<&MediaSegment> {
-        let position = self.player_status.position;
-        self.segments.iter().find(|s| {
+        let position = self.playback.status.position;
+        self.playback.segments.iter().find(|s| {
             // A range under three seconds is not worth a prompt.
             s.end_secs() - s.start_secs() >= 3.
                 && position >= s.start_secs()
@@ -2952,7 +2197,7 @@ impl Bloom {
 
     /// Shows or hides the data of the player about the video that plays.
     pub fn toggle_playback_info(&mut self, cx: &mut Context<Self>) {
-        self.playback_info = !self.playback_info;
+        self.playback.info = !self.playback.info;
         self.player
             .command("script-binding", &["stats/display-stats-toggle"]);
         self.rebuild_track_menus(cx);
@@ -2965,19 +2210,19 @@ impl Bloom {
     /// window that was full screen before the item started stays so, and
     /// the next item of a queue keeps the player, and so the full screen.
     fn follow_player_fullscreen(&mut self, window: &mut Window) {
-        if self.player_open == self.player_was_open {
+        if self.playback.open == self.playback.was_open {
             return;
         }
-        self.player_was_open = self.player_open;
-        if self.player_open {
-            self.fullscreen_before_player = window.is_fullscreen();
-        } else if leaves_fullscreen_with_the_player(self.fullscreen_before_player, window.is_fullscreen()) {
+        self.playback.was_open = self.playback.open;
+        if self.playback.open {
+            self.playback.fullscreen_before = window.is_fullscreen();
+        } else if leaves_fullscreen_with_the_player(self.playback.fullscreen_before, window.is_fullscreen()) {
             window.toggle_fullscreen();
         }
     }
 
     pub fn close_player_view(&mut self, cx: &mut Context<Self>) {
-        self.player_open = false;
+        self.playback.open = false;
         if self.phone() {
             crate::set_landscape(false);
         }
@@ -2993,29 +2238,23 @@ impl Bloom {
     /// quarter seconds, in the draw of a frame (see the frames task): while
     /// frames flow, the poll asks for no draw of its own for the position.
     fn follow_position(&mut self, cx: &mut Context<Self>) {
-        let status = &self.player_status;
-        if self.scrubbing || status.duration <= 0. {
+        let status = &self.playback.status;
+        if self.playback.scrubbing || status.duration <= 0. {
             return;
         }
         let pos = (status.position * 4.).floor() / 4.;
-        if pos == self.slider_pos {
+        if pos == self.playback.slider_pos {
             return;
         }
-        self.slider_pos = pos;
+        self.playback.slider_pos = pos;
         self.move_seek_slider(cx);
     }
 
     /// Puts the seek slider at the position of the player.
     fn move_seek_slider(&mut self, cx: &mut Context<Self>) {
-        let (pos, dur) = (self.player_status.position as f32, self.player_status.duration as f32);
-        self.seek_slider.update(cx, |s, cx| {
-            // Update in place: a fresh state has no bounds, and a click
-            // before the next paint would divide by zero.
-            *s = std::mem::replace(s, SliderState::new())
-                .min(0.)
-                .max(dur)
-                .step(1.)
-                .default_value(pos.clamp(0., dur));
+        let (pos, dur) = (self.playback.status.position as f32, self.playback.status.duration as f32);
+        self.playback.seek_slider.update(cx, |s, cx| {
+            crate::ui::slider::set_range_and_value(s, dur, pos);
             cx.notify();
         });
     }
@@ -3023,8 +2262,8 @@ impl Bloom {
     /// Measures how long a new frame waited for the UI, once for a frame.
     fn note_frame_wait(&mut self) {
         let seq = self.player.frame_seq();
-        if seq != self.noticed_frame_seq {
-            self.noticed_frame_seq = seq;
+        if seq != self.playback.noticed_frame_seq {
+            self.playback.noticed_frame_seq = seq;
             crate::perf::video_frame_noticed(self.player.frame_wait_ms());
         }
     }
@@ -3034,16 +2273,16 @@ impl Bloom {
     fn sync_frame(&mut self, window: &mut Window) {
         self.player.ui_seen();
         let display = self.player.display_pacing();
-        if display && self.player_open {
+        if display && self.playback.open {
             crate::pacing::note_window(window, &self.player);
         }
-        let prev_draw = std::mem::replace(&mut self.last_draw_ns, crate::player::clock_ns());
+        let prev_draw = std::mem::replace(&mut self.playback.last_draw_ns, crate::player::clock_ns());
         // A closed player draws no frame: the surface goes back to the pool
         // at once, not when the next item plays.
-        if !self.player_open {
-            self.current_frame = None;
+        if !self.playback.open {
+            self.playback.frame = None;
         }
-        if self.player.frame_seq() == self.frame_seq {
+        if self.player.frame_seq() == self.playback.frame_seq {
             return;
         }
         // One read of the frame, its number and its tick: a frame that is
@@ -3051,7 +2290,7 @@ impl Bloom {
         // one before.
         let published = self.player.frame();
         let seq = published.seq;
-        if seq == self.frame_seq {
+        if seq == self.playback.frame_seq {
             return;
         }
         let draw_id = gpui_apple::present_trace::next_draw_id();
@@ -3071,141 +2310,17 @@ impl Bloom {
             // The phase loop hears where this draw comes out.
             crate::pacing::phase::adopted(seq, draw_id, published.tick_ns, published.vsync_ns, period, now);
         }
-        self.frame_seq = seq;
-        crate::pacing::trace::adopted(seq, self.frame_wake_ns, self.last_draw_ns, prev_draw, draw_id);
+        self.playback.frame_seq = seq;
+        crate::pacing::trace::adopted(seq, self.playback.frame_wake_ns, self.playback.last_draw_ns, prev_draw, draw_id);
         crate::perf::video_frame_shown();
-        self.current_frame = if self.player_open { published.frame } else { None };
-    }
-
-    /// Rebuilds the audio and subtitle menus from the current track list.
-    pub fn rebuild_track_menus(&mut self, cx: &mut Context<Self>) {
-        let this = cx.weak_entity();
-        let status = &self.player_status;
-        let build = |kind: &str, none_label: &str, set: fn(&Player, Option<i64>)| {
-            let mut items = Vec::new();
-            let tracks: Vec<&crate::player::Track> =
-                status.tracks.iter().filter(|t| t.kind == kind).collect();
-            let any_selected = tracks.iter().any(|t| t.selected);
-            if kind == "sub" {
-                let handle = this.clone();
-                items.push(
-                    MenuItem::new(
-                        gpui_kit::SharedString::from(format!("track.{kind}.none")),
-                        none_label,
-                    )
-                    .radio(!any_selected)
-                    .on_click(move |_, _, cx| {
-                        handle.update(cx, |t, _| set(&t.player, None)).ok();
-                    }),
-                );
-            }
-            for track in tracks {
-                let id = track.id;
-                let handle = this.clone();
-                items.push(
-                    MenuItem::new(
-                        gpui_kit::SharedString::from(format!("track.{kind}.{id}")),
-                        track.label(),
-                    )
-                    .radio(track.selected)
-                    .on_click(move |_, _, cx| {
-                        handle.update(cx, |t, _| set(&t.player, Some(id))).ok();
-                    }),
-                );
-            }
-            // The subtitle files the server offers that mpv does not have
-            // yet: an image track comes when it is chosen.
-            if kind == "sub" && let Some(resolved) = crate::stream::current() {
-                for sub in &resolved.external_subs {
-                    if resolved.sid_of_external(sub.index, status).is_some() {
-                        continue;
-                    }
-                    let (index, handle) = (sub.index, this.clone());
-                    let detail = if status.pending_subs.contains(&index) { "Loading…" } else { "" };
-                    items.push(
-                        MenuItem::new(
-                            gpui_kit::SharedString::from(format!("track.sub.file.{index}")),
-                            sub.title.clone(),
-                        )
-                        .detail(detail)
-                        .radio(false)
-                        .on_click(move |_, _, cx| {
-                            handle.update(cx, |t, _| t.stream_subtitle(index)).ok();
-                        }),
-                    );
-                }
-            }
-            if items.is_empty() {
-                items.push(
-                    MenuItem::new(
-                        gpui_kit::SharedString::from(format!("track.{kind}.empty")),
-                        "No tracks",
-                    )
-                    .disabled(true),
-                );
-            }
-            items
-        };
-        // While a transcode plays, the server picks the tracks.
-        let audio = self
-            .stream_track_items("audio", cx)
-            .unwrap_or_else(|| build("audio", "", |p, id| p.set_audio(id)));
-        let subs = self
-            .stream_track_items("sub", cx)
-            .unwrap_or_else(|| build("sub", "Off", |p, id| p.set_subtitle(id)));
-        let mut audio = audio;
-        audio.push(MenuItem::separator());
-        audio.push(self.timing_menu_item(crate::subtitles::Delay::Audio, cx));
-        let mut subs = subs;
-        subs.push(MenuItem::separator());
-        subs.push(self.timing_menu_item(crate::subtitles::Delay::Subtitle, cx));
-        if let Some((id, title)) = self.subs_playing()
-            && let Some(search) = self.subs_search_item(&id, &title, cx)
-        {
-            subs.push(search);
-        }
-        self.subs_load_rights(cx);
-        let mut settings = vec![MenuItem::label("settings.audio", "Audio")];
-        settings.extend(audio.clone());
-        settings.push(MenuItem::separator());
-        settings.push(self.quality_menu_item(cx));
-        settings.push(MenuItem::separator());
-        settings.push(MenuItem::label("settings.speed", "Playback speed"));
-        for speed in [0.5_f32, 0.75, 1., 1.25, 1.5, 2.] {
-            let handle = this.clone();
-            settings.push(
-                MenuItem::new(
-                    gpui_kit::SharedString::from(format!("settings.speed.{speed}")),
-                    format!("{speed}x"),
-                )
-                .radio(self.speed == speed)
-                .on_click(move |_, _, cx| {
-                    handle.update(cx, |t, cx| t.set_speed(speed, cx)).ok();
-                }),
-            );
-        }
-        settings.push(MenuItem::separator());
-        let handle = this.clone();
-        settings.push(
-            MenuItem::new("settings.info", "Playback info")
-                .checked(self.playback_info)
-                .on_click(move |_, _, cx| {
-                    handle.update(cx, |t, cx| t.toggle_playback_info(cx)).ok();
-                }),
-        );
-        self.settings_menu
-            .update(cx, |menu, cx| menu.set_items(settings, cx));
-        self.audio_menu
-            .update(cx, |menu, cx| menu.set_items(audio, cx));
-        self.subtitle_menu
-            .update(cx, |menu, cx| menu.set_items(subs, cx));
+        self.playback.frame = if self.playback.open { published.frame } else { None };
     }
 
     pub(crate) fn start_player_poll(&mut self, cx: &mut Context<Self>) {
-        self.player_poll = Some(cx.spawn(async move |this, cx| {
+        self.playback.poll = Some(cx.spawn(async move |this, cx| {
             loop {
                 let fast = this
-                    .read_with(cx, |this, _| this.player_open)
+                    .read_with(cx, |this, _| this.playback.open)
                     .unwrap_or(false);
                 // The frames have their own signal. Everything here moves
                 // by quarter seconds or slower, or is a change the eye sees
@@ -3223,10 +2338,10 @@ impl Bloom {
                         // The seek slider and the time label move by whole
                         // seconds; a redraw for each 8 ms change of the
                         // position cost the whole UI about 48 draws a
-                        // second. `player_status` itself stays current for
+                        // second. `playback.status` itself stays current for
                         // everything that reads it.
                         let position_moved = (status.position * 4.).floor()
-                            != (this.player_status.position * 4.).floor();
+                            != (this.playback.status.position * 4.).floor();
                         // While frames come, each of them draws the UI and
                         // moves the slider (`follow_position`), so a draw
                         // for the position alone is not needed: it lands at
@@ -3241,22 +2356,22 @@ impl Bloom {
                         this.backdrop_seen = backdrop;
                         let changed = (position_moved && !frames_flow)
                             || backdrop_moved
-                            || status.paused != this.player_status.paused
-                            || status.buffering != this.player_status.buffering
-                            || status.state != this.player_status.state
-                            || status.tracks_version != this.player_status.tracks_version;
-                        this.player_status = status;
+                            || status.paused != this.playback.status.paused
+                            || status.buffering != this.playback.status.buffering
+                            || status.state != this.playback.status.state
+                            || status.tracks_version != this.playback.status.tracks_version;
+                        this.playback.status = status;
                         this.subs_status_changed(cx);
                         for index in this.player.take_failed_subtitles() {
                             this.subtitle_file_failed(index);
                         }
-                        if this.player_status.tracks_version != this.tracks_version {
-                            this.tracks_version = this.player_status.tracks_version;
+                        if this.playback.status.tracks_version != this.playback.tracks_version {
+                            this.playback.tracks_version = this.playback.status.tracks_version;
                             this.rebuild_track_menus(cx);
                         }
                         // The slider follows the position; an update with no
                         // change would only cause a redraw.
-                        if changed && !this.scrubbing && this.player_status.duration > 0. {
+                        if changed && !this.playback.scrubbing && this.playback.status.duration > 0. {
                             this.move_seek_slider(cx);
                         }
                         this.enhanced_tick(cx);
@@ -3269,7 +2384,7 @@ impl Bloom {
                             && !this.advance_at_end(cx)
                             && !this.refind_lost_episode(cx);
                         if ended {
-                            if let Some(err) = this.player_status.error.clone() {
+                            if let Some(err) = this.playback.status.error.clone() {
                                 this.toast("Playback stopped", err, cx);
                             }
                             // Nothing may play behind the closed view: an
@@ -3277,7 +2392,7 @@ impl Bloom {
                             // or a load whose answer is on its way.
                             this.player.stop();
                             this.player.acknowledge_end();
-                            this.player_status = this.player.status();
+                            this.playback.status = this.player.status();
                             // The one way out of the player view, as Stop
                             // takes it: the preview sheets go as well.
                             this.close_player_view(cx);
@@ -3286,18 +2401,18 @@ impl Bloom {
                         if changed || ended {
                             this.macos_player_changed(cx);
                         }
-                        let idle = this.last_pointer_activity.elapsed() > CONTROLS_HIDE_AFTER;
-                        let should_show = !this.player_open || !idle || this.controls_pinned(cx);
-                        let controls_changed = should_show != this.controls_visible;
-                        this.controls_visible = should_show;
+                        let idle = this.playback.last_activity.elapsed() > CONTROLS_HIDE_AFTER;
+                        let should_show = !this.playback.open || !idle || this.controls_pinned(cx);
+                        let controls_changed = should_show != this.playback.controls_visible;
+                        this.playback.controls_visible = should_show;
                         // The pause screen comes up after a rest with no input.
-                        let pause_screen = this.player_open
-                            && this.pip.is_none()
-                            && this.player_status.paused
-                            && this.player_status.state == PlayState::Playing
-                            && this.last_pointer_activity.elapsed() > PAUSE_SCREEN_AFTER;
-                        let pause_changed = pause_screen != this.pause_screen;
-                        this.pause_screen = pause_screen;
+                        let pause_screen = this.playback.open
+                            && this.playback.pip.is_none()
+                            && this.playback.status.paused
+                            && this.playback.status.state == PlayState::Playing
+                            && this.playback.last_activity.elapsed() > PAUSE_SCREEN_AFTER;
+                        let pause_changed = pause_screen != this.playback.pause_screen;
+                        this.playback.pause_screen = pause_screen;
                         if changed || ended || controls_changed || pause_changed {
                             cx.notify();
                         }
@@ -3311,83 +2426,6 @@ impl Bloom {
             }
         }));
     }
-}
-
-pub fn library_query(data: &LibraryData) -> ItemQuery {
-    let view = &data.view;
-    let favorites = view.collection_type.as_deref() == Some(FAVORITES_ID);
-    let person = view.collection_type.as_deref() == Some(PERSON_VIEW);
-    let include_types = match view.collection_type.as_deref() {
-        Some("movies") => vec!["Movie".to_string()],
-        Some("tvshows") => vec!["Series".to_string()],
-        Some(FAVORITES_ID) | Some(PERSON_VIEW) => {
-            vec!["Movie".to_string(), "Series".to_string()]
-        }
-        Some(crate::lists::PLAYLISTS_ID) => vec!["Playlist".to_string()],
-        _ => Vec::new(),
-    };
-    let include_types = match data.show {
-        LibraryShow::Collections => vec!["BoxSet".to_string()],
-        LibraryShow::Episodes => vec!["Episode".to_string()],
-        _ => include_types,
-    };
-    // The collections are not inside the movie library.
-    let collections = data.show == LibraryShow::Collections;
-    let playlists = view.collection_type.as_deref() == Some(crate::lists::PLAYLISTS_ID);
-    let recursive = !include_types.is_empty();
-    let filters: Vec<&str> = (favorites || data.show == LibraryShow::Favorites)
-        .then_some("IsFavorite")
-        .into_iter()
-        .chain(data.filter.filter(|f| *f != "IsFavorite" || data.show != LibraryShow::Favorites))
-        .collect();
-    ItemQuery {
-        parent_id: (!favorites && !person && !collections && !playlists).then(|| view.id.clone()),
-        person_id: person.then(|| view.id.clone()),
-        filters: (!filters.is_empty()).then(|| filters.join(",")),
-        include_types,
-        recursive: Some(recursive),
-        sort_by: Some(data.sort.to_string()),
-        sort_order: Some(
-            if data.descending {
-                "Descending"
-            } else {
-                "Ascending"
-            }
-            .to_string(),
-        ),
-        name_starts_with: data.letter.filter(|c| *c != '#').map(|c| c.to_string()),
-        name_less_than: (data.letter == Some('#')).then(|| "A".to_string()),
-        limit: Some(PAGE_SIZE),
-        start: Some(data.start),
-        ..Default::default()
-    }
-}
-
-/// The user's views that the app shows as libraries.
-fn library_views(views: Vec<Item>) -> Vec<Item> {
-    views
-        .into_iter()
-        .filter(|v| {
-            !matches!(
-                v.collection_type.as_deref(),
-                Some("playlists") | Some("livetv") | Some("books") | Some("music")
-            )
-        })
-        .collect()
-}
-
-/// The libraries with a "Recently Added" row on the home page.
-fn home_libraries(views: &[Item]) -> Vec<Item> {
-    views
-        .iter()
-        .filter(|v| {
-            matches!(
-                v.collection_type.as_deref(),
-                Some("movies") | Some("tvshows") | Some("homevideos") | None
-            )
-        })
-        .cloned()
-        .collect()
 }
 
 /// Whether the window leaves full screen as the player closes: only when
@@ -3415,7 +2453,7 @@ impl Render for Bloom {
         let started_cpu = crate::perf::thread_cpu_ns();
         self.hero.only_frame = !std::mem::take(&mut self.content_dirty);
         self.sync_frame(window);
-        crate::ui::glass::set_over_video(self.player_open);
+        crate::ui::glass::set_over_video(self.playback.open);
         // iOS: the video is under GPUI's layer, so a glass over it needs a
         // copy of the frame while a popup is open over the player, or while
         // the controls show (Daniel, 2026-10-23: the bar is glass over the
@@ -3423,7 +2461,7 @@ impl Render for Bloom {
         // seconds, so the copies stop then).
         if cfg!(target_os = "ios") {
             let popup = self.panel_open() || self.menus().iter().any(|menu| menu.read(cx).is_open());
-            self.player.set_backdrop(self.player_open && (popup || self.controls_visible));
+            self.player.set_backdrop(self.playback.open && (popup || self.playback.controls_visible));
         }
         // The page moves with the software keyboard: a frame per tick
         // while it slides.
@@ -3433,15 +2471,15 @@ impl Render for Bloom {
         self.viewport_w = f32::from(window.viewport_size().width);
         self.viewport_h = f32::from(window.viewport_size().height);
         // Picture in picture ends with the player.
-        if !self.player_open {
+        if !self.playback.open {
             self.leave_pip(window);
         }
         self.follow_player_fullscreen(window);
         // The window buttons go away with the controls of the player.
         // Picture in picture hides them by itself.
-        let buttons_hidden = self.player_open && self.pip.is_none() && !self.controls_visible;
-        if buttons_hidden != self.window_buttons_hidden {
-            self.window_buttons_hidden = buttons_hidden;
+        let buttons_hidden = self.playback.open && self.playback.pip.is_none() && !self.playback.controls_visible;
+        if buttons_hidden != self.playback.window_buttons_hidden {
+            self.playback.window_buttons_hidden = buttons_hidden;
             crate::pip::set_window_buttons_hidden(window, buttons_hidden);
         }
         // The pointer goes away with the controls, also in picture in
@@ -3449,17 +2487,17 @@ impl Render for Bloom {
         // brings the controls back. A key can bring the controls back
         // with no move, so the pointer is given back then.
         let pointer_hidden =
-            self.player_open && !self.controls_visible && window.is_window_active();
-        if pointer_hidden != self.pointer_hidden {
-            self.pointer_hidden = pointer_hidden;
+            self.playback.open && !self.playback.controls_visible && window.is_window_active();
+        if pointer_hidden != self.playback.pointer_hidden {
+            self.playback.pointer_hidden = pointer_hidden;
             crate::macos::hide_pointer_until_it_moves(pointer_hidden);
         }
         // The main screen holds the focus when nothing else does, so its
         // keyboard shortcuts work without a click first.
         if self.screen == Screen::Main
-            && !self.player_open
+            && !self.playback.open
             && self.connect.authorize.is_none()
-            && (window.focused(cx).is_none() || self.player_focus.is_focused(window))
+            && (window.focused(cx).is_none() || self.playback.focus.is_focused(window))
         {
             window.focus(&self.app_focus, cx);
         }
@@ -3468,8 +2506,8 @@ impl Render for Bloom {
                 .password
                 .update(cx, |input, cx| input.set_value("", window, cx));
         }
-        if std::mem::take(&mut self.sync.focus_player) && self.player_open {
-            window.focus(&self.player_focus, cx);
+        if std::mem::take(&mut self.sync.focus_player) && self.playback.open {
+            window.focus(&self.playback.focus, cx);
         }
         self.prepare_admin_prompt(window, cx);
         self.prepare_metadata(window, cx);
@@ -3498,14 +2536,14 @@ impl Render for Bloom {
             .on_action(cx.listener(|this, _: &menus::Back, _, cx| {
                 if this.text_editor_open() {
                     cx.propagate();
-                } else if !this.player_open {
+                } else if !this.playback.open {
                     this.back(cx)
                 }
             }))
             .on_action(cx.listener(|this, _: &menus::Forward, _, cx| {
                 if this.text_editor_open() {
                     cx.propagate();
-                } else if !this.player_open {
+                } else if !this.playback.open {
                     this.forward(cx)
                 }
             }))
@@ -3513,7 +2551,7 @@ impl Render for Bloom {
             // has no listener then, which is what AppKit asks for.
             .when(self.session.is_some() && self.screen == Screen::Main, |el| {
                 el.on_action(cx.listener(|this, _: &menus::Settings, _, cx| {
-                    if !this.player_open {
+                    if !this.playback.open {
                         this.open_settings(crate::settings::Section::Profile, cx)
                     }
                 }))
@@ -3529,7 +2567,7 @@ impl Render for Bloom {
                 window.remove_window();
             }))
             .on_action(cx.listener(|this, _: &menus::About, _, cx| {
-                if !this.player_open && this.screen == Screen::Main {
+                if !this.playback.open && this.screen == Screen::Main {
                     this.open_settings(crate::settings::Section::About, cx)
                 }
             }))
@@ -3537,12 +2575,12 @@ impl Render for Bloom {
                 this.check_for_updates(cx)
             }))
             .on_action(cx.listener(|this, _: &menus::Home, _, cx| {
-                if !this.player_open && this.screen == Screen::Main {
+                if !this.playback.open && this.screen == Screen::Main {
                     this.open_home(cx)
                 }
             }))
             .on_action(cx.listener(|this, _: &menus::Random, _, cx| {
-                if !this.player_open && this.screen == Screen::Main {
+                if !this.playback.open && this.screen == Screen::Main {
                     this.open_random(cx)
                 }
             }))
@@ -3553,15 +2591,15 @@ impl Render for Bloom {
                 }
             }))
             .on_action(cx.listener(|this, _: &menus::Search, window, cx| {
-                if !this.player_open && this.screen == Screen::Main {
-                    let query = this.search_input.read(cx).value().to_string();
+                if !this.playback.open && this.screen == Screen::Main {
+                    let query = this.search.input.read(cx).value().to_string();
                     this.open_search(query, cx);
-                    let focus = this.search_input.read(cx).focus_handle(cx);
+                    let focus = this.search.input.read(cx).focus_handle(cx);
                     window.focus(&focus, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &menus::PlayPause, _, cx| {
-                if this.player_open {
+                if this.playback.open {
                     this.request_toggle_pause(cx);
                 } else {
                     this.toggle_hero_pause();
@@ -3569,26 +2607,27 @@ impl Render for Bloom {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &menus::PictureInPicture, window, cx| {
-                if this.player_open {
+                if this.playback.open {
                     this.toggle_pip(window, cx)
                 }
             }))
             // On iOS the player page is a hole over the video layer of
             // the window: nothing under it may paint.
-            .when(!(cfg!(target_os = "ios") && self.player_open), |el| el.bg(theme.colors.background))
+            .when(!(cfg!(target_os = "ios") && self.playback.open), |el| el.bg(theme.colors.background))
             .text_color(theme.colors.foreground)
             .font_family(theme.fonts.body.clone())
             .text_size(px(14.))
             .line_height(px(20.))
             .child(content)
-            .child(self.card_menu.clone())
-            .child(self.admin_menu.clone())
+            .child(self.popups.card_menu.clone())
+            .child(self.popups.admin_menu.clone())
             .children(self.render_metadata(window, cx))
             .children(self.render_lists_dialog(cx))
+            .children(self.render_confirm(cx))
             .children(self.render_authorize(cx))
             // The open panel, under the top bar; the player places its own.
             .children(
-                (!self.player_open)
+                (!self.playback.open)
                     .then(|| {
                         let top = Some(crate::views::shell::TOPBAR_H + 4.);
                         self.render_sync_panel(top, cx)

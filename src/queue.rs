@@ -92,7 +92,7 @@ impl Bloom {
         self.queue.upcoming = items;
         self.queue.resume_first = true;
         if self.play_next(cx) {
-            window.focus(&self.player_focus, cx);
+            window.focus(&self.playback.focus, cx);
             self.start_player_poll(cx);
         }
     }
@@ -138,7 +138,7 @@ impl Bloom {
             },
             move |this, result, cx| {
                 if let Ok(timeline) = result
-                    && this.playing.as_ref().is_some_and(|i| i.id == item_id)
+                    && this.playback.playing.as_ref().is_some_and(|i| i.id == item_id)
                 {
                     // The audio track that fits the settings of the user,
                     // unless the user chose one on the detail page. In a
@@ -173,7 +173,7 @@ impl Bloom {
     fn preload_previews(&mut self, cx: &mut Context<Self>) {
         let (Some(trickplay), Some(item), Some(session)) = (
             self.queue.timeline.trickplay.as_ref(),
-            self.playing.as_ref(),
+            self.playback.playing.as_ref(),
             self.session.as_ref(),
         ) else {
             return;
@@ -212,7 +212,7 @@ impl Bloom {
             move |this, result, cx| {
                 if let Ok(episodes) = result
                     && this.queue.upcoming.is_empty()
-                    && this.playing.as_ref().is_some_and(|i| i.id == item_id)
+                    && this.playback.playing.as_ref().is_some_and(|i| i.id == item_id)
                 {
                     this.queue.upcoming = episodes;
                     cx.notify();
@@ -237,7 +237,7 @@ impl Bloom {
         // Only the first item of a queue goes on from its resume point; an
         // item that follows another starts at its beginning, as on the web.
         let first = std::mem::take(&mut self.queue.resume_first);
-        if let Some(current) = self.playing.take()
+        if let Some(current) = self.playback.playing.take()
             && !first
         {
             self.queue.history.push(current);
@@ -249,12 +249,12 @@ impl Bloom {
     /// Goes to the item before; later than a few seconds into an item, or
     /// with no item before, it starts the item again.
     pub fn play_previous(&mut self, cx: &mut Context<Self>) {
-        let early = self.player_status.position <= RESTART_AFTER_SECS;
+        let early = self.playback.status.position <= RESTART_AFTER_SECS;
         let Some(previous) = early.then(|| self.queue.history.pop()).flatten() else {
             self.player.seek_absolute(0.);
             return;
         };
-        if let Some(current) = self.playing.take() {
+        if let Some(current) = self.playback.playing.take() {
             self.queue.upcoming.insert(0, current);
         }
         self.begin(&previous, false, cx);
@@ -272,10 +272,10 @@ impl Bloom {
         if self.queue.refinding {
             return true;
         }
-        if !self.player_status.item_gone {
+        if !self.playback.status.item_gone {
             return false;
         }
-        let Some(lost) = self.playing.clone() else { return false };
+        let Some(lost) = self.playback.playing.clone() else { return false };
         let Some(series_id) = lost.series_id.clone().filter(|_| lost.kind == ItemKind::Episode) else {
             return false;
         };
@@ -302,7 +302,7 @@ impl Bloom {
             },
             move |this, result, cx| {
                 this.queue.refinding = false;
-                if this.queue.epoch != epoch || this.playing.as_ref().is_none_or(|i| i.id != lost.id) {
+                if this.queue.epoch != epoch || this.playback.playing.as_ref().is_none_or(|i| i.id != lost.id) {
                     return;
                 }
                 match result {
@@ -328,10 +328,10 @@ impl Bloom {
     /// starts. False when playback is over and the player must close.
     pub fn advance_at_end(&mut self, cx: &mut Context<Self>) -> bool {
         // After an episode, the user's setting decides if the next starts.
-        let stay = self.playing.as_ref().is_some_and(|item| item.kind == ItemKind::Episode)
+        let stay = self.playback.playing.as_ref().is_some_and(|item| item.kind == ItemKind::Episode)
             && !self.prefs.auto_play_next();
-        self.player_status.reached_end
-            && self.player_status.error.is_none()
+        self.playback.status.reached_end
+            && self.playback.status.error.is_none()
             && !stay
             && self.play_next(cx)
     }
@@ -339,35 +339,35 @@ impl Bloom {
     /// The next item and the seconds until it starts, in the time the
     /// "Up next" card shows: the last half minute, or the credits.
     pub fn up_next(&self) -> Option<(&Item, i64)> {
-        let s = &self.player_status;
+        let s = &self.playback.status;
         if self.queue.up_next_hidden || s.state != PlayState::Playing || s.duration <= 0. {
             return None;
         }
         // The card is a setting of the user, and it has nothing to say when
         // the next episode does not start by itself.
-        let episode = self.playing.as_ref().is_some_and(|item| item.kind == ItemKind::Episode);
+        let episode = self.playback.playing.as_ref().is_some_and(|item| item.kind == ItemKind::Episode);
         if !self.prefs.up_next_card() || (episode && !self.prefs.auto_play_next()) {
             return None;
         }
         let next = self.queue.upcoming.first()?;
         let remaining = (s.duration - s.position).max(0.);
         let in_credits = self
-            .segments
+            .playback.segments
             .iter()
             .any(|seg| seg.kind == "Outro" && s.position >= seg.start_secs());
         (remaining <= UP_NEXT_SECS || in_credits)
-            .then(|| (next, (remaining / self.speed.max(0.25) as f64).ceil() as i64))
+            .then(|| (next, (remaining / self.playback.speed.max(0.25) as f64).ceil() as i64))
     }
 
     /// The time under the pointer on the timeline; during a drag, the time
     /// of the thumb.
     pub fn timeline_hover_secs(&self, cx: &gpui_kit::App) -> Option<f64> {
-        let duration = self.player_status.duration;
+        let duration = self.playback.status.duration;
         if duration <= 0. {
             return None;
         }
-        if self.scrubbing {
-            return Some(self.seek_slider.read(cx).value().end() as f64);
+        if self.playback.scrubbing {
+            return Some(self.playback.seek_slider.read(cx).value().end() as f64);
         }
         self.queue.hover.map(|f| f as f64 * duration)
     }
@@ -385,7 +385,7 @@ impl Bloom {
     /// The preview image of a time.
     pub fn preview_frame(&self, secs: f64) -> Option<PreviewFrame> {
         let trickplay = self.queue.timeline.trickplay.as_ref()?;
-        let item = self.playing.as_ref()?;
+        let item = self.playback.playing.as_ref()?;
         let client = &self.session.as_ref()?.client;
         let index = frame_at(trickplay, secs);
         let per_sheet = trickplay.tile_width * trickplay.tile_height;

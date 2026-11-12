@@ -197,9 +197,9 @@ struct Task {
 
 pub fn load(client: &Client) -> Result<Data> {
     std::thread::scope(|scope| {
-        let info = scope.spawn(|| client.get::<Info>("/System/Info", &[]));
-        let counts = scope.spawn(|| client.get::<Counts>("/Items/Counts", &[]));
-        let storage = scope.spawn(|| client.get::<Storage>("/System/Info/Storage", &[]));
+        let info = scope.spawn(|| client.system_info::<Info>());
+        let counts = scope.spawn(|| client.item_counts::<Counts>());
+        let storage = scope.spawn(|| client.storage_info::<Storage>());
         let live = refresh(client)?;
         Ok(Data {
             info: info.join().expect("info thread")?,
@@ -215,34 +215,24 @@ pub fn refresh(client: &Client) -> Result<Live> {
     // The last plays of the users, a start and its stop as one line.
     let played = || {
         client
-            .get::<ActivityPage>(
-                "/System/ActivityLog/Entries",
-                &[("Limit", "30".to_string()), ("HasUserId", "true".to_string())],
-            )
+            .activity_log::<ActivityPage>(&[("Limit", "30".to_string()), ("HasUserId", "true".to_string())])
             .map(|page| collapse(page.items).into_iter().take(7).collect::<Vec<_>>())
             .unwrap_or_default()
     };
     // What the server did by itself: no user is named.
     let alerts = || {
         client
-            .get::<ActivityPage>(
-                "/System/ActivityLog/Entries",
-                &[("Limit", "7".to_string()), ("HasUserId", "false".to_string())],
-            )
+            .activity_log::<ActivityPage>(&[("Limit", "7".to_string()), ("HasUserId", "false".to_string())])
             .map(|e| e.items)
             .unwrap_or_default()
     };
     std::thread::scope(|scope| {
-        let tasks = scope.spawn(|| {
-            client.get::<Vec<Task>>("/ScheduledTasks", &[("IsHidden", "false".to_string())])
-        });
+        let tasks = scope.spawn(|| client.scheduled_tasks::<Vec<Task>>());
         let activity = scope.spawn(played);
         let alerts = scope.spawn(alerts);
-        let devices = scope.spawn(|| client.get::<Devices>("/Devices", &[]));
-        let mut sessions: Vec<Session> = client.get(
-            "/Sessions",
-            &[("ActiveWithinSeconds", ACTIVE_SECONDS.to_string())],
-        )?;
+        let devices = scope.spawn(|| client.devices::<Devices>());
+        let mut sessions: Vec<Session> =
+            client.sessions(&[("ActiveWithinSeconds", ACTIVE_SECONDS.to_string())])?;
         // The web shows only the sessions of a signed-in user.
         sessions.retain(|s| s.user_id.is_some());
         // A device that only asks the server for data (a TV that sits on its
@@ -388,7 +378,7 @@ fn server_card(data: &Data, wide: bool, cx: &mut Context<Bloom>) -> Div {
         )
         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
             this.admin_action("Library scan started", cx, |client| {
-                client.call("POST", "/Library/Refresh", &[])
+                client.scan_libraries()
             })
         })),
     };
@@ -407,7 +397,7 @@ fn server_card(data: &Data, wide: bool, cx: &mut Context<Bloom>) -> Div {
                         danger: true,
                         run: Rc::new(|this, cx| {
                             this.admin_action("The server restarts", cx, |client| {
-                                client.call("POST", "/System/Restart", &[])
+                                client.restart_server()
                             })
                         }),
                     },
@@ -428,7 +418,7 @@ fn server_card(data: &Data, wide: bool, cx: &mut Context<Bloom>) -> Div {
                     danger: true,
                     run: Rc::new(|this, cx| {
                         this.admin_action("The server shuts down", cx, |client| {
-                            client.call("POST", "/System/Shutdown", &[])
+                            client.shutdown_server()
                         })
                     }),
                 },

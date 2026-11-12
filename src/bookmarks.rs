@@ -12,6 +12,7 @@
 //! is not lost. The app keeps the file as it got it, so keys it does not know
 //! stay.
 
+use crate::jellyfin::Method;
 use crate::ui::tone;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
@@ -256,7 +257,7 @@ pub(crate) impl Client {
     fn bookmark_remove(&self, id: &str) -> anyhow::Result<()> {
         let user = self.user()?.to_string();
         self.call(
-            "DELETE",
+            Method::Delete,
             &format!("/JellyfinEnhanced/user-settings/{user}/bookmark.json/{id}"),
             &[],
         )
@@ -361,10 +362,10 @@ impl Bloom {
     /// far as the app has them; a bookmark of an item that came from a list
     /// is matched by its item id.
     fn bookmark_item(&self) -> Option<Item> {
-        if let Some(item) = &self.playing {
+        if let Some(item) = &self.playback.playing {
             return Some(item.clone());
         }
-        match &self.page {
+        match &self.nav.page {
             crate::app::Page::Detail(data) => Some(data.item.clone()),
             _ => None,
         }
@@ -480,7 +481,7 @@ impl Bloom {
     /// Adds a bookmark at the position of the player, with the text of the
     /// label field.
     pub fn add_bookmark_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.playing.clone() else {
+        let Some(item) = self.playback.playing.clone() else {
             return;
         };
         let label = match &self.enhanced.bookmarks.input {
@@ -491,7 +492,7 @@ impl Bloom {
             }
             None => String::new(),
         };
-        self.add_bookmark(item.id, self.player_status.position, label, cx);
+        self.add_bookmark(item.id, self.playback.status.position, label, cx);
     }
 
     /// Opens or closes the panel of the player.
@@ -511,7 +512,7 @@ impl Bloom {
             return false;
         }
         self.close_panel(Panel::Bookmarks);
-        window.focus(&self.player_focus, cx);
+        window.focus(&self.playback.focus, cx);
         true
     }
 
@@ -535,7 +536,7 @@ impl Bloom {
             return None;
         }
         // The marks of the seek bar are drawn with this button.
-        if let Some(item) = &self.playing {
+        if let Some(item) = &self.playback.playing {
             self.learn_bookmark_target(item, cx);
         }
         let open = self.panel_is(Panel::Bookmarks);
@@ -560,8 +561,8 @@ impl Bloom {
 
     /// Marks of the bookmarks on the seek bar, over the slider.
     pub fn bookmark_marks(&self) -> Vec<Div> {
-        let duration = self.player_status.duration;
-        let Some(item) = self.playing.as_ref().filter(|_| self.bookmarks_on()) else {
+        let duration = self.playback.status.duration;
+        let Some(item) = self.playback.playing.as_ref().filter(|_| self.bookmarks_on()) else {
             return Vec::new();
         };
         if duration <= 0. {
@@ -594,11 +595,11 @@ impl Bloom {
         }
         let t = UiTheme::read(cx).clone();
         let soft = tone::INK_70;
-        let item = self.playing.clone()?;
+        let item = self.playback.playing.clone()?;
         self.learn_bookmark_target(&item, cx);
         let list = self.bookmarks_of(&item);
         let input = self.enhanced.bookmarks.input.clone();
-        let position = self.player_status.position;
+        let position = self.playback.status.position;
 
         fn swallow(_: &mut Bloom, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Bloom>) {
             cx.stop_propagation();
@@ -844,7 +845,7 @@ impl Bloom {
 
     /// `je bookmark-jump <place>`: the player goes to a bookmark of its item.
     pub fn bookmark_jump_debug(&mut self, rest: &str, cx: &mut Context<Self>) -> String {
-        let Some(item) = self.playing.clone() else {
+        let Some(item) = self.playback.playing.clone() else {
             return "error: nothing plays".into();
         };
         match rest.trim().parse::<usize>().ok().and_then(|n| self.bookmarks_of(&item).get(n.wrapping_sub(1)).cloned()) {

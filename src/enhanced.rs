@@ -111,42 +111,6 @@ impl Feature {
     }
 }
 
-/// What names a feature: the feature, or its config key (the settings
-/// page and the debug channel have the key as text). TODO: the callers in
-/// other modules pass the key; they can pass the `Feature`.
-pub trait AsFeature {
-    fn feature(self) -> Option<Feature>;
-}
-
-impl AsFeature for Feature {
-    fn feature(self) -> Option<Feature> {
-        Some(self)
-    }
-}
-
-impl AsFeature for &str {
-    fn feature(self) -> Option<Feature> {
-        Feature::of(self)
-    }
-}
-
-impl AsFeature for &&str {
-    fn feature(self) -> Option<Feature> {
-        Feature::of(self)
-    }
-}
-
-/// The features with a switch, as config key and menu text.
-pub const TOGGLES: [(&str, &str); 11] = {
-    let mut toggles = [("", ""); 11];
-    let mut i = 0;
-    while i < toggles.len() {
-        toggles[i] = (Feature::ALL[i].key(), Feature::ALL[i].label());
-        i += 1;
-    }
-    toggles
-};
-
 /// Speed change of one key press.
 const SPEED_STEP: f32 = 0.25;
 /// A position change above this between two looks at the player is a seek.
@@ -180,7 +144,7 @@ pub struct SubtitleStyle {
 /// What the plugin has set for this user.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
-    /// Server values of the switches in [`TOGGLES`].
+    /// Server values of the switches of [`Feature::ALL`].
     flags: HashMap<Feature, bool>,
     pub seerr_similar: bool,
     pub seerr_recommended: bool,
@@ -558,10 +522,7 @@ fn app_in_view() -> bool {
 impl Bloom {
     /// True when a feature is on: the choice made in this app, or else the
     /// user's setting in the plugin.
-    pub fn je(&self, feature: impl AsFeature) -> bool {
-        let Some(feature) = feature.feature() else {
-            return false;
-        };
+    pub fn je(&self, feature: Feature) -> bool {
         if feature.server_gated() {
             return self.enhanced_feature(feature);
         }
@@ -574,18 +535,14 @@ impl Bloom {
 
     /// True when the server has a server-gated feature on and the user has
     /// not switched it off in this app.
-    pub fn enhanced_feature(&self, feature: impl AsFeature) -> bool {
-        feature.feature().is_some_and(|feature| {
-            self.enhanced.settings.flag(feature)
-                && self.config.enhanced.get(feature.key()).copied().unwrap_or(true)
-        })
+    pub fn enhanced_feature(&self, feature: Feature) -> bool {
+        self.enhanced.settings.flag(feature)
+            && self.config.enhanced.get(feature.key()).copied().unwrap_or(true)
     }
 
     /// True when the switch shows in the menu and in the settings.
-    pub fn enhanced_toggle_shown(&self, feature: impl AsFeature) -> bool {
-        feature
-            .feature()
-            .is_some_and(|feature| !feature.server_gated() || self.enhanced.settings.flag(feature))
+    pub fn enhanced_toggle_shown(&self, feature: Feature) -> bool {
+        !feature.server_gated() || self.enhanced.settings.flag(feature)
     }
 
     /// Reads the plugin's settings for the open session.
@@ -633,10 +590,7 @@ impl Bloom {
         );
     }
 
-    pub fn toggle_enhanced(&mut self, feature: impl AsFeature, cx: &mut Context<Self>) {
-        let Some(feature) = feature.feature() else {
-            return;
-        };
+    pub fn toggle_enhanced(&mut self, feature: Feature, cx: &mut Context<Self>) {
         let on = !self.je(feature);
         self.config.enhanced.insert(feature.key().to_string(), on);
         self.save_config(cx);
@@ -696,10 +650,10 @@ impl Bloom {
     pub fn load_enhanced_detail(&mut self, cx: &mut Context<Self>) {
         self.load_request_more(cx);
         // The web client may have added a bookmark since the last look.
-        if matches!(&self.page, Page::Detail(data) if data.item.is_playable()) {
+        if matches!(&self.nav.page, Page::Detail(data) if data.item.is_playable()) {
             self.load_bookmarks(cx);
         }
-        let Page::Detail(data) = &self.page else {
+        let Page::Detail(data) = &self.nav.page else {
             return;
         };
         let item = &data.item;
@@ -775,7 +729,7 @@ impl Bloom {
                 })
             },
             |this, result, cx| {
-                if let (Ok(extras), Page::Detail(data)) = (result, &this.page)
+                if let (Ok(extras), Page::Detail(data)) = (result, &this.nav.page)
                     && data.item.id == extras.item_id
                 {
                     this.enhanced.detail = Some(extras);
@@ -890,7 +844,7 @@ impl Bloom {
 
     /// Community and critic rating of the item in the player.
     pub fn enhanced_player_rating(&self) -> Option<Div> {
-        let item = self.playing.as_ref().filter(|_| self.je(Feature::RatingInPlayer))?;
+        let item = self.playback.playing.as_ref().filter(|_| self.je(Feature::RatingInPlayer))?;
         let community = item.community_rating.filter(|r| *r > 0.);
         let critic = item.critic_rating.filter(|r| *r > 0.);
         if community.is_none() && critic.is_none() {
@@ -994,13 +948,13 @@ impl Bloom {
         if self.sync.following() {
             return;
         }
-        if self.player_status.state != PlayState::Playing {
+        if self.playback.status.state != PlayState::Playing {
             return;
         }
-        let Some(item_id) = self.playing.as_ref().map(|i| i.id.clone()) else {
+        let Some(item_id) = self.playback.playing.as_ref().map(|i| i.id.clone()) else {
             return;
         };
-        let position = self.player_status.position;
+        let position = self.playback.status.position;
         if self.enhanced.item != item_id {
             self.enhanced.item = item_id.clone();
             self.enhanced.before_jump = None;
@@ -1046,7 +1000,7 @@ impl Bloom {
         }
         self.enhanced.visibility_checked = Some(Instant::now());
         let in_view = app_in_view();
-        let paused = self.player_status.paused;
+        let paused = self.playback.status.paused;
         let wanted = auto_pause_wanted(
             self.je(Feature::AutoPause),
             self.enhanced.remote_activity,
@@ -1114,8 +1068,8 @@ impl Bloom {
             "CycleAudioTracks" => self.stream_cycle("audio"),
             "IncreasePlaybackSpeed" | "DecreasePlaybackSpeed" | "ResetPlaybackSpeed" => {
                 let speed = match name {
-                    "IncreasePlaybackSpeed" => (self.speed + SPEED_STEP).min(4.),
-                    "DecreasePlaybackSpeed" => (self.speed - SPEED_STEP).max(0.25),
+                    "IncreasePlaybackSpeed" => (self.playback.speed + SPEED_STEP).min(4.),
+                    "DecreasePlaybackSpeed" => (self.playback.speed - SPEED_STEP).max(0.25),
                     _ => 1.,
                 };
                 self.set_speed(speed, cx);
@@ -1125,9 +1079,9 @@ impl Bloom {
                 Some(end) => self.request_seek_to(end, cx),
                 None => return false,
             },
-            "BookmarkCurrentTime" => match self.playing.as_ref().map(|i| i.id.clone()) {
+            "BookmarkCurrentTime" => match self.playback.playing.as_ref().map(|i| i.id.clone()) {
                 Some(id) if self.bookmarks_on() => {
-                    self.add_bookmark(id, self.player_status.position, String::new(), cx)
+                    self.add_bookmark(id, self.playback.status.position, String::new(), cx)
                 }
                 _ => return false,
             },
@@ -1141,7 +1095,7 @@ impl Bloom {
                 let Ok(tenth) = argument.parse::<f64>() else {
                     return false;
                 };
-                self.request_seek_to(self.player_status.duration * tenth / 10., cx);
+                self.request_seek_to(self.playback.status.duration * tenth / 10., cx);
             }
             _ => return false,
         }
@@ -1422,7 +1376,7 @@ impl Bloom {
             app_in_view(),
             self.enhanced.auto_paused,
             self.enhanced.remote_activity == Some(self.last_activity()),
-            self.speed,
+            self.playback.speed,
             self.panel_is(Panel::Bookmarks),
         )
     }
@@ -1478,9 +1432,8 @@ mod tests {
 
     #[test]
     fn every_feature_has_its_own_key() {
-        for (i, feature) in Feature::ALL.into_iter().enumerate() {
+        for feature in Feature::ALL {
             assert_eq!(Feature::of(feature.key()), Some(feature));
-            assert_eq!(TOGGLES[i], (feature.key(), feature.label()));
         }
         assert_eq!(Feature::of("auto_puase"), None);
     }

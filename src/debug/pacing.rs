@@ -92,7 +92,7 @@ impl Bloom {
                 let Some(client) = self.session.as_ref().map(|s| s.client.clone()) else {
                     return "error: not signed in".into();
                 };
-                self.muted = true;
+                self.playback.muted = true;
                 self.player.set_muted(true);
                 self.player.play(crate::player::PlayRequest {
                     client,
@@ -109,8 +109,8 @@ impl Bloom {
                     subtitles: Vec::new(),
                 });
                 self.player.set_muted(true);
-                self.player_status = self.player.status();
-                self.player_open = true;
+                self.playback.status = self.player.status();
+                self.playback.open = true;
                 self.start_player_poll(cx);
                 // The menus of the player, as a play through the app builds
                 // them; without this the settings menu had no entries.

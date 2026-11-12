@@ -108,6 +108,24 @@ impl Drop for Listener {
     }
 }
 
+/// The channel as the window holds it.
+pub struct Channel {
+    /// Where the listeners send the commands, and the listener that the
+    /// setting turned on.
+    pub(crate) requests: Option<async_channel::Sender<Request>>,
+    pub(crate) listener: Option<Listener>,
+    /// The listener on the socket of `BLOOM_DEBUG_SOCK`, kept so it ends
+    /// with the window.
+    pub(crate) env_listener: Option<Listener>,
+    /// The question and the form a debug command opened, by the address
+    /// of their action; 0 for none. `write confirm` and `write submit`
+    /// run these only, never a dialog a person opened.
+    pub(crate) dialogs: (
+        Option<std::rc::Weak<dyn Fn(&mut Bloom, &mut Context<Bloom>)>>,
+        Option<std::rc::Weak<dyn Fn(&mut Bloom, Vec<String>, &mut Context<Bloom>)>>,
+    ),
+}
+
 /// The socket of the debug channel that the setting turns on, in the folder
 /// of the app.
 pub fn setting_socket() -> String {
@@ -128,7 +146,7 @@ pub fn setting_socket() -> String {
 const COMMANDS: &[&str] = &[
     "home", "back", "search", "library", "item", "resize", "scroll", "hero", "hover-card", "play",
     "stop", "track", "tracks", "mute", "playall", "next", "libraries", "previous", "enqueue",
-    "hover", "queue", "pip", "pause", "seek", "admin", "meta", "admin-edit", "admin-config",
+    "hover", "queue", "pip", "window-front", "window-back", "pause", "seek", "admin", "meta", "admin-edit", "admin-config",
     "admin-discard", "write", "admin-save", "admin-dialog", "connect", "authorize",
     "authorize-close", "je", "tags", "show", "scrub", "type", "a11y", "menu", "settings",
     "plugin-config", "branding", "airplay", "access", "triggers", "awake", "updates", "nowplaying",
@@ -146,9 +164,9 @@ impl Bloom {
         let (tx, rx) = async_channel::unbounded::<Request>();
         if let Some(path) = &crate::options::options().debug_sock {
             // Lives as long as the window.
-            self.debug_env_listener = Listener::start(path.clone(), tx.clone());
+            self.debug.env_listener = Listener::start(path.clone(), tx.clone());
         }
-        self.debug_requests = Some(tx);
+        self.debug.requests = Some(tx);
         if self.config.debug_channel == Some(true) {
             self.listen_for_debug();
         }
@@ -168,16 +186,16 @@ impl Bloom {
     }
 
     fn listen_for_debug(&mut self) {
-        if self.debug_listener.is_none()
-            && let Some(requests) = self.debug_requests.clone()
+        if self.debug.listener.is_none()
+            && let Some(requests) = self.debug.requests.clone()
         {
-            self.debug_listener = Listener::start(setting_socket(), requests);
+            self.debug.listener = Listener::start(setting_socket(), requests);
         }
     }
 
     /// Whether the setting has the debug channel on.
     pub fn debug_channel_on(&self) -> bool {
-        self.debug_listener.is_some()
+        self.debug.listener.is_some()
     }
 
     /// The setting "Debug channel": on or off at once, and kept for the
@@ -187,9 +205,9 @@ impl Bloom {
             self.listen_for_debug();
         } else {
             // The drop ends the thread.
-            self.debug_listener = None;
+            self.debug.listener = None;
         }
-        self.config.debug_channel = Some(self.debug_listener.is_some());
+        self.config.debug_channel = Some(self.debug.listener.is_some());
         self.save_config(cx);
         cx.notify();
     }
@@ -205,7 +223,7 @@ impl Bloom {
 
     /// True when the open question is the one a debug command opened.
     pub(crate) fn debug_opened_confirm(&self) -> bool {
-        match (&self.dialogs.confirm, &self.debug_dialogs.0) {
+        match (&self.dialogs.confirm, &self.debug.dialogs.0) {
             (Some(open), Some(noted)) => noted.upgrade().is_some_and(|run| std::rc::Rc::ptr_eq(&run, &open.run)),
             _ => false,
         }
@@ -213,7 +231,7 @@ impl Bloom {
 
     /// The same for the open form.
     fn debug_opened_prompt(&self) -> bool {
-        match (&self.dialogs.prompt, &self.debug_dialogs.1) {
+        match (&self.dialogs.prompt, &self.debug.dialogs.1) {
             (Some(open), Some(noted)) => noted.upgrade().is_some_and(|run| std::rc::Rc::ptr_eq(&run, &open.run)),
             _ => false,
         }
@@ -228,10 +246,10 @@ impl Bloom {
         // any dialog can be compared with it, and its place in memory is
         // not given to another dialog meanwhile.
         if after.0 != before.0 {
-            self.debug_dialogs.0 = self.dialogs.confirm.as_ref().map(|c| std::rc::Rc::downgrade(&c.run));
+            self.debug.dialogs.0 = self.dialogs.confirm.as_ref().map(|c| std::rc::Rc::downgrade(&c.run));
         }
         if after.1 != before.1 {
-            self.debug_dialogs.1 = self.dialogs.prompt.as_ref().map(|p| std::rc::Rc::downgrade(&p.run));
+            self.debug.dialogs.1 = self.dialogs.prompt.as_ref().map(|p| std::rc::Rc::downgrade(&p.run));
         }
         answer
     }
@@ -251,7 +269,7 @@ impl Bloom {
             // focused (on a phone that raises the keyboard).
             "search" => {
                 self.open_search(rest.to_string(), cx);
-                let focus = gpui_kit::Focusable::focus_handle(self.search_input.read(cx), cx);
+                let focus = gpui_kit::Focusable::focus_handle(self.search.input.read(cx), cx);
                 window.focus(&focus, cx);
             }
             "library" => {
@@ -284,7 +302,7 @@ impl Bloom {
                 }
             }
             "scroll" => match rest.parse::<f32>() {
-                Ok(y) => self.page_scroll.set_offset(gpui_kit::point(px(0.), px(-y))),
+                Ok(y) => self.nav.scroll.set_offset(gpui_kit::point(px(0.), px(-y))),
                 Err(_) => return "error: usage: scroll <y>".into(),
             },
             "hero" => self.step_hero(rest != "previous"),
@@ -295,7 +313,7 @@ impl Bloom {
             )),
             // Player test hooks: play the item of the open detail page, muted.
             "play" => {
-                self.muted = true;
+                self.playback.muted = true;
                 self.play_detail(true, window, cx);
             }
             "stop" => {
@@ -303,7 +321,7 @@ impl Bloom {
                 // `play` muted the player for the test; give the sound back.
                 // A test instance (`BLOOM_MUTED`) never makes a sound.
                 if !crate::options::options().muted {
-                    self.muted = false;
+                    self.playback.muted = false;
                     self.player.set_muted(false);
                 }
             }
@@ -340,12 +358,12 @@ impl Bloom {
             "tracks" => return self.debug_tracks(),
             // Mutes this instance, for a test member that only follows a group.
             "mute" => {
-                self.muted = true;
+                self.playback.muted = true;
                 self.player.set_muted(true);
             }
             // Plays the open library, muted: `playall`, `playall shuffle`.
             "playall" => {
-                self.muted = true;
+                self.playback.muted = true;
                 self.play_library(rest == "shuffle", window, cx);
             }
             "next" => {
@@ -393,8 +411,8 @@ impl Bloom {
                 };
                 return format!(
                     "playing={:?} muted={} history=[{}] upcoming=[{}] chapters={} trickplay={} up_next={:?}",
-                    self.playing.as_ref().map(|i| i.display_title()),
-                    self.muted,
+                    self.playback.playing.as_ref().map(|i| i.display_title()),
+                    self.playback.muted,
                     names(&self.queue.history),
                     names(&self.queue.upcoming),
                     self.queue.timeline.chapters.len(),
@@ -403,6 +421,24 @@ impl Bloom {
                 );
             }
             "pip" => self.toggle_pip(window, cx),
+            // For a screenshot of a test instance that sits under other
+            // windows: brings its window over them without taking the
+            // focus, and puts it back.
+            "window-front" | "window-back" => {
+                use crate::macos::{Id, class, send};
+                let app = send!(Id, class(c"NSApplication"), c"sharedApplication");
+                let windows = send!(Id, app, c"windows");
+                let count = send!(usize, windows, c"count");
+                for i in 0..count {
+                    let window = send!(Id, windows, c"objectAtIndex:", i => usize);
+                    if command == "window-front" {
+                        send!((), window, c"orderFront:", std::ptr::null_mut() => Id);
+                    } else {
+                        send!((), window, c"orderBack:", std::ptr::null_mut() => Id);
+                    }
+                }
+                return command.to_string();
+            }
             "pause" => self.request_toggle_pause(cx),
             "seek" => match rest.parse::<f64>() {
                 Ok(secs) => self.request_seek_to(secs, cx),
@@ -413,7 +449,7 @@ impl Bloom {
             "admin" if rest.starts_with("user ") => {
                 let name = rest.trim_start_matches("user ").trim();
                 self.open_admin(crate::admin::Section::Users, cx);
-                if let Page::Admin(data) = &mut self.page {
+                if let Page::Admin(data) = &mut self.nav.page {
                     data.list = false;
                 }
                 if !crate::admin::users::open_user_named(self, name, cx) {
@@ -428,7 +464,7 @@ impl Bloom {
                 Some(section) => {
                     self.open_admin(section, cx);
                     // The section itself, also on a phone (not its list).
-                    if let Page::Admin(data) = &mut self.page {
+                    if let Page::Admin(data) = &mut self.nav.page {
                         data.list = false;
                     }
                 }
@@ -495,12 +531,12 @@ impl Bloom {
             // Holds the seek slider at a time, as a drag of its thumb does.
             "scrub" => match rest.parse::<f32>() {
                 Ok(secs) => {
-                    self.scrubbing = true;
-                    self.seek_slider
+                    self.playback.scrubbing = true;
+                    self.playback.seek_slider
                         .update(cx, |slider, cx| slider.set_value(secs, window, cx));
                     self.show_controls();
                 }
-                Err(_) => self.scrubbing = false,
+                Err(_) => self.playback.scrubbing = false,
             },
             // What a keystroke in the search field does: the title index
             // answers, with no request.
@@ -529,19 +565,19 @@ impl Bloom {
                     return self.debug_state(window);
                 }
                 let menu = match rest {
-                    "profile" => self.profile_menu.clone(),
-                    "sort" => self.sort_menu.clone(),
-                    "filter" => self.filter_menu.clone(),
-                    "show" => self.show_menu.clone(),
-                    "more" => self.more_menu.clone(),
-                    "audio" => self.detail_audio_menu.clone(),
-                    "subtitles" => self.subtitle_menu.clone(),
-                    "detail-subtitles" => self.detail_subtitle_menu.clone(),
+                    "profile" => self.popups.profile_menu.clone(),
+                    "sort" => self.popups.sort_menu.clone(),
+                    "filter" => self.popups.filter_menu.clone(),
+                    "show" => self.popups.show_menu.clone(),
+                    "more" => self.popups.more_menu.clone(),
+                    "audio" => self.popups.detail_audio_menu.clone(),
+                    "subtitles" => self.playback.subtitle_menu.clone(),
+                    "detail-subtitles" => self.popups.detail_subtitle_menu.clone(),
                     _ => {
                         // The entries of the player's menus follow its
                         // tracks; a menu opened before a rebuild was empty.
                         self.rebuild_track_menus(cx);
-                        self.settings_menu.clone()
+                        self.playback.settings_menu.clone()
                     }
                 };
                 if menu.read(cx).is_empty() {
@@ -570,7 +606,8 @@ impl Bloom {
             "branding" => return self.debug_branding(rest, window, cx),
             // AirPlay: routes, the picker, and the sender (src/airplay/hook.rs).
             "airplay" => return self.debug_airplay(rest, window, cx),
-            "access" | "triggers" => return self.debug_access(command, rest, window, cx),
+            "access" => return self.debug_access(rest, window, cx),
+            "triggers" => return self.debug_triggers(rest, cx),
             // The display-sleep assertion, and the Now Playing tile with the
             // media keys (src/awake.rs, src/nowplaying.rs).
             "awake" => return self.debug_awake(rest, cx),
@@ -718,8 +755,8 @@ impl Bloom {
                     size_of::<crate::admin::AdminData>(),
                     size_of::<crate::lists::PlaylistData>(),
                     size_of::<crate::jellyfin::Item>(),
-                    self.history.len(),
-                    self.history.iter().map(page_items).sum::<usize>(),
+                    self.nav.history.len(),
+                    self.nav.history.iter().map(|(page, _)| page_items(page)).sum::<usize>(),
                 );
             }
             // One value of the user's settings, for the save race tests.
@@ -735,8 +772,8 @@ impl Bloom {
             "catalog" => {
                 return format!(
                     "catalog={} first={:?}",
-                    self.catalog.len(),
-                    self.catalog.iter().take(3).map(|i| i.id.as_str()).collect::<Vec<_>>()
+                    self.search.catalog.items().len(),
+                    self.search.catalog.items().iter().take(3).map(|i| i.id.as_str()).collect::<Vec<_>>()
                 );
             }
             // The menu bar as AppKit holds it, and whether this window
@@ -819,7 +856,7 @@ impl Bloom {
         } else if word == "scroll" {
             let y = arg.parse::<f32>().unwrap_or(0.);
             self.metadata.scroll.set_offset(gpui_kit::point(px(0.), px(-y)));
-        } else if let Page::Detail(data) = &self.page {
+        } else if let Page::Detail(data) = &self.nav.page {
             let tab = match word {
                 "images" => Tab::Images,
                 "identify" => Tab::Identify,
@@ -883,7 +920,6 @@ impl Bloom {
             // A yes-or-no field of the user's configuration.
             "pref" => {
                 let (key, value) = arg.split_once(' ').unwrap_or((arg, ""));
-                let key: &'static str = Box::leak(key.to_string().into_boxed_str());
                 self.set_user_config(key, serde_json::Value::Bool(value == "true"), cx);
             }
             // The tagline of the item in the open metadata editor.
@@ -958,11 +994,8 @@ impl Bloom {
                     self.open_panel(Panel::Help, window, cx);
                 }
             }
-            "toggle" => match crate::enhanced::TOGGLES
-                .iter()
-                .find(|(key, _)| *key == argument)
-            {
-                Some((key, _)) => self.toggle_enhanced(key, cx),
+            "toggle" => match crate::enhanced::Feature::of(argument) {
+                Some(feature) => self.toggle_enhanced(feature, cx),
                 None => return format!("error: no switch named {argument:?}"),
             },
             "do" => {
@@ -1180,12 +1213,12 @@ impl Bloom {
     fn debug_tracks(&self) -> String {
         let resolved = crate::stream::current();
         let rows: Vec<String> = self
-            .player_status
+            .playback.status
             .tracks
             .iter()
             .map(|t| {
                 let index = match (t.kind.as_str(), resolved.as_ref()) {
-                    ("sub", Some(r)) => r.subtitle_of(t.id, &self.player_status),
+                    ("sub", Some(r)) => r.subtitle_of(t.id, &self.playback.status),
                     ("audio", Some(r)) => r.audio_of(t.id),
                     _ => None,
                 };
@@ -1209,8 +1242,8 @@ impl Bloom {
             resolved.as_ref().is_some_and(|r| r.burn_in),
             resolved.as_ref().map(|r| r.external_subs.iter().map(|s| s.index).collect::<Vec<_>>()).unwrap_or_default(),
             resolved.as_ref().and_then(|r| r.selected_external),
-            self.player_status.external_sids,
-            self.player_status.pending_subs,
+            self.playback.status.external_sids,
+            self.playback.status.pending_subs,
             rows.join("\n")
         )
     }
@@ -1227,7 +1260,7 @@ impl Bloom {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let page = match &self.page {
+        let page = match &self.nav.page {
             Page::Home(d) => format!(
                 "home loading={} resume={} next_up={} latest_rows={} [{}]",
                 d.loading,
@@ -1284,14 +1317,14 @@ impl Bloom {
         let viewport = window.viewport_size();
         format!(
             "{page} | history={} forward={} player={:?} pos={:.0} playing={:?} window={}x{} scroll={} source={}",
-            self.history.len(),
-            self.forward.len(),
-            self.player_status.state,
-            self.player_status.position,
-            self.playing.as_ref().map(|item| item.name.as_str()).unwrap_or(""),
+            self.nav.history.len(),
+            self.nav.forward.len(),
+            self.playback.status.state,
+            self.playback.status.position,
+            self.playback.playing.as_ref().map(|item| item.name.as_str()).unwrap_or(""),
             f32::from(viewport.width),
             f32::from(viewport.height),
-            -f32::from(self.page_scroll.offset().y),
+            -f32::from(self.nav.scroll.offset().y),
             self.downloads_source_label(),
         )
     }

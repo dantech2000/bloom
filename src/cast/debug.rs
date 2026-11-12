@@ -74,7 +74,7 @@ impl Bloom {
             // This player, as a target sees it.
             "local" => {
                 let tracks: Vec<String> = self
-                    .player_status
+                    .playback.status
                     .tracks
                     .iter()
                     .filter(|t| t.kind != "video")
@@ -82,12 +82,12 @@ impl Bloom {
                     .collect();
                 return format!(
                     "player={:?} playing={:?} position={:.1} paused={} volume={} muted={} tracks=[{}] fullscreen={} allowed={}",
-                    self.player_status.state,
-                    self.playing.as_ref().map(|i| i.display_title()),
-                    self.player_status.position,
-                    self.player_status.paused,
-                    self.volume,
-                    self.muted,
+                    self.playback.status.state,
+                    self.playback.playing.as_ref().map(|i| i.display_title()),
+                    self.playback.status.position,
+                    self.playback.status.paused,
+                    self.playback.volume,
+                    self.playback.muted,
                     tracks.join(" "),
                     window.is_fullscreen(),
                     self.remote_control_allowed(),
@@ -234,8 +234,7 @@ impl Bloom {
                 self.fetch(
                     cx,
                     move |client| {
-                        let sessions: Vec<SessionInfo> =
-                            client.get("/Sessions", &[("deviceId", device_id)])?;
+                        let sessions: Vec<SessionInfo> = client.sessions(&[("deviceId", device_id)])?;
                         Ok(sessions
                             .into_iter()
                             .map(|s| {

@@ -62,8 +62,8 @@ impl Bloom {
     /// Opens the socket of the session of `client` and reads it.
     pub(crate) fn start_socket(&mut self, client: Client, cx: &mut Context<Self>) {
         let (realtime, events) = realtime::start(client);
-        self.sync.socket.realtime = Some(realtime);
-        self.sync.socket.reader = Some(cx.spawn(async move |this, cx| {
+        self.socket.realtime = Some(realtime);
+        self.socket.reader = Some(cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {
                 let fed = this.update(cx, |this, cx| this.on_socket_event(event, cx));
                 if fed.is_err() {
@@ -75,15 +75,15 @@ impl Bloom {
 
     /// Closes the socket. News that waits keeps its reload.
     pub(crate) fn stop_socket(&mut self) {
-        self.sync.socket.reader = None;
-        self.sync.socket.realtime = None;
+        self.socket.reader = None;
+        self.socket.realtime = None;
     }
 
     /// An event of the socket: a real one, or a message the debug command
     /// `socket-inject` makes. Both go the same way, to every reader.
     pub fn on_socket_event(&mut self, event: SocketEvent, cx: &mut Context<Self>) {
         if let SocketEvent::Message { kind, .. } = &event {
-            self.sync.socket.news.stats.message(kind);
+            self.socket.news.stats.message(kind);
         }
         // Remote control reads the socket as well.
         self.cast_socket(&event, cx);
@@ -110,7 +110,7 @@ impl Bloom {
             return;
         };
         log::debug!("server news: {kind}");
-        let state = &mut self.sync.socket.news;
+        let state = &mut self.socket.news;
         state.library |= library;
         state.pending = true;
         let first = *state.first.get_or_insert_with(Instant::now);
@@ -125,16 +125,16 @@ impl Bloom {
     /// Runs the reload that the news asks for. While the player is open the
     /// reload stays owed until the player closes.
     fn settle_news(&mut self, cx: &mut Context<Self>) {
-        let state = &mut self.sync.socket.news;
+        let state = &mut self.socket.news;
         state.first = None;
-        if self.player_open {
+        if self.playback.open {
             state.owed = true;
             return;
         }
         state.owed = false;
         let library = std::mem::take(&mut state.library);
         state.pending = false;
-        let shows = match self.page {
+        let shows = match self.nav.page {
             Page::Home(_) => news::Shows::Home,
             Page::Library(_) => news::Shows::Library,
             _ => news::Shows::Other,
@@ -152,13 +152,13 @@ impl Bloom {
 
     /// The player view closed: runs the reload that came due under it.
     pub fn news_player_closed(&mut self, cx: &mut Context<Self>) {
-        if self.sync.socket.news.owed {
+        if self.socket.news.owed {
             self.settle_news(cx);
         }
     }
 
     /// The counters of `events`.
     pub fn news_describe(&self) -> String {
-        self.sync.socket.news.stats.describe(self.sync.socket.news.pending)
+        self.socket.news.stats.describe(self.socket.news.pending)
     }
 }

@@ -21,6 +21,7 @@ pub mod jellyfin;
 pub mod languages;
 pub mod news;
 pub mod options;
+pub mod pages;
 pub mod playback;
 pub mod quality_tags;
 pub mod queue;

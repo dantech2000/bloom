@@ -6,11 +6,10 @@ use super::*;
 
 /// The item, its segments and the names of its files, for `meta.json`.
 pub(super) fn fetch_meta(client: &Client, item_id: &str, server_id: &str) -> Result<Value> {
-    let user = client.user()?.to_string();
-    let item: Value = client.get(&format!("/Items/{item_id}"), &[("userId", user)])?;
+    let item = client.item_json(item_id)?;
     // Intro and credits ranges; optional.
     let segments = client
-        .get::<Value>(&format!("/MediaSegments/{item_id}"), &[])
+        .media_segments_json(item_id)
         .ok()
         .and_then(|page| page.get("Items").cloned())
         .unwrap_or(Value::Array(Vec::new()));

@@ -179,7 +179,7 @@ const TABBAR_MARGIN: f32 = 10.;
 impl Bloom {
     pub fn render_shell(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The player covers the window, so the page behind it is not built.
-        if self.player_open {
+        if self.playback.open {
             return div()
                 .flex()
                 .size_full()
@@ -188,7 +188,7 @@ impl Bloom {
         }
         // A page with nothing to show because the server does not answer
         // says so, instead of an empty page.
-        let page = match &self.page {
+        let page = match &self.nav.page {
             _ if self.offline_page_shows() => self.render_offline_page(cx).into_any_element(),
             Page::Home(_) => self.render_home(cx).into_any_element(),
             Page::Library(_) => self.render_library(cx).into_any_element(),
@@ -203,7 +203,7 @@ impl Bloom {
         // the right, or fades when Back brought it; on the Mac it lifts
         // into place. The key names the page, so the next page runs it
         // again and a redraw of the same page does not.
-        let page_key = SharedString::from(match &self.page {
+        let page_key = SharedString::from(match &self.nav.page {
             _ if self.offline_page_shows() => "page.offline".to_string(),
             Page::Home(_) => "page.home".to_string(),
             Page::Library(d) => format!("page.library.{}.{:?}", d.view.id, d.show),
@@ -220,7 +220,7 @@ impl Bloom {
             page_key,
             if !compact {
                 Enter::Lift
-            } else if self.nav_back {
+            } else if self.nav.back {
                 Enter::Fade
             } else {
                 Enter::Push
@@ -229,8 +229,8 @@ impl Bloom {
         );
         // On home and detail pages the bar lies over the artwork; other
         // pages start below it.
-        let overlay = matches!(self.page, Page::Home(_) | Page::Detail(_));
-        let scrolled = f32::from(self.page_scroll.offset().y) < -8.;
+        let overlay = matches!(self.nav.page, Page::Home(_) | Page::Detail(_));
+        let scrolled = f32::from(self.nav.scroll.offset().y) < -8.;
         VIEWPORT_W.store(
             f32::from(window.viewport_size().width).to_bits(),
             std::sync::atomic::Ordering::Relaxed,
@@ -305,7 +305,7 @@ impl Bloom {
 
     /// The title of the page for the top bar of a compact window.
     fn page_title(&self) -> String {
-        match &self.page {
+        match &self.nav.page {
             Page::Home(_) => self
                 .session
                 .as_ref()
@@ -334,12 +334,12 @@ impl Bloom {
         let fg = UiTheme::read(cx).colors.foreground;
         // A page that is no library and has no library behind it lights no
         // tab but its own (search), as the tab bars of iOS do.
-        let active = match &self.page {
+        let active = match &self.nav.page {
             Page::Search(_) | Page::Settings(_) | Page::Admin(_) | Page::Downloads => None,
             _ => self.active_tab(),
         };
-        let is_home = matches!(self.page, Page::Home(_)) && self.history.is_empty();
-        let is_search = matches!(self.page, Page::Search(_));
+        let is_home = matches!(self.nav.page, Page::Home(_)) && self.nav.history.is_empty();
+        let is_search = matches!(self.nav.page, Page::Search(_));
         let item = |id: SharedString, label: String, glyph: LucideIcon, selected: bool| {
             let color = if selected { fg } else { fg.opacity(0.6) };
             div()
@@ -417,9 +417,9 @@ impl Bloom {
     /// Opens the search page with the text of its field, and puts the
     /// keys into the field.
     fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let query = self.search_input.read(cx).value().to_string();
+        let query = self.search.input.read(cx).value().to_string();
         self.open_search(query, cx);
-        let focus = self.search_input.read(cx).focus_handle(cx);
+        let focus = self.search.input.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
     }
 
@@ -450,7 +450,7 @@ impl Bloom {
             return;
         };
         let phase = event.touch_phase;
-        let allowed = !self.player_open
+        let allowed = !self.playback.open
             && (phase != TouchPhase::Started || crate::macos::swipe_between_pages_with_scroll());
         let turned = cx.default_global::<Swipe>().feed(phase, f32::from(delta.x), f32::from(delta.y), allowed);
         match turned {
@@ -488,14 +488,14 @@ impl Bloom {
         }
         // The dialog of "Request more seasons" closes on Escape, as the
         // other dialogs do.
-        if self.enhanced.seasons.open && keystroke.key == "escape" {
+        if self.panel_is(Panel::Seasons) && keystroke.key == "escape" {
             self.close_seasons_dialog(cx);
             cx.stop_propagation();
             return;
         }
         // Keys typed into the search field are text, not shortcuts. Only
         // Escape acts there: it takes the focus off the field.
-        if self.search_input.read(cx).focus_handle(cx).contains_focused(window, cx) {
+        if self.search.input.read(cx).focus_handle(cx).contains_focused(window, cx) {
             if keystroke.key == "escape" {
                 window.focus(&self.app_focus, cx);
                 cx.stop_propagation();
@@ -512,9 +512,9 @@ impl Bloom {
             return;
         }
         // The hero keys apply while the hero is in view on the home page.
-        let on_hero = matches!(self.page, Page::Home(_))
+        let on_hero = matches!(self.nav.page, Page::Home(_))
             && !self.hero.slides.is_empty()
-            && -f32::from(self.page_scroll.offset().y) < self.hero_height();
+            && -f32::from(self.nav.scroll.offset().y) < self.hero_height();
         // The list of keys and the shortcuts of Jellyfin Enhanced.
         if self.enhanced_shell_key(event, window, cx) {
             cx.notify();
@@ -525,7 +525,7 @@ impl Bloom {
             "[" if modifiers.platform => self.back(cx),
             // Escape closes an open panel first; the page stays.
             "escape" if self.panel_is(Panel::SyncPlay) || self.panel_is(Panel::Cast) => self.close_popups(None, window, cx),
-            "escape" | "backspace" if !self.history.is_empty() => self.back(cx),
+            "escape" | "backspace" if !self.nav.history.is_empty() => self.back(cx),
             "/" => self.focus_search(window, cx),
             "h" if modifiers.shift => self.open_home(cx),
             "r" if !modifiers.modified() => self.open_random(cx),
@@ -547,11 +547,11 @@ impl Bloom {
                 .find(|v| v.collection_type.as_deref() == Some(collection))
                 .map(|v| v.id.clone())
         };
-        let root = self.history.first().unwrap_or(&self.page);
+        let root = self.nav.history.first().map_or(&self.nav.page, |(page, _)| page);
         if let Page::Library(data) = root {
             return Some(data.view.id.clone());
         }
-        match &self.page {
+        match &self.nav.page {
             Page::Detail(data) => match data.item.kind {
                 ItemKind::Movie => by_type("movies"),
                 ItemKind::Series | ItemKind::Season | ItemKind::Episode => by_type("tvshows"),
@@ -757,7 +757,7 @@ impl Bloom {
                 }),
             );
         }
-        self.profile_menu
+        self.popups.profile_menu
             .update(cx, |menu, cx| menu.set_items(items, cx));
     }
 
@@ -765,7 +765,7 @@ impl Bloom {
         let colors = UiTheme::read(cx).colors;
         let fg = colors.foreground;
         let active = self.active_tab();
-        let is_home = matches!(self.page, Page::Home(_)) && self.history.is_empty();
+        let is_home = matches!(self.nav.page, Page::Home(_)) && self.nav.history.is_empty();
         let server = self
             .session
             .as_ref()
@@ -893,7 +893,7 @@ impl Bloom {
                         cx.listener(|this, _, _, cx| {
                             if this.admin_back_to_list(cx) || this.settings_back_to_list(cx) {
                                 // The page went back to its list of sections.
-                            } else if this.history.is_empty() {
+                            } else if this.nav.history.is_empty() {
                                 this.open_home(cx)
                             } else {
                                 this.back(cx)
@@ -915,7 +915,7 @@ impl Bloom {
                 .children(self.render_offline_chip(cx))
                 .children(self.render_downloads_chip(cx))
                 .child(
-                    Menu::new(&self.profile_menu, "Account")
+                    Menu::new(&self.popups.profile_menu, "Account")
                         .trigger(div().id("top.account").child(avatar)),
                 )
                 .into_any_element();
@@ -941,7 +941,7 @@ impl Bloom {
                                 .tooltip(tip("Back (Esc)"))
                                 .on_click(cx.listener(
                                 |this, _, _, cx| {
-                                    if this.history.is_empty() {
+                                    if this.nav.history.is_empty() {
                                         this.open_home(cx)
                                     } else {
                                         this.back(cx)
@@ -1001,7 +1001,7 @@ impl Bloom {
                             .on_click(cx.listener(|this, _, window, cx| this.focus_search(window, cx))),
                     )
                     .child(
-                        Menu::new(&self.profile_menu, "Account")
+                        Menu::new(&self.popups.profile_menu, "Account")
                             // The avatar is the whole button; no frame around it.
                             .trigger(div().id("top.account").tooltip(tip("Account")).child(avatar)),
                     ),
@@ -1053,7 +1053,7 @@ impl Bloom {
         if state == State::Checking && !self.connection.page_failed {
             return false;
         }
-        match &self.page {
+        match &self.nav.page {
             Page::Home(d) => {
                 !d.loading
                     && d.resume.is_empty()

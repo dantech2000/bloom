@@ -379,20 +379,20 @@ impl Bloom {
     ) {
         let filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter the settings"));
-        let path = format!("/Plugins/{id}/Configuration");
+        let plugin = id.clone();
         // The answer is for this open: the user may close the editor, open
         // another plugin or another session before it comes.
         let epoch = self.session_epoch;
         let revision = self.next_revision();
-        if let Page::Admin(admin) = &mut self.page {
+        if let Page::Admin(admin) = &mut self.nav.page {
             admin.plugin_open = Some(revision);
         }
         self.fetch(
             cx,
-            move |client| client.get_text(&path, &[]),
+            move |client| client.plugin_configuration_text(&plugin),
             move |this, result, cx| {
                 if this.session_epoch != epoch
-                    || !matches!(&this.page, Page::Admin(admin) if admin.plugin_open == Some(revision))
+                    || !matches!(&this.nav.page, Page::Admin(admin) if admin.plugin_open == Some(revision))
                 {
                     return;
                 }
@@ -433,9 +433,9 @@ impl Bloom {
                     revision,
                     _filter_change: change,
                 };
-                if let Page::Admin(admin) = &mut this.page {
+                if let Page::Admin(admin) = &mut this.nav.page {
                     admin.plugin_editor = Some(editor);
-                    this.page_scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+                    this.nav.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
                 }
                 cx.notify();
             },
@@ -481,7 +481,7 @@ impl Bloom {
     }
 
     fn plugin_leave(&mut self, cx: &mut Context<Self>) {
-        if let Page::Admin(admin) = &mut self.page {
+        if let Page::Admin(admin) = &mut self.nav.page {
             admin.plugin_editor = None;
             admin.plugin_open = None;
         }
@@ -505,7 +505,7 @@ impl Bloom {
             return;
         }
         editor.draft.saving = true;
-        let path = format!("/Plugins/{}/Configuration", editor.id);
+        let plugin = editor.id.clone();
         // The answer is for this instance of the editor: the user may have
         // left it and opened another one (of this plugin or another, on
         // this server or another) meanwhile.
@@ -517,9 +517,9 @@ impl Bloom {
             move |client| -> Result<(String, Value)> {
                 // The object of the server now, with the edits in it: what
                 // changed there since the editor opened stays.
-                let fresh = client.get::<Value>(&path, &[])?;
-                client.post(&path, &sent.body(&fresh))?;
-                let raw = client.get_text(&path, &[])?;
+                let fresh = client.plugin_configuration(&plugin)?;
+                client.save_plugin_configuration(&plugin, &sent.body(&fresh))?;
+                let raw = client.plugin_configuration_text(&plugin)?;
                 let server = serde_json::from_str(&raw)?;
                 Ok((raw, server))
             },
@@ -621,7 +621,7 @@ impl Bloom {
     pub fn render_plugin_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
         // The bar is the editor's: on another section its Save would send
         // the plugin settings from a page that does not show them.
-        let on_plugins = matches!(&self.page, Page::Admin(admin) if admin.section == super::Section::Plugins);
+        let on_plugins = matches!(&self.nav.page, Page::Admin(admin) if admin.section == super::Section::Plugins);
         let editor = self.plugin_editor().filter(|e| e.dirty() && on_plugins)?;
         let changes = editor.changed().len().max(1);
         Some(bar_shell(
@@ -642,7 +642,7 @@ impl Bloom {
             "" | "state" => {}
             "open" => {
                 let wanted = arg.trim().to_lowercase();
-                let found = match &self.page {
+                let found = match &self.nav.page {
                     Page::Admin(admin) => admin.plugins.as_ref().and_then(|data| {
                         data.plugins
                             .iter()
@@ -1086,7 +1086,7 @@ mod race_tests {
             this.screen = Screen::Main;
             let mut admin = AdminData::new(Section::Plugins);
             admin.loading = false;
-            this.page = Page::Admin(admin);
+            this.nav.page = Page::Admin(admin);
         });
         (bloom, cx)
     }

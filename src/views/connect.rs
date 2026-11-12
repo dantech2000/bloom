@@ -299,7 +299,7 @@ impl Bloom {
             return;
         }
         let client = Client::new(url, &self.config.device_id)
-            .with_token(&profile.token, &profile.user_id);
+            .with_session(&profile.token, &profile.user_id);
         self.fetch_with(
             client,
             cx,
@@ -325,7 +325,7 @@ impl Bloom {
             .as_ref()
             .is_some_and(|s| s.server_id == server_id && s.user_id == user_id)
         {
-            self.drop_session();
+            self.drop_session(cx);
         }
         self.save_config(cx);
         self.rebuild_menu(cx);
@@ -344,7 +344,7 @@ impl Bloom {
             .as_ref()
             .is_some_and(|s| s.server_id == server_id)
         {
-            self.drop_session();
+            self.drop_session(cx);
         }
         self.connect.public_users.clear();
         self.connect.quick = None;

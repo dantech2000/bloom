@@ -674,13 +674,10 @@ impl Bloom {
         self.fetch_in_session(
             cx,
             move |client| -> Result<(Value, Vec<ImageInfo>)> {
-                let user = client.user()?.to_string();
                 // The two requests run at the same time.
                 std::thread::scope(|scope| {
-                    let images = scope.spawn(|| {
-                        client.get::<Vec<ImageInfo>>(&format!("/Items/{id}/Images"), &[])
-                    });
-                    let item: Value = client.get(&format!("/Items/{id}"), &[("userId", user)])?;
+                    let images = scope.spawn(|| client.item_images::<Vec<ImageInfo>>(&id));
+                    let item = client.item_json(&id)?;
                     Ok((item, images.join().expect("images thread")?))
                 })
             },
@@ -890,7 +887,7 @@ impl Bloom {
         }
         let id = manager.id.clone();
         self.metadata_action("Metadata saved", Texts::Reload, cx, move |client| {
-            client.post(&format!("/Items/{id}"), &item).map(drop)
+            client.save_item(&id, &item)
         });
     }
 
@@ -915,7 +912,7 @@ impl Bloom {
         ];
         self.fetch_in_session(
             cx,
-            move |client| client.call("POST", &format!("/Items/{id}/Refresh"), &query),
+            move |client| client.refresh_item(&id, &query),
             |this, result, cx| match result {
                 Ok(()) => this.toast("Refresh queued", "The server works on it now.", cx),
                 Err(err) => this.toast("The server refused the refresh", format!("{err:#}"), cx),
@@ -963,8 +960,8 @@ impl Bloom {
         self.fetch_in_session(
             cx,
             move |client| {
-                client.get::<Page>(
-                    &format!("/Items/{id}/RemoteImages"),
+                client.remote_images::<Page>(
+                    &id,
                     &[
                         ("type", kind),
                         ("startIndex", start.to_string()),
@@ -1035,11 +1032,7 @@ impl Bloom {
                 let (id, kind, url, provider) =
                     (id.clone(), kind.clone(), url.clone(), provider.clone());
                 this.metadata_action("Image saved", Texts::Keep, cx, move |client| {
-                    client.call(
-                        "POST",
-                        &format!("/Items/{id}/RemoteImages/Download"),
-                        &[("Type", kind), ("ImageUrl", url), ("ProviderName", provider)],
-                    )
+                    client.download_remote_image(&id, &kind, &url, &provider)
                 });
             }),
         });
@@ -1069,7 +1062,7 @@ impl Bloom {
             run: Rc::new(move |this, cx| {
                 let (id, kind) = (id.clone(), kind.clone());
                 this.metadata_action("Image deleted", Texts::Keep, cx, move |client| {
-                    client.call("DELETE", &format!("/Items/{id}/Images/{kind}/{index}"), &[])
+                    client.delete_item_image(&id, &kind, index)
                 });
             }),
         });
@@ -1119,10 +1112,7 @@ impl Bloom {
         let (kind, wanted) = (manager.kind.clone(), manager.id.clone());
         self.fetch_in_session(
             cx,
-            move |client| -> Result<Vec<Value>> {
-                let mut answer = client.post(&format!("/Items/RemoteSearch/{kind}"), &body)?;
-                Ok(answer.read_json()?)
-            },
+            move |client| client.remote_search(&kind, &body),
             move |this, result, cx| {
                 let Some(manager) = &mut this.metadata.open else {
                     return;
@@ -1373,7 +1363,7 @@ mod dialog_tests {
         cx.run_until_parked();
         let delete = |this: &mut crate::app::Bloom, cx: &mut gpui_kit::Context<crate::app::Bloom>| {
             this.metadata_action("Image deleted", super::Texts::Keep, cx, |client| {
-                client.call("DELETE", "/Items/m1/Images/Backdrop/0", &[])
+                client.delete_item_image("m1", "Backdrop", 0)
             });
         };
         bloom.update(cx, |this, cx| {

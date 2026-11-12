@@ -1027,7 +1027,8 @@ impl Engine {
         };
         drop(status);
         session.last_report = Instant::now();
-        let _ = self.reports.send(Report { client, kind, progress });
+        // The server encodes every stream of AirPlay: the stop ends it.
+        let _ = self.reports.send(Report { client, kind, progress, transcoding: true });
     }
 
     /// Ends the session: the stop report, the end of the transcode, and

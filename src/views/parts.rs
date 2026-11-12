@@ -135,7 +135,7 @@ impl Bloom {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.player_focus, cx);
+        window.focus(&self.playback.focus, cx);
         cx.stop_propagation();
     }
 
