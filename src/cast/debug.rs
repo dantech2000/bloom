@@ -3,6 +3,7 @@
 //! the panel has it, driven and read with no window. `chromecast`
 //! (`src/chromecast/debug.rs`) drives a cast device below the target.
 
+use crate::player::TrackKind;
 use gpui_kit::{Context, Window};
 
 use super::{
@@ -77,7 +78,7 @@ impl Bloom {
                     .playback.status
                     .tracks
                     .iter()
-                    .filter(|t| t.kind != "video")
+                    .filter(|t| t.kind != TrackKind::Video)
                     .map(|t| format!("{}{}:{}{}", t.kind, t.id, t.label(), if t.selected { "*" } else { "" }))
                     .collect();
                 return format!(

@@ -58,12 +58,36 @@ pub enum PlayState {
     Ended,
 }
 
+/// The type of a track in mpv's `track-list`.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TrackKind {
+    Video,
+    Audio,
+    /// Subtitles; mpv's name is "sub".
+    Sub,
+    #[serde(other)]
+    Other,
+}
+
+/// mpv's name of the type, as the debug channel prints it.
+impl std::fmt::Display for TrackKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            TrackKind::Video => "video",
+            TrackKind::Audio => "audio",
+            TrackKind::Sub => "sub",
+            TrackKind::Other => "other",
+        })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct Track {
     pub id: i64,
     #[serde(rename = "type")]
-    pub kind: String,
+    pub kind: TrackKind,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
@@ -2097,7 +2121,7 @@ fn run(shared: Arc<Shared>, rx: &mpsc::Receiver<Cmd>, tx: mpsc::Sender<Cmd>, rep
                                 .get_property::<String>("track-list")
                                 .ok()
                                 .and_then(|json| serde_json::from_str::<Vec<Track>>(&json).ok())
-                                .and_then(|tracks| tracks.iter().filter(|t| t.kind == "sub").map(|t| t.id).max());
+                                .and_then(|tracks| tracks.iter().filter(|t| t.kind == TrackKind::Sub).map(|t| t.id).max());
                             let mut status = shared.status.lock().unwrap();
                             if let Some(sid) = sid
                                 && worker.owns(&status)
@@ -2781,7 +2805,7 @@ fn handle_event(
                 ("track-list", PropertyData::Str(json)) if mine => {
                     let tracks: Vec<Track> = serde_json::from_str(json).unwrap_or_default();
                     let tracks: Vec<Track> =
-                        tracks.into_iter().filter(|t| t.kind != "video").collect();
+                        tracks.into_iter().filter(|t| t.kind != TrackKind::Video).collect();
                     if tracks != status.tracks {
                         status.tracks = tracks;
                         status.tracks_version += 1;
@@ -3124,7 +3148,7 @@ mod tests {
         let p = player.clone();
         wait(
             "tracks",
-            Box::new(move || p.status().tracks.iter().any(|t| t.kind == "audio")),
+            Box::new(move || p.status().tracks.iter().any(|t| t.kind == TrackKind::Audio)),
         );
         player.toggle_pause();
         let p = player.clone();
@@ -3581,7 +3605,7 @@ mod tests {
             }
         };
         let codec = |status: &PlayerStatus, sid: i64| {
-            status.tracks.iter().find(|t| t.kind == "sub" && t.id == sid).and_then(|t| t.codec.clone()).unwrap_or_default()
+            status.tracks.iter().find(|t| t.kind == TrackKind::Sub && t.id == sid).and_then(|t| t.codec.clone()).unwrap_or_default()
         };
         let status = wait("the PGS file", &|s| s.external_sids.iter().any(|(index, _)| *index == 1) && s.pending_subs.is_empty());
         let pgs = status.external_sids.iter().find(|(index, _)| *index == 1).map(|(_, sid)| *sid).unwrap();
@@ -3727,7 +3751,7 @@ mod tests {
         }
         // The subtitle comes when the server answers.
         let deadline = started + DELAY + Duration::from_secs(10);
-        while !player.status().tracks.iter().any(|t| t.kind == "sub" && t.title.as_deref() == Some("slow")) {
+        while !player.status().tracks.iter().any(|t| t.kind == TrackKind::Sub && t.title.as_deref() == Some("slow")) {
             assert!(Instant::now() < deadline, "the subtitle never came: {:?}", player.status().tracks);
             thread::sleep(Duration::from_millis(50));
         }
@@ -4439,7 +4463,7 @@ mod tests {
         player.fetch_subtitle_file(file(true));
         let deadline = Instant::now() + DELAY + Duration::from_secs(10);
         let of_file = |status: &PlayerStatus| {
-            status.tracks.iter().filter(|t| t.kind == "sub" && t.title.as_deref() == Some("twice")).cloned().collect::<Vec<_>>()
+            status.tracks.iter().filter(|t| t.kind == TrackKind::Sub && t.title.as_deref() == Some("twice")).cloned().collect::<Vec<_>>()
         };
         while of_file(&player.status()).is_empty() {
             assert!(Instant::now() < deadline, "the subtitle never came: {:?}", player.status());

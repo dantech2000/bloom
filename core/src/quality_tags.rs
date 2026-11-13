@@ -11,7 +11,7 @@
 
 use std::{collections::HashMap, sync::Mutex};
 
-use crate::jellyfin::{Item, MediaSource, MediaStream};
+use crate::jellyfin::{Item, MediaSource, MediaStream, StreamKind};
 
 /// The six kinds of tag, in the default stack order of the plugin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -504,11 +504,11 @@ impl std::fmt::Debug for Tag {
 /// of the plugin: IMAX, resolution, codec, range, audio, 3D, stub.
 pub fn detect(input: &Input) -> Vec<Tag> {
     let mut tags: Vec<Tag> = Vec::new();
-    let video = input.streams.iter().find(|s| s.kind == "Video").copied();
+    let video = input.streams.iter().find(|s| s.kind == StreamKind::Video).copied();
     let audio_streams: Vec<&MediaStream> = input
         .streams
         .iter()
-        .filter(|s| s.kind == "Audio")
+        .filter(|s| s.kind == StreamKind::Audio)
         .copied()
         .collect();
 

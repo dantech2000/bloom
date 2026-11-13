@@ -4,6 +4,7 @@
 //! Each feature follows the setting of the user in the plugin; the profile
 //! menu can set it for this app alone.
 
+use crate::jellyfin::SegmentKind;
 use crate::ui::tone;
 use std::{
     collections::HashMap,
@@ -972,14 +973,14 @@ impl Bloom {
 
         // Skips a marked intro or credits range once.
         if let Some(segment) = self.current_segment() {
-            let wanted = match segment.kind.as_str() {
-                "Intro" => self.je(Feature::AutoSkipIntro),
-                "Outro" => self.je(Feature::AutoSkipOutro),
+            let wanted = match segment.kind {
+                SegmentKind::Intro => self.je(Feature::AutoSkipIntro),
+                SegmentKind::Outro => self.je(Feature::AutoSkipOutro),
                 _ => false,
             };
             let mark = (item_id, (segment.start_secs() * 1000.) as i64);
             if wanted && self.enhanced.skipped.as_ref() != Some(&mark) {
-                let (end, intro) = (segment.end_secs(), segment.kind == "Intro");
+                let (end, intro) = (segment.end_secs(), segment.kind == SegmentKind::Intro);
                 self.enhanced.skipped = Some(mark);
                 self.player.seek_absolute(end);
                 self.toast(if intro { "Skipped intro" } else { "Skipped credits" }, "", cx);
@@ -1064,8 +1065,8 @@ impl Bloom {
                 self.toast(format!("Aspect ratio: {next:?}"), "", cx);
             }
             "ShowPlaybackInfo" => self.toggle_playback_info(cx),
-            "CycleSubtitleTracks" => self.stream_cycle("sub"),
-            "CycleAudioTracks" => self.stream_cycle("audio"),
+            "CycleSubtitleTracks" => self.stream_cycle(crate::player::TrackKind::Sub),
+            "CycleAudioTracks" => self.stream_cycle(crate::player::TrackKind::Audio),
             "IncreasePlaybackSpeed" | "DecreasePlaybackSpeed" | "ResetPlaybackSpeed" => {
                 let speed = match name {
                     "IncreasePlaybackSpeed" => (self.playback.speed + SPEED_STEP).min(4.),

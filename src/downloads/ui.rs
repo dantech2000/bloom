@@ -191,7 +191,7 @@ impl Listing {
             .map(|(name, mut rows)| {
                 rows.sort_by_key(|row| (row.entry.season.unwrap_or(0), row.entry.episode.unwrap_or(0), row.entry.name.clone()));
                 let size = rows.iter().map(|row| row.entry.total.unwrap_or(row.entry.done)).sum();
-                let row_h = match rows.iter().all(|row| row.entry.kind == "Episode") {
+                let row_h = match rows.iter().all(|row| row.entry.kind == ItemKind::Episode) {
                     true => ROW_EPISODE,
                     false => ROW_MOVIE,
                 };
@@ -606,7 +606,7 @@ impl Bloom {
         let fg = t.colors.foreground;
         let quiet = fg.opacity(0.6);
         let id = entry.item_id.clone();
-        let episode = entry.kind == "Episode";
+        let episode = entry.kind == ItemKind::Episode;
         let (w, h) = if episode { (88., 50.) } else { (44., 66.) };
         let art = div()
             .relative()

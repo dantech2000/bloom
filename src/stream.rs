@@ -6,6 +6,8 @@
 //! tracks of the server to the tracks of mpv while a transcode plays, ends
 //! a transcode that is not needed any more, and shows what plays.
 
+use crate::player::TrackKind;
+use crate::jellyfin::{StreamKind, SubtitleDelivery};
 use crate::jellyfin::Method;
 use std::sync::{
     Arc, Mutex,
@@ -188,12 +190,12 @@ impl Resolved {
 
     /// The source video stream.
     pub fn video(&self) -> Option<&MediaStream> {
-        self.streams.iter().find(|s| s.kind == "Video")
+        self.streams.iter().find(|s| s.kind == StreamKind::Video)
     }
 
     /// The streams of one kind that are in the file itself, in the order
     /// mpv numbers them (from 1).
-    pub fn embedded(&self, kind: &str) -> Vec<&MediaStream> {
+    pub fn embedded(&self, kind: StreamKind) -> Vec<&MediaStream> {
         self.streams
             .iter()
             .filter(|s| s.kind == kind && !s.is_external)
@@ -202,7 +204,7 @@ impl Resolved {
 
     /// The server index of the audio track mpv plays as its track `aid`.
     pub fn audio_of(&self, aid: i64) -> Option<i64> {
-        self.embedded("Audio")
+        self.embedded(StreamKind::Audio)
             .get((aid - 1).max(0) as usize)
             .map(|s| s.index)
     }
@@ -218,7 +220,7 @@ impl Resolved {
         if self.play_method == PlayMethod::Transcode {
             return None;
         }
-        self.embedded("Subtitle")
+        self.embedded(StreamKind::Subtitle)
             .get((sid - 1).max(0) as usize)
             .map(|s| s.index)
     }
@@ -345,7 +347,7 @@ pub fn resolve(
     let mut external_subs: Vec<SubtitleFile> = source
         .media_streams
         .iter()
-        .filter(|s| s.kind == "Subtitle" && s.delivery_method.as_deref() == Some("External"))
+        .filter(|s| s.kind == StreamKind::Subtitle && s.delivery_method == Some(SubtitleDelivery::External))
         .filter_map(|s| {
             let url = s.delivery_url.as_deref()?;
             // The player sends the token in a header; the key in the
@@ -419,7 +421,7 @@ pub fn negotiate(client: &Client, load: &Load) -> Result<Resolved> {
             info.source(&load.item_id).and_then(|s| s.default_audio_stream_index)
         });
         let preferred = first
-            .embedded("Audio")
+            .embedded(StreamKind::Audio)
             .iter()
             .find(|s| s.language.as_deref().is_some_and(|l| crate::subtitles::same_language(l, &language)))
             .map(|s| s.index);
@@ -584,10 +586,10 @@ impl Bloom {
     /// indexes (-1 is no subtitle); taken, so they count once.
     fn stream_take_choice(&mut self, item: &Item) -> (Option<i64>, Option<i64>) {
         let audio = self.stream.wanted_audio.take().and_then(|place| {
-            item.streams("Audio").get(place).map(|s| s.index)
+            item.streams(StreamKind::Audio).get(place).map(|s| s.index)
         });
         let subtitle = self.stream.wanted_subtitle.take().map(|choice| match choice {
-            Some(place) => item.streams("Subtitle").get(place).map_or(-1, |s| s.index),
+            Some(place) => item.streams(StreamKind::Subtitle).get(place).map_or(-1, |s| s.index),
             None => -1,
         });
         (audio, subtitle)
@@ -610,7 +612,7 @@ impl Bloom {
         let streams = item_streams(item);
         if let Some(index) = audio {
             self.stream.chose(Chosen::Audio);
-            if let Some(aid) = mpv_id(streams, "Audio", index) {
+            if let Some(aid) = mpv_id(streams, StreamKind::Audio, index) {
                 self.player.set_audio(Some(aid));
             }
         }
@@ -618,7 +620,7 @@ impl Bloom {
             self.stream.chose(Chosen::Subtitle);
             if index < 0 {
                 self.player.set_subtitle(None);
-            } else if let Some(sid) = mpv_id(streams, "Subtitle", index) {
+            } else if let Some(sid) = mpv_id(streams, StreamKind::Subtitle, index) {
                 self.player.set_subtitle(Some(sid));
             }
         }
@@ -669,14 +671,14 @@ impl Bloom {
         }
         let Some(resolved) = current_of(&item.id) else { return };
         let status = &self.playback.status;
-        let selected = |kind: &str| status.tracks.iter().find(|t| t.kind == kind && t.selected);
+        let selected = |kind: TrackKind| status.tracks.iter().find(|t| t.kind == kind && t.selected);
         let audio = audio.or_else(|| match resolved.play_method {
             PlayMethod::Transcode => resolved.audio_index,
-            PlayMethod::DirectPlay => selected("audio").and_then(|t| resolved.audio_of(t.id)),
+            PlayMethod::DirectPlay => selected(TrackKind::Audio).and_then(|t| resolved.audio_of(t.id)),
         });
         let subtitle = subtitle.or_else(|| {
             resolved.burned_subtitle.or_else(|| {
-                Some(selected("sub").and_then(|t| resolved.subtitle_of(t.id, status)).unwrap_or(-1))
+                Some(selected(TrackKind::Sub).and_then(|t| resolved.subtitle_of(t.id, status)).unwrap_or(-1))
             })
         });
         start(
@@ -788,12 +790,12 @@ impl Bloom {
     /// picks the audio and burns a subtitle in, so these are its streams
     /// and a choice loads the item again. None with direct play, where
     /// mpv switches its own tracks.
-    pub fn stream_track_items(&self, kind: &str, cx: &mut Context<Self>) -> Option<Vec<MenuItem>> {
+    pub fn stream_track_items(&self, kind: TrackKind, cx: &mut Context<Self>) -> Option<Vec<MenuItem>> {
         let resolved = self.stream_resolved().filter(|r| r.play_method == PlayMethod::Transcode)?;
         let this = cx.weak_entity();
         let mut items = Vec::new();
-        if kind == "audio" {
-            for stream in resolved.embedded("Audio") {
+        if kind == TrackKind::Audio {
+            for stream in resolved.embedded(StreamKind::Audio) {
                 let (index, handle) = (stream.index, this.clone());
                 items.push(
                     MenuItem::new(
@@ -819,7 +821,7 @@ impl Bloom {
                             .ok();
                     }),
             );
-            for stream in resolved.streams.iter().filter(|s| s.kind == "Subtitle") {
+            for stream in resolved.streams.iter().filter(|s| s.kind == StreamKind::Subtitle) {
                 let (index, handle) = (stream.index, this.clone());
                 // A track with no file is burned in by the server; a file
                 // on its way says so (an image track comes when chosen).
@@ -857,7 +859,7 @@ impl Bloom {
         status
             .tracks
             .iter()
-            .find(|t| t.kind == "sub" && t.selected)
+            .find(|t| t.kind == TrackKind::Sub && t.selected)
             .and_then(|t| resolved.subtitle_of(t.id, status))
             .or(resolved.burned_subtitle)
     }
@@ -874,7 +876,7 @@ impl Bloom {
         // With no answer of the server (a downloaded item, or a load on
         // its way) the streams are those of the item.
         let streams = resolved.as_ref().map_or(item_streams(item), |r| r.streams.as_slice());
-        let Some(aid) = mpv_id(streams, "Audio", index) else {
+        let Some(aid) = mpv_id(streams, StreamKind::Audio, index) else {
             log::debug!("no audio track for stream {index}");
             return;
         };
@@ -896,14 +898,14 @@ impl Bloom {
         let Some(resolved) = current_of(&item.id) else {
             // A downloaded item, or a load on its way: the tracks of the
             // file are mpv's.
-            let sid = mpv_id(item_streams(item), "Subtitle", index);
+            let sid = mpv_id(item_streams(item), StreamKind::Subtitle, index);
             if index < 0 || sid.is_some() {
                 self.stream.chose(Chosen::Subtitle);
                 self.player.set_subtitle(sid);
             }
             return;
         };
-        if index >= 0 && !resolved.streams.iter().any(|s| s.kind == "Subtitle" && s.index == index) {
+        if index >= 0 && !resolved.streams.iter().any(|s| s.kind == StreamKind::Subtitle && s.index == index) {
             log::debug!("no subtitle for stream {index}");
             return;
         }
@@ -935,7 +937,7 @@ impl Bloom {
             }
         }
         if resolved.play_method != PlayMethod::Transcode
-            && let Some(sid) = mpv_id(&resolved.streams, "Subtitle", index)
+            && let Some(sid) = mpv_id(&resolved.streams, StreamKind::Subtitle, index)
         {
             self.player.set_subtitle(Some(sid));
             return;
@@ -943,27 +945,28 @@ impl Bloom {
         self.stream_reload(None, Some(index));
     }
 
-    /// The next track of a kind ("audio" or "sub"), for a key. The file
+    /// The next track of a kind (audio or subtitles), for a key. The file
     /// itself has all its tracks and mpv steps through them; in a
     /// transcode the tracks are the server's, in the order of the menu
     /// (for subtitles "Off" first).
-    pub fn stream_cycle(&mut self, kind: &str) {
+    pub fn stream_cycle(&mut self, kind: TrackKind) {
         let Some(resolved) = self.stream_resolved().filter(|r| r.play_method == PlayMethod::Transcode) else {
             match kind {
-                "audio" => self.stream.chose(Chosen::Audio),
+                TrackKind::Audio => self.stream.chose(Chosen::Audio),
                 _ => self.stream.chose(Chosen::Subtitle),
             }
-            self.player.command("cycle", &[kind]);
+            // mpv's properties of the tracks have the names of the types.
+            self.player.command("cycle", &[&kind.to_string()]);
             return;
         };
-        if kind == "audio" {
-            let tracks: Vec<i64> = resolved.embedded("Audio").iter().map(|s| s.index).collect();
+        if kind == TrackKind::Audio {
+            let tracks: Vec<i64> = resolved.embedded(StreamKind::Audio).iter().map(|s| s.index).collect();
             if let Some(next) = next_track(&tracks, resolved.audio_index) {
                 self.stream_audio(next);
             }
         } else {
             let tracks: Vec<i64> = std::iter::once(-1)
-                .chain(resolved.streams.iter().filter(|s| s.kind == "Subtitle").map(|s| s.index))
+                .chain(resolved.streams.iter().filter(|s| s.kind == StreamKind::Subtitle).map(|s| s.index))
                 .collect();
             let shown = self.shown_subtitle(&resolved).unwrap_or(-1);
             if let Some(next) = next_track(&tracks, Some(shown)) {

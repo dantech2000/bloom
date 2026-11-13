@@ -1115,7 +1115,7 @@ impl Bloom {
         items.extend(self.cast_menu_items(item, cx));
         items.extend(self.download_menu_items(item, cx));
         items.extend(self.hide_menu_items(item, false, cx));
-        items.extend(self.metadata_menu_items(&item.id, &item.name, item.kind.name(), cx));
+        items.extend(self.metadata_menu_items(&item.id, &item.name, &item.kind, cx));
         if let Some(url) = self.session.as_ref().map(|s| s.client.web_url(&item.id)) {
             items.push(MenuItem::separator());
             items.push(

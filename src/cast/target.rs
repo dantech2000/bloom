@@ -12,7 +12,7 @@ use std::time::Instant;
 use super::protocol::SessionInfo;
 use crate::{
     airplay::{AirPlayEvent, AirPlayState, AirPlayStatus},
-    chromecast::{discovery::Device, session::Status},
+    chromecast::{discovery::Device, messages::PlayerState, session::Status},
 };
 
 /// Where playback goes.
@@ -205,7 +205,7 @@ pub fn from_chromecast(device: &Device, status: &Status, title: Option<String>, 
         item_id: status.item_id.clone(),
         position: status.position_now(),
         duration: status.duration.unwrap_or(0.),
-        paused: status.player_state == "PAUSED",
+        paused: status.player_state == Some(PlayerState::Paused),
         volume: Some((status.volume * 100.).round().clamp(0., 100.) as f32),
         muted: status.muted,
         audio_index: tracks.audio_index,
@@ -382,7 +382,7 @@ mod tests {
             }),
             volume: 0.35,
             muted: false,
-            player_state: "PLAYING".into(),
+            player_state: Some(PlayerState::Playing),
             position: 100.,
             position_at: Some(Instant::now() - Duration::from_secs(1)),
             duration: Some(600.),
@@ -403,7 +403,7 @@ mod tests {
         // The media receiver takes no stream index.
         let mut default_app = status.clone();
         default_app.app.as_mut().unwrap().app_id = crate::chromecast::messages::APP_DEFAULT_MEDIA.into();
-        default_app.player_state = "PAUSED".into();
+        default_app.player_state = Some(PlayerState::Paused);
         let view = from_chromecast(&device("c1"), &default_app, None, CastTracks::default());
         assert!(view.paused && !view.can_tracks);
         assert_eq!(view.title.as_deref(), Some("item1"), "falls back to the id");

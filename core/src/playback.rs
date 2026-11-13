@@ -6,7 +6,7 @@
 
 use serde::Deserialize;
 
-use crate::jellyfin::{Client, MediaSource, MediaStream, TICKS_PER_SECOND};
+use crate::jellyfin::{Client, MediaSource, MediaStream, StreamKind, TICKS_PER_SECOND};
 
 // ----- the answer of the server ------------------------------------------------
 
@@ -71,11 +71,11 @@ pub fn stream_title(stream: &MediaStream) -> String {
 }
 
 /// mpv's id of a stream of the file, by its server index: mpv numbers the
-/// tracks of a kind ("Audio", "Subtitle") from 1 in file order, and the
+/// tracks of a kind (audio, subtitles) from 1 in file order, and the
 /// server numbers every stream of the source in one list. A stream in a
 /// file of its own is not in mpv's list, so it has none. Every choice of
 /// a track by its server index goes through this.
-pub fn mpv_id(streams: &[MediaStream], kind: &str, index: i64) -> Option<i64> {
+pub fn mpv_id(streams: &[MediaStream], kind: StreamKind, index: i64) -> Option<i64> {
     streams
         .iter()
         .filter(|s| s.kind == kind && !s.is_external)
@@ -353,13 +353,13 @@ mod tests {
             stream("Subtitle", 4, false),
             stream("Subtitle", 5, false),
         ];
-        assert_eq!(mpv_id(&streams, "Audio", 2), Some(1));
-        assert_eq!(mpv_id(&streams, "Audio", 3), Some(2));
-        assert_eq!(mpv_id(&streams, "Subtitle", 4), Some(1));
-        assert_eq!(mpv_id(&streams, "Subtitle", 5), Some(2));
-        assert_eq!(mpv_id(&streams, "Subtitle", 0), None, "a file of its own is not a track of the file");
-        assert_eq!(mpv_id(&streams, "Audio", 9), None);
-        assert_eq!(mpv_id(&streams, "Subtitle", -1), None);
+        assert_eq!(mpv_id(&streams, StreamKind::Audio, 2), Some(1));
+        assert_eq!(mpv_id(&streams, StreamKind::Audio, 3), Some(2));
+        assert_eq!(mpv_id(&streams, StreamKind::Subtitle, 4), Some(1));
+        assert_eq!(mpv_id(&streams, StreamKind::Subtitle, 5), Some(2));
+        assert_eq!(mpv_id(&streams, StreamKind::Subtitle, 0), None, "a file of its own is not a track of the file");
+        assert_eq!(mpv_id(&streams, StreamKind::Audio, 9), None);
+        assert_eq!(mpv_id(&streams, StreamKind::Subtitle, -1), None);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The dialog of the metadata manager and its four tabs.
 
+use crate::jellyfin::ItemKind;
 use crate::ui::tone::{self, State};
 use gpui_icons::LucideIcon;
 use gpui_kit::{
@@ -101,8 +102,8 @@ impl Bloom {
                                     .text_color(t.colors.foreground)
                                     .child(manager.name.clone()),
                             )
-                            .when(!manager.kind.is_empty(), |el| {
-                                el.child(badge(manager.kind.clone(), None))
+                            .when(!manager.kind.is_unknown(), |el| {
+                                el.child(badge(manager.kind.to_string(), None))
                             })
                             .when(manager.lock, |el| {
                                 el.child(badge("Locked", Some(State::Warn)))
@@ -461,7 +462,7 @@ impl Bloom {
         for index in TAGLINE + 1..super::GENRES {
             dates = dates.child(self.metadata_field(index, content_w, cx));
         }
-        if manager.kind == "Series" {
+        if manager.kind == ItemKind::Series {
             let mut status = div().flex().gap(px(8.));
             for name in ["Continuing", "Ended", "Unreleased"] {
                 status = status.child(
@@ -1018,10 +1019,10 @@ impl Bloom {
                     cx.notify();
                 })),
             );
-        let scope = match manager.kind.as_str() {
-            "Series" => "The refresh covers every season and episode of the series.",
-            "Season" => "The refresh covers every episode of the season.",
-            "BoxSet" => "The refresh covers every item of the collection.",
+        let scope = match manager.kind {
+            ItemKind::Series => "The refresh covers every season and episode of the series.",
+            ItemKind::Season => "The refresh covers every episode of the season.",
+            ItemKind::BoxSet => "The refresh covers every item of the collection.",
             _ => "The refresh covers this item.",
         };
         div()

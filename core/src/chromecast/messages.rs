@@ -4,7 +4,7 @@
 //! it; the connection numbers a request when it sends it, so the messages
 //! here have none.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const NS_CONNECTION: &str = "urn:x-cast:com.google.cast.tp.connection";
@@ -216,12 +216,38 @@ pub struct MediaItem {
     pub duration: Option<f64>,
 }
 
+/// The state of a receiver's media player (`playerState`).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PlayerState {
+    #[default]
+    Idle,
+    Buffering,
+    Playing,
+    Paused,
+    /// A state a newer receiver adds; treated as idle.
+    #[serde(other)]
+    Other,
+}
+
+impl PlayerState {
+    /// The receiver's name of the state, for the debug channel.
+    pub fn name(self) -> &'static str {
+        match self {
+            PlayerState::Idle => "IDLE",
+            PlayerState::Buffering => "BUFFERING",
+            PlayerState::Playing => "PLAYING",
+            PlayerState::Paused => "PAUSED",
+            PlayerState::Other => "OTHER",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MediaStatus {
     pub media_session_id: i64,
-    /// IDLE, BUFFERING, PLAYING, PAUSED.
-    pub player_state: String,
+    pub player_state: PlayerState,
     pub current_time: f64,
     pub idle_reason: Option<String>,
     pub media: Option<MediaItem>,
@@ -373,7 +399,7 @@ mod tests {
         });
         let status = MediaStatus::parse(&payload).unwrap();
         assert_eq!(status.len(), 1);
-        assert_eq!(status[0].player_state, "PAUSED");
+        assert_eq!(status[0].player_state, PlayerState::Paused);
         assert_eq!(status[0].current_time, 12.25);
         assert_eq!(status[0].media.as_ref().unwrap().duration, Some(600.5));
         assert_eq!(status[0].active_track_ids, vec![1]);

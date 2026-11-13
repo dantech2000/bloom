@@ -9,6 +9,7 @@
 //! shows the remote control of it, the same for every kind, with the
 //! controls the kind lacks left out.
 
+use crate::jellyfin::StreamKind;
 use gpui_icons::LucideIcon;
 use gpui_kit::{
     IntoElement as _,
@@ -445,8 +446,8 @@ impl Bloom {
                 let mut tracks = div().flex().flex_col().gap(px(2.));
                 let mut count = 0;
                 for (kind, track, current, off) in [
-                    ("Audio", Track::Audio, view.audio_index, false),
-                    ("Subtitle", Track::Subtitle, view.subtitle_index, true),
+                    (StreamKind::Audio, Track::Audio, view.audio_index, false),
+                    (StreamKind::Subtitle, Track::Subtitle, view.subtitle_index, true),
                 ] {
                     let streams = item.streams(kind);
                     if streams.is_empty() {
@@ -465,7 +466,7 @@ impl Bloom {
                         count += 1;
                         let chosen = current == Some(index) || (off && index == -1 && current.is_none());
                         tracks = tracks.child(
-                            row(SharedString::from(format!("cast.track.{kind}.{index}")))
+                            row(SharedString::from(format!("cast.track.{kind:?}.{index}")))
                                 .min_h(px(38.))
                                 .child(div().w(px(16.)).child(if chosen {
                                     icon(LucideIcon::Check, 16., fg)

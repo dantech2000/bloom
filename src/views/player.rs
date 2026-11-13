@@ -4,6 +4,8 @@
 //! the video fills the window, a title bar lies over its top, and the
 //! controls sit in a floating glass panel at the bottom.
 
+use crate::player::TrackKind;
+use crate::jellyfin::SegmentKind;
 use crate::ui::tone;
 #[cfg(target_os = "macos")]
 use gpui_kit::surface;
@@ -209,7 +211,7 @@ impl Bloom {
                 .playback.playing
                 .as_ref()
                 .is_some_and(|item| item.user_data.is_favorite);
-            let has_subs = s.tracks.iter().any(|track| track.kind == "sub");
+            let has_subs = s.tracks.iter().any(|track| track.kind == TrackKind::Sub);
             let silent = self.playback.muted || self.playback.volume == 0.;
 
             let has_previous = !self.queue.history.is_empty();
@@ -514,12 +516,12 @@ impl Bloom {
         let corner_taken = m.phone && self.panel_open();
         let skip = self.current_segment().filter(|_| up_next.is_none() && !corner_taken).map(|segment| {
             let end = segment.end_secs();
-            let text = match segment.kind.as_str() {
-                "Intro" => "Skip Intro",
-                "Outro" => "Skip Credits",
-                "Recap" => "Skip Recap",
-                "Preview" => "Skip Preview",
-                _ => "Skip",
+            let text = match segment.kind {
+                SegmentKind::Intro => "Skip Intro",
+                SegmentKind::Outro => "Skip Credits",
+                SegmentKind::Recap => "Skip Recap",
+                SegmentKind::Preview => "Skip Preview",
+                SegmentKind::Commercial | SegmentKind::Unknown => "Skip",
             };
             div()
                 .id("player.skip")
@@ -1263,12 +1265,12 @@ impl Bloom {
     pub(crate) fn rebuild_track_menus(&mut self, cx: &mut Context<Self>) {
         let this = cx.weak_entity();
         let status = &self.playback.status;
-        let build = |kind: &str, none_label: &str, set: fn(&Player, Option<i64>)| {
+        let build = |kind: TrackKind, none_label: &str, set: fn(&Player, Option<i64>)| {
             let mut items = Vec::new();
             let tracks: Vec<&crate::player::Track> =
                 status.tracks.iter().filter(|t| t.kind == kind).collect();
             let any_selected = tracks.iter().any(|t| t.selected);
-            if kind == "sub" {
+            if kind == TrackKind::Sub {
                 let handle = this.clone();
                 items.push(
                     MenuItem::new(
@@ -1297,7 +1299,7 @@ impl Bloom {
             }
             // The subtitle files the server offers that mpv does not have
             // yet: an image track comes when it is chosen.
-            if kind == "sub" && let Some(resolved) = crate::stream::current() {
+            if kind == TrackKind::Sub && let Some(resolved) = crate::stream::current() {
                 for sub in &resolved.external_subs {
                     if resolved.sid_of_external(sub.index, status).is_some() {
                         continue;
@@ -1330,11 +1332,11 @@ impl Bloom {
         };
         // While a transcode plays, the server picks the tracks.
         let audio = self
-            .stream_track_items("audio", cx)
-            .unwrap_or_else(|| build("audio", "", |p, id| p.set_audio(id)));
+            .stream_track_items(TrackKind::Audio, cx)
+            .unwrap_or_else(|| build(TrackKind::Audio, "", |p, id| p.set_audio(id)));
         let subs = self
-            .stream_track_items("sub", cx)
-            .unwrap_or_else(|| build("sub", "Off", |p, id| p.set_subtitle(id)));
+            .stream_track_items(TrackKind::Sub, cx)
+            .unwrap_or_else(|| build(TrackKind::Sub, "Off", |p, id| p.set_subtitle(id)));
         let mut audio = audio;
         audio.push(MenuItem::separator());
         audio.push(self.timing_menu_item(crate::subtitles::Delay::Audio, cx));

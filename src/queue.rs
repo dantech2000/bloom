@@ -2,6 +2,7 @@
 //! What the player has beyond the one item it plays: the items that follow,
 //! the chapters and preview images of its timeline, and the "Up next" card.
 
+use crate::jellyfin::SegmentKind;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -354,7 +355,7 @@ impl Bloom {
         let in_credits = self
             .playback.segments
             .iter()
-            .any(|seg| seg.kind == "Outro" && s.position >= seg.start_secs());
+            .any(|seg| seg.kind == SegmentKind::Outro && s.position >= seg.start_secs());
         (remaining <= UP_NEXT_SECS || in_credits)
             .then(|| (next, (remaining / self.playback.speed.max(0.25) as f64).ceil() as i64))
     }

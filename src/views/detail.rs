@@ -4,6 +4,7 @@
 //! theme: a full-window backdrop, the logo, a poster that stays in place at
 //! the left, a title ribbon with the actions, then details and rows.
 
+use crate::jellyfin::{PersonKind, StreamKind};
 use crate::ui::tone;
 use gpui_icons::LucideIcon;
 use gpui_kit::{
@@ -603,10 +604,10 @@ impl Bloom {
         };
 
         let mut rows = div().max_w(px(655.)).flex().flex_col().gap(px(10.));
-        if let Some(video) = item.stream_title("Video") {
+        if let Some(video) = item.stream_title(StreamKind::Video) {
             rows = rows.child(row("Video").h(px(34.)).child(div().text_color(value).child(video)));
         }
-        let audio = item.streams("Audio");
+        let audio = item.streams(StreamKind::Audio);
         if !audio.is_empty() {
             let current = data
                 .audio
@@ -625,7 +626,7 @@ impl Bloom {
                     .child(div().text_color(value).child(title(&audio, current)))
             });
         }
-        let subtitles = item.streams("Subtitle");
+        let subtitles = item.streams(StreamKind::Subtitle);
         if !subtitles.is_empty() {
             let current = data
                 .subtitle
@@ -748,7 +749,7 @@ fn meta_line(item: &Item, cx: &Context<Bloom>) -> Div {
     }
     // Audio languages, as the Jellyfin Enhanced plugin lists them.
     let mut languages: Vec<&'static str> = Vec::new();
-    for stream in item.streams("Audio") {
+    for stream in item.streams(StreamKind::Audio) {
         if let Some(name) = stream.language.as_deref().and_then(bloom_core::languages::name)
             && !languages.contains(&name)
         {
@@ -807,9 +808,9 @@ fn tags_and_links(item: &Item, cx: &Context<Bloom>) -> Option<Div> {
 fn credits(item: &Item, cx: &Context<Bloom>) -> Option<Div> {
     let t = UiTheme::read(cx);
     let plural = |one: &'static str, many: &'static str, n: usize| if n == 1 { one } else { many };
-    let directors = item.people_of("Director");
-    let writers = item.people_of("Writer");
-    let creators = item.people_of("Creator");
+    let directors = item.people_of(&PersonKind::Director);
+    let writers = item.people_of(&PersonKind::Writer);
+    let creators = item.people_of(&PersonKind::Creator);
     let studios: Vec<String> = item.studios.iter().filter_map(|s| s.name.clone()).collect();
     let rows = [
         (plural("Creator", "Creators", creators.len()), creators),
@@ -1060,7 +1061,7 @@ impl Bloom {
                 .unwrap_or_else(|| format!("Track {}", n + 1))
         };
 
-        let audio_streams = data.item.streams("Audio");
+        let audio_streams = data.item.streams(StreamKind::Audio);
         let current_audio = data
             .audio
             .or_else(|| audio_streams.iter().position(|s| s.is_default))
@@ -1086,7 +1087,7 @@ impl Bloom {
             })
             .collect();
 
-        let subtitle_streams = data.item.streams("Subtitle");
+        let subtitle_streams = data.item.streams(StreamKind::Subtitle);
         let current_subtitle = data
             .subtitle
             .unwrap_or_else(|| subtitle_streams.iter().position(|s| s.is_default));
@@ -1147,7 +1148,7 @@ impl Bloom {
             more.extend(list_items);
         }
         more.extend(self.hide_menu_items(&item, true, cx));
-        more.extend(self.metadata_menu_items(&item.id, &item.name, item.kind.name(), cx));
+        more.extend(self.metadata_menu_items(&item.id, &item.name, &item.kind, cx));
 
         self.popups.detail_audio_menu
             .update(cx, |menu, cx| menu.set_items(audio, cx));
