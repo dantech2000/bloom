@@ -132,4 +132,4 @@ workspace = true
 # server. `dev/bump`, `dev/bundle` and `dev/release` read this line: it is
 # the first one of the file that starts with `version = `.
 [workspace.package]
-version = "0.1.11"
+version = "0.1.12"

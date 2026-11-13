@@ -49,7 +49,7 @@ use serde_json::Value;
 use super::{
     jellyfin::{self, Identity, ItemStub},
     discovery::Device,
-    messages::{self, App, LoadMedia, MediaStatus, NS_CONNECTION, NS_HEARTBEAT, NS_MEDIA, NS_RECEIVER, RECEIVER, ReceiverStatus, SENDER},
+    messages::{self, App, LoadMedia, MediaStatus, PlayerState, NS_CONNECTION, NS_HEARTBEAT, NS_MEDIA, NS_RECEIVER, RECEIVER, ReceiverStatus, SENDER},
     proto::{CastMessage, Inbox},
 };
 
@@ -118,8 +118,8 @@ pub struct Status {
     /// 0 to 1.
     pub volume: f64,
     pub muted: bool,
-    /// IDLE, BUFFERING, PLAYING, PAUSED; empty with nothing loaded.
-    pub player_state: String,
+    /// `None` with nothing loaded.
+    pub player_state: Option<PlayerState>,
     /// Seconds into the item, at `position_at`.
     pub position: f64,
     pub position_at: Option<Instant>,
@@ -142,14 +142,14 @@ impl Status {
     /// The position now: the last one, plus the time since when playing.
     pub fn position_now(&self) -> f64 {
         match self.position_at {
-            Some(at) if self.player_state == "PLAYING" => self.position + at.elapsed().as_secs_f64(),
+            Some(at) if self.player_state == Some(PlayerState::Playing) => self.position + at.elapsed().as_secs_f64(),
             _ => self.position,
         }
     }
 
     /// An item is in the player of the app: the transport shows.
     pub fn loaded(&self) -> bool {
-        matches!(self.player_state.as_str(), "PLAYING" | "PAUSED" | "BUFFERING")
+        matches!(self.player_state, Some(PlayerState::Playing | PlayerState::Paused | PlayerState::Buffering))
     }
 
     pub fn playing_jellyfin_app(&self) -> bool {
@@ -1094,7 +1094,7 @@ impl Worker {
             self.status.content_id = Some(media.url);
         }
         self.app_load = Some(load);
-        self.status.player_state = "BUFFERING".into();
+        self.status.player_state = Some(PlayerState::Buffering);
         self.publish();
         Ok(())
     }
@@ -1237,12 +1237,11 @@ impl Worker {
                     self.status.error = None;
                     self.status.position = report.position;
                     self.status.position_at = Some(Instant::now());
-                    self.status.player_state = match report.kind.as_str() {
-                        "playbackstop" => "IDLE",
-                        _ if report.paused => "PAUSED",
-                        _ => "PLAYING",
-                    }
-                    .into();
+                    self.status.player_state = Some(match report.kind.as_str() {
+                        "playbackstop" => PlayerState::Idle,
+                        _ if report.paused => PlayerState::Paused,
+                        _ => PlayerState::Playing,
+                    });
                     if report.kind == "playbackstop" {
                         self.status.idle_reason = Some("FINISHED".into());
                     } else {
@@ -1308,7 +1307,7 @@ impl Worker {
                     self.transport = Some(app.transport_id.clone());
                     self.our_session = Some(app.session_id.clone());
                     self.status.media_session_id = None;
-                    self.status.player_state = String::new();
+                    self.status.player_state = None;
                     self.status.idle_reason = None;
                     let speaks_media = app.speaks(NS_MEDIA);
                     self.status.app = Some(app.clone());
@@ -1361,7 +1360,7 @@ impl Worker {
         self.identity = None;
         self.status.app = None;
         self.status.media_session_id = None;
-        self.status.player_state = String::new();
+        self.status.player_state = None;
         self.status.content_id = None;
         self.status.item_id = None;
         // The length is of the item that is gone: the next one must not
@@ -1379,7 +1378,7 @@ impl Worker {
         match entry {
             Some(entry) => {
                 self.status.media_session_id = Some(entry.media_session_id);
-                self.status.player_state = entry.player_state.clone();
+                self.status.player_state = Some(entry.player_state);
                 self.status.position = entry.current_time;
                 self.status.position_at = Some(Instant::now());
                 self.status.idle_reason = entry.idle_reason.clone();
@@ -1390,13 +1389,13 @@ impl Worker {
                         self.status.duration = media.duration;
                     }
                 }
-                if entry.player_state == "IDLE" && entry.media.is_none() {
+                if entry.player_state == PlayerState::Idle && entry.media.is_none() {
                     self.status.media_session_id = None;
                 }
             }
             None => {
                 self.status.media_session_id = None;
-                self.status.player_state = "IDLE".into();
+                self.status.player_state = Some(PlayerState::Idle);
             }
         }
         self.publish();
@@ -1603,7 +1602,7 @@ mod tests {
         // Mode 1: the Jellyfin app launches and gets the item.
         session.load(request());
         let status = until(&session, &events, &mut log, "jellyfin load", 5., |s| {
-            s.item_id.as_deref() == Some("i1") && s.player_state == "PLAYING"
+            s.item_id.as_deref() == Some("i1") && s.player_state == Some(PlayerState::Playing)
         });
         assert_eq!(status.app.as_ref().unwrap().app_id, jellyfin::APP_STABLE);
         assert_eq!(status.app.as_ref().unwrap().transport_id, "transport-1");
@@ -1633,15 +1632,15 @@ mod tests {
 
         // Pause, play, seek: the words of the Jellyfin app.
         session.pause();
-        until(&session, &events, &mut log, "pause", 2., |s| s.player_state == "PAUSED");
+        until(&session, &events, &mut log, "pause", 2., |s| s.player_state == Some(PlayerState::Paused));
         session.play();
-        until(&session, &events, &mut log, "play", 2., |s| s.player_state == "PLAYING");
+        until(&session, &events, &mut log, "play", 2., |s| s.player_state == Some(PlayerState::Playing));
         session.seek(45.);
         let status = until(&session, &events, &mut log, "seek", 2., |s| {
             let seeks = mock.payloads(jellyfin::NAMESPACE).iter().filter(|p| p.1["command"] == "Seek").count();
             seeks == 1 && s.position == 45.
         });
-        assert_eq!(status.player_state, "PLAYING");
+        assert_eq!(status.player_state, Some(PlayerState::Playing));
         let seek = mock.payloads(jellyfin::NAMESPACE).into_iter().find(|p| p.1["command"] == "Seek").unwrap();
         assert_eq!(seek.1["options"]["position"], 45.0);
         // The receiver reports its subtitle index; it comes through the
@@ -1669,7 +1668,7 @@ mod tests {
         let before = mock.seen().len();
         session.load(request());
         let status = until(&session, &events, &mut log, "media load", 5., |s| {
-            s.player_state == "PLAYING" && s.media_session_id == Some(1)
+            s.player_state == Some(PlayerState::Playing) && s.media_session_id == Some(1)
         });
         assert_eq!(status.app.as_ref().unwrap().app_id, messages::APP_DEFAULT_MEDIA);
         assert_eq!(status.content_id.as_deref(), Some("https://jellyfin.example/Videos/i1/master.m3u8?ApiKey=fake-token"));
@@ -1698,11 +1697,11 @@ mod tests {
         assert_eq!(load.1["autoplay"], true);
 
         session.pause();
-        until(&session, &events, &mut log, "media pause", 2., |s| s.player_state == "PAUSED");
+        until(&session, &events, &mut log, "media pause", 2., |s| s.player_state == Some(PlayerState::Paused));
         let pause = mock.payloads(NS_MEDIA).into_iter().find(|p| p.1["type"] == "PAUSE").unwrap();
         assert_eq!(pause.1["mediaSessionId"], 1);
         session.play();
-        until(&session, &events, &mut log, "media play", 2., |s| s.player_state == "PLAYING");
+        until(&session, &events, &mut log, "media play", 2., |s| s.player_state == Some(PlayerState::Playing));
 
         // Seeks coalesce: the second waits for the first, the third takes
         // the place of the second.
@@ -1718,7 +1717,7 @@ mod tests {
         thread::sleep(Duration::from_millis(600));
         let seeks: Vec<Value> = mock.payloads(NS_MEDIA).into_iter().filter(|p| p.1["type"] == "SEEK").map(|p| p.1["currentTime"].clone()).collect();
         assert_eq!(seeks, vec![json!(10.0), json!(30.0)]);
-        assert_eq!(status.player_state, "PLAYING");
+        assert_eq!(status.player_state, Some(PlayerState::Playing));
         mock.set(|m| m.seek_delay = Duration::ZERO);
 
         session.set_subtitle(Some(2));
@@ -1727,7 +1726,7 @@ mod tests {
         assert_eq!(tracks.1["activeTrackIds"], json!([2]));
 
         session.stop_media();
-        until(&session, &events, &mut log, "media stop", 2., |s| s.player_state == "IDLE" && s.idle_reason.as_deref() == Some("CANCELLED"));
+        until(&session, &events, &mut log, "media stop", 2., |s| s.player_state == Some(PlayerState::Idle) && s.idle_reason.as_deref() == Some("CANCELLED"));
 
         // The whole run went over one connection.
         assert_eq!(mock.state.lock().unwrap().connections, 1);
@@ -1739,9 +1738,12 @@ mod tests {
     #[test]
     fn connects_again_when_the_device_goes_silent() {
         let mock = Mock::start();
+        // The silence is far above a ping, so a runner that stalls for a
+        // moment (a CI machine, 2026-11-13: 400 ms was not enough) does not
+        // count as a silent device.
         let short = Timing {
             ping: Duration::from_millis(50),
-            silence: Duration::from_millis(400),
+            silence: Duration::from_millis(1500),
             answer: Duration::from_secs(1),
             launch: Duration::from_secs(1),
         };
@@ -1761,7 +1763,7 @@ mod tests {
         // The device says nothing: the session gives the socket up and
         // opens it again, and joins its app again.
         mock.set(|m| m.silent = true);
-        until(&session, &events, &mut log, "closed", 3., |s| !s.connected);
+        until(&session, &events, &mut log, "closed", 5., |s| !s.connected);
         mock.set(|m| m.silent = false);
         let connects = mock.payloads(NS_CONNECTION).len();
         until(&session, &events, &mut log, "again", 5., |s| s.connected);
@@ -1833,7 +1835,7 @@ mod tests {
         let mut log = Vec::new();
         until(&session, &events, &mut log, "connect", 5., |s| s.connected);
         session.load(request());
-        until(&session, &events, &mut log, "media load", 5., |s| s.player_state == "PLAYING" && s.media_session_id == Some(1));
+        until(&session, &events, &mut log, "media load", 5., |s| s.player_state == Some(PlayerState::Playing) && s.media_session_id == Some(1));
         (session, events, log)
     }
 
@@ -1861,7 +1863,7 @@ mod tests {
         let (session, events, mut log, sent_before, errors_before) = dropped_with_held_controls(&mock);
         until(&session, &events, &mut log, "again", 5., |s| s.connected);
         let status = until(&session, &events, &mut log, "paused at the last seek", 5., |s| {
-            s.player_state == "PAUSED" && s.media_session_id == Some(1) && s.position == 299.
+            s.player_state == Some(PlayerState::Paused) && s.media_session_id == Some(1) && s.position == 299.
         });
         // Nothing more goes out: the status at the end of the replay is
         // the last word.
@@ -1873,7 +1875,7 @@ mod tests {
         assert_eq!(errors(&log).len(), errors_before, "{log:?}");
         assert_eq!(sent, 2, "{:?}", mock.seen());
         let device = mock.state.lock().unwrap().media.clone().unwrap();
-        assert_eq!((device.state.as_str(), device.position), ("PAUSED", 299.));
+        assert_eq!((device.state, device.position), (PlayerState::Paused, 299.));
     }
 
     /// The socket dies again as the held commands go out, right after the
@@ -1890,7 +1892,7 @@ mod tests {
         // is the evidence, with the two closes in the events.
         until(&session, &events, &mut log, "third", 8., |_| mock.state.lock().unwrap().connections >= 3);
         let status = until(&session, &events, &mut log, "paused at the last seek", 5., |s| {
-            s.connected && s.player_state == "PAUSED" && s.media_session_id == Some(1) && s.position == 299.
+            s.connected && s.player_state == Some(PlayerState::Paused) && s.media_session_id == Some(1) && s.position == 299.
         });
         thread::sleep(Duration::from_millis(300));
         drain(&events, &mut log);
@@ -1902,7 +1904,7 @@ mod tests {
         assert_eq!(status.error, None);
         assert_eq!(errors(&log).len(), errors_before, "{log:?}");
         let device = mock.state.lock().unwrap().media.clone().unwrap();
-        assert_eq!((device.state.as_str(), device.position), ("PAUSED", 299.));
+        assert_eq!((device.state, device.position), (PlayerState::Paused, 299.));
     }
 
     /// The media status after the join comes later than an answer is
@@ -1916,7 +1918,7 @@ mod tests {
         until(&session, &events, &mut log, "again", 5., |s| s.connected);
         let connected = Instant::now();
         let status = until(&session, &events, &mut log, "paused at the last seek", 6., |s| {
-            s.player_state == "PAUSED" && s.media_session_id == Some(1) && s.position == 299.
+            s.player_state == Some(PlayerState::Paused) && s.media_session_id == Some(1) && s.position == 299.
         });
         assert!(connected.elapsed() >= Duration::from_millis(1400), "the controls went before the status");
         thread::sleep(Duration::from_millis(300));
@@ -1961,12 +1963,12 @@ mod tests {
         drain(&events, &mut log);
         assert_eq!(&errors(&log)[errors_before..], ["no app runs", "no app runs"]);
         // Nothing of the old app lingers in the status.
-        assert_eq!((status.app, status.media_session_id, status.player_state.as_str()), (None, None, ""), "{log:?}");
+        assert_eq!((status.app, status.media_session_id, status.player_state), (None, None, None), "{log:?}");
         assert_eq!(media_count(&mock, "SEEK") + media_count(&mock, "PAUSE") - sent_before, 0, "{:?}", mock.seen());
         session.load(request());
         until(&session, &events, &mut log, "our app again", 5., |s| {
             s.app.as_ref().is_some_and(|app| app.app_id == messages::APP_DEFAULT_MEDIA)
-                && s.player_state == "PLAYING"
+                && s.player_state == Some(PlayerState::Playing)
                 && s.media_session_id == Some(1)
         });
     }
@@ -2010,7 +2012,7 @@ mod tests {
         let started = Instant::now();
         session.load(request());
         let status = until(&session, &events, &mut log, "fallback after the silence", 6., |s| {
-            s.player_state == "PLAYING" && s.media_session_id == Some(1)
+            s.player_state == Some(PlayerState::Playing) && s.media_session_id == Some(1)
         });
         assert_eq!(status.app.as_ref().unwrap().app_id, messages::APP_DEFAULT_MEDIA);
         assert!(started.elapsed() >= timing().answer, "the fallback must wait for the answer time");
@@ -2048,13 +2050,13 @@ mod tests {
         // Statuses with no app, before any load: nothing ended.
         session.get_status().recv_timeout(Duration::from_secs(2)).unwrap();
         let first = session.load(request());
-        until(&session, &events, &mut log, "playing", 6., |s| s.player_state == "PLAYING");
+        until(&session, &events, &mut log, "playing", 6., |s| s.player_state == Some(PlayerState::Playing));
         assert_eq!(ended(&log), [0u64; 0], "{log:?}");
         // The next item has no Jellyfin form: the media receiver takes the
         // place of the Jellyfin app.
         let second = session.load(LoadRequest { jellyfin: None, ..request() });
         assert_eq!((first, second), (1, 2));
-        until(&session, &events, &mut log, "media load", 6., |s| s.player_state == "PLAYING" && s.media_session_id == Some(1));
+        until(&session, &events, &mut log, "media load", 6., |s| s.player_state == Some(PlayerState::Playing) && s.media_session_id == Some(1));
         drain(&events, &mut log);
         assert_eq!(ended(&log), [first], "the change of the app ended another load than the one before: {log:?}");
         // The app of the second item goes: that is its end.
@@ -2213,15 +2215,15 @@ mod tests {
         let mock = Mock::start();
         let (session, events, mut log) = media_receiver_playing(&mock, timing());
         session.pause();
-        until(&session, &events, &mut log, "pause", 2., |s| s.player_state == "PAUSED");
+        until(&session, &events, &mut log, "pause", 2., |s| s.player_state == Some(PlayerState::Paused));
         session.seek(100.);
         until(&session, &events, &mut log, "seek", 2., |_| media_count(&mock, "SEEK") == 1);
         thread::sleep(Duration::from_millis(200));
         session.media_status();
         let status = until(&session, &events, &mut log, "status", 2., |s| s.position == 100.);
         let device = mock.state.lock().unwrap().media.clone().unwrap();
-        assert_eq!(device.state, "PAUSED", "the device plays after a seek while paused");
-        assert_eq!(status.player_state, "PAUSED");
+        assert_eq!(device.state, PlayerState::Paused, "the device plays after a seek while paused");
+        assert_eq!(status.player_state, Some(PlayerState::Paused));
     }
 }
 

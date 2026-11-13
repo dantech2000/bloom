@@ -255,7 +255,7 @@ impl Bloom {
             status.connected,
             status.volume,
             status.muted,
-            if status.player_state.is_empty() { "-" } else { &status.player_state },
+            status.player_state.map_or("-", |state| state.name()),
             status.position_now(),
             status.duration.map_or("-".to_string(), |d| format!("{d:.1}")),
             status.idle_reason.as_deref().unwrap_or("-"),

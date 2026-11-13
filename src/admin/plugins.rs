@@ -50,10 +50,33 @@ pub struct Plugin {
     pub can_uninstall: bool,
     #[serde(default)]
     pub has_image: bool,
-    /// "Active", "Restart", "Disabled", "Malfunctioned", "NotSupported",
-    /// "Superseded" or "Deleted".
     #[serde(default)]
-    pub status: String,
+    pub status: PluginStatus,
+}
+
+/// The state of an installed plugin.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub enum PluginStatus {
+    Active,
+    /// Changed; the server needs a restart.
+    Restart,
+    Disabled,
+    Malfunctioned,
+    NotSupported,
+    /// A newer version of it is installed.
+    Superseded,
+    /// Removed at the next restart.
+    Deleted,
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
+impl PluginStatus {
+    /// Loaded, or loaded until the restart.
+    fn running(self) -> bool {
+        matches!(self, PluginStatus::Active | PluginStatus::Restart)
+    }
 }
 
 pub struct Data {
@@ -101,7 +124,7 @@ pub fn load(client: &Client) -> Result<Data> {
     let asked: Vec<((String, String), bool)> = std::thread::scope(|scope| {
         let asks: Vec<_> = plugins
             .iter()
-            .filter(|p| matches!(p.status.as_str(), "Active" | "Restart"))
+            .filter(|p| p.status.running())
             .map(|p| (p.id.clone(), p.version.clone()))
             .filter(|key| !known.contains_key(key))
             .map(|key| {
@@ -124,7 +147,7 @@ pub fn load(client: &Client) -> Result<Data> {
     known.extend(asked);
     let settings = plugins
         .iter()
-        .filter(|p| matches!(p.status.as_str(), "Active" | "Restart"))
+        .filter(|p| p.status.running())
         .filter(|p| known.get(&(p.id.clone(), p.version.clone())).copied().unwrap_or(false))
         .map(|p| p.id.clone())
         .collect();
@@ -146,22 +169,22 @@ struct MenuPlugin {
     id: String,
     version: String,
     name: String,
-    status: String,
+    status: PluginStatus,
     can_uninstall: bool,
     web_url: String,
 }
 
 impl MenuPlugin {
     fn toggle(&self) -> Option<&'static str> {
-        match self.status.as_str() {
-            "Active" | "Restart" => Some("Disable"),
-            "Disabled" => Some("Enable"),
+        match self.status {
+            PluginStatus::Active | PluginStatus::Restart => Some("Disable"),
+            PluginStatus::Disabled => Some("Enable"),
             _ => None,
         }
     }
 
     fn has_entries(&self) -> bool {
-        self.toggle().is_some() || self.status == "Active" || (self.can_uninstall && self.status != "Deleted")
+        self.toggle().is_some() || self.status == PluginStatus::Active || (self.can_uninstall && self.status != PluginStatus::Deleted)
     }
 
     /// The entries of the menu: enable or disable, the settings page of
@@ -180,7 +203,7 @@ impl MenuPlugin {
                     }),
             );
         }
-        if self.status == "Active" {
+        if self.status == PluginStatus::Active {
             let url = self.web_url.clone();
             items.push(
                 MenuItem::new("admin.plugins.menu.web", "Open settings in the web")
@@ -188,7 +211,7 @@ impl MenuPlugin {
                     .on_click(move |_, _, cx| cx.open_url(&url)),
             );
         }
-        if self.can_uninstall && self.status != "Deleted" {
+        if self.can_uninstall && self.status != PluginStatus::Deleted {
             if !items.is_empty() {
                 items.push(MenuItem::separator());
             }
@@ -248,16 +271,16 @@ impl MenuPlugin {
 }
 
 /// Text and state of the badge for a plugin status.
-fn status_badge(status: &str) -> (&'static str, Option<State>) {
+fn status_badge(status: PluginStatus) -> (&'static str, Option<State>) {
     match status {
-        "Active" => ("Active", Some(State::Ok)),
-        "Restart" => ("Restart needed", Some(State::Warn)),
-        "Disabled" => ("Disabled", None),
-        "Malfunctioned" => ("Malfunctioned", Some(State::Bad)),
-        "NotSupported" => ("Not supported", Some(State::Bad)),
-        "Superseded" => ("Superseded", None),
-        "Deleted" => ("Removed at restart", None),
-        _ => ("Unknown", None),
+        PluginStatus::Active => ("Active", Some(State::Ok)),
+        PluginStatus::Restart => ("Restart needed", Some(State::Warn)),
+        PluginStatus::Disabled => ("Disabled", None),
+        PluginStatus::Malfunctioned => ("Malfunctioned", Some(State::Bad)),
+        PluginStatus::NotSupported => ("Not supported", Some(State::Bad)),
+        PluginStatus::Superseded => ("Superseded", None),
+        PluginStatus::Deleted => ("Removed at restart", None),
+        PluginStatus::Other => ("Unknown", None),
     }
 }
 
@@ -269,11 +292,11 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
     let content_w = app.admin_content_w().max(CARD_MIN_W);
     let (_, card_w) = crate::ui::rows::grid(content_w, CARD_MIN_W, CARD_GAP, 1, usize::MAX);
 
-    let active = data.plugins.iter().filter(|p| p.status == "Active").count();
+    let active = data.plugins.iter().filter(|p| p.status == PluginStatus::Active).count();
     let restart = data
         .plugins
         .iter()
-        .filter(|p| matches!(p.status.as_str(), "Restart" | "Deleted"))
+        .filter(|p| matches!(p.status, PluginStatus::Restart | PluginStatus::Deleted))
         .count();
     let mut summary = format!("{} installed · {active} active", data.plugins.len());
     if restart > 0 {
@@ -290,7 +313,7 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
         );
     }
     for plugin in &data.plugins {
-        let (status, status_state) = status_badge(&plugin.status);
+        let (status, status_state) = status_badge(plugin.status);
         let image = plugin.has_image.then(|| {
             client.url(
                 &format!("/Plugins/{}/{}/Image", plugin.id, plugin.version),
@@ -328,7 +351,7 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
             id: plugin.id.clone(),
             version: plugin.version.clone(),
             name: plugin.name.clone(),
-            status: plugin.status.clone(),
+            status: plugin.status,
             can_uninstall: plugin.can_uninstall,
             web_url: client.web_plugin_url(&plugin.id),
         };
@@ -357,7 +380,7 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                 .flex()
                 .flex_col()
                 .when(
-                    matches!(plugin.status.as_str(), "Disabled" | "Superseded" | "Deleted"),
+                    matches!(plugin.status, PluginStatus::Disabled | PluginStatus::Superseded | PluginStatus::Deleted),
                     |el| el.opacity(0.62),
                 )
                 // The image, over a quiet tile with the first letter. The

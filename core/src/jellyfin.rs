@@ -1251,6 +1251,14 @@ impl std::fmt::Display for ItemKind {
     }
 }
 
+/// As the server's name, so a file written with a kind (the downloads'
+/// index) reads the same as when the kind was a string.
+impl serde::Serialize for ItemKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
 impl<'de> Deserialize<'de> for ItemKind {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         Ok(String::deserialize(deserializer)?.as_str().into())
@@ -1321,13 +1329,39 @@ pub struct Item {
     pub user_data: UserData,
 }
 
+/// What a marked range is (the server's `MediaSegmentType`).
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub enum SegmentKind {
+    Intro,
+    Outro,
+    Recap,
+    Preview,
+    Commercial,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl SegmentKind {
+    /// The server's name, as the events and the lights helper carry it.
+    pub fn name(self) -> &'static str {
+        match self {
+            SegmentKind::Intro => "Intro",
+            SegmentKind::Outro => "Outro",
+            SegmentKind::Recap => "Recap",
+            SegmentKind::Preview => "Preview",
+            SegmentKind::Commercial => "Commercial",
+            SegmentKind::Unknown => "Unknown",
+        }
+    }
+}
+
 /// A marked range of an item, such as its intro.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct MediaSegment {
-    /// "Intro", "Outro", "Recap", "Preview" or "Commercial".
     #[serde(rename = "Type")]
-    pub kind: String,
+    pub kind: SegmentKind,
     start_ticks: i64,
     end_ticks: i64,
 }
@@ -1402,6 +1436,60 @@ impl SeerrItem {
     }
 }
 
+/// What a person did on an item (the server's `PersonKind`). The kinds
+/// the app treats in a way of their own have a variant; a crew credit of
+/// another kind keeps its name, which the credits show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PersonKind {
+    Actor,
+    GuestStar,
+    Director,
+    Writer,
+    Creator,
+    /// Another kind by its name ("Producer", "Composer", ...);
+    /// empty when the server sent none.
+    Other(String),
+}
+
+impl Default for PersonKind {
+    fn default() -> Self {
+        PersonKind::Other(String::new())
+    }
+}
+
+impl PersonKind {
+    /// The server's name of the kind.
+    pub fn name(&self) -> &str {
+        match self {
+            PersonKind::Actor => "Actor",
+            PersonKind::GuestStar => "GuestStar",
+            PersonKind::Director => "Director",
+            PersonKind::Writer => "Writer",
+            PersonKind::Creator => "Creator",
+            PersonKind::Other(name) => name,
+        }
+    }
+}
+
+impl From<&str> for PersonKind {
+    fn from(name: &str) -> Self {
+        match name {
+            "Actor" => PersonKind::Actor,
+            "GuestStar" => PersonKind::GuestStar,
+            "Director" => PersonKind::Director,
+            "Writer" => PersonKind::Writer,
+            "Creator" => PersonKind::Creator,
+            other => PersonKind::Other(other.to_string()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PersonKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        Ok(String::deserialize(deserializer)?.as_str().into())
+    }
+}
+
 /// A cast or crew member of an item.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
@@ -1409,9 +1497,8 @@ pub struct Person {
     pub id: String,
     pub name: String,
     pub role: Option<String>,
-    /// "Actor", "Director", "Writer", "GuestStar", ...
     #[serde(rename = "Type")]
-    pub kind: String,
+    pub kind: PersonKind,
     pub primary_image_tag: Option<String>,
 }
 
@@ -1445,12 +1532,48 @@ pub struct MediaSource {
     pub default_subtitle_stream_index: Option<i64>,
 }
 
+/// What a stream of a media source carries (the server's `Type`).
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub enum StreamKind {
+    Video,
+    Audio,
+    Subtitle,
+    /// Cover art, data and lyric streams, and any type a newer server adds.
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
+impl From<&str> for StreamKind {
+    fn from(name: &str) -> Self {
+        match name {
+            "Video" => StreamKind::Video,
+            "Audio" => StreamKind::Audio,
+            "Subtitle" => StreamKind::Subtitle,
+            _ => StreamKind::Other,
+        }
+    }
+}
+
+/// How a subtitle gets to the player, in an answer to `PlaybackInfo`.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub enum SubtitleDelivery {
+    /// In the stream.
+    Embed,
+    /// A file at `delivery_url`.
+    External,
+    /// Burned into the picture.
+    Encode,
+    /// HLS segments, and any method a newer server adds.
+    #[serde(other)]
+    Other,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct MediaStream {
-    /// "Video", "Audio" or "Subtitle".
     #[serde(rename = "Type")]
-    pub kind: String,
+    pub kind: StreamKind,
     /// Place of the stream in the media source; a remote control names a
     /// track by it.
     pub index: i64,
@@ -1475,10 +1598,9 @@ pub struct MediaStream {
     pub path: Option<String>,
     /// A subtitle of text (SubRip, ASS, VTT); false for an image track.
     pub is_text_subtitle_stream: bool,
-    /// How a subtitle gets to the player, in an answer to `PlaybackInfo`:
-    /// "Embed" (in the stream), "External" (a file at `delivery_url`),
-    /// "Encode" (burned in).
-    pub delivery_method: Option<String>,
+    /// How a subtitle gets to the player; only in an answer to
+    /// `PlaybackInfo`.
+    pub delivery_method: Option<SubtitleDelivery>,
     pub delivery_url: Option<String>,
 }
 
@@ -1587,8 +1709,8 @@ impl Item {
         }
     }
 
-    /// The streams of one kind ("Video", "Audio", "Subtitle") in file order.
-    pub fn streams(&self, kind: &str) -> Vec<&MediaStream> {
+    /// The streams of one kind in file order.
+    pub fn streams(&self, kind: StreamKind) -> Vec<&MediaStream> {
         self.media_sources
             .first()
             .map_or(&self.media_streams, |source| &source.media_streams)
@@ -1598,16 +1720,16 @@ impl Item {
     }
 
     /// Display title of the first stream of a kind; the default one wins.
-    pub fn stream_title(&self, kind: &str) -> Option<String> {
+    pub fn stream_title(&self, kind: StreamKind) -> Option<String> {
         let streams = self.streams(kind);
         let shown = streams.iter().find(|s| s.is_default).or(streams.first())?;
         shown.display_title.clone()
     }
 
     /// Names of the people of one kind, in credit order, without repeats.
-    pub fn people_of(&self, kind: &str) -> Vec<String> {
+    pub fn people_of(&self, kind: &PersonKind) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
-        for person in self.people.iter().filter(|p| p.kind == kind) {
+        for person in self.people.iter().filter(|p| &p.kind == kind) {
             if !names.contains(&person.name) {
                 names.push(person.name.clone());
             }
@@ -1811,7 +1933,7 @@ impl Client {
             let tracks: Vec<&MediaStream> = source
                 .media_streams
                 .iter()
-                .filter(|stream| stream.kind == "Audio" && !stream.is_external)
+                .filter(|stream| stream.kind == StreamKind::Audio && !stream.is_external)
                 .collect();
             // A track in the language of the user comes first. The server
             // can name another one: it remembers the track of an earlier
@@ -1833,7 +1955,7 @@ impl Client {
                 return Some(None);
             };
             // A subtitle in a file of its own is not in the stream mpv plays.
-            crate::playback::mpv_id(&source.media_streams, "Subtitle", wanted).map(Some)
+            crate::playback::mpv_id(&source.media_streams, StreamKind::Subtitle, wanted).map(Some)
         });
         Ok(TimelineInfo {
             chapters: full.chapters,
@@ -2050,9 +2172,9 @@ mod tests {
                 .collect();
             serde_json::from_value(serde_json::json!({ "Id": "1", "MediaSources": [{ "MediaStreams": streams }] })).unwrap()
         };
-        assert_eq!(item(1).stream_title("Audio").as_deref(), Some("a1"));
-        assert_eq!(item(9).stream_title("Audio").as_deref(), Some("a0"), "with no default stream: the first");
-        assert_eq!(item(0).stream_title("Video"), None);
+        assert_eq!(item(1).stream_title(StreamKind::Audio).as_deref(), Some("a1"));
+        assert_eq!(item(9).stream_title(StreamKind::Audio).as_deref(), Some("a0"), "with no default stream: the first");
+        assert_eq!(item(0).stream_title(StreamKind::Video), None);
     }
 
     /// The end of a text of any size, in the memory of its end alone.

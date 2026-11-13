@@ -71,7 +71,7 @@ impl Bloom {
             // The entries the card menu of an item gets, by their ids.
             "menu" => {
                 let item = engine.item(arg).or_else(|| {
-                    engine.entry(arg).map(|e| Item { id: e.item_id.clone(), kind: e.kind.as_str().into(), ..Default::default() })
+                    engine.entry(arg).map(|e| Item { id: e.item_id.clone(), kind: e.kind.clone(), ..Default::default() })
                 });
                 let Some(item) = item else {
                     return "error: not a downloaded item; use `add` first".into();
@@ -117,7 +117,7 @@ impl Bloom {
             self.downloads_source_label(),
             self.playback.segments
                 .iter()
-                .map(|s| format!("{} {:.1}-{:.1}", s.kind, s.start_secs(), s.end_secs()))
+                .map(|s| format!("{} {:.1}-{:.1}", s.kind.name(), s.start_secs(), s.end_secs()))
                 .collect::<Vec<_>>()
                 .join(", "),
         )

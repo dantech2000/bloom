@@ -1379,3 +1379,16 @@ fn formats_bytes() {
     assert_eq!(format_bytes(347_800_000), "348 MB");
     assert_eq!(format_bytes(5_000_000_000), "5.0 GB");
 }
+
+/// The kind of an entry is an `ItemKind` since 2026-11-13; an index
+/// written when it was a string reads, and writes back, the same text.
+#[test]
+fn an_index_entry_keeps_its_kind_as_text() {
+    let mut written = serde_json::to_value(Entry::from_item(&item("e1"), "s", Generation::default())).unwrap();
+    assert_eq!(written["kind"], "Episode");
+    // An entry of a kind with no variant, as an older index may hold.
+    written["kind"] = "Recording".into();
+    let entry: Entry = serde_json::from_value(written).unwrap();
+    assert_eq!(entry.kind, ItemKind::Other("Recording".into()));
+    assert_eq!(serde_json::to_value(&entry).unwrap()["kind"], "Recording");
+}

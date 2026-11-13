@@ -49,7 +49,7 @@ use serde_json::Value;
 
 use crate::{
     fsutil,
-    jellyfin::{Client, Item},
+    jellyfin::{Client, Item, ItemKind},
 };
 
 mod fetch;
@@ -103,7 +103,7 @@ pub struct Entry {
     pub server_id: String,
     pub item_id: String,
     pub name: String,
-    pub kind: String,
+    pub kind: ItemKind,
     #[serde(default)]
     pub series_name: Option<String>,
     #[serde(default)]
@@ -179,7 +179,7 @@ impl Entry {
             server_id: server_id.to_string(),
             item_id: item.id.clone(),
             name: item.name.clone(),
-            kind: item.kind.to_string(),
+            kind: item.kind.clone(),
             series_name: item.series_name.clone(),
             series_id: item.series_id.clone(),
             season: item.parent_index_number,
@@ -216,7 +216,7 @@ impl Entry {
             server_id: server_id.to_string(),
             item_id: item_id.to_string(),
             name: String::new(),
-            kind: String::new(),
+            kind: ItemKind::default(),
             series_name: None,
             series_id: None,
             season: None,
@@ -252,7 +252,7 @@ impl Entry {
             self.name = name;
         }
         if let Some(kind) = text("Type") {
-            self.kind = kind;
+            self.kind = kind.as_str().into();
         }
         self.series_name = text("SeriesName").or(self.series_name.take());
         self.series_id = text("SeriesId").or(self.series_id.take());
@@ -282,8 +282,8 @@ impl Entry {
     /// "S1:E2 · Name" for an episode, "Name (2014)" for a movie.
     pub fn title(&self) -> String {
         match (self.season, self.episode) {
-            (Some(s), Some(e)) if self.kind == "Episode" => format!("S{s}:E{e} · {}", self.name),
-            (None, Some(e)) if self.kind == "Episode" => format!("E{e} · {}", self.name),
+            (Some(s), Some(e)) if self.kind == ItemKind::Episode => format!("S{s}:E{e} · {}", self.name),
+            (None, Some(e)) if self.kind == ItemKind::Episode => format!("E{e} · {}", self.name),
             _ => match self.year {
                 Some(year) => format!("{} ({year})", self.name),
                 None => self.name.clone(),

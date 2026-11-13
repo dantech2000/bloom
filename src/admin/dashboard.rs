@@ -189,7 +189,7 @@ struct ActivityPage {
 #[serde(rename_all = "PascalCase", default)]
 struct Task {
     name: String,
-    state: String,
+    state: super::tasks::TaskState,
     key: String,
     current_progress_percentage: Option<f64>,
 }
@@ -276,7 +276,7 @@ pub fn refresh(client: &Client) -> Result<Live> {
                 .cmp(&(a.now_playing_item.is_some(), &a.last_activity_date))
         });
         let mut running = tasks.join().expect("tasks thread").unwrap_or_default();
-        running.retain(|t| t.state != "Idle");
+        running.retain(|t| t.state != super::tasks::TaskState::Idle);
         Ok(Live {
             sessions,
             running,
@@ -904,7 +904,7 @@ fn running_tasks(tasks: &[Task], cx: &mut Context<Bloom>) -> Div {
                         .w(px(96.))
                         .flex_shrink_0()
                         .text_color(t.colors.foreground.opacity(0.7))
-                        .child(if task.state == "Cancelling" {
+                        .child(if task.state == super::tasks::TaskState::Cancelling {
                             "Stopping…".to_string()
                         } else {
                             format!("{percent:.0}%")

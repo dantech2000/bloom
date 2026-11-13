@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 
-use crate::jellyfin::{Client, Item, ItemKind, ItemQuery, ItemsResult, Person, SeerrItem};
+use crate::jellyfin::{Client, Item, ItemKind, ItemQuery, ItemsResult, Person, PersonKind, SeerrItem};
 
 pub const PAGE_SIZE: usize = 100;
 /// Slides in the home hero.
@@ -165,17 +165,17 @@ impl DetailData {
 pub fn merged_people(people: &[Person], guests: bool) -> Vec<(Person, String)> {
     let mut out: Vec<(Person, String)> = Vec::new();
     for person in people {
-        if (person.kind == "GuestStar") != guests {
+        if (person.kind == PersonKind::GuestStar) != guests {
             continue;
         }
-        let role = match person.kind.as_str() {
-            "Actor" | "GuestStar" => person
+        let role = match &person.kind {
+            PersonKind::Actor | PersonKind::GuestStar => person
                 .role
                 .clone()
                 .filter(|r| !r.is_empty())
                 .map(|r| format!("as {r}"))
                 .unwrap_or_default(),
-            other => other.to_string(),
+            other => other.name().to_string(),
         };
         match out.iter_mut().find(|(p, _)| p.id == person.id) {
             Some((_, roles)) if !role.is_empty() && !roles.contains(&role) => {

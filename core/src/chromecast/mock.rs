@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 
 use super::{
     jellyfin,
-    messages::{NS_CONNECTION, NS_HEARTBEAT, NS_MEDIA, NS_RECEIVER},
+    messages::{NS_CONNECTION, NS_HEARTBEAT, NS_MEDIA, NS_RECEIVER, PlayerState},
     discovery::Device,
     proto::{CastMessage, Inbox},
 };
@@ -30,7 +30,7 @@ const KEY: &[u8] = include_bytes!("testdata/mock-key.der");
 
 #[derive(Clone, Debug, Default)]
 pub struct MockMedia {
-    pub state: String,
+    pub state: PlayerState,
     pub position: f64,
     pub content_id: String,
     pub content_type: String,
@@ -339,7 +339,7 @@ fn answer(message: &CastMessage, state: &Arc<Mutex<MockState>>) -> Vec<(String, 
                 "GET_STATUS" => {}
                 "LOAD" => {
                     state.media = Some(MockMedia {
-                        state: "PLAYING".into(),
+                        state: PlayerState::Playing,
                         position: payload["currentTime"].as_f64().unwrap_or(0.),
                         content_id: payload["media"]["contentId"].as_str().unwrap_or("").into(),
                         content_type: payload["media"]["contentType"].as_str().unwrap_or("").into(),
@@ -349,12 +349,12 @@ fn answer(message: &CastMessage, state: &Arc<Mutex<MockState>>) -> Vec<(String, 
                 }
                 "PAUSE" => {
                     if let Some(media) = &mut state.media {
-                        media.state = "PAUSED".into();
+                        media.state = PlayerState::Paused;
                     }
                 }
                 "PLAY" => {
                     if let Some(media) = &mut state.media {
-                        media.state = "PLAYING".into();
+                        media.state = PlayerState::Playing;
                     }
                 }
                 "SEEK" => {
@@ -364,15 +364,15 @@ fn answer(message: &CastMessage, state: &Arc<Mutex<MockState>>) -> Vec<(String, 
                         // the state after the seek; without it the state
                         // stays what it was.
                         match payload["resumeState"].as_str() {
-                            Some("PLAYBACK_START") => media.state = "PLAYING".into(),
-                            Some("PLAYBACK_PAUSE") => media.state = "PAUSED".into(),
+                            Some("PLAYBACK_START") => media.state = PlayerState::Playing,
+                            Some("PLAYBACK_PAUSE") => media.state = PlayerState::Paused,
                             _ => {}
                         }
                     }
                 }
                 "STOP" => {
                     if let Some(media) = &mut state.media {
-                        media.state = "IDLE".into();
+                        media.state = PlayerState::Idle;
                         media.idle_reason = Some("CANCELLED".into());
                     }
                 }

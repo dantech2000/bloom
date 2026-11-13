@@ -140,7 +140,7 @@ impl Bloom {
             rate: self.playback.speed as f64,
             reached_end: status.reached_end,
             failed: status.error.is_some(),
-            segment: self.current_segment().filter(|_| active).map(|segment| segment.kind.clone()),
+            segment: self.current_segment().filter(|_| active).map(|segment| segment.kind.name().to_string()),
             fullscreen: self.events_fullscreen(),
             pip: self.playback.pip.is_some(),
         }

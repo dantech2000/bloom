@@ -17,6 +17,8 @@
 //! the last call is for the debug channel (`subs remove`), which puts a
 //! test download away again.
 
+use crate::player::TrackKind;
+use crate::jellyfin::StreamKind;
 use crate::jellyfin::Method;
 use std::{collections::HashMap, time::Duration};
 
@@ -63,7 +65,7 @@ pub(crate) impl Client {
         }
         let user = self.user()?.to_string();
         let mut item: Streams = self.get(&format!("/Items/{}", segment(item_id)), &[("userId", user)])?;
-        item.media_streams.retain(|s| s.kind == "Subtitle");
+        item.media_streams.retain(|s| s.kind == StreamKind::Subtitle);
         Ok(item.media_streams)
     }
 
@@ -776,7 +778,7 @@ impl Bloom {
         let selected = status
             .tracks
             .iter()
-            .find(|t| t.kind == "sub" && t.selected)
+            .find(|t| t.kind == TrackKind::Sub && t.selected)
             .map_or("none".to_string(), |t| format!("{} ({})", t.id, t.label()));
         let rights = self.subs.rights.as_ref().map_or("unknown".to_string(), |r| {
             format!("manage={} admin={}", r.manage, r.admin)

@@ -45,7 +45,7 @@ impl State {
             session::Event::Status(status) => format!(
                 "status app={} player={} pos={:.1}",
                 status.app.as_ref().map_or("-", |app| app.app_id.as_str()),
-                if status.player_state.is_empty() { "-" } else { &status.player_state },
+                status.player_state.map_or("-", |state| state.name()),
                 status.position
             ),
             session::Event::Message { namespace, payload } => {

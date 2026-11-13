@@ -32,14 +32,53 @@ const ROW_PAD: f32 = 12.;
 const NAME_LINE_H: f32 = 20.;
 const DESCRIPTION_LINE_H: f32 = 18.;
 
+/// What a scheduled task is doing.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub enum TaskState {
+    #[default]
+    Idle,
+    Running,
+    Cancelling,
+    /// A state a newer server adds; counted as busy.
+    #[serde(other)]
+    Other,
+}
+
+/// How the last run of a task ended.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub enum RunStatus {
+    Completed,
+    Failed,
+    Cancelled,
+    Aborted,
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
+impl RunStatus {
+    fn name(self) -> &'static str {
+        match self {
+            RunStatus::Completed => "Completed",
+            RunStatus::Failed => "Failed",
+            RunStatus::Cancelled => "Cancelled",
+            RunStatus::Aborted => "Aborted",
+            RunStatus::Other => "Ended",
+        }
+    }
+
+    fn failed(self) -> bool {
+        matches!(self, RunStatus::Failed | RunStatus::Aborted)
+    }
+}
+
 #[derive(Deserialize, PartialEq)]
 #[serde(rename_all = "PascalCase")]
 pub struct Task {
     #[serde(default)]
     pub name: String,
-    /// "Idle", "Running" or "Cancelling".
     #[serde(default)]
-    pub state: String,
+    pub state: TaskState,
     #[serde(default)]
     pub current_progress_percentage: Option<f64>,
     #[serde(default)]
@@ -62,9 +101,8 @@ pub struct LastRun {
     pub start_time_utc: String,
     #[serde(default)]
     pub end_time_utc: String,
-    /// "Completed", "Failed", "Cancelled" or "Aborted".
     #[serde(default)]
-    pub status: String,
+    pub status: RunStatus,
     #[serde(default)]
     pub error_message: Option<String>,
 }
@@ -111,11 +149,11 @@ fn one_line(text: &str) -> String {
 }
 
 /// Colour of the dot for the result of a run.
-fn result_color(status: &str) -> Rgba {
+fn result_color(status: RunStatus) -> Rgba {
     match status {
-        "Completed" => rgb(0x4caf50),
-        "Failed" | "Aborted" => rgb(0xef5350),
-        _ => rgb(0xffb300),
+        RunStatus::Completed => State::Ok.color(),
+        _ if status.failed() => State::Bad.color(),
+        _ => State::Warn.color(),
     }
 }
 
@@ -127,12 +165,12 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
     let t = UiTheme::read(cx).clone();
 
     let tasks = || data.groups.iter().flat_map(|(_, list)| list.iter());
-    let running = tasks().filter(|task| task.state != "Idle").count();
+    let running = tasks().filter(|task| task.state != TaskState::Idle).count();
     let failed = tasks()
         .filter(|task| {
             task.last_execution_result
                 .as_ref()
-                .is_some_and(|run| matches!(run.status.as_str(), "Failed" | "Aborted"))
+                .is_some_and(|run| run.status.failed())
         })
         .count();
 
@@ -250,7 +288,7 @@ fn row_height(task: &Task, compact: bool, show_schedule: bool, content_w: f32) -
     if compact {
         // The state under the texts: one line, two with the run time or the
         // progress bar.
-        let busy = task.state != "Idle";
+        let busy = task.state != TaskState::Idle;
         text_h += 4. + if busy || task.last_execution_result.is_some() { 38. } else { 20. };
     }
     (text_h + 2. * ROW_PAD).max(ROW_H)
@@ -267,7 +305,7 @@ fn row(
 ) -> Div {
     // The colours alone: a row is built for every frame of a scroll.
     let colors = UiTheme::read(cx).colors;
-    let busy = task.state != "Idle";
+    let busy = task.state != TaskState::Idle;
     let progress = (task.current_progress_percentage.unwrap_or(0.) as f32 / 100.)
         .clamp(0., 1.);
 
@@ -284,7 +322,7 @@ fn row(
                     .text_size(px(13.))
                     // A task that works now is the live state: green.
                     .text_color(State::Ok.color())
-                    .child(if task.state == "Cancelling" {
+                    .child(if task.state == TaskState::Cancelling {
                         "Stopping…"
                     } else {
                         "Running"
@@ -323,11 +361,11 @@ fn row(
                                 .size(px(8.))
                                 .flex_shrink_0()
                                 .rounded_full()
-                                .bg(result_color(&run.status)),
+                                .bg(result_color(run.status)),
                         )
                         .child(div().truncate().child(format!(
                             "{} {}",
-                            run.status,
+                            run.status.name(),
                             ago(&run.end_time_utc)
                         ))),
                 )

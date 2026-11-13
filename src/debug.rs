@@ -4,6 +4,8 @@
 //! connection, so a script can drive navigation and read state without input
 //! events. See `dev/jctl`.
 
+use crate::player::TrackKind;
+use crate::jellyfin::StreamKind;
 use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixListener,
@@ -347,7 +349,7 @@ impl Bloom {
                     // Direct play: mpv's own tracks, in the file's order.
                     "audio" => {
                         let aid = resolved.as_ref().and_then(|r| {
-                            r.embedded("Audio").iter().position(|s| s.index == index).map(|p| p as i64 + 1)
+                            r.embedded(StreamKind::Audio).iter().position(|s| s.index == index).map(|p| p as i64 + 1)
                         });
                         self.player.set_audio(aid);
                     }
@@ -865,7 +867,7 @@ impl Bloom {
             };
             let (id, name, kind) =
                 (data.item.id.clone(), data.item.name.clone(), data.item.kind.clone());
-            self.open_metadata(&id, &name, kind.name(), tab, cx);
+            self.open_metadata(&id, &name, &kind, tab, cx);
         } else {
             return "error: open an item first".into();
         }
@@ -1217,9 +1219,9 @@ impl Bloom {
             .tracks
             .iter()
             .map(|t| {
-                let index = match (t.kind.as_str(), resolved.as_ref()) {
-                    ("sub", Some(r)) => r.subtitle_of(t.id, &self.playback.status),
-                    ("audio", Some(r)) => r.audio_of(t.id),
+                let index = match (t.kind, resolved.as_ref()) {
+                    (TrackKind::Sub, Some(r)) => r.subtitle_of(t.id, &self.playback.status),
+                    (TrackKind::Audio, Some(r)) => r.audio_of(t.id),
                     _ => None,
                 };
                 format!(

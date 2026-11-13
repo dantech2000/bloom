@@ -9,6 +9,7 @@
 
 mod tabs;
 
+use crate::jellyfin::ItemKind;
 use std::rc::Rc;
 
 use anyhow::Result;
@@ -224,7 +225,7 @@ const BROWSE_PAGE: usize = 30;
 pub struct Manager {
     pub id: String,
     pub name: String,
-    pub kind: String,
+    pub kind: ItemKind,
     pub tab: Tab,
     /// The whole item as the server gave it, so a save loses nothing.
     pub item: Option<Value>,
@@ -265,8 +266,14 @@ impl Manager {
     /// True when Identify can look this kind of item up.
     pub fn can_identify(&self) -> bool {
         matches!(
-            self.kind.as_str(),
-            "Movie" | "Series" | "BoxSet" | "Trailer" | "Person" | "MusicAlbum" | "MusicArtist"
+            self.kind,
+            ItemKind::Movie
+                | ItemKind::Series
+                | ItemKind::BoxSet
+                | ItemKind::Trailer
+                | ItemKind::Person
+                | ItemKind::MusicAlbum
+                | ItemKind::MusicArtist
         )
     }
 
@@ -545,14 +552,14 @@ fn apply_field(item: &mut Value, index: usize, value: &str) -> Result<()> {
 impl Bloom {
     /// Menu entries of the metadata manager for an item. Empty for a user
     /// who is not an administrator.
-    pub fn metadata_menu_items(&self, id: &str, name: &str, kind: &str, cx: &mut Context<Self>) -> Vec<MenuItem> {
+    pub fn metadata_menu_items(&self, id: &str, name: &str, kind: &ItemKind, cx: &mut Context<Self>) -> Vec<MenuItem> {
         if !self.is_admin() {
             return Vec::new();
         }
         let this = cx.weak_entity();
         let entry = |key: &'static str, label: &'static str, tab: Tab| {
             let (handle, id, name, kind) =
-                (this.clone(), id.to_string(), name.to_string(), kind.to_string());
+                (this.clone(), id.to_string(), name.to_string(), kind.clone());
             MenuItem::new(key, label).on_click(move |_, _, cx| {
                 handle
                     .update(cx, |this, cx| this.open_metadata(&id, &name, &kind, tab, cx))
@@ -569,14 +576,14 @@ impl Bloom {
     }
 
     /// Opens the metadata manager for an item on one of its tabs.
-    pub fn open_metadata(&mut self, id: &str, name: &str, kind: &str, tab: Tab, cx: &mut Context<Self>) {
+    pub fn open_metadata(&mut self, id: &str, name: &str, kind: &ItemKind, tab: Tab, cx: &mut Context<Self>) {
         if !self.is_admin() {
             return;
         }
         self.metadata.open = Some(Manager {
             id: id.to_string(),
             name: name.to_string(),
-            kind: kind.to_string(),
+            kind: kind.clone(),
             tab,
             item: None,
             error: None,
@@ -693,7 +700,7 @@ impl Bloom {
                     Ok((item, images)) => {
                         manager.error = None;
                         manager.name = text(&item, "Name");
-                        manager.kind = text(&item, "Type");
+                        manager.kind = text(&item, "Type").as_str().into();
                         manager.status = text(&item, "Status");
                         manager.lock = item["LockData"].as_bool().unwrap_or(false);
                         manager.locked = item["LockedFields"]
@@ -871,7 +878,7 @@ impl Bloom {
                 return;
             }
         }
-        if manager.kind == "Series" && !manager.status.is_empty() {
+        if manager.kind == ItemKind::Series && !manager.status.is_empty() {
             item["Status"] = json!(manager.status);
         }
         item["LockData"] = json!(manager.lock);
@@ -1112,7 +1119,7 @@ impl Bloom {
         let (kind, wanted) = (manager.kind.clone(), manager.id.clone());
         self.fetch_in_session(
             cx,
-            move |client| client.remote_search(&kind, &body),
+            move |client| client.remote_search(kind.name(), &body),
             move |this, result, cx| {
                 let Some(manager) = &mut this.metadata.open else {
                     return;
@@ -1300,6 +1307,7 @@ mod dialog_tests {
     use gpui_kit::TestAppContext;
 
     use super::Tab;
+    use crate::jellyfin::ItemKind;
     use crate::app::race_harness::{MockServer, app, plain, session};
 
     /// The dialog is busy from the start of an action until the load after
@@ -1315,7 +1323,7 @@ mod dialog_tests {
             let mut account = session(&server.url, "u1");
             account.is_admin = true;
             this.session = Some(account);
-            this.open_metadata("m1", "One", "Movie", Tab::Images, cx);
+            this.open_metadata("m1", "One", &ItemKind::Movie, Tab::Images, cx);
             let manager = this.metadata.open.as_mut().unwrap();
             assert!(manager.action_starts());
             assert!(!manager.action_starts(), "a second action started beside the first");
@@ -1358,7 +1366,7 @@ mod dialog_tests {
             let mut account = session(&server.url, "u1");
             account.is_admin = true;
             this.session = Some(account);
-            this.open_metadata("m1", "One", "Movie", Tab::Images, cx);
+            this.open_metadata("m1", "One", &ItemKind::Movie, Tab::Images, cx);
         });
         cx.run_until_parked();
         let delete = |this: &mut crate::app::Bloom, cx: &mut gpui_kit::Context<crate::app::Bloom>| {
@@ -1398,7 +1406,7 @@ mod dialog_tests {
         let (bloom, cx) = app(cx);
         bloom.update(cx, |this, cx| {
             this.session = Some(admin(&server));
-            this.open_metadata("m1", "One", "Movie", Tab::Images, cx);
+            this.open_metadata("m1", "One", &ItemKind::Movie, Tab::Images, cx);
             this.browse_images("Primary", cx);
             let image = super::RemoteImage { url: "http://example/a.jpg".to_string(), ..Default::default() };
             let found = serde_json::json!({ "Name": "One" });
@@ -1428,7 +1436,7 @@ mod dialog_tests {
         let (bloom, cx) = app(cx);
         bloom.update(cx, |this, cx| {
             this.session = Some(admin(&server));
-            this.open_metadata("m1", "One", "Movie", Tab::Details, cx);
+            this.open_metadata("m1", "One", &ItemKind::Movie, Tab::Details, cx);
         });
         cx.run_until_parked();
         bloom.update_in(cx, |this, window, cx| {
@@ -1442,7 +1450,7 @@ mod dialog_tests {
             (confirm.run)(this, cx);
             assert!(this.metadata.open.is_none());
         });
-        bloom.update(cx, |this, cx| this.open_metadata("m1", "One", "Movie", Tab::Details, cx));
+        bloom.update(cx, |this, cx| this.open_metadata("m1", "One", &ItemKind::Movie, Tab::Details, cx));
         cx.run_until_parked();
         bloom.update_in(cx, |this, window, cx| {
             this.prepare_metadata(window, cx);
@@ -1473,7 +1481,7 @@ mod dialog_tests {
         let (bloom, cx) = app(cx);
         bloom.update(cx, |this, cx| {
             this.session = Some(admin(&server));
-            this.open_metadata("m1", "One", "Movie", Tab::Images, cx);
+            this.open_metadata("m1", "One", &ItemKind::Movie, Tab::Images, cx);
             this.browse_images("Backdrop", cx);
         });
         cx.run_until_parked();

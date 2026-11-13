@@ -429,7 +429,7 @@ impl Bloom {
             engine().entry(Key::of(server_id, item_id)).map(|e| Item {
                 id: e.item_id.clone(),
                 name: e.name.clone(),
-                kind: e.kind.as_str().into(),
+                kind: e.kind.clone(),
                 series_name: e.series_name.clone(),
                 series_id: e.series_id.clone(),
                 parent_index_number: e.season,
@@ -491,7 +491,7 @@ mod segment_tests {
         ]});
         let segments = segments_of_meta(&meta).unwrap();
         assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].kind, "Intro");
+        assert_eq!(segments[0].kind, crate::jellyfin::SegmentKind::Intro);
         assert!((segments[0].start_secs() - 109.84).abs() < 1e-6);
         assert!((segments[0].end_secs() - 195.195).abs() < 1e-6);
     }
