@@ -29,7 +29,26 @@ if [ -n "$GITHUB_STEP_SUMMARY" ]; then
     echo "The skipped tests need the real player (libmpv, OpenGL, audio). Run \`dev/test\` on a Mac before a release."
   } >>"$GITHUB_STEP_SUMMARY"
 fi
-[ "$status" -eq 0 ] || { echo "dev/ci-test: cargo test failed (status $status)" >&2; exit 1; }
+if [ "$status" -ne 0 ]; then
+  # The tail above shows the count alone. Name the tests that failed and
+  # give their messages: the "failures:" section of cargo test, and each
+  # panic with the lines after it (the output runs with --nocapture, so a
+  # message can sit far from the test's own line).
+  echo "--- failed tests"
+  grep -E '\.\.\. FAILED$' "$log"
+  echo "--- panics"
+  grep -E -A 8 'panicked at' "$log"
+  echo "--- failures section"
+  sed -n '/^failures:$/,$p' "$log"
+  if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+    {
+      echo "### Failed"
+      grep -E '\.\.\. FAILED$' "$log" | sed 's/^test /- /; s/ \.\.\. FAILED$//'
+    } >>"$GITHUB_STEP_SUMMARY"
+  fi
+  echo "dev/ci-test: cargo test failed (status $status)" >&2
+  exit 1
+fi
 [ "${passed:-0}" -gt 0 ] || { echo "dev/ci-test: no test passed" >&2; exit 1; }
 [ "$skipped" -gt 0 ] || { echo "dev/ci-test: no test skipped; BLOOM_CI_NO_PLAYER has no effect" >&2; exit 1; }
 [ -z "$expect" ] || [ "$skipped" -eq "$expect" ] ||
