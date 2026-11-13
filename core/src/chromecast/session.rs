@@ -1738,9 +1738,12 @@ mod tests {
     #[test]
     fn connects_again_when_the_device_goes_silent() {
         let mock = Mock::start();
+        // The silence is far above a ping, so a runner that stalls for a
+        // moment (a CI machine, 2026-11-13: 400 ms was not enough) does not
+        // count as a silent device.
         let short = Timing {
             ping: Duration::from_millis(50),
-            silence: Duration::from_millis(400),
+            silence: Duration::from_millis(1500),
             answer: Duration::from_secs(1),
             launch: Duration::from_secs(1),
         };
@@ -1760,7 +1763,7 @@ mod tests {
         // The device says nothing: the session gives the socket up and
         // opens it again, and joins its app again.
         mock.set(|m| m.silent = true);
-        until(&session, &events, &mut log, "closed", 3., |s| !s.connected);
+        until(&session, &events, &mut log, "closed", 5., |s| !s.connected);
         mock.set(|m| m.silent = false);
         let connects = mock.payloads(NS_CONNECTION).len();
         until(&session, &events, &mut log, "again", 5., |s| s.connected);
