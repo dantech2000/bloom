@@ -327,32 +327,6 @@ pub mod phase {
             && loop_period_ns.is_none_or(|period| period == f.period_ns)
     }
 
-    #[cfg(test)]
-    mod feedback_tests {
-        use super::*;
-
-        const PERIOD: u64 = 16_666_667;
-
-        fn frame() -> InFlight {
-            InFlight { draw_id: 7, seq: 1, vsync_ns: 0, period_ns: PERIOD, draw_after_phase_ns: 0, adopt_ns: 1_000_000_000 }
-        }
-
-        /// The number noted for a frame can go to a later draw, when the
-        /// draw of the frame got no drawable: its times are not the frame's.
-        #[test]
-        fn the_times_of_another_draw_do_not_count_for_a_frame() {
-            let f = frame();
-            let at = |ms: f64| f.adopt_ns as i64 + (ms * 1e6) as i64;
-            assert!(is_the_draw_of(&f, at(0.7), 1, Some(PERIOD)), "the draw of the frame itself");
-            assert!(is_the_draw_of(&f, at(0.7), 2, None), "late by a refresh, before a loop exists");
-            assert!(!is_the_draw_of(&f, at(40.), 1, Some(PERIOD)), "a draw two refreshes later took the number");
-            assert!(!is_the_draw_of(&f, at(-5.), 1, Some(PERIOD)), "submitted before the frame was taken");
-            assert!(!is_the_draw_of(&f, at(0.7), 9, Some(PERIOD)), "shown far from the frame's refresh");
-            assert!(!is_the_draw_of(&f, at(0.7), -1, Some(PERIOD)), "shown before the frame's refresh");
-            assert!(!is_the_draw_of(&f, at(0.7), 1, Some(8_333_333)), "the loop runs on another display now");
-        }
-    }
-
     /// A draw at `now_ns` took the frame `seq` of the tick at `tick_ns`
     /// (`Bloom::sync_frame`).
     pub fn adopted(seq: u64, draw_id: u64, tick_ns: u64, vsync_ns: u64, period_ns: u64, now_ns: u64) {
@@ -408,6 +382,32 @@ pub mod phase {
                 l.made_it.map(|m| m as f64 / 1e6),
             ),
             None => "phase loop: not started".into(),
+        }
+    }
+
+    #[cfg(test)]
+    mod feedback_tests {
+        use super::*;
+
+        const PERIOD: u64 = 16_666_667;
+
+        fn frame() -> InFlight {
+            InFlight { draw_id: 7, seq: 1, vsync_ns: 0, period_ns: PERIOD, draw_after_phase_ns: 0, adopt_ns: 1_000_000_000 }
+        }
+
+        /// The number noted for a frame can go to a later draw, when the
+        /// draw of the frame got no drawable: its times are not the frame's.
+        #[test]
+        fn the_times_of_another_draw_do_not_count_for_a_frame() {
+            let f = frame();
+            let at = |ms: f64| f.adopt_ns as i64 + (ms * 1e6) as i64;
+            assert!(is_the_draw_of(&f, at(0.7), 1, Some(PERIOD)), "the draw of the frame itself");
+            assert!(is_the_draw_of(&f, at(0.7), 2, None), "late by a refresh, before a loop exists");
+            assert!(!is_the_draw_of(&f, at(40.), 1, Some(PERIOD)), "a draw two refreshes later took the number");
+            assert!(!is_the_draw_of(&f, at(-5.), 1, Some(PERIOD)), "submitted before the frame was taken");
+            assert!(!is_the_draw_of(&f, at(0.7), 9, Some(PERIOD)), "shown far from the frame's refresh");
+            assert!(!is_the_draw_of(&f, at(0.7), -1, Some(PERIOD)), "shown before the frame's refresh");
+            assert!(!is_the_draw_of(&f, at(0.7), 1, Some(8_333_333)), "the loop runs on another display now");
         }
     }
 }
@@ -610,13 +610,12 @@ unsafe extern "C" fn on_display_tick(
         }
         let vsync = trace::host_to_clock_ns(output.host_time);
         state.vsync_ns.store(vsync, Ordering::Release);
-        if trace::enabled() {
-            if !cv_now.is_null() {
+        if trace::enabled()
+            && !cv_now.is_null() {
                 let cv_now = trace::host_to_clock_ns(unsafe { (*cv_now).host_time });
                 bin(&LEADS, vsync.saturating_sub(cv_now));
                 bin(&WAKES, now.saturating_sub(cv_now));
             }
-        }
     }
     state.ticks.fetch_add(1, Ordering::AcqRel);
     crate::perf::count_loop(crate::perf::Loop::Link);
@@ -1413,6 +1412,7 @@ mod tests {
     ///   tick T+1 (the design: `lag` 1) was at T + 22.0 to 22.4, that is
     ///   one period plus 0.33 of a period, and the deadline for the
     ///   refresh of tick T is at T + 0.33 period (5.5 ms).
+    ///
     /// Whether the 0.33 is a fraction of the period or a fixed 5.5 ms on a
     /// faster display is not known: this Mac has a 60 Hz display, and 120
     /// Hz is reasoned here, not measured. The test checks both models.

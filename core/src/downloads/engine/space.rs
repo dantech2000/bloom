@@ -128,7 +128,7 @@ pub fn free_space(path: &Path) -> Option<u64> {
             return None;
         }
         let buf = unsafe { buf.assume_init() };
-        (buf.f_bavail as u64).checked_mul(buf.f_frsize as u64)
+        (buf.f_bavail as u64).checked_mul(buf.f_frsize)
     }
     #[cfg(not(unix))]
     {

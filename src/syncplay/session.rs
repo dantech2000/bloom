@@ -629,6 +629,8 @@ mod tests {
         respond(&mut stream, "204 No Content", "text/plain", "", b"");
     }
 
+    // The handshake callback's error type is tungstenite's.
+    #[allow(clippy::result_large_err)]
     fn serve_socket(stream: TcpStream, seen: Arc<Mutex<Seen>>) {
         let mut auth = String::new();
         let callback = |request: &tungstenite::handshake::server::Request,

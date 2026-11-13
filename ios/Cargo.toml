@@ -19,3 +19,6 @@ gpui = { package = "gpui-pre", version = "=0.3.4", default-features = false }
 gpui-ios = { package = "gpui-pre-ios", path = "../vendor/gpui-pre-ios" }
 log = "0.4"
 objc2 = "0.6"
+
+[lints]
+workspace = true

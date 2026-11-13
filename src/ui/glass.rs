@@ -313,6 +313,7 @@ fn layer(radius: Pixels, tint: Rgba, surface: Surface) -> Canvas<()> {
 ///   percentage; stop 1's colour is (h saturation, s rim, l counter-light),
 ///   opaque so the quad never counts as transparent, with the blur share
 ///   of the flat middle as its percentage.
+///
 /// Alpha fields carry no parameter: `paint_quad` scales them by the
 /// element's opacity.
 fn encode(bounds: Bounds<Pixels>, radius: Pixels, tint: Rgba, liquid: &Liquid, card: bool, scale: f32) -> PaintQuad {

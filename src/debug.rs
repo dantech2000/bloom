@@ -982,7 +982,7 @@ impl Bloom {
             _ => return "error: connect [servers | add <address> | quick | cancel | done]".into(),
         }
         cx.notify();
-        return self.debug_connect();
+        self.debug_connect()
     }
 
     /// The verb `je`: Jellyfin Enhanced.
@@ -1010,7 +1010,7 @@ impl Bloom {
             }
         }
         cx.notify();
-        return self.enhanced_debug();
+        self.enhanced_debug()
     }
 
     /// The verb `syncplay`: the state, the groups, and the actions of the panel.
@@ -1150,14 +1150,14 @@ impl Bloom {
             );
         }
         let hub = crate::events::hub();
-        return format!(
+        format!(
             "stream on={} titles={} readers={} closed_slow={} socket={}",
             hub.on(),
             self.config.events_titles == Some(true),
             hub.readers(),
             hub.closed_slow.load(std::sync::atomic::Ordering::Relaxed),
             crate::events::socket_path()
-        );
+        )
     }
 
     /// The menu bar with, for each entry that runs an action, whether this

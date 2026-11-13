@@ -241,7 +241,7 @@ enum Cmd {
     /// (`Queued`). They travel in the load, not ahead of it: the worker
     /// applies them only when it accepts the load, so the choice made for
     /// a cancelled load never reaches the item after it.
-    Load { generation: u64, request: PlayRequest, tracks: Tracks },
+    Load { generation: u64, request: Box<PlayRequest>, tracks: Tracks },
     /// Ends the worker, so mpv is closed before the process exits: at the
     /// quit of the app, and at the end of a test.
     Quit,
@@ -899,7 +899,7 @@ impl Player {
         // refuses the load when it takes it. A worker that failed to start
         // before the load reached it answers here.
         let leftover = Leftover::of(&request);
-        if !self.send(Cmd::Load { generation, request, tracks }) {
+        if !self.send(Cmd::Load { generation, request: Box::new(request), tracks }) {
             self.shared.emit(PlayerEvent::LoadFailed { token });
             leftover.end();
         }

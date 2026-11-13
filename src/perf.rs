@@ -232,7 +232,7 @@ pub fn pacing_report(period_ns: u64) -> String {
         .count();
     let max = list.iter().cloned().fold(0., f64::max);
     format!(
-        "pacing (draw requests): frames={} mean={mean:.1}ms max={max:.0}ms jumps={jumps} ({:.1}%) | refreshes 1:{} 2:{} 3:{} 4:{} 5:{} 6+:{} | {}",
+        "pacing (draw requests): frames={} mean={mean:.1}ms max={max:.0}ms jumps={jumps} ({:.1}%) | refreshes 1:{} 2:{} 3:{} 4:{} 5:{} 6+:{} | {} | {}",
         list.len() + 1,
         jumps as f64 * 100. / list.len() as f64,
         by_refreshes[1],
@@ -241,7 +241,8 @@ pub fn pacing_report(period_ns: u64) -> String {
         by_refreshes[4],
         by_refreshes[5],
         by_refreshes[6],
-        format!("{} | {}", waits_report(), crate::pacing::report()),
+        waits_report(),
+        crate::pacing::report(),
     )
 }
 

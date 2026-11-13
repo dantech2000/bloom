@@ -1086,7 +1086,7 @@ mod race_tests {
             this.screen = Screen::Main;
             let mut admin = AdminData::new(Section::Plugins);
             admin.loading = false;
-            this.nav.page = Page::Admin(admin);
+            this.nav.page = Page::Admin(Box::new(admin));
         });
         (bloom, cx)
     }

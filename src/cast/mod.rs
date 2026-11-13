@@ -524,7 +524,7 @@ impl Bloom {
             // state of now.
             Target::JellyfinSession(session) if same => {
                 if let Some(remote) = self.cast.jellyfin_mut() {
-                    remote.update(session);
+                    remote.update(*session);
                 }
             }
             _ if same => {}
@@ -532,7 +532,7 @@ impl Bloom {
             Target::JellyfinSession(session) => {
                 self.leave_remote(cx);
                 let name = session.device_name.clone();
-                let mut remote = JellyfinRemote::new(session);
+                let mut remote = JellyfinRemote::new(*session);
                 remote.poll = Some(self.cast_poll(cx));
                 self.cast.remote = Some(Remote::Jellyfin(remote));
                 self.cast_subscribe();
@@ -591,7 +591,7 @@ impl Bloom {
             return Err(format!("no controllable session {session_id}"));
         };
         let name = session.device_name.clone();
-        self.select_target(Target::JellyfinSession(session), cx);
+        self.select_target(Target::JellyfinSession(Box::new(session)), cx);
         Ok(name)
     }
 

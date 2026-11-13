@@ -788,7 +788,7 @@ fn rows_card(title: &'static str, list: &'static [Row], editor: &Editor, cx: &mu
             Kind::Flag => lockable(checkbox(id, value.as_bool().unwrap_or(false), cx), locked.is_some())
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.access_toggle(key, cx))),
             Kind::Choice(options) => {
-                let options = options.iter().map(|(option, label)| (json!(option), SharedString::new_static(*label))).collect();
+                let options = options.iter().map(|(option, label)| (json!(option), SharedString::new_static(label))).collect();
                 choice_box(id, options, json!(value.as_str().unwrap_or("")), cx, move |this, option, cx| {
                     this.access_put(key, option.clone(), cx)
                 })
@@ -981,7 +981,7 @@ mod race_tests {
             this.screen = Screen::Main;
             let mut admin = AdminData::new(Section::Users);
             admin.loading = false;
-            this.nav.page = Page::Admin(admin);
+            this.nav.page = Page::Admin(Box::new(admin));
             let user: User = serde_json::from_value(json!({ "Id": "u9", "Name": "jellyui-test-nine" })).expect("user");
             this.access_open(&user, cx);
         });

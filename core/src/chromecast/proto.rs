@@ -153,7 +153,7 @@ impl Inbox {
     /// message is skipped with a word in the log: its length is known, so
     /// the frames after it still read. An error is a length no frame has;
     /// after that the stream cannot be read on.
-    pub fn next(&mut self) -> Result<Option<CastMessage>> {
+    pub fn message(&mut self) -> Result<Option<CastMessage>> {
         loop {
             if self.bytes.len() < 4 {
                 return Ok(None);
@@ -294,14 +294,14 @@ mod tests {
         let mut inbox = Inbox::default();
         let mut first = &frame[..20];
         assert!(inbox.fill(&mut first).unwrap());
-        assert!(inbox.next().unwrap().is_none());
+        assert!(inbox.message().unwrap().is_none());
         let mut rest = &frame[20..];
         assert!(inbox.fill(&mut rest).unwrap());
         let mut again = &frame[..];
         assert!(inbox.fill(&mut again).unwrap());
-        assert_eq!(inbox.next().unwrap().unwrap().text_payload(), r#"{"type":"PING"}"#);
-        assert_eq!(inbox.next().unwrap().unwrap().text_payload(), r#"{"type":"PING"}"#);
-        assert!(inbox.next().unwrap().is_none());
+        assert_eq!(inbox.message().unwrap().unwrap().text_payload(), r#"{"type":"PING"}"#);
+        assert_eq!(inbox.message().unwrap().unwrap().text_payload(), r#"{"type":"PING"}"#);
+        assert!(inbox.message().unwrap().is_none());
         assert!(!inbox.fill(&mut &b""[..]).unwrap(), "a closed socket");
     }
 
@@ -315,14 +315,14 @@ mod tests {
         bytes.extend(ping_frame());
         let mut inbox = Inbox::default();
         inbox.push(&bytes);
-        assert_eq!(inbox.next().unwrap().unwrap().text_payload(), r#"{"type":"PING"}"#);
-        assert!(inbox.next().unwrap().is_none());
+        assert_eq!(inbox.message().unwrap().unwrap().text_payload(), r#"{"type":"PING"}"#);
+        assert!(inbox.message().unwrap().is_none());
     }
 
     #[test]
     fn rejects_a_huge_frame() {
         let mut inbox = Inbox::default();
         inbox.fill(&mut &[0x7f, 0xff, 0xff, 0xff, 0][..]).unwrap();
-        assert!(inbox.next().is_err());
+        assert!(inbox.message().is_err());
     }
 }

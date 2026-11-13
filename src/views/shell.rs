@@ -797,7 +797,7 @@ impl Bloom {
                 .child(match glyph {
                     Glyph::Lucide(glyph) => icon(glyph, 16., color),
                     // The web theme shows the mark in white, a little dimmed.
-                    Glyph::Logo => crate::icons::logo(19., color.opacity(0.85).into()),
+                    Glyph::Logo => crate::icons::logo(19., color.opacity(0.85)),
                 })
                 .when(!icon_only || logo, |el| el.child(label))
         };

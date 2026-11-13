@@ -815,8 +815,7 @@ mod tests {
         ];
         let tags = tags_of(&streams);
         // As the server of the user is set: resolution and range only.
-        let mut prefs = Prefs::default();
-        prefs.show = [true, false, true, false, false, false];
+        let prefs = Prefs { show: [true, false, true, false, false, false], ..Default::default() };
         assert_eq!(arrange(&tags, &prefs), ["4K", "HDR10"]);
         // The user stacks audio first.
         let mut prefs = Prefs::default();
@@ -826,7 +825,7 @@ mod tests {
 
     #[test]
     fn imax_and_three_d_and_stub() {
-        let streams = vec![video("1080p H264", "h264", "SDR", 1920, 1080)];
+        let streams = [video("1080p H264", "h264", "SDR", 1920, 1080)];
         let source = |path: &str| MediaSource {
             path: Some(path.into()),
             ..Default::default()

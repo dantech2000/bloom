@@ -79,7 +79,7 @@ impl Bloom {
         let m = self.player_metrics(fullscreen);
         // A popup from the bar on a phone opens above the bar, where the
         // episode picker sits (`ui::menu`, `touch_bottom`).
-        let menu_bottom = m.phone.then(|| self.viewport_h - m.corner.1);
+        let menu_bottom = m.phone.then_some(self.viewport_h - m.corner.1);
         for menu in [&self.playback.subtitle_menu, &self.playback.settings_menu] {
             if menu.read(cx).touch_bottom != menu_bottom {
                 menu.update(cx, |menu, _| menu.touch_bottom = menu_bottom);

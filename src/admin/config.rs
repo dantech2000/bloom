@@ -180,7 +180,7 @@ fn whole(min: f64, max: f64, unit: &'static str) -> Kind {
 }
 
 fn choice(options: &[(&str, &'static str)]) -> Kind {
-    Kind::Choice(options.iter().map(|(value, label)| (json!(value), SharedString::new_static(*label))).collect())
+    Kind::Choice(options.iter().map(|(value, label)| (json!(value), SharedString::new_static(label))).collect())
 }
 
 fn named(options: &[(String, String)], first: Option<(&str, &'static str)>) -> Kind {

@@ -46,16 +46,12 @@ base64 = "0.22"
 # The socket of the server: SyncPlay commands and live events. The TLS
 # stack is the one ureq already uses (rustls with ring).
 tungstenite = { version = "0.29", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-webpki-roots = "1"
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
 log = "0.4"
 env_logger = "0.11"
 image = { version = "0.25", default-features = false }
 smallvec = "1"
-# The version GPUI already builds; draws SVG images to pixels.
-resvg = "0.46"
 core-foundation = "0.10"
 jiff = "0.2"
 raw-window-handle = "0.6"
@@ -122,6 +118,15 @@ strip = true
 [workspace]
 members = ["core", "lights", "ios"]
 default-members = [".", "core", "lights"]
+
+# `cargo clippy --release --workspace --all-targets` is a CI gate.
+[workspace.lints.clippy]
+# The complex types are GPUI's listener types (`Rc<dyn Fn(&E, &mut Window,
+# &mut App)>`); an alias per shape hides what the type is.
+type_complexity = "allow"
+
+[lints]
+workspace = true
 
 # The version of the app, for it and for `bloom-core`, which names it to the
 # server. `dev/bump`, `dev/bundle` and `dev/release` read this line: it is

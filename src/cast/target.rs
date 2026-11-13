@@ -21,8 +21,9 @@ pub enum Target {
     /// The player of this app.
     #[default]
     Local,
-    /// Another session of the server, with its last known state.
-    JellyfinSession(SessionInfo),
+    /// Another session of the server, with its last known state. Boxed:
+    /// a session with its item is about 1 KB, the other targets 100 bytes.
+    JellyfinSession(Box<SessionInfo>),
     /// A cast device; the target that is set has its connection (`remote.rs`).
     Chromecast(Device),
     /// The AirPlay receiver the user picked in the system picker. macOS
@@ -288,9 +289,9 @@ mod tests {
     /// with them; choosing the same one again leaves nothing.
     #[test]
     fn two_choices_are_the_same_device_by_its_id() {
-        let tv = Target::JellyfinSession(session("s1", "TV"));
-        assert!(tv.same(&Target::JellyfinSession(session("s1", "TV, renamed"))));
-        assert!(!tv.same(&Target::JellyfinSession(session("s2", "TV"))));
+        let tv = Target::JellyfinSession(Box::new(session("s1", "TV")));
+        assert!(tv.same(&Target::JellyfinSession(Box::new(session("s1", "TV, renamed")))));
+        assert!(!tv.same(&Target::JellyfinSession(Box::new(session("s2", "TV")))));
         let cast = Target::Chromecast(device("c1"));
         assert!(cast.same(&Target::Chromecast(Device { port: 9, ..device("c1") })));
         assert!(!cast.same(&Target::Chromecast(device("c2"))));
@@ -299,7 +300,7 @@ mod tests {
         // Names and kinds for the chip and the debug channel.
         assert_eq!(Target::AirPlay.name(), "AirPlay");
         assert_eq!(cast.name(), "Living room");
-        assert_eq!(Target::JellyfinSession(session("s", "Bedroom")).name(), "Bedroom");
+        assert_eq!(Target::JellyfinSession(Box::new(session("s", "Bedroom"))).name(), "Bedroom");
         assert_eq!((tv.kind(), cast.kind()), (Kind::Jellyfin, Kind::Chromecast));
         assert_eq!(Kind::Chromecast.name(), "chromecast");
     }

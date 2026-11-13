@@ -153,13 +153,15 @@ pub struct SearchData {
     pub answered: Option<(String, Vec<Item>, Vec<SeerrItem>)>,
 }
 
+/// A page and its data. The two large ones are boxed: each entry of the
+/// Back history holds a page, and a detail page's data is about 2 KB.
 pub enum Page {
     Home(HomeData),
     Library(LibraryData),
-    Detail(DetailData),
+    Detail(Box<DetailData>),
     Search(SearchData),
     /// Server dashboard for administrators.
-    Admin(crate::admin::AdminData),
+    Admin(Box<crate::admin::AdminData>),
     /// Settings of the signed-in user.
     Settings(crate::settings::Section),
     /// One playlist, with its entries in order.
@@ -1454,11 +1456,11 @@ impl Bloom {
                 self.open_folder(item, cx)
             }
             _ => self.navigate(
-                Page::Detail(DetailData {
+                Page::Detail(Box::new(DetailData {
                     item,
                     loading: true,
                     ..Default::default()
-                }),
+                })),
                 cx,
             ),
         }
@@ -1857,7 +1859,7 @@ impl Bloom {
                             if fresh.item.id == data.item.id {
                                 (fresh.audio, fresh.subtitle) = (data.audio, data.subtitle);
                             }
-                            *data = fresh;
+                            **data = fresh;
                             // The row of the season starts at the
                             // episode of the page; the ones before
                             // it are a scroll to the left away.

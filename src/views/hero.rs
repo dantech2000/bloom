@@ -626,7 +626,7 @@ impl Bloom {
         } else {
             (self.hero_shown().as_secs_f32() / HERO_SLIDE.as_secs_f32()).clamp(0., 1.)
         };
-        let fill = if index % 2 == 0 {
+        let fill = if index.is_multiple_of(2) {
             div().h_full().w(relative(fraction))
         } else {
             div()

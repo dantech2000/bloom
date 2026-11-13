@@ -379,7 +379,7 @@ impl Bloom {
         ));
         let offset = self.config.sync_offset_ms;
         let offset_text = |ms: f64| match ms {
-            ms if ms == 0. => "None".to_string(),
+            0. => "None".to_string(),
             ms if ms > 0. => format!("{ms:.0} ms later"),
             ms => format!("{:.0} ms earlier", -ms),
         };

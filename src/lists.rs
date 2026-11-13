@@ -912,11 +912,11 @@ impl Bloom {
                 if list.kind == ItemKind::Playlist {
                     let entries = client.playlist_entries(&list.id)?;
                     let entry = entries.get(n).ok_or_else(|| anyhow!("no entry at that place"))?;
-                    client.remove_from_playlist(&list.id, &[entry.entry_id.clone()])?;
+                    client.remove_from_playlist(&list.id, std::slice::from_ref(&entry.entry_id))?;
                 } else {
                     let page = client.items(&ItemQuery { parent_id: Some(list.id.clone()), ..Default::default() })?;
                     let item = page.items.get(n).ok_or_else(|| anyhow!("no item at that place"))?;
-                    client.remove_from_collection(&list.id, &[item.id.clone()])?;
+                    client.remove_from_collection(&list.id, std::slice::from_ref(&item.id))?;
                 }
                 self.after_list_change(cx);
                 Ok("removed".into())

@@ -19,7 +19,9 @@ use crate::macos::{Id, class, ns_string, send, string_of};
 pub use crate::macos::Pool;
 
 // The frameworks are loaded with the app; the link lines make the symbols
-// of the classes and of the C calls below resolve.
+// of the classes and of the C calls below resolve. Clippy takes the second
+// `kind` for a repeat of the first; each line names its own framework.
+#[allow(clippy::duplicated_attributes)]
 #[link(name = "AVFoundation", kind = "framework")]
 #[link(name = "AVKit", kind = "framework")]
 #[link(name = "CoreMedia", kind = "framework")]

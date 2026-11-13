@@ -80,7 +80,7 @@ impl Swipe {
                     && phase == TouchPhase::Ended
                     && self.dx.abs() >= SWIPE_PX
                     && self.dy.abs() < self.dx.abs() / 2.;
-                let direction = decided.then(|| if self.dx > 0. { Direction::Back } else { Direction::Forward });
+                let direction = decided.then_some(if self.dx > 0. { Direction::Back } else { Direction::Forward });
                 *self = Self::default();
                 direction
             }

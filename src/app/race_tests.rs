@@ -338,7 +338,7 @@ fn back_to_a_detail_page_brings_its_own_menus(cx: &mut TestAppContext) {
         _ => plain(method, path),
     });
     let (bloom, cx) = app(cx);
-    let detail = |item| Page::Detail(super::DetailData { item, ..Default::default() });
+    let detail = |item| Page::Detail(Box::new(super::DetailData { item, ..Default::default() }));
     bloom.update(cx, |this, cx| {
         this.session = Some(session(&server.url, "u1"));
         this.screen = Screen::Main;
@@ -441,12 +441,12 @@ fn a_reload_of_the_detail_page_keeps_the_picked_tracks(cx: &mut TestAppContext) 
     bloom.update(cx, |this, cx| {
         this.session = Some(session(&server.url, "u1"));
         this.screen = Screen::Main;
-        this.nav.page = Page::Detail(super::DetailData {
+        this.nav.page = Page::Detail(Box::new(super::DetailData {
             item: item_with_audio("a", "Track of A"),
             audio: Some(0),
             subtitle: Some(None),
             ..Default::default()
-        });
+        }));
         this.load_page(cx);
     });
     cx.run_until_parked();

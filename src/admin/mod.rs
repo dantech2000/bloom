@@ -175,7 +175,8 @@ impl Section {
 
 /// What one load brings back.
 enum Loaded {
-    Dashboard(dashboard::Data),
+    /// Boxed: the dashboard's data is 800 bytes, the others under 100.
+    Dashboard(Box<dashboard::Data>),
     Users(users::Data),
     Libraries(libraries::Data),
     Devices(devices::Data),
@@ -362,7 +363,7 @@ impl Bloom {
         self.nav
             .pages_mut()
             .filter_map(|page| match page {
-                Page::Admin(data) => Some(data),
+                Page::Admin(data) => Some(&mut **data),
                 _ => None,
             })
     }
@@ -399,7 +400,7 @@ impl Bloom {
                 let mut data = AdminData::new(section);
                 // A phone starts at the list of sections, as Settings does.
                 data.list = self.compact_w();
-                self.navigate(Page::Admin(data), cx)
+                self.navigate(Page::Admin(Box::new(data)), cx)
             }
         }
     }
@@ -510,7 +511,7 @@ impl Bloom {
             move |client| -> Result<Loaded> {
                 let client = &client;
                 Ok(match section {
-                    Section::Dashboard => Loaded::Dashboard(dashboard::load(client)?),
+                    Section::Dashboard => Loaded::Dashboard(Box::new(dashboard::load(client)?)),
                     Section::Users => Loaded::Users(users::load(client)?),
                     Section::Libraries => Loaded::Libraries(libraries::load(client, &[])?),
                     Section::Devices => Loaded::Devices(devices::load(client)?),
@@ -529,7 +530,7 @@ impl Bloom {
                         Ok(loaded) => {
                             data.error = None;
                             match loaded {
-                                Loaded::Dashboard(d) => data.dashboard = Some(d),
+                                Loaded::Dashboard(d) => data.dashboard = Some(*d),
                                 Loaded::Users(d) => data.users = Some(d),
                                 Loaded::Libraries(d) => data.libraries = Some(d),
                                 Loaded::Devices(d) => data.devices = Some(d),
@@ -1322,7 +1323,7 @@ mod live_tests {
             this.session = Some(session(&server.url, "u1"));
             let mut admin = AdminData::new(Section::Tasks);
             admin.loading = false;
-            this.nav.page = Page::Admin(admin);
+            this.nav.page = Page::Admin(Box::new(admin));
             // Three ticks before the first answer.
             this.refresh_admin(cx);
             this.refresh_admin(cx);

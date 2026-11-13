@@ -495,7 +495,7 @@ mod colour_tests {
         let columns = [column.clone(), column].concat();
         assert_eq!(band_colours(&columns, 12, 2, 24), [[200, 0, 0], [0, 0, 100]]);
         assert_eq!(band_colours(&columns, 12, 4, 24), [[200, 0, 0], [200, 0, 0], [0, 0, 100], [0, 0, 100]]);
-        assert_eq!(band_colours(&vec![3u8; 96], 12, 3, 24), [[0; 3]; 3]);
+        assert_eq!(band_colours(&[3u8; 96], 12, 3, 24), [[0; 3]; 3]);
         // A black column at the side of the picture does not darken it.
         let with_bar = [columns.clone(), vec![3u8; 48]].concat();
         assert_eq!(band_colours(&with_bar, 12, 2, 24), [[200, 0, 0], [0, 0, 100]]);

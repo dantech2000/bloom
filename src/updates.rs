@@ -420,7 +420,8 @@ impl Bloom {
         // The debug channel is a tool for tests and for a look at a
         // problem while it happens; it is off unless someone needs it.
         let on = self.debug_channel_on();
-        let card = card.child(field(
+        
+        card.child(field(
             "Debug channel",
             if on {
                 format!("On. A tool on this device can drive the app and read its state through {}.", crate::debug::setting_socket())
@@ -431,8 +432,7 @@ impl Bloom {
                 move |this, _: &ClickEvent, _, cx| this.set_debug_channel(!on, cx),
             )),
             cx,
-        ));
-        card
+        ))
     }
 
     pub fn debug_updates(&mut self, rest: &str, cx: &mut Context<Self>) -> String {

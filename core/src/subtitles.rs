@@ -152,7 +152,7 @@ pub fn thousands(value: i64) -> String {
     let digits = value.abs().to_string();
     let mut out = String::new();
     for (n, c) in digits.chars().enumerate() {
-        if n > 0 && (digits.len() - n) % 3 == 0 {
+        if n > 0 && (digits.len() - n).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);

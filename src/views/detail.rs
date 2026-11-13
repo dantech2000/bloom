@@ -761,7 +761,7 @@ fn meta_line(item: &Item, cx: &Context<Bloom>) -> Div {
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .child(icon(LucideIcon::Languages, 16., color.into()))
+                .child(icon(LucideIcon::Languages, 16., color))
                 .child(languages.join(", ")),
         );
     }

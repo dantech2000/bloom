@@ -780,8 +780,6 @@ dependencies = [
  "libmpv2-sys",
  "log",
  "raw-window-handle",
- "resvg 0.46.0",
- "rustls",
  "serde",
  "serde_json",
  "smallvec",
@@ -789,7 +787,6 @@ dependencies = [
  "ureq",
  "uuid",
  "web-time",
- "webpki-roots 1.0.9",
 ]
 
 [[package]]

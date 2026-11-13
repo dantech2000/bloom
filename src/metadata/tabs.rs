@@ -1251,7 +1251,7 @@ fn small_button(
         .text_size(px(13.))
         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
         .text_color(if danger {
-            rgb(0xff8a80).into()
+            rgb(0xff8a80)
         } else {
             t.colors.foreground
         })

@@ -236,7 +236,7 @@ impl JellyfinRemote {
 
 impl RemoteTarget for JellyfinRemote {
     fn choice(&self) -> Target {
-        Target::JellyfinSession(self.session.clone())
+        Target::JellyfinSession(Box::new(self.session.clone()))
     }
 
     fn view(&self) -> TargetView {
@@ -556,7 +556,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::chromecast::session::Status;
 
     fn item(id: &str) -> Item {
         serde_json::from_value(json!({ "Id": id, "Name": id, "Type": "Movie" })).unwrap()
@@ -582,7 +581,7 @@ mod tests {
         loaded.sent(item("m2"), 2);
         loaded.note(&CastEvent::Ended { load: 1 });
         assert!(loaded.item.is_some(), "the end of the item before dropped the new item");
-        loaded.note(&CastEvent::Status(Status::default()));
+        loaded.note(&CastEvent::Status(Box::default()));
         assert!(loaded.item.is_some(), "a status during the launch dropped the item");
         loaded.note(&CastEvent::Ended { load: 2 });
         assert!(loaded.item.is_none(), "the item stays though its app is gone");

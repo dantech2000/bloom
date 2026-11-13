@@ -145,7 +145,7 @@ pub struct SendRequest {
 }
 
 enum Cmd {
-    Send(SendRequest, u64),
+    Send(Box<SendRequest>, u64),
     /// A URL as it is, with no server behind it: the debug channel plays a
     /// file on disk to see what the engine makes of it.
     SendUrl(String, u64),
@@ -502,7 +502,7 @@ impl AirPlay {
     /// Sends an item. Returns the token of its `Loaded` or `LoadFailed`.
     pub fn send(&self, request: SendRequest) -> u64 {
         let token = self.next_token();
-        self.send_cmd(Cmd::Send(request, token));
+        self.send_cmd(Cmd::Send(Box::new(request), token));
         token
     }
 
@@ -743,7 +743,7 @@ impl Engine {
     fn handle(&mut self, cmd: Cmd) -> bool {
         let now = Instant::now();
         match cmd {
-            Cmd::Send(request, token) => self.send(request, token),
+            Cmd::Send(request, token) => self.send(*request, token),
             Cmd::SendUrl(url, token) => {
                 // No server: no client, and so no report.
                 let stream = stream::Stream { url, play_session_id: "url".into() };

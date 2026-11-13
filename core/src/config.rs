@@ -454,8 +454,7 @@ mod tests {
     }
 
     fn sample() -> Config {
-        let mut config = Config::default();
-        config.device_id = "dev".into();
+        let mut config = Config { device_id: "dev".into(), ..Default::default() };
         config.upsert_server(Server {
             id: "s".into(),
             name: "S".into(),

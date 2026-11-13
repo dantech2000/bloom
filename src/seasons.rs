@@ -563,11 +563,11 @@ impl Bloom {
                             .px(px(16.))
                             .rounded(px(12.))
                             .gap(px(6.))
-                            .bg(if can_send { t.colors.primary } else { tone::HOVER.into() })
+                            .bg(if can_send { t.colors.primary } else { tone::HOVER })
                             .when(!can_send, |el| el.cursor_default())
                             .text_size(px(14.))
                             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .text_color(if can_send { tone::ON_ACCENT } else { gpui_kit::Rgba::from(soft) })
+                            .text_color(if can_send { tone::ON_ACCENT } else { soft })
                             .child(icon(
                                 LucideIcon::Download,
                                 16.,

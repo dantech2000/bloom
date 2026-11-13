@@ -1,0 +1,7 @@
+#!/bin/sh
+# Clippy over the workspace and its tests, with every warning an error.
+# CI runs it after the build (the same profile, so it reuses the build).
+# The lints the workspace allows, and why, are in Cargo.toml
+# ([workspace.lints.clippy]). Usage: dev/lint [extra cargo args]
+cd "$(dirname "$0")/.." || exit 1
+exec cargo clippy --release --locked --workspace --all-targets "$@" -- -D warnings

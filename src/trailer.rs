@@ -642,7 +642,7 @@ impl Crop {
         self.frames += 1;
         let first_frame = *self.first_frame.get_or_insert_with(std::time::Instant::now);
         // Frames some time apart, so that one scene does not decide alone.
-        if self.frames % CROP_EVERY != 0 {
+        if !self.frames.is_multiple_of(CROP_EVERY) {
             return;
         }
         let started = std::time::Instant::now();

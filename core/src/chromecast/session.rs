@@ -88,7 +88,7 @@ pub enum Event {
     /// The socket is open; `again` when it was open before in this run.
     Connected { again: bool },
     /// Something in the status changed.
-    Status(Status),
+    Status(Box<Status>),
     /// A message of the receiver app, such as a playback report of the
     /// Jellyfin app, or one of a namespace this module does not know.
     Message { namespace: String, payload: Value },
@@ -188,7 +188,7 @@ enum Command {
     SetVolume(f64),
     SetMuted(bool),
     /// With the number of the load (see [`Event::Ended`]).
-    Load(LoadRequest, u64),
+    Load(Box<LoadRequest>, u64),
     Play,
     Pause,
     Seek(f64),
@@ -328,7 +328,7 @@ impl Session {
     /// gone from the device.
     pub fn load(&self, request: LoadRequest) -> u64 {
         let load = self.shared.loads.fetch_add(1, Ordering::AcqRel) + 1;
-        self.send(Command::Load(request, load));
+        self.send(Command::Load(Box::new(request), load));
         load
     }
 
@@ -714,7 +714,7 @@ impl Worker {
                 Ok(Input::Command(command)) => self.command(stream, command)?,
                 Ok(Input::Bytes { link, bytes }) if link == self.link => {
                     let open = stream.take(&bytes, &mut inbox)?;
-                    while let Some(message) = inbox.next()? {
+                    while let Some(message) = inbox.message()? {
                         last_heard = Instant::now();
                         self.receive(stream, message)?;
                     }
@@ -869,7 +869,7 @@ impl Worker {
     /// Copies the status for the app and tells it.
     fn publish(&self) {
         *self.shared.status.lock().unwrap() = self.status.clone();
-        self.emit(Event::Status(self.status.clone()));
+        self.emit(Event::Status(Box::new(self.status.clone())));
     }
 
     /// The load that waits for its app is given up; the app hears that
@@ -961,7 +961,7 @@ impl Worker {
             Command::SetMuted(muted) => {
                 self.request(stream, RECEIVER, NS_RECEIVER, messages::set_muted(muted), Waiting::Quiet)?;
             }
-            Command::Load(request, load) => self.load(stream, load, request)?,
+            Command::Load(request, load) => self.load(stream, load, *request)?,
             Command::Play => self.media_command(stream, jellyfin::unpause, messages::play)?,
             Command::Pause => self.media_command(stream, jellyfin::pause, messages::pause)?,
             Command::StopMedia => {

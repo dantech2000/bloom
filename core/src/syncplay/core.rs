@@ -824,12 +824,14 @@ impl Core {
                 self.stalled = true;
                 let in_step = matches!(self.phase, Phase::Playing { since } if now - since >= HOLD_OFF_MS);
                 let recent = self.buffering_sent.is_some_and(|at| now - at < BUFFERING_EVERY_MS);
-                if in_step && self.following && !recent {
-                    if let Some(report) = self.report(now, clock, view) {
-                        self.buffering_sent = Some(now);
-                        self.expect_ready();
-                        out.push(Action::Send(Request::Buffering(report)));
-                    }
+                if in_step
+                    && self.following
+                    && !recent
+                    && let Some(report) = self.report(now, clock, view)
+                {
+                    self.buffering_sent = Some(now);
+                    self.expect_ready();
+                    out.push(Action::Send(Request::Buffering(report)));
                 }
             }
             PlayerEvent::Recovered => {
@@ -930,9 +932,9 @@ impl Core {
     fn on_user(&mut self, intent: Intent, now: f64, view: &PlayerView, out: &mut Vec<Action>) {
         let send = |out: &mut Vec<Action>, request| out.push(Action::Send(request));
         match intent {
-            Intent::Create { name } => return send(out, Request::New { name }),
-            Intent::Join { group_id } => return send(out, Request::Join { group_id }),
-            _ if self.group.is_none() => return,
+            Intent::Create { name } => send(out, Request::New { name }),
+            Intent::Join { group_id } => send(out, Request::Join { group_id }),
+            _ if self.group.is_none() => (),
             Intent::Leave => send(out, Request::Leave),
             Intent::TogglePause => {
                 let intent = if self.group_plays() { Intent::Pause } else { Intent::Unpause };

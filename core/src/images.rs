@@ -1565,7 +1565,7 @@ mod tests {
             .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
             .unwrap();
         assert!(bytes.len() < 1_000_000, "the test file is small next to its 48 MB of pixels: {}", bytes.len());
-        let err = decode(Format::Png, &bytes).err().expect("the picture was decoded");
+        let err = decode(Format::Png, &bytes).expect_err("the picture was decoded");
         assert!(format!("{err:#}").contains("too large"), "{err:#}");
         assert!(!looks_like_image(&bytes), "a picture that is not decoded is not kept");
     }

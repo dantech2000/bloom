@@ -31,3 +31,6 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # The version GPUI already builds; draws SVG images to pixels.
 resvg = "0.46"
 jiff = "0.2"
+
+[lints]
+workspace = true

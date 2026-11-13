@@ -634,7 +634,7 @@ pub fn render(editor: &Editor, cx: &mut Context<Bloom>) -> Div {
         cx,
     ));
     if kind == Kind::Weekly {
-        let days = DAYS.iter().enumerate().map(|(at, name)| (json!(at), SharedString::new_static(*name))).collect();
+        let days = DAYS.iter().enumerate().map(|(at, name)| (json!(at), SharedString::new_static(name))).collect();
         form = form.child(field(
             "Day",
             "",
@@ -792,7 +792,7 @@ mod race_tests {
             this.screen = Screen::Main;
             let mut admin = AdminData::new(Section::Tasks);
             admin.loading = false;
-            this.nav.page = Page::Admin(admin);
+            this.nav.page = Page::Admin(Box::new(admin));
             this.triggers_open("t1", "Scan", "", cx);
         });
         cx.run_until_parked();

@@ -143,7 +143,8 @@ fn readable(reference: DNSServiceRef, wait: Duration) -> bool {
 pub struct Browser {
     reference: DNSServiceRef,
     /// What the callback saw since the last `wait`. In a box: the system
-    /// keeps its address.
+    /// keeps its address, and a `Browser` that moves must not move it.
+    #[allow(clippy::box_collection)]
     seen: Box<Vec<Change>>,
 }
 

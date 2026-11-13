@@ -1,2 +1,5 @@
 [toolchain]
 channel = "1.97.1"
+# clippy: `cargo clippy --release --workspace` is a CI gate (dev/lint).
+# No rustfmt: the code is not formatted by it; do not run `cargo fmt`.
+components = ["clippy"]

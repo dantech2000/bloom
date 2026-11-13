@@ -43,7 +43,7 @@ jobs:
       - name: Toolchain
         run: |
           channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
-          rustup toolchain install "$channel" --profile minimal --no-self-update
+          rustup toolchain install "$channel" --profile minimal --component clippy --no-self-update
           cargo --version
           rustc --version
           xcodebuild -version
@@ -86,6 +86,10 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
+      - name: Clippy
+        # Every warning fails the run; the allowed lints are in Cargo.toml.
+        run: dev/lint
+
       - name: Icon
         # The release needs `actool` to compile the Icon Composer document;
         # a push finds out here and not on release day.
@@ -110,8 +114,6 @@ jobs:
         # lights/ is a program of its own. Its tests speak to a lamp that is
         # a socket of the test, on this runner only.
         run: cargo test --release --locked -p bloom-lights
-
-      # Not clippy: the pinned toolchain has no clippy component.
 
       - name: Make the cache small
         if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'

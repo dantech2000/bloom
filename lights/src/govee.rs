@@ -309,7 +309,7 @@ mod tests {
         // A frame of two colours: BB 00 08 B0 00 02, the colours, the check byte.
         assert_eq!(told[4]["data"]["pt"], json!("uwAIsAAC/wAAAAD/AQ=="));
         // More colours than a frame takes are cut to 14: 6 + 42 + 1 bytes.
-        assert_eq!(told[5]["data"]["pt"].as_str().unwrap().len(), (6 + 3 * 14 + 1 + 2) / 3 * 4);
+        assert_eq!(told[5]["data"]["pt"].as_str().unwrap().len(), (6 + 3 * 14 + 1_usize).div_ceil(3) * 4);
         // An address with no port is the port of the commands.
         assert!(govee.open(&Found { address: "10.0.0.9".into(), ..found[0].clone() }).is_some());
         assert!(govee.open(&Found { address: "lamp.local".into(), ..found[0].clone() }).is_none());

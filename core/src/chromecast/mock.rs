@@ -190,7 +190,7 @@ fn serve(stream: TcpStream, config: Arc<rustls::ServerConfig>, seen: Arc<Mutex<V
             Err(err) if matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
             Err(_) => return,
         }
-        while let Ok(Some(message)) = inbox.next() {
+        while let Ok(Some(message)) = inbox.message() {
             seen.lock().unwrap().push(message.clone());
             {
                 let mut state = state.lock().unwrap();
