@@ -345,17 +345,16 @@ fn a_saved_window_place_does_not_wait_to_be_saved_again(cx: &mut TestAppContext)
 /// and Back, start with no card hovered.
 #[gpui_kit::test]
 fn no_card_stays_hovered_over_a_change_of_the_page(cx: &mut TestAppContext) {
-    use crate::views::cards::HoveredCard;
     let (bloom, cx) = app(cx);
-    let hovered = |cx: &mut gpui_kit::VisualTestContext| cx.update(|_, cx| cx.try_global::<HoveredCard>().and_then(|h| h.0.clone()));
+    let hovered = |cx: &mut gpui_kit::VisualTestContext| bloom.read_with(cx, |this, _| this.nav.hovered_card.clone());
     bloom.update(cx, |this, cx| {
         this.screen = Screen::Main;
-        cx.set_global(HoveredCard(Some("poster.m1".into())));
+        this.nav.hovered_card = Some("poster.m1".into());
         this.navigate(Page::Downloads, cx);
     });
     assert_eq!(hovered(cx), None, "the card of the page before is still hovered");
     bloom.update(cx, |this, cx| {
-        cx.set_global(HoveredCard(Some("poster.m2".into())));
+        this.nav.hovered_card = Some("poster.m2".into());
         this.back(cx);
     });
     assert_eq!(hovered(cx), None, "Back kept the hovered card");

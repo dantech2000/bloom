@@ -213,7 +213,7 @@ impl Bloom {
                 "Next Up",
                 l.content_left,
                 l.side,
-                vec![episode_card(next, &client, w, cx)],
+                vec![episode_card(next, &client, w, self.nav.hovered_card.as_ref(), cx)],
                 cx,
             ));
         }
@@ -222,7 +222,7 @@ impl Bloom {
             let cards = data
                 .seasons
                 .iter()
-                .map(|season| poster_card(season, &client, w, cx))
+                .map(|season| poster_card(season, &client, w, self.nav.hovered_card.as_ref(), cx))
                 .collect();
             rows.push(plain_section(
                 "Seasons",
@@ -239,7 +239,7 @@ impl Bloom {
             let cards = Cards::new(w, data.episodes.len(), |i, cx| {
                 let episode = &data.episodes[i];
                 // A ring on the image marks the episode of the page.
-                episode_card(episode, &client, w, cx).when(episode.id == current, |el| {
+                episode_card(episode, &client, w, self.nav.hovered_card.as_ref(), cx).when(episode.id == current, |el| {
                     el.relative().child(
                         div()
                             .absolute()
@@ -301,7 +301,7 @@ impl Bloom {
         if !data.similar.is_empty() {
             let w = self.metrics().portrait_w;
             let cards = Cards::new(w, data.similar.len(), |i, cx| {
-                poster_card(&data.similar[i], &client, w, cx)
+                poster_card(&data.similar[i], &client, w, self.nav.hovered_card.as_ref(), cx)
             });
             rows.push(section_padded(
                 self,

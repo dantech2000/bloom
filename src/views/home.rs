@@ -210,7 +210,7 @@ impl Bloom {
                 Some(library.clone()),
                 row_h,
                 Cards::new(m.portrait_w, items.len(), |i, cx| {
-                    poster_card(&items[i], client, m.portrait_w, cx)
+                    poster_card(&items[i], client, m.portrait_w, self.nav.hovered_card.as_ref(), cx)
                 }),
                 cx,
             ),
@@ -232,7 +232,7 @@ impl Bloom {
                 None,
                 row_h,
                 Cards::new(m.backdrop_w, data.resume.len(), |i, cx| {
-                    wide_card(&data.resume[i], client, m.backdrop_w, CardRow::Resume, cx)
+                    wide_card(&data.resume[i], client, m.backdrop_w, CardRow::Resume, self.nav.hovered_card.as_ref(), cx)
                 }),
                 cx,
             ),
@@ -243,7 +243,7 @@ impl Bloom {
                 None,
                 row_h,
                 Cards::new(m.backdrop_w, data.next_up.len(), |i, cx| {
-                    wide_card(&data.next_up[i], client, m.backdrop_w, CardRow::NextUp, cx)
+                    wide_card(&data.next_up[i], client, m.backdrop_w, CardRow::NextUp, self.nav.hovered_card.as_ref(), cx)
                 }),
                 cx,
             ),

@@ -255,6 +255,11 @@ pub struct Navigation {
     pub(crate) generation: u64,
     /// Scroll positions of the horizontal rows, by row id.
     pub(crate) rows: RefCell<HashMap<SharedString, ScrollHandle>>,
+    /// The glide of each row its arrows started (`cards::page_row`).
+    pub(crate) glides: crate::views::cards::RowGlides,
+    /// Key of the card under the pointer (`cards::card`); a change of the
+    /// page clears it (`leave_page`).
+    pub(crate) hovered_card: Option<SharedString>,
 }
 
 impl Navigation {
@@ -709,6 +714,8 @@ impl Bloom {
                 scroll: ScrollHandle::new(),
                 generation: 0,
                 rows: RefCell::new(HashMap::new()),
+                glides: Default::default(),
+                hovered_card: None,
             },
             search: TitleSearch {
                 input: search_input,
@@ -1255,7 +1262,7 @@ impl Bloom {
 
     pub fn navigate(&mut self, page: Page, cx: &mut Context<Self>) {
         self.forget_admin_dialogs();
-        self.leave_page(cx);
+        self.leave_page();
         // The rows of a detail page have one name on every detail page:
         // the next one starts at the left, not where the last one was.
         self.nav.rows.borrow_mut().retain(|id, _| !id.starts_with("detail."));
@@ -1277,8 +1284,8 @@ impl Bloom {
     /// What goes with the page that leaves: the card under the pointer is
     /// a card of that page, and the pointer may never leave it (the page
     /// changed under it), so its hover layer would show on the way back.
-    fn leave_page(&mut self, cx: &mut Context<Self>) {
-        cx.set_global(crate::views::cards::HoveredCard(None));
+    fn leave_page(&mut self) {
+        self.nav.hovered_card = None;
     }
 
     pub fn back(&mut self, cx: &mut Context<Self>) {
@@ -1307,7 +1314,7 @@ impl Bloom {
         cx: &mut Context<Self>,
     ) -> (Page, gpui_kit::Point<gpui_kit::Pixels>) {
         self.forget_admin_dialogs();
-        self.leave_page(cx);
+        self.leave_page();
         let left_offset = self.nav.scroll.offset();
         self.nav.scroll.set_offset(offset);
         let left = std::mem::replace(&mut self.nav.page, page);

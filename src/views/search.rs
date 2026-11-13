@@ -69,7 +69,7 @@ impl Bloom {
                     continue;
                 }
                 let cards = Cards::new(m.portrait_w, items.len(), |i, cx| {
-                    poster_card(items[i], &client, m.portrait_w, cx)
+                    poster_card(items[i], &client, m.portrait_w, self.nav.hovered_card.as_ref(), cx)
                 });
                 rows.push(section(
                     self,
@@ -83,7 +83,7 @@ impl Bloom {
             }
             if !episodes.is_empty() {
                 let cards = Cards::new(m.backdrop_w, episodes.len(), |i, cx| {
-                    wide_card(episodes[i], &client, m.backdrop_w, CardRow::None, cx)
+                    wide_card(episodes[i], &client, m.backdrop_w, CardRow::None, self.nav.hovered_card.as_ref(), cx)
                 });
                 rows.push(section(
                     self,

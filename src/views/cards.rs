@@ -22,11 +22,6 @@ use crate::{
 };
 use crate::ui::tip::tip;
 
-/// Id of the card under the pointer.
-pub struct HoveredCard(pub Option<SharedString>);
-
-impl gpui_kit::Global for HoveredCard {}
-
 /// Corner radius of card images.
 pub const CARD_RADIUS: f32 = 12.;
 /// Space between two card images in a row or grid on the Mac; a phone has
@@ -388,6 +383,7 @@ fn card(
     subtitle: Option<String>,
     placeholder: LucideIcon,
     row: CardRow,
+    hovered: Option<&SharedString>,
     cx: &mut Context<Bloom>,
 ) -> Stateful<Div> {
     crate::perf::count_card();
@@ -401,9 +397,7 @@ fn card(
         CardRow::NextUp => "nextup.",
     };
     let key = SharedString::from(format!("{prefix}.{row_tag}{}", item.id));
-    let hovered = cx
-        .try_global::<HoveredCard>()
-        .is_some_and(|h| h.0.as_ref() == Some(&key));
+    let hovered = hovered == Some(&key);
     // One copy of the item for all the listeners of the card: a card is
     // built again at each frame, and an item is forty fields.
     let item = &Rc::new(item.clone());
@@ -444,12 +438,11 @@ fn card(
         // For assistive tech and the tests that tap by label.
         .role(gpui_kit::Role::Button)
         .aria_label(title.clone())
-        .on_hover(cx.listener(move |_, inside: &bool, _, cx| {
-            let current = cx.try_global::<HoveredCard>().and_then(|h| h.0.clone());
+        .on_hover(cx.listener(move |this, inside: &bool, _, cx| {
             if *inside {
-                cx.set_global(HoveredCard(Some(key.clone())));
-            } else if current.as_ref() == Some(&key) {
-                cx.set_global(HoveredCard(None));
+                this.nav.hovered_card = Some(key.clone());
+            } else if this.nav.hovered_card.as_ref() == Some(&key) {
+                this.nav.hovered_card = None;
             }
             cx.notify();
         }))
@@ -476,6 +469,7 @@ pub fn poster_card(
     item: &Item,
     client: &Client,
     w: f32,
+    hovered: Option<&SharedString>,
     cx: &mut Context<Bloom>,
 ) -> Stateful<Div> {
     let h = (w * 1.5).round();
@@ -505,6 +499,7 @@ pub fn poster_card(
         subtitle,
         placeholder,
         CardRow::None,
+        hovered,
         cx,
     );
     if !crate::jellyfin::quality_tags() {
@@ -538,6 +533,7 @@ pub fn wide_card(
     client: &Client,
     w: f32,
     row: CardRow,
+    hovered: Option<&SharedString>,
     cx: &mut Context<Bloom>,
 ) -> Stateful<Div> {
     let h = (w * 9. / 16.).round();
@@ -556,6 +552,7 @@ pub fn wide_card(
         subtitle,
         LucideIcon::Tv,
         row,
+        hovered,
         cx,
     )
 }
@@ -565,6 +562,7 @@ pub fn episode_card(
     item: &Item,
     client: &Client,
     w: f32,
+    hovered: Option<&SharedString>,
     cx: &mut Context<Bloom>,
 ) -> Stateful<Div> {
     let h = (w * 9. / 16.).round();
@@ -580,6 +578,7 @@ pub fn episode_card(
         None,
         LucideIcon::Tv,
         CardRow::None,
+        hovered,
         cx,
     )
 }
@@ -630,9 +629,7 @@ fn episode_line(item: &Item) -> String {
 /// while the row still glides starts a second glide; without an owner the
 /// two wrote their own offsets to the row in turn, and the row shook.
 #[derive(Default)]
-struct RowGlides(HashMap<SharedString, u64>);
-
-impl gpui_kit::Global for RowGlides {}
+pub(crate) struct RowGlides(HashMap<SharedString, u64>);
 
 /// Steps of a glide, and the time between two.
 const GLIDE_STEP: Duration = Duration::from_millis(8);
@@ -664,11 +661,12 @@ impl RowGlides {
 /// glides there in about a quarter of a second, or jumps under Reduce
 /// Motion.
 fn page_row(
+    this: &mut Bloom,
     row: &SharedString,
     handle: &ScrollHandle,
     direction: f32,
     window: &mut Window,
-    cx: &mut App,
+    cx: &mut Context<Bloom>,
 ) {
     let view = handle.bounds().size.width;
     let max = handle.max_offset().x;
@@ -677,7 +675,7 @@ fn page_row(
     if to == from {
         return;
     }
-    let number = cx.default_global::<RowGlides>().start(row);
+    let number = this.nav.glides.start(row);
     if UiTheme::read(cx).motion.reduced || cx.reduce_motion() {
         let mut offset = handle.offset();
         offset.x = to;
@@ -687,13 +685,11 @@ fn page_row(
     }
     let (row, handle) = (row.clone(), handle.clone());
     let (from, to) = (f32::from(from), f32::from(to));
-    window
-        .spawn(cx, async move |cx| {
+    cx.spawn_in(window, async move |bloom, cx| {
             for step in 1..=GLIDE_STEPS {
                 cx.background_executor().timer(GLIDE_STEP).await;
-                let moved = cx.update(|window, cx| {
-                    let Some(x) = cx.default_global::<RowGlides>().offset(&row, number, from, to, step)
-                    else {
+                let moved = bloom.update_in(cx, |this, window, _| {
+                    let Some(x) = this.nav.glides.offset(&row, number, from, to, step) else {
                         return false;
                     };
                     let mut offset = handle.offset();
@@ -826,7 +822,9 @@ pub fn section_padded(
             .hover(|s| s.bg(rgba(0x00000066)))
             .child(icon(glyph, 22., fg))
             .tooltip(tip(if direction < 0. { "Previous" } else { "Next" }))
-            .on_click(move |_, window, cx| page_row(&row, &handle, direction, window, cx))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                page_row(this, &row, &handle, direction, window, cx)
+            }))
     };
 
     // A phone pans the row with a finger: no arrows there, and the heading
@@ -919,7 +917,7 @@ pub fn grid(
         .children(
             visible
                 .iter()
-                .map(|item| poster_card(item, client, m.grid_w, cx).mb(px(ROW_GAP))),
+                .map(|item| poster_card(item, client, m.grid_w, this.nav.hovered_card.as_ref(), cx).mb(px(ROW_GAP))),
         )
         .child(div().w_full().h(px((rows - last) as f32 * stride)))
 }

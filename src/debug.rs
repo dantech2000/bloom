@@ -308,9 +308,9 @@ impl Bloom {
             "hero" => self.step_hero(rest != "previous"),
             // Shows the hover layer of a card without the pointer, as
             // `poster.<item id>`; no argument clears it.
-            "hover-card" => cx.set_global(crate::views::cards::HoveredCard(
-                (!rest.is_empty()).then(|| SharedString::from(rest.to_string())),
-            )),
+            "hover-card" => {
+                self.nav.hovered_card = (!rest.is_empty()).then(|| SharedString::from(rest.to_string()))
+            }
             // Player test hooks: play the item of the open detail page, muted.
             "play" => {
                 self.playback.muted = true;
