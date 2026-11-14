@@ -1,5 +1,6 @@
-# Builds and tests every push to main and every pull request. It never
-# publishes anything and never reads a secret. See docs/RELEASING.md.
+# Builds and tests every pull request, and every push to main that a pull
+# request has not already tested (the job `tested`). It never publishes
+# anything and never reads a secret. See docs/RELEASING.md.
 name: CI
 
 on:
@@ -29,8 +30,57 @@ env:
   MPV_CACHE_DIR: ${{ github.workspace }}/vendor/mpv/build
 
 jobs:
+  # A push to main whose files a pull request already tested is not built
+  # again. Branch protection makes a pull request test main as it is now
+  # (it must be up to date to merge), so the merge commit has the files of
+  # the branch, and the run of the branch is the test of main. The run
+  # still passes, so the release finds a passed run on its commit.
+  #
+  # Not skipped: a push of new files (a direct push, a branch that was not
+  # up to date), and a push that changes what the caches are made of. Only
+  # a run on main saves a cache, and a release builds from those.
+  tested:
+    name: Already tested
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      skip: ${{ steps.find.outputs.skip }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Find a passed pull request with the same files
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tree=$(git rev-parse 'HEAD^{tree}')
+          if ! git rev-parse -q --verify HEAD^1 >/dev/null \
+            || ! git diff --quiet HEAD^1 HEAD -- Cargo.lock rust-toolchain.toml dev/build-mpv vendor/mpv/patches; then
+            echo "What the caches are made of changed: a full run, which saves new caches."
+            echo skip=false >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          for sha in $(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?event=pull_request&status=success&per_page=30" --jq '.workflow_runs[].head_sha'); do
+            if [ "$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha" --jq .commit.tree.sha 2>/dev/null)" = "$tree" ]; then
+              echo "::notice::A pull request passed on these files ($sha). This run builds nothing."
+              echo skip=true >> "$GITHUB_OUTPUT"; exit 0
+            fi
+          done
+          echo "No pull request passed on these files: a full run."
+          echo skip=false >> "$GITHUB_OUTPUT"
+
   build-test:
     name: Build and test
+    needs: tested
+    # `tested` is skipped outside a push; a job after a skipped one runs
+    # only with a condition that says so.
+    if: ${{ !cancelled() && needs.tested.outputs.skip != 'true' }}
     runs-on: macos-26 # Apple Silicon, Xcode 26.6; not macos-latest, so a new image never changes the build unasked
     timeout-minutes: 60
     permissions:
@@ -150,6 +200,8 @@ jobs:
   # `dev/ios`.
   ios-build:
     name: Build for iOS
+    needs: tested
+    if: ${{ !cancelled() && needs.tested.outputs.skip != 'true' }}
     runs-on: macos-26
     timeout-minutes: 45
     permissions:

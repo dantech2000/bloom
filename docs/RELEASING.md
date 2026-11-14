@@ -5,7 +5,9 @@ Mac. This page tells you what to do. Every step is one action.
 
 What the workflows do:
 
-- `ci.yml` builds and tests every push to `main` and every pull request.
+- `ci.yml` builds and tests every pull request, and every push to `main`
+  that a pull request has not already tested (a merge of a branch that was
+  up to date has the same files, so its run passes without a build).
 - `release.yml` makes a release. It starts only when you start it by hand.
   A tag push does not start it.
 - `release.yml` makes a DRAFT release unless you turn on `publish`. No
@@ -158,7 +160,12 @@ branch other than `main` uses a throwaway key and cannot publish.
 
 ## What CI proves, and what it does not
 
-Each push to `main` and each pull request runs `.github/workflows/ci.yml`.
+Each pull request runs `.github/workflows/ci.yml`. Branch protection on
+`main` requires `Build and test` and `Build for iOS` to pass, on a branch
+that is up to date with `main`. A push to `main` with the files of such a
+pull request passes at once (the job `Already tested`); any other push to
+`main`, and one that changes `Cargo.lock`, the toolchain or the libmpv
+build, runs the whole workflow.
 
 - The job `Build and test` is the gate. It builds libmpv with
   `dev/build-mpv`, builds the app, compiles the icon, makes the bundle,
