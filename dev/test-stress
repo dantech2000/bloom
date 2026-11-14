@@ -1,0 +1,68 @@
+#!/bin/sh
+# Runs tests the way a slow CI runner does. A shared runner is a virtual
+# machine: now and then the whole process stops for a moment, every thread
+# at once. Busy cores alone do not show that on a Mac with many cores
+# (2026-11-13: three loaded runs passed the test CI failed). So this script
+# also freezes the test process (SIGSTOP, then SIGCONT) for FREEZE_MS
+# (default 600) every FREEZE_EVERY_MS (default 2000), besides keeping every
+# core busy. The tests with the real player are skipped (BLOOM_CI_NO_PLAYER,
+# as in CI) and the time of the tests is scaled (BLOOM_TEST_TIME_SCALE, 4 as
+# on a runner). A test that passes on a quiet Mac and fails here leans on a
+# timing margin; see "Timing in tests" in CLAUDE.md.
+#
+#   dev/test-stress [-n runs] [cargo test arguments]
+#       dev/test-stress                      every crate, once
+#       dev/test-stress -n 5 -p bloom-core   the core, five times
+#       dev/test-stress -p bloom --lib -- chromecast
+cd "$(dirname "$0")/.." || exit 1
+runs=1
+if [ "$1" = -n ]; then runs=$2; shift 2; fi
+[ $# -gt 0 ] || set -- --workspace --exclude bloom-ios
+cores=$(sysctl -n hw.ncpu 2>/dev/null || nproc)
+# Build first, with no load, so the load falls on the tests alone.
+cargo test --release --no-run "$@" >/dev/null 2>&1 || { echo "dev/test-stress: the build failed" >&2; exit 1; }
+hogs=
+stop() {
+  [ -z "$hogs" ] || kill $hogs 2>/dev/null
+  # A test binary must not stay stopped after the script.
+  pkill -CONT -f "^$(pwd)/target/release/deps/" 2>/dev/null
+}
+trap stop EXIT INT TERM
+i=0
+while [ $i -lt "$cores" ]; do
+  sh -c 'while :; do :; done' &
+  hogs="$hogs $!"
+  i=$((i + 1))
+done
+# The freezer: stops and starts every test binary of this checkout.
+freeze_ms=${FREEZE_MS:-600}
+every_ms=${FREEZE_EVERY_MS:-2000}
+deps="$(pwd)/target/release/deps/"
+(
+  while :; do
+    sleep "$(echo "$every_ms / 1000" | bc -l)"
+    pids=$(pgrep -f "^$deps" 2>/dev/null)
+    [ -n "$pids" ] || continue
+    kill -STOP $pids 2>/dev/null
+    sleep "$(echo "$freeze_ms / 1000" | bc -l)"
+    kill -CONT $pids 2>/dev/null
+  done
+) &
+hogs="$hogs $!"
+export BLOOM_CI_NO_PLAYER=1 BLOOM_TEST_TIME_SCALE=${BLOOM_TEST_TIME_SCALE:-4}
+failed=0
+run=1
+while [ $run -le "$runs" ]; do
+  echo "== run $run of $runs ($cores cores busy, frozen ${freeze_ms} ms every ${every_ms} ms, time scale $BLOOM_TEST_TIME_SCALE)"
+  log=$(mktemp)
+  if cargo test --release "$@" >"$log" 2>&1; then
+    grep '^test result' "$log" | sed 's/^/   /'
+  else
+    failed=$((failed + 1))
+    grep -E '\.\.\. FAILED$|panicked at|^test result' "$log" | sed 's/^/   /'
+  fi
+  rm -f "$log"
+  run=$((run + 1))
+done
+[ $failed -eq 0 ] || { echo "dev/test-stress: $failed of $runs runs failed" >&2; exit 1; }
+echo "dev/test-stress: $runs runs passed"

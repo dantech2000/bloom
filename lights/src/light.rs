@@ -503,6 +503,16 @@ mod tests {
 
     const NO_GAP: Duration = Duration::ZERO;
 
+    /// Waits until no fade of the light has a command left to send. A wait
+    /// for a condition, not a sleep: a slow runner pauses the process.
+    fn settled(light: &Light) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while light.busy() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!light.busy(), "a fade still has a command to send");
+    }
+
     /// Down in two commands with the level half-way for the eye between
     /// them, up in one.
     #[test]
@@ -526,7 +536,7 @@ mod tests {
         light.act(Action::Fade { to: 5., kelvin: None }, Duration::from_millis(120), 0.05);
         // The first command is there at once, the second after the gap.
         assert_eq!(lamp.told(), [Told::Asked, Told::Level(31)]);
-        thread::sleep(Duration::from_millis(400));
+        settled(&light);
         assert_eq!(lamp.levels(), [31, 5], "not the half-way level and the target");
         // The colour of a film, the lamp's own colour, the white of a pause.
         light.act(Action::Colour([0, 80, 255]), NO_GAP, 0.05);
@@ -534,19 +544,23 @@ mod tests {
         light.act(Action::Fade { to: 25., kelvin: Some(2700) }, NO_GAP, 0.05);
         assert_eq!(lamp.told()[3..], [Told::Colour([0, 80, 255]), Told::Colour([255, 200, 100]), Told::White(2700), Told::Level(25)]);
         // A slow fade down, and the end of the film in its gap: the second
-        // command of that fade never comes.
-        light.act(Action::Fade { to: 5., kelvin: None }, Duration::from_millis(400), 0.05);
+        // command of that fade never comes. The gap is long, so a test
+        // process paused for a moment still sends the restore inside it.
+        light.act(Action::Fade { to: 5., kelvin: None }, Duration::from_secs(2), 0.05);
         thread::sleep(Duration::from_millis(100));
         light.act(Action::Restore, Duration::from_millis(120), 0.05);
-        thread::sleep(Duration::from_millis(900));
-        assert_eq!(lamp.levels(), [31, 5, 25, 13, 80], "the old fade ran on, or the light is not back");
-        assert_eq!(lamp.told().iter().rev().find(|told| matches!(told, Told::Colour(_))), Some(&Told::Colour([255, 200, 100])));
         // The next film starts while the lamp still glides back: the lamp
         // is not asked again (it would answer with a level on the way).
+        // Right after the restore, so a pause cannot carry the test past
+        // the RESTORE_TIME.
         let asked = |lamp: &Mock| lamp.told().iter().filter(|told| **told == Told::Asked).count();
         light.act(Action::Remember, NO_GAP, 0.05);
         assert_eq!(asked(&lamp), 1, "the lamp was asked in the middle of its restore");
         assert_eq!(light.before.lock().unwrap().as_ref().map(|before| before.level), Some(80.));
+        // The cut fade's thread wakes after its gap and sends nothing.
+        settled(&light);
+        assert_eq!(lamp.levels(), [31, 5, 25, 13, 80], "the old fade ran on, or the light is not back");
+        assert_eq!(lamp.told().iter().rev().find(|told| matches!(told, Told::Colour(_))), Some(&Told::Colour([255, 200, 100])));
         // Later it is asked again: a person can have changed the lamp.
         light.act(Action::Restore, NO_GAP, 0.05);
         thread::sleep(RESTORE_TIME + Duration::from_millis(100));

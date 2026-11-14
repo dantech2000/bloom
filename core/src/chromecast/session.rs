@@ -202,6 +202,16 @@ enum Command {
     /// Any message, to the app when one is connected, else to the device.
     Raw { namespace: String, payload: Value, reply: Option<Reply> },
     Close,
+    /// Holds the loop for a while, as a busy machine does (tests only).
+    #[cfg(test)]
+    Stall(Duration),
+}
+
+/// Whether the loop of a socket goes on after an input.
+#[derive(PartialEq, Eq)]
+enum Flow {
+    Open,
+    Closed,
 }
 
 impl Command {
@@ -698,7 +708,17 @@ impl Worker {
                 last_ping = Instant::now();
             }
             if last_heard.elapsed() >= self.timing.silence {
-                return Err(anyhow!("no word of the device for {:?}", self.timing.silence));
+                // The loop itself may have been held up (a busy machine)
+                // while the device answered: what waits in the queue is
+                // taken before the device counts as silent.
+                while let Ok(input) = self.inputs.try_recv() {
+                    if self.take_input(stream, &mut inbox, &mut last_heard, input)? == Flow::Closed {
+                        return Ok(());
+                    }
+                }
+                if last_heard.elapsed() >= self.timing.silence {
+                    return Err(anyhow!("no word of the device for {:?}", self.timing.silence));
+                }
             }
             self.expire(stream)?;
             self.replay_step(stream)?;
@@ -706,28 +726,42 @@ impl Worker {
             // next thing that is due.
             let wait = self.next_due(last_ping, last_heard).saturating_duration_since(Instant::now());
             match self.inputs.recv_timeout(wait) {
-                // A close does not wait behind the held commands: they
-                // were for a target the user has left.
-                Ok(Input::Command(Command::Close)) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-                // Behind the ones that wait, so the order holds.
-                Ok(Input::Command(command)) if self.replay != Replay::Done => self.hold(command),
-                Ok(Input::Command(command)) => self.command(stream, command)?,
-                Ok(Input::Bytes { link, bytes }) if link == self.link => {
-                    let open = stream.take(&bytes, &mut inbox)?;
-                    while let Some(message) = inbox.message()? {
-                        last_heard = Instant::now();
-                        self.receive(stream, message)?;
-                    }
-                    if !open {
-                        return Err(anyhow!("the device closed the connection"));
+                Ok(input) => {
+                    if self.take_input(stream, &mut inbox, &mut last_heard, input)? == Flow::Closed {
+                        return Ok(());
                     }
                 }
-                Ok(Input::Lost { link, why }) if link == self.link => return Err(anyhow!(why)),
-                // Of a socket before this one.
-                Ok(Input::Bytes { .. } | Input::Lost { .. }) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
         }
+    }
+
+    /// One input of the loop: a command of the app, or bytes or the loss
+    /// of the socket.
+    fn take_input(&mut self, stream: &mut Stream, inbox: &mut Inbox, last_heard: &mut Instant, input: Input) -> Result<Flow> {
+        match input {
+            // A close does not wait behind the held commands: they were
+            // for a target the user has left.
+            Input::Command(Command::Close) => return Ok(Flow::Closed),
+            // Behind the ones that wait, so the order holds.
+            Input::Command(command) if self.replay != Replay::Done => self.hold(command),
+            Input::Command(command) => self.command(stream, command)?,
+            Input::Bytes { link, bytes } if link == self.link => {
+                let open = stream.take(&bytes, inbox)?;
+                while let Some(message) = inbox.message()? {
+                    *last_heard = Instant::now();
+                    self.receive(stream, message)?;
+                }
+                if !open {
+                    return Err(anyhow!("the device closed the connection"));
+                }
+            }
+            Input::Lost { link, why } if link == self.link => return Err(anyhow!(why)),
+            // Of a socket before this one.
+            Input::Bytes { .. } | Input::Lost { .. } => {}
+        }
+        Ok(Flow::Open)
     }
 
     /// When the loop has work with no input: the next ping, the silence
@@ -931,6 +965,8 @@ impl Worker {
 
     fn command(&mut self, stream: &mut Stream, command: Command) -> Result<()> {
         match command {
+            #[cfg(test)]
+            Command::Stall(time) => thread::sleep(time),
             Command::GetStatus(reply) => {
                 let waiting = reply.map_or(Waiting::Quiet, Waiting::Reply);
                 self.request(stream, RECEIVER, NS_RECEIVER, messages::get_status(), waiting)?;
@@ -1506,15 +1542,13 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::chromecast::mock::Mock;
+    use crate::{
+        chromecast::mock::Mock,
+        test_time::{ms, secs},
+    };
 
     fn timing() -> Timing {
-        Timing {
-            ping: Duration::from_millis(200),
-            silence: Duration::from_secs(3),
-            answer: Duration::from_secs(2),
-            launch: Duration::from_secs(2),
-        }
+        Timing { ping: ms(200), silence: secs(3.), answer: secs(2.), launch: secs(2.) }
     }
 
     /// Takes the events that came, and waits until the status is as the
@@ -1524,10 +1558,12 @@ mod tests {
         events: &async_channel::Receiver<Event>,
         log: &mut Vec<Event>,
         what: &str,
-        secs: f64,
+        seconds: f64,
         mut done: impl FnMut(&Status) -> bool,
     ) -> Status {
-        let deadline = Instant::now() + Duration::from_secs_f64(secs);
+        // A deadline only costs time when the test fails: scaled, so a
+        // slow runner has room (crate::test_time).
+        let deadline = Instant::now() + secs(seconds);
         loop {
             while let Ok(event) = events.try_recv() {
                 log.push(event);
@@ -1588,8 +1624,8 @@ mod tests {
         // Two answers find their requests by id, whichever order they come.
         let availability = session.app_availability(vec![jellyfin::APP_STABLE.into(), "DEADBEEF".into()]);
         let status = session.get_status();
-        let status = status.recv_timeout(Duration::from_secs(2)).unwrap();
-        let availability = availability.recv_timeout(Duration::from_secs(2)).unwrap();
+        let status = status.recv_timeout(secs(2.)).unwrap();
+        let availability = availability.recv_timeout(secs(2.)).unwrap();
         assert_eq!(status["type"], "RECEIVER_STATUS");
         assert_eq!(availability["responseType"], "GET_APP_AVAILABILITY");
         assert_eq!(availability["availability"]["F007D354"], "APP_AVAILABLE");
@@ -1705,7 +1741,7 @@ mod tests {
 
         // Seeks coalesce: the second waits for the first, the third takes
         // the place of the second.
-        mock.set(|m| m.seek_delay = Duration::from_millis(400));
+        mock.set(|m| m.seek_delay = ms(400));
         session.seek(10.);
         thread::sleep(Duration::from_millis(60));
         session.seek(20.);
@@ -1714,7 +1750,7 @@ mod tests {
         let status = until(&session, &events, &mut log, "seeks", 5., |s| {
             mock.payloads(NS_MEDIA).iter().filter(|p| p.1["type"] == "SEEK").count() == 2 && s.position == 30.
         });
-        thread::sleep(Duration::from_millis(600));
+        thread::sleep(ms(600));
         let seeks: Vec<Value> = mock.payloads(NS_MEDIA).into_iter().filter(|p| p.1["type"] == "SEEK").map(|p| p.1["currentTime"].clone()).collect();
         assert_eq!(seeks, vec![json!(10.0), json!(30.0)]);
         assert_eq!(status.player_state, Some(PlayerState::Playing));
@@ -1731,8 +1767,36 @@ mod tests {
         // The whole run went over one connection.
         assert_eq!(mock.state.lock().unwrap().connections, 1);
         drop(session);
-        thread::sleep(Duration::from_millis(100));
+        let deadline = Instant::now() + secs(2.);
+        while mock.seen().last().is_none_or(|m| m.1 != "CLOSE") && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(mock.seen().last().unwrap().1, "CLOSE");
+    }
+
+    /// A loop held up for longer than the silence (a busy machine) while
+    /// the device answered: the answer waits in the queue, and the loop
+    /// takes it before it calls the device silent. Before 2026-11-13 the
+    /// loop judged the silence first and opened a second connection.
+    #[test]
+    fn a_held_up_loop_takes_the_answer_that_waits_before_it_calls_the_device_silent() {
+        let mock = Mock::start();
+        let timing = Timing { ping: ms(100), silence: ms(1000), answer: secs(5.), launch: secs(5.) };
+        let (session, events) = Session::connect_with(mock.device(), timing);
+        let mut log = Vec::new();
+        until(&session, &events, &mut log, "connect", 5., |s| s.connected);
+        // A status asked for, then the loop held for twice the silence; the
+        // device answers at once, so the answer waits through the hold.
+        let answer = session.get_status();
+        session.send(Command::Stall(timing.silence * 2));
+        let reply = answer.recv_timeout(secs(10.)).expect("the status came");
+        assert_eq!(reply["type"], "RECEIVER_STATUS");
+        assert!(session.status().connected);
+        assert_eq!(mock.state.lock().unwrap().connections, 1, "the waiting answer counted, no new socket: {log:?}");
+        while let Ok(event) = events.try_recv() {
+            log.push(event);
+        }
+        assert!(!log.iter().any(|e| matches!(e, Event::Closed)), "{log:?}");
     }
 
     #[test]
@@ -1741,20 +1805,15 @@ mod tests {
         // The silence is far above a ping, so a runner that stalls for a
         // moment (a CI machine, 2026-11-13: 400 ms was not enough) does not
         // count as a silent device.
-        let short = Timing {
-            ping: Duration::from_millis(50),
-            silence: Duration::from_millis(1500),
-            answer: Duration::from_secs(1),
-            launch: Duration::from_secs(1),
-        };
+        let short = Timing { ping: ms(50), silence: ms(1500), answer: secs(1.), launch: secs(1.) };
         let (session, events) = Session::connect_with(mock.device(), short);
         let mut log = Vec::new();
         until(&session, &events, &mut log, "connect", 5., |s| s.connected);
-        // PINGs go out and PONGs come back, so the socket stays.
-        thread::sleep(Duration::from_millis(600));
+        // PINGs go out and PONGs come back, so the socket stays. A wait
+        // for the pings, not a sleep: a paused runner sends fewer in a
+        // fixed time.
+        until(&session, &events, &mut log, "pings", 3., |_| mock.seen().iter().filter(|m| m.1 == "PING").count() >= 5);
         assert_eq!(mock.state.lock().unwrap().connections, 1);
-        let pings = mock.seen().iter().filter(|m| m.1 == "PING").count();
-        assert!(pings >= 5, "{pings} pings");
         assert!(session.status().connected);
         // An app of ours runs.
         session.launch(vec![messages::APP_DEFAULT_MEDIA.into()]);
@@ -1784,7 +1843,7 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, ["open", "closed", "open-again"]);
-        let answer = session.get_status().recv_timeout(Duration::from_secs(2)).unwrap();
+        let answer = session.get_status().recv_timeout(secs(2.)).unwrap();
         assert_eq!(answer["type"], "RECEIVER_STATUS");
 
         // A dropped socket as well.
@@ -1820,12 +1879,7 @@ mod tests {
     /// closes the socket), and a status the device is slow with has time
     /// to come before the silence counts.
     fn reconnect_timing() -> Timing {
-        Timing {
-            ping: Duration::from_millis(50),
-            silence: Duration::from_secs(5),
-            answer: Duration::from_secs(1),
-            launch: Duration::from_secs(1),
-        }
+        Timing { ping: ms(50), silence: secs(5.), answer: secs(1.), launch: secs(1.) }
     }
 
     /// The media receiver with an item, over a connection with short times.
@@ -1867,7 +1921,7 @@ mod tests {
         });
         // Nothing more goes out: the status at the end of the replay is
         // the last word.
-        thread::sleep(Duration::from_millis(300));
+        thread::sleep(ms(300));
         drain(&events, &mut log);
         let sent = media_count(&mock, "SEEK") + media_count(&mock, "PAUSE") - sent_before;
         eprintln!("after the reconnect: {sent} media messages for a pause and 200 seeks");
@@ -1894,7 +1948,7 @@ mod tests {
         let status = until(&session, &events, &mut log, "paused at the last seek", 5., |s| {
             s.connected && s.player_state == Some(PlayerState::Paused) && s.media_session_id == Some(1) && s.position == 299.
         });
-        thread::sleep(Duration::from_millis(300));
+        thread::sleep(ms(300));
         drain(&events, &mut log);
         assert_eq!(log.iter().filter(|e| matches!(e, Event::Closed)).count(), 2, "{log:?}");
         assert_eq!(mock.state.lock().unwrap().connections, 3);
@@ -1914,14 +1968,14 @@ mod tests {
     fn a_late_media_status_still_gets_the_held_controls() {
         let mock = Mock::start();
         let (session, events, mut log, sent_before, errors_before) = dropped_with_held_controls(&mock);
-        mock.set(|m| m.status_delay = Duration::from_millis(1500));
+        mock.set(|m| m.status_delay = ms(1500));
         until(&session, &events, &mut log, "again", 5., |s| s.connected);
         let connected = Instant::now();
         let status = until(&session, &events, &mut log, "paused at the last seek", 6., |s| {
             s.player_state == Some(PlayerState::Paused) && s.media_session_id == Some(1) && s.position == 299.
         });
-        assert!(connected.elapsed() >= Duration::from_millis(1400), "the controls went before the status");
-        thread::sleep(Duration::from_millis(300));
+        assert!(connected.elapsed() >= ms(1400), "the controls went before the status");
+        thread::sleep(ms(300));
         drain(&events, &mut log);
         assert_eq!(status.error, None);
         assert_eq!(errors(&log).len(), errors_before, "{log:?}");
@@ -1938,12 +1992,12 @@ mod tests {
         mock.set(|m| m.media = None);
         until(&session, &events, &mut log, "again", 5., |s| s.connected);
         until(&session, &events, &mut log, "the controls failed", 5., |s| s.error.as_deref() == Some("nothing is loaded"));
-        thread::sleep(Duration::from_millis(300));
+        thread::sleep(ms(300));
         drain(&events, &mut log);
         assert_eq!(&errors(&log)[errors_before..], ["nothing is loaded", "nothing is loaded"]);
         assert_eq!(media_count(&mock, "SEEK") + media_count(&mock, "PAUSE") - sent_before, 0, "{:?}", mock.seen());
         // Done with the held ones: a command goes at once again.
-        let answer = session.get_status().recv_timeout(Duration::from_secs(2)).unwrap();
+        let answer = session.get_status().recv_timeout(secs(2.)).unwrap();
         assert_eq!(answer["type"], "RECEIVER_STATUS");
     }
 
@@ -1959,7 +2013,7 @@ mod tests {
         });
         until(&session, &events, &mut log, "again", 5., |s| s.connected);
         let status = until(&session, &events, &mut log, "the controls failed", 5., |s| s.error.as_deref() == Some("no app runs"));
-        thread::sleep(Duration::from_millis(300));
+        thread::sleep(ms(300));
         drain(&events, &mut log);
         assert_eq!(&errors(&log)[errors_before..], ["no app runs", "no app runs"]);
         // Nothing of the old app lingers in the status.
@@ -1985,7 +2039,7 @@ mod tests {
         until(&session, &events, &mut log, "again", 5., |s| s.connected);
         let connected = Instant::now();
         until(&session, &events, &mut log, "given up", 8., |s| s.error.as_deref().is_some_and(|e| e.contains("did not say")));
-        thread::sleep(Duration::from_millis(300));
+        thread::sleep(ms(300));
         drain(&events, &mut log);
         let asks = reconnect_timing().answer * (REPLAY_ASKS - 1);
         assert!(connected.elapsed() >= asks, "given up after {:?}, before the asks", connected.elapsed());
@@ -1994,7 +2048,7 @@ mod tests {
         assert!(late[0].contains("did not say what it runs") && late[0].contains("2 commands"), "{late:?}");
         assert_eq!(media_count(&mock, "SEEK") + media_count(&mock, "PAUSE") - sent_before, 0, "{:?}", mock.seen());
         mock.set(|m| m.mute_status = false);
-        let answer = session.get_status().recv_timeout(Duration::from_secs(2)).unwrap();
+        let answer = session.get_status().recv_timeout(secs(2.)).unwrap();
         assert_eq!(answer["type"], "RECEIVER_STATUS");
     }
 
@@ -2048,7 +2102,7 @@ mod tests {
         let mut log = Vec::new();
         until(&session, &events, &mut log, "connect", 5., |s| s.connected);
         // Statuses with no app, before any load: nothing ended.
-        session.get_status().recv_timeout(Duration::from_secs(2)).unwrap();
+        session.get_status().recv_timeout(secs(2.)).unwrap();
         let first = session.load(request());
         until(&session, &events, &mut log, "playing", 6., |s| s.player_state == Some(PlayerState::Playing));
         assert_eq!(ended(&log), [0u64; 0], "{log:?}");
@@ -2160,7 +2214,7 @@ mod tests {
         drain(&events, &mut log);
         session.stop_media();
         drop(session);
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + secs(2.);
         while media_count(&mock, "STOP") == 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
@@ -2176,14 +2230,19 @@ mod tests {
         let (session, events) = Session::connect_with(mock.device(), Timing::default());
         let mut log = Vec::new();
         until(&session, &events, &mut log, "connect", 5., |s| s.connected && s.volume == 0.5);
-        let mut total = Duration::ZERO;
+        let mut times = Vec::new();
         for n in 0..10 {
             thread::sleep(Duration::from_millis(20 + n * 7));
             let started = Instant::now();
-            session.get_status().recv_timeout(Duration::from_secs(2)).unwrap();
-            total += started.elapsed();
+            session.get_status().recv_timeout(secs(2.)).unwrap();
+            times.push(started.elapsed());
         }
-        assert!(total < Duration::from_millis(300), "ten commands took {total:?}");
+        // The two slowest are left out: a runner that pauses the process
+        // spoils a sample or two, while the old wait of up to 100 ms per
+        // read showed in most of them.
+        times.sort();
+        let total: Duration = times[..8].iter().sum();
+        assert!(total < Duration::from_millis(240), "eight commands took {total:?}: {times:?}");
     }
 
     /// A stop while the app of a load still launches ends the load: the
@@ -2203,7 +2262,7 @@ mod tests {
         session.stop_media();
         // The launch of the first app is given up and the next app comes.
         until(&session, &events, &mut log, "the next app", 6., |s| s.app.is_some());
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(ms(500));
         assert!(mock.state.lock().unwrap().media.is_none(), "the item plays after the stop");
         assert_eq!(media_count(&mock, "LOAD"), 0);
     }
@@ -2218,7 +2277,9 @@ mod tests {
         until(&session, &events, &mut log, "pause", 2., |s| s.player_state == Some(PlayerState::Paused));
         session.seek(100.);
         until(&session, &events, &mut log, "seek", 2., |_| media_count(&mock, "SEEK") == 1);
-        thread::sleep(Duration::from_millis(200));
+        until(&session, &events, &mut log, "the device seeks", 2., |_| {
+            mock.state.lock().unwrap().media.as_ref().is_some_and(|m| m.position == 100.)
+        });
         session.media_status();
         let status = until(&session, &events, &mut log, "status", 2., |s| s.position == 100.);
         let device = mock.state.lock().unwrap().media.clone().unwrap();
