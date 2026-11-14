@@ -29,6 +29,7 @@ pub mod realtime;
 pub mod search_index;
 pub mod subtitles;
 pub mod syncplay;
+pub mod test_time;
 pub mod trailers;
 #[cfg(test)]
 mod test_net;
