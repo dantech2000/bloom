@@ -116,7 +116,7 @@ strip = true
 # `ios` is the static library of the iOS app (dev/ios builds it for an
 # iOS target); it is not in the default set, which builds for the Mac.
 [workspace]
-members = ["core", "lights", "ios"]
+members = ["core", "lights", "ios", "ffi"]
 default-members = [".", "core", "lights"]
 
 # `cargo clippy --release --workspace --all-targets` is a CI gate.

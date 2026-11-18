@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A small stand-in for a Jellyfin server, for a test instance of Bloom.
 
-    dev/mock-jellyfin [--port N] [--port-file FILE]
+    dev/mock-jellyfin [--host ADDR] [--port N] [--port-file FILE]
 
 It serves a fixed library (movies, two shows, a collection) with pictures it
 draws itself, so the pages of the app load and paint with no server and no
@@ -12,20 +12,43 @@ stderr, so a gap shows in the log. `dev/test-server` starts it for
 
 BLOOM_MOCK_PICTURE=rrggbb makes every picture that one colour, for a check
 of what the app paints (dev/paint-check).
+
+BLOOM_MOCK_STRICT=1 answers as Jellyfin does where the app could lean on a
+lenient mock: a path it does not know gets 404 (not an empty 200), and a
+request without the token gets 401, but for the endpoints that need no
+sign-in. dev/ios-next turns it on.
+
+The test's hands (`/mock/...`, no token needed): POST /mock/reset puts the
+library, the settings, the playlists and the plugin's data back as they
+were at the start; GET /mock/remote lists the play commands sent to other
+sessions; GET /mock/counts counts the library pages and searches served;
+POST /mock/search?hold=1 holds every search answer until ?hold=0.
+
+BLOOM_MOCK_EXTRA_MOVIES=N adds N films ("The Extra Reel 1" ...) to the
+Movies library, so a grid and a search have pages to scroll (the
+performance tests of dev/ios-next perf). `--host 0.0.0.0` listens on every
+interface, for a phone on the house network (dev/ios-next perf-device);
+the default is 127.0.0.1.
 """
 
 import argparse
+import base64
+import copy
 import hashlib
 import json
 import os
 import re
 import struct
 import sys
+import threading
 import zlib
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 SERVER_ID = "mock"
+# The polls of a Quick Connect code (BLOOM_MOCK_QUICKCONNECT).
+QUICK = {"polls": 0}
 USER_ID = "u1"
 USER_NAME = "tester"
 TOKEN = "mock-token"
@@ -41,6 +64,7 @@ MOVIES = [
     ("Amber Signal", 2023), ("Kite Season", 2013), ("Harbour Lights", 2019),
 ]
 SHOWS = [("Station Eleven North", 2022, 2, 4), ("The Night Desk", 2020, 1, 6)]
+EXTRA_MOVIES = int(os.environ.get("BLOOM_MOCK_EXTRA_MOVIES") or 0)
 
 
 def ident(text):
@@ -78,7 +102,15 @@ def build():
              "OfficialRating": ["PG", "PG-13", "R"][n % 3], "Genres": [GENRES[n % 6], GENRES[(n + 2) % 6]],
              "Overview": f"{name} is a film of the mock library. It has no file, only this text.",
              "DateCreated": f"2026-09-{28 - n:02d}T10:00:00Z",
+             "ProviderIds": {"Tmdb": str(1000 + n)},
              "UserData": user_data(n, played=n == 3, position=position)})
+    for n in range(EXTRA_MOVIES):
+        name = f"The Extra Reel {n + 1}"
+        add({"Id": ident(name), "Name": name, "Type": "Movie", "ParentId": movies["Id"],
+             "ProductionYear": 1990 + n % 36, "RunTimeTicks": (80 + n % 60) * 60 * TICKS,
+             "CommunityRating": 5.0 + (n % 40) / 10, "OfficialRating": ["PG", "PG-13", "R"][n % 3],
+             "Genres": [GENRES[n % 6]], "Overview": f"{name} fills the mock library for a scroll.",
+             "DateCreated": "2025-01-01T10:00:00Z", "UserData": user_data(n + 1)})
     for s, (name, year, seasons, episodes) in enumerate(SHOWS):
         series = add({"Id": ident(name), "Name": name, "Type": "Series", "ParentId": shows["Id"],
                       "ProductionYear": year, "CommunityRating": 7.5 + s / 2, "OfficialRating": "TV-14",
@@ -107,6 +139,17 @@ def build():
 
 
 ITEMS, ORDER = build()
+
+
+# Playlists made in this run: id -> [(entry id, item id)].
+PLAYLISTS = {}
+
+
+def playlist_add(list_id, ids):
+    for item in ids:
+        if item in ITEMS:
+            PLAYLISTS[list_id].append((ident(f"entry {list_id} {len(PLAYLISTS[list_id])} {item}"), item))
+    ITEMS[list_id]["ChildCount"] = len(PLAYLISTS[list_id])
 
 
 def public(item):
@@ -213,11 +256,75 @@ USER = {"Id": USER_ID, "Name": USER_NAME, "ServerId": SERVER_ID, "HasPassword": 
                           "PlayDefaultAudioTrack": True, "EnableNextEpisodeAutoPlay": True}}
 
 
+# The iOS app's tests download (BLOOM_MOCK_DOWNLOADS); the user may.
+if os.environ.get("BLOOM_MOCK_DOWNLOADS") == "1":
+    USER["Policy"]["EnableContentDownloading"] = True
+
+# The user's display preferences; a save replaces them for this run.
+DISPLAY = {"Id": "usersettings", "CustomPrefs": {}, "Client": "emby"}
+
+STRICT = os.environ.get("BLOOM_MOCK_STRICT") == "1"
+
+# What the tests read back (GET /mock/remote, /mock/counts): the play
+# commands sent to another session, and the pages served.
+REMOTE = []
+COUNTS = {"LibraryPages": 0, "SearchesAsked": 0, "SearchesAnswered": 0}
+# Set: a search answers at once; cleared by POST /mock/search?hold=1.
+SEARCH_GATE = threading.Event()
+SEARCH_GATE.set()
+
+# The paths that need no sign-in on a real server (lower case; a prefix
+# ends in "/"). Pictures are public on Jellyfin as well.
+PUBLIC = ("/system/info/public", "/system/ping", "/users/public", "/users/authenticatebyname",
+          "/quickconnect/enabled", "/quickconnect/initiate", "/quickconnect/connect",
+          "/users/authenticatewithquickconnect", "/branding/configuration", "/branding/css",
+          "/branding/css.css", "/branding/splashscreen", "/getutctime", "/mock/")
+
+
+def is_public(lower):
+    return "/images/" in lower or any(lower == p or (p.endswith("/") and lower.startswith(p)) for p in PUBLIC)
+
+
+def utc_now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *_):
         pass
+
+    def send_file(self, path):
+        """A file with Range support, as a media server sends a stream."""
+        size = os.path.getsize(path)
+        start, end = 0, size - 1
+        wanted = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
+        if wanted and (wanted[1] or wanted[2]):
+            if wanted[1]:
+                start = int(wanted[1])
+                end = int(wanted[2]) if wanted[2] else end
+            else:
+                start = max(0, size - int(wanted[2]))
+        try:
+            self.send_response(206 if wanted else 200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(end - start + 1))
+            if wanted:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
+            with open(path, "rb") as f:
+                f.seek(start)
+                left = end - start + 1
+                while left > 0:
+                    chunk = f.read(min(1 << 20, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def send(self, status, body=b"", kind="application/json"):
         if isinstance(body, (dict, list)):
@@ -233,12 +340,61 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def unknown(self, method, path):
+        """A path the mock does not serve: logged, and in strict mode a 404
+        (True: the caller answers nothing more)."""
         print(f"mock-jellyfin: no answer for {method} {path}", file=sys.stderr, flush=True)
+        if STRICT:
+            self.send(404)
+            return True
+        return False
+
+    def refused(self, method):
+        """Strict mode: a request without the session's token gets 401, as
+        Jellyfin answers it. The token comes in the Authorization or
+        X-Emby-Token header, or as api_key (mpv, the socket)."""
+        if not STRICT:
+            return False
+        url = urlparse(self.path)
+        lower = url.path.rstrip("/").lower()
+        if is_public(lower):
+            return False
+        q = {k.lower(): v for k, v in parse_qs(url.query).items()}
+        held = " ".join([self.headers.get("Authorization", ""), self.headers.get("X-Emby-Authorization", ""),
+                         self.headers.get("X-Emby-Token", ""), self.headers.get("X-MediaBrowser-Token", ""),
+                         *(q.get("api_key") or []), *(q.get("apikey") or [])])
+        if TOKEN in held:
+            return False
+        print(f"mock-jellyfin: 401 for {method} {self.path} (no token)", file=sys.stderr, flush=True)
+        self.send(401)
+        return True
+
+    def mock_control(self, method, lower, body):
+        """The test's hands on the mock (no token needed)."""
+        if method == "POST" and lower == "/mock/reset":
+            reset()
+            print("mock-jellyfin: reset", file=sys.stderr, flush=True)
+            return self.send(204)
+        if method == "GET" and lower == "/mock/remote":
+            return self.send(200, REMOTE)
+        if method == "GET" and lower == "/mock/counts":
+            return self.send(200, COUNTS)
+        if method == "POST" and lower == "/mock/search":
+            hold = (parse_qs(urlparse(self.path).query).get("hold") or ["0"])[0] == "1"
+            if hold:
+                SEARCH_GATE.clear()
+            else:
+                SEARCH_GATE.set()
+            return self.send(204)
+        return self.send(404)
 
     def do_GET(self):
         url = urlparse(self.path)
         path, q = url.path.rstrip("/"), parse_qs(url.query)
         lower = path.lower()
+        if lower.startswith("/mock/"):
+            return self.mock_control("GET", lower, b"")
+        if self.refused("GET"):
+            return
         match = re.fullmatch(r"/items/([0-9a-f]{32})/images/(\w+)(/\d+)?", lower)
         if match:
             if match[1] not in ITEMS:
@@ -250,6 +406,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, png(width, height, match[1] + match[2]), "image/png")
         if "/images/" in lower or lower.endswith("/splashscreen"):
             return self.send(404)
+        # A file to play, for the native iOS app's tests: BLOOM_MOCK_CLIP
+        # names a local video served for every item's stream (with Range,
+        # so the player can seek). Without it, a play fails as before.
+        match = re.fullmatch(r"/videos/([0-9a-f]{32})/stream(\.\w+)?|/items/([0-9a-f]{32})/download", lower)
+        if match and os.environ.get("BLOOM_MOCK_CLIP"):
+            return self.send_file(os.environ["BLOOM_MOCK_CLIP"])
+        if re.fullmatch(r"/videos/[0-9a-f]{32}/[0-9a-f]{32}/subtitles/\d+/0/stream\.srt", lower) and os.environ.get("BLOOM_MOCK_CLIP"):
+            srt = "1\n00:00:01,000 --> 00:02:59,000\nA subtitle from the mock server.\n\n"
+            return self.send(200, srt.encode(), "text/plain; charset=utf-8")
         if lower == "/system/info/public":
             return self.send(200, {"Id": SERVER_ID, "ServerName": "Mock Jellyfin", "Version": "10.11.0",
                                    "StartupWizardCompleted": True})
@@ -262,11 +427,32 @@ class Handler(BaseHTTPRequestHandler):
         if lower in ("/userviews", f"/users/{USER_ID}/views"):
             views = [i for i in all_items() if i["Type"] == "CollectionFolder"]
             return self.send(200, {"Items": [public(i) for i in views], "TotalRecordCount": len(views)})
+        match = re.fullmatch(r"/playlists/([0-9a-f]{32})/items", lower)
+        if match and match[1] in PLAYLISTS:
+            entries = [dict(public(ITEMS[item]), PlaylistItemId=entry) for entry, item in PLAYLISTS[match[1]]]
+            return self.send(200, {"Items": entries, "TotalRecordCount": len(entries)})
         if lower in ("/items", f"/users/{USER_ID}/items"):
-            return self.send(200, page(query_items(q), q))
+            found = query_items(q)
+            if (q.get("searchTerm") or q.get("SearchTerm")):
+                COUNTS["SearchesAsked"] += 1
+                SEARCH_GATE.wait(60)
+                COUNTS["SearchesAnswered"] += 1
+            elif (q.get("parentId") or q.get("ParentId")):
+                COUNTS["LibraryPages"] += 1
+            return self.send(200, page(found, q))
         match = re.fullmatch(r"(?:/users/[^/]+)?/items/([0-9a-f]{32})", lower)
         if match:
             item = ITEMS.get(match[1])
+            if item and os.environ.get("BLOOM_MOCK_CLIP") and item["Type"] in ("Movie", "Episode"):
+                # With a clip, the streams a detail page offers: two audio
+                # tracks and the subtitle file of PlaybackInfo.
+                streams = [
+                    {"Type": "Video", "Index": 0, "Codec": "h264", "IsDefault": True},
+                    {"Type": "Audio", "Index": 1, "Codec": "aac", "Language": "eng", "DisplayTitle": "English · AAC", "IsDefault": True},
+                    {"Type": "Subtitle", "Index": 2, "Codec": "subrip", "Language": "eng", "DisplayTitle": "English · SRT", "IsExternal": True},
+                    {"Type": "Audio", "Index": 3, "Codec": "aac", "Language": "fre", "DisplayTitle": "French · AAC"},
+                ]
+                return self.send(200, dict(public(item), MediaSources=[{"Id": item["Id"], "MediaStreams": streams}]))
             return self.send(200, public(item)) if item else self.send(404)
         if lower == "/useritems/resume" or lower.endswith("/items/resume"):
             resumable = [i for i in all_items() if i.get("UserData", {}).get("PlaybackPositionTicks")]
@@ -304,27 +490,147 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, page(similar[:12], q))
         if lower == "/branding/configuration":
             return self.send(200, {"LoginDisclaimer": "", "CustomCss": "", "SplashscreenEnabled": False})
+        # Quick Connect, for the native iOS app's tests
+        # (BLOOM_MOCK_QUICKCONNECT=1): the code is approved at the second
+        # poll, as if another device had entered it.
+        quick = os.environ.get("BLOOM_MOCK_QUICKCONNECT") == "1"
         if lower == "/quickconnect/enabled":
-            return self.send(200, b"false")
+            return self.send(200, b"true" if quick else b"false")
+        if quick and lower == "/quickconnect/connect":
+            QUICK["polls"] += 1
+            return self.send(200, {"Authenticated": QUICK["polls"] >= 2, "Secret": "mock-secret", "Code": "123456"})
+        # A Jellyfin app of the user that takes commands, for the native iOS
+        # app's Play on test (BLOOM_MOCK_SESSION=1). Never a real device.
+        if lower == "/sessions" and os.environ.get("BLOOM_MOCK_SESSION") == "1":
+            return self.send(200, [{
+                "Id": "mock-session", "UserId": USER["Id"], "UserName": USER["Name"],
+                "Client": "Jellyfin Web", "DeviceName": "Mock TV", "DeviceId": "mock-tv",
+                "SupportsRemoteControl": True, "SupportsMediaControl": True,
+                "PlayState": {"IsPaused": False, "PositionTicks": 0},
+            }])
         if lower.startswith("/mediasegments/"):
+            # With a clip, an intro over its first 12 seconds (Skip Intro).
+            if os.environ.get("BLOOM_MOCK_CLIP"):
+                intro = {"Type": "Intro", "StartTicks": 0, "EndTicks": 12 * 10_000_000}
+                return self.send(200, {"Items": [intro], "TotalRecordCount": 1})
             return self.send(200, {"Items": [], "TotalRecordCount": 0})
         if lower == "/displaypreferences/usersettings":
-            return self.send(200, {"Id": "usersettings", "CustomPrefs": {}, "Client": "emby"})
+            return self.send(200, DISPLAY)
+        if lower == "/localization/cultures":
+            return self.send(200, [
+                {"DisplayName": "English", "ThreeLetterISOLanguageName": "eng", "TwoLetterISOLanguageName": "en"},
+                {"DisplayName": "French", "ThreeLetterISOLanguageName": "fre", "TwoLetterISOLanguageName": "fr"},
+                {"DisplayName": "German", "ThreeLetterISOLanguageName": "ger", "TwoLetterISOLanguageName": "de"},
+                {"DisplayName": "Japanese", "ThreeLetterISOLanguageName": "jpn", "TwoLetterISOLanguageName": "ja"},
+                {"DisplayName": "Spanish", "ThreeLetterISOLanguageName": "spa", "TwoLetterISOLanguageName": "es"},
+            ])
+        if lower.startswith("/jellyfinenhanced") and os.environ.get("BLOOM_MOCK_ENHANCED") == "1":
+            return self.enhanced_get(lower)
         if lower.startswith("/jellyfinenhanced") or lower.startswith("/plugins"):
             return self.send(404)
         if lower == "/socket":
+            if os.environ.get("BLOOM_MOCK_SOCKET") == "1" and self.headers.get("Upgrade", "").lower() == "websocket":
+                return self.serve_socket()
             return self.send(404)
-        self.unknown("GET", self.path)
+        # The server's clock, for SyncPlay's clock sync.
+        if lower == "/getutctime":
+            now = utc_now()
+            return self.send(200, {"RequestReceptionTime": now, "ResponseTransmissionTime": now})
+        # The bitrate test of the Auto quality: `size` bytes of nothing.
+        if lower == "/playback/bitratetest":
+            try:
+                size = min(int((q.get("size") or q.get("Size") or ["102400"])[0]), 10_000_000)
+            except ValueError:
+                size = 102400
+            return self.send(200, bytes(size), "application/octet-stream")
+        if self.unknown("GET", self.path):
+            return
         self.send(200, {"Items": [], "TotalRecordCount": 0})
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)
+        body = self.rfile.read(length) if length else b""
         lower = urlparse(self.path).path.rstrip("/").lower()
+        if lower.startswith("/mock/") and lower != "/mock/socket":
+            return self.mock_control("POST", lower, body)
+        if self.refused("POST"):
+            return
+        # The test's hand on the socket (BLOOM_MOCK_SOCKET): the body, a
+        # {"MessageType", "Data"} message, goes to every open socket.
+        if lower == "/mock/socket" and os.environ.get("BLOOM_MOCK_SOCKET") == "1":
+            sent = socket_broadcast(body.decode())
+            return self.send(200, {"Sockets": sent})
+        if lower.startswith("/jellyfinenhanced") and os.environ.get("BLOOM_MOCK_ENHANCED") == "1":
+            return self.enhanced_post(lower, body)
+        # The user's settings: a save is kept for this run, so a read shows it.
+        if lower == "/users/configuration":
+            USER["Configuration"] = json.loads(body or b"{}")
+            print(f"mock-jellyfin: configuration {body.decode()}", file=sys.stderr, flush=True)
+            return self.send(204)
+        if lower == "/displaypreferences/usersettings":
+            DISPLAY.clear()
+            DISPLAY.update(json.loads(body or b"{}"))
+            print(f"mock-jellyfin: display {body.decode()}", file=sys.stderr, flush=True)
+            return self.send(204)
+        if lower == "/sessions/capabilities/full":
+            print(f"mock-jellyfin: capabilities {body.decode()}", file=sys.stderr, flush=True)
+        if lower == "/quickconnect/initiate" and os.environ.get("BLOOM_MOCK_QUICKCONNECT") == "1":
+            QUICK["polls"] = 0
+            return self.send(200, {"Authenticated": False, "Secret": "mock-secret", "Code": "123456"})
+        if lower == "/users/authenticatewithquickconnect" and os.environ.get("BLOOM_MOCK_QUICKCONNECT") == "1":
+            return self.send(200, {"User": USER, "AccessToken": TOKEN, "ServerId": SERVER_ID})
         if lower == "/users/authenticatebyname":
             return self.send(200, {"User": USER, "AccessToken": TOKEN, "ServerId": SERVER_ID})
-        match = re.fullmatch(r"(?:/users/[^/]+)?/(playeditems|favoriteitems)/([0-9a-f]{32})", lower)
+        # With a clip (BLOOM_MOCK_CLIP): how to play an item, as a server
+        # answers PlaybackInfo for a file it plays as it is, with one
+        # subtitle file beside it. Without a clip, a play fails as before.
+        match = re.fullmatch(r"/items/([0-9a-f]{32})/playbackinfo", lower)
+        if match and match[1] in ITEMS and os.environ.get("BLOOM_MOCK_CLIP"):
+            item = match[1]
+            return self.send(200, {
+                "PlaySessionId": "mock-session",
+                "MediaSources": [{
+                    "Id": item,
+                    "SupportsDirectPlay": True,
+                    "SupportsDirectStream": True,
+                    "SupportsTranscoding": True,
+                    "MediaStreams": [{
+                        "Type": "Subtitle", "Index": 2, "Codec": "subrip", "Language": "eng",
+                        "DisplayTitle": "English · SRT", "IsExternal": True,
+                        "DeliveryMethod": "External",
+                        "DeliveryUrl": f"/Videos/{item}/{item}/Subtitles/2/0/Stream.srt",
+                    }],
+                }],
+            })
+        # Playlists: made, filled, moved, renamed (kept for this run).
+        query = parse_qs(urlparse(self.path).query)
+        if lower == "/playlists":
+            request = json.loads(body or b"{}")
+            list_id = ident(f"playlist {request.get('Name')} {len(PLAYLISTS)}")
+            ITEMS[list_id] = {"Id": list_id, "Name": request.get("Name", ""), "Type": "Playlist", "MediaType": "Video",
+                              "ServerId": SERVER_ID, "ImageTags": {}, "BackdropImageTags": [], "ChildCount": 0,
+                              "UserData": user_data(1)}
+            ORDER.append(list_id)
+            PLAYLISTS[list_id] = []
+            playlist_add(list_id, request.get("Ids", []))
+            print(f"mock-jellyfin: playlist {request.get('Name')} {request.get('Ids')}", file=sys.stderr, flush=True)
+            return self.send(200, {"Id": list_id})
+        match = re.fullmatch(r"/playlists/([0-9a-f]{32})(/items)?", lower)
+        if match and match[1] in PLAYLISTS:
+            if match[2]:
+                playlist_add(match[1], (query.get("ids") or [""])[0].split(","))
+            else:
+                ITEMS[match[1]]["Name"] = json.loads(body or b"{}").get("Name", ITEMS[match[1]]["Name"])
+            return self.send(204)
+        match = re.fullmatch(r"/playlists/([0-9a-f]{32})/items/([0-9a-f]{32})/move/(\d+)", lower)
+        if match and match[1] in PLAYLISTS:
+            entries = PLAYLISTS[match[1]]
+            entry = next((e for e in entries if e[0] == match[2]), None)
+            if entry:
+                entries.remove(entry)
+                entries.insert(min(int(match[3]), len(entries)), entry)
+            return self.send(204)
+        match = re.fullmatch(r"(?:/users/[^/]+)?/(?:user)?(playeditems|favoriteitems)/([0-9a-f]{32})", lower)
         if match and match[2] in ITEMS:
             data = ITEMS[match[2]]["UserData"]
             if match[1] == "playeditems":
@@ -332,32 +638,228 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 data["IsFavorite"] = True
             return self.send(200, data)
-        if not (lower.startswith("/sessions/") or lower.startswith("/displaypreferences")):
-            self.unknown("POST", self.path)
+        # A command to another session (Play on): kept for GET /mock/remote.
+        match = re.fullmatch(r"/sessions/([^/]+)/playing(/\w+)?", lower)
+        if match and match[1] not in ("progress", "stopped", "ping"):
+            query = parse_qs(urlparse(self.path).query)
+            REMOTE.append({"Session": match[1], "Command": (match[2] or "").lstrip("/"),
+                           "ItemIds": (query.get("itemIds") or query.get("ItemIds") or [""])[0].split(","),
+                           "PlayCommand": (query.get("playCommand") or query.get("PlayCommand") or [""])[0]})
+            print(f"mock-jellyfin: remote {self.path}", file=sys.stderr, flush=True)
+            return self.send(204)
+        # The sessions' own reports and commands that need no state here.
+        if re.fullmatch(r"/sessions/(playing(/progress|/stopped|/ping)?|capabilities(/full)?|logout"
+                        r"|[^/]+/(command(/\w+)?|message|system/\w+))", lower):
+            return self.send(204)
+        if self.unknown("POST", self.path):
+            return
         self.send(204)
 
     def do_DELETE(self):
         lower = urlparse(self.path).path.rstrip("/").lower()
-        match = re.fullmatch(r"(?:/users/[^/]+)?/(playeditems|favoriteitems)/([0-9a-f]{32})", lower)
+        if self.refused("DELETE"):
+            return
+        # The end of a transcode (the player's stop): nothing to end here.
+        if lower == "/videos/activeencodings":
+            return self.send(204)
+        match = re.fullmatch(r"/jellyfinenhanced/user-settings/[^/]+/bookmark\.json/([\w-]+)", lower)
+        if match and os.environ.get("BLOOM_MOCK_ENHANCED") == "1":
+            ENHANCED["bookmarks"]["Bookmarks"].pop(match[1], None)
+            return self.send(204)
+        query = parse_qs(urlparse(self.path).query)
+        match = re.fullmatch(r"/playlists/([0-9a-f]{32})/items", lower)
+        if match and match[1] in PLAYLISTS:
+            gone = (query.get("entryIds") or [""])[0].split(",")
+            PLAYLISTS[match[1]] = [e for e in PLAYLISTS[match[1]] if e[0] not in gone]
+            ITEMS[match[1]]["ChildCount"] = len(PLAYLISTS[match[1]])
+            return self.send(204)
+        match = re.fullmatch(r"/items/([0-9a-f]{32})", lower)
+        if match and match[1] in PLAYLISTS:
+            del PLAYLISTS[match[1]]
+            del ITEMS[match[1]]
+            ORDER.remove(match[1])
+            print(f"mock-jellyfin: playlist deleted {match[1]}", file=sys.stderr, flush=True)
+            return self.send(204)
+        match = re.fullmatch(r"(?:/users/[^/]+)?/(?:user)?(playeditems|favoriteitems)/([0-9a-f]{32})", lower)
         if match and match[2] in ITEMS:
             data = ITEMS[match[2]]["UserData"]
             data["Played" if match[1] == "playeditems" else "IsFavorite"] = False
             return self.send(200, data)
-        self.unknown("DELETE", self.path)
+        if self.unknown("DELETE", self.path):
+            return
         self.send(204)
+
+
+# The Jellyfin Enhanced plugin (BLOOM_MOCK_ENHANCED): its settings, the
+# user's hidden content and bookmarks (kept for this run), and Seerr lists.
+# There is no Seerr request here: the app sends none.
+ENHANCED = {
+    "public": {"JellyseerrEnabled": True, "JellyseerrShowSimilar": True, "JellyseerrShowRecommended": True,
+               "JellyseerrShowDetailPageLink": True, "JellyseerrBaseUrl": "https://seerr.example.com",
+               "HiddenContentEnabled": True, "BookmarksEnabled": True, "ArrLinksEnabled": False},
+    "hidden": {"Items": {}, "Settings": {"Enabled": True}},
+    "bookmarks": {"Bookmarks": {}},
+}
+SEERR = [{"id": 900 + n, "mediaType": "movie", "title": f"Seerr Film {n}", "releaseDate": f"20{10 + n}-01-01",
+          "posterPath": None, "mediaInfo": {"status": 2} if n == 1 else None} for n in range(1, 5)]
+
+
+def enhanced_get(self, lower):
+    if lower == "/jellyfinenhanced/public-config":
+        return self.send(200, ENHANCED["public"])
+    if lower.endswith("/hidden-content.json"):
+        return self.send(200, ENHANCED["hidden"])
+    if lower.endswith("/bookmark.json"):
+        return self.send(200, ENHANCED["bookmarks"])
+    if lower.endswith("/settings.json"):
+        return self.send(200, {})
+    if lower.startswith("/jellyfinenhanced/jellyseerr/") and (lower.endswith("/similar") or lower.endswith("/recommendations")
+                                                              or lower.endswith("/search")):
+        return self.send(200, {"results": SEERR})
+    return self.send(404)
+
+
+def enhanced_post(self, lower, body):
+    if lower.endswith("/hidden-content.json"):
+        ENHANCED["hidden"] = json.loads(body or b"{}")
+        print(f"mock-jellyfin: hidden {body.decode()}", file=sys.stderr, flush=True)
+        return self.send(204)
+    if lower.endswith("/bookmark.json/add"):
+        entry = json.loads(body or b"{}")
+        key = ident(f"bookmark {len(ENHANCED['bookmarks']['Bookmarks'])} {entry.get('Timestamp')}")
+        ENHANCED["bookmarks"]["Bookmarks"][key] = entry
+        print(f"mock-jellyfin: bookmark {entry.get('ItemId')} {entry.get('Timestamp')}", file=sys.stderr, flush=True)
+        return self.send(200, {"id": key})
+    if "/jellyseerr/request" in lower:
+        # Never in a test: the app must not send it.
+        print("mock-jellyfin: SEERR REQUEST (refused)", file=sys.stderr, flush=True)
+        return self.send(403)
+    return self.send(204)
+
+
+# The state at the start, for POST /mock/reset: each test starts from it,
+# whatever the test before it saved, hid, made or played.
+INITIAL = copy.deepcopy({"items": ITEMS, "order": ORDER, "playlists": PLAYLISTS, "user": USER,
+                         "display": DISPLAY, "enhanced": ENHANCED})
+
+
+def reset():
+    start = copy.deepcopy(INITIAL)
+    for live, key in ((ITEMS, "items"), (PLAYLISTS, "playlists"), (USER, "user"), (DISPLAY, "display"),
+                      (ENHANCED, "enhanced")):
+        live.clear()
+        live.update(start[key])
+    ORDER[:] = start["order"]
+    REMOTE.clear()
+    for key in COUNTS:
+        COUNTS[key] = 0
+    QUICK["polls"] = 0
+    SEARCH_GATE.set()
+
+
+Handler.enhanced_get = enhanced_get
+Handler.enhanced_post = enhanced_post
+
+
+# The open sockets (BLOOM_MOCK_SOCKET), each a writer with its lock.
+SOCKETS = []
+SOCKETS_LOCK = threading.Lock()
+
+
+def socket_frame(text):
+    """A text frame from the server: not masked."""
+    data = text.encode()
+    head = bytes([0x81])
+    if len(data) < 126:
+        head += bytes([len(data)])
+    elif len(data) < 65536:
+        head += bytes([126]) + struct.pack(">H", len(data))
+    else:
+        head += bytes([127]) + struct.pack(">Q", len(data))
+    return head + data
+
+
+def socket_broadcast(text):
+    with SOCKETS_LOCK:
+        open_now = list(SOCKETS)
+    sent = 0
+    for wfile, lock in open_now:
+        try:
+            with lock:
+                wfile.write(socket_frame(text))
+                wfile.flush()
+            sent += 1
+        except OSError:
+            pass
+    print(f"mock-jellyfin: socket -> {sent}: {text}", file=sys.stderr, flush=True)
+    return sent
+
+
+def serve_socket(self):
+    """The server's socket, as far as a test needs it: the handshake, an
+    answer to each KeepAlive, and what `/mock/socket` sends."""
+    key = self.headers.get("Sec-WebSocket-Key", "")
+    accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+    self.send_response(101)
+    self.send_header("Upgrade", "websocket")
+    self.send_header("Connection", "Upgrade")
+    self.send_header("Sec-WebSocket-Accept", accept)
+    self.end_headers()
+    self.wfile.flush()
+    entry = (self.wfile, threading.Lock())
+    with SOCKETS_LOCK:
+        SOCKETS.append(entry)
+    print("mock-jellyfin: socket open", file=sys.stderr, flush=True)
+    try:
+        while True:
+            head = self.rfile.read(2)
+            if len(head) < 2:
+                return
+            opcode, size = head[0] & 0x0F, head[1] & 0x7F
+            if size == 126:
+                size = struct.unpack(">H", self.rfile.read(2))[0]
+            elif size == 127:
+                size = struct.unpack(">Q", self.rfile.read(8))[0]
+            mask = self.rfile.read(4) if head[1] & 0x80 else b"\0\0\0\0"
+            data = bytes(b ^ mask[i % 4] for i, b in enumerate(self.rfile.read(size)))
+            if opcode == 8:
+                return
+            if opcode == 9:  # a ping: the pong
+                with entry[1]:
+                    self.wfile.write(bytes([0x8A, len(data)]) + data)
+                    self.wfile.flush()
+                continue
+            if opcode == 1:
+                text = data.decode(errors="replace")
+                print(f"mock-jellyfin: socket <- {text}", file=sys.stderr, flush=True)
+                if '"KeepAlive"' in text:
+                    with entry[1]:
+                        self.wfile.write(socket_frame('{"MessageType":"KeepAlive"}'))
+                        self.wfile.flush()
+    except OSError:
+        return
+    finally:
+        with SOCKETS_LOCK:
+            SOCKETS.remove(entry)
+        print("mock-jellyfin: socket closed", file=sys.stderr, flush=True)
+        self.close_connection = True
+
+
+Handler.serve_socket = serve_socket
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--host", default="127.0.0.1", help="0.0.0.0 listens on every interface")
     parser.add_argument("--port", type=int, default=0, help="0 takes a free port")
     parser.add_argument("--port-file", help="the port goes into this file once the server listens")
     args = parser.parse_args()
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
     port = server.server_address[1]
     if args.port_file:
         with open(args.port_file, "w") as out:
             out.write(str(port))
-    print(f"mock-jellyfin: http://127.0.0.1:{port} ({len(ITEMS)} items)", file=sys.stderr, flush=True)
+    print(f"mock-jellyfin: http://{args.host}:{port} ({len(ITEMS)} items)", file=sys.stderr, flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

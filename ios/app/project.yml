@@ -1,0 +1,107 @@
+# The native iOS app (specs/ios-native). Spike S1 for now: proves the
+# bridge (ios/BloomCore, made by dev/ios-core) links beside MPVUI and
+# works against dev/mock-jellyfin. `xcodegen generate` makes the project.
+name: BloomNext
+options:
+  bundleIdPrefix: dev.bloom
+  deploymentTarget:
+    iOS: "27.0"
+  createIntermediateGroups: true
+packages:
+  BloomCore:
+    path: ../BloomCore
+  # mpv with the AVFoundation sample-buffer output, for Picture in Picture
+  # and AirPlay (spike S2, spec §17). MPVUI is MIT; its mpv build is GPL,
+  # fine for personal use (spec §2).
+  MPVUI:
+    url: https://github.com/LePips/MPVUI.git
+    exactVersion: 0.10.0
+targets:
+  BloomNext:
+    type: application
+    platform: iOS
+    sources:
+      - path: Bloom
+      # The roots mpv checks the server's certificate against (as on the Mac).
+      - path: ../../assets/cacert.pem
+        buildPhase: resources
+      # Google Sans for display titles (spec §7, Q2); SF for the rest.
+      - path: ../../assets/fonts/GoogleSans-Bold.ttf
+        buildPhase: resources
+    dependencies:
+      - package: BloomCore
+        product: BloomCore
+      - package: MPVUI
+        product: MPVUI
+    info:
+      path: Bloom/Info.plist
+      properties:
+        CFBundleDisplayName: $(BLOOM_APP_NAME)
+        UILaunchScreen: {}
+        UIUserInterfaceStyle: Dark
+        UIAppFonts:
+          - GoogleSans-Bold.ttf
+        # The pages are portrait on an iPhone and the player landscape
+        # (`AppDelegate.orientations` picks at run time). The iPad allows
+        # all four, which Split View and Slide Over need (spec README: no
+        # UIRequiresFullScreen; the layout reads the size, not the idiom).
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # Chromecasts are found with Bonjour on the local network; the
+        # sentence shows in the system's prompt (spec §8.4).
+        NSLocalNetworkUsageDescription: Bloom uses your local network to reach your Jellyfin server and to find Chromecasts.
+        NSBonjourServices:
+          - _googlecast._tcp
+          - _CC1AD845._googlecast._tcp
+        # Sound plays on with the screen locked or the app behind another.
+        UIBackgroundModes:
+          - audio
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+    settings:
+      base:
+        # A performance run on the phone builds under its own id and name
+        # (dev/ios-next perf-device), beside the installed app.
+        BLOOM_APP_ID: dev.bloom.ios.next
+        BLOOM_APP_NAME: Bloom Next
+        PRODUCT_BUNDLE_IDENTIFIER: $(BLOOM_APP_ID)
+        SWIFT_VERSION: "6.0"
+        SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+        SWIFT_APPROACHABLE_CONCURRENCY: YES
+        ARCHS: arm64
+        GENERATE_INFOPLIST_FILE: NO
+        # Bloom/AppIcon.icon (Icon Composer, layered Liquid Glass; xcodegen
+        # adds it to Resources as a wrapper.icon from the Bloom folder).
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+  # Screenshots of the shell for the design decisions (spike S3): an
+  # XCUITest that drives the app and writes PNGs to $SHOT_DIR
+  # (TEST_RUNNER_SHOT_DIR when run through xcodebuild).
+  BloomShots:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: BloomShots
+    dependencies:
+      - target: BloomNext
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.bloom.ios.shots
+        SWIFT_VERSION: "6.0"
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  BloomNext:
+    build:
+      targets:
+        BloomNext: all
+    test:
+      targets:
+        - BloomShots

@@ -13,3 +13,10 @@ CLAUDE.md
 
 # Made by xcodegen from ios/host/project.yml (dev/ios).
 ios/host/Bloom.xcodeproj/
+# The native iOS app (specs/ios-native): the project xcodegen makes from
+# ios/app/project.yml, and what dev/ios-core makes into ios/BloomCore.
+ios/app/BloomNext.xcodeproj/
+ios/BloomCore/BloomFFI.xcframework/
+ios/BloomCore/Sources/BloomCore/bloom_ffi.swift
+ios/BloomCore/.build/
+ios/pipspike/PiPSpike.xcodeproj/

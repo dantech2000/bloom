@@ -1,0 +1,201 @@
+#!/bin/sh
+# The native iOS app (specs/ios-native): build, test and install.
+#
+#   dev/ios-next build              the bridge (dev/ios-core), the project, a simulator build
+#   dev/ios-next test [name]        the UI tests against dev/mock-jellyfin (all but Performance, or one: Shots/testPlay)
+#   dev/ios-next perf [name]        the performance tests on the simulator (all, or one: testScrollHome)
+#   dev/ios-next perf-device [id] [name]   the performance tests on a phone, against the mock on this Mac's address
+#   dev/ios-next monkey [steps] [seed]   the random walk (spec §11), 120 steps by default
+#   dev/ios-next device [id]        a release build installed on a phone (BLOOM_IOS_TEAM, default T46QDHL88N)
+#
+# The tests run on an iOS 27 simulator (BLOOM_IOS_NEXT_SIM, or the first
+# "iPhone 17 Pro (iOS 27)"), against the mock server only, with the fake
+# Chromecast, muted, and with no playback reports. Screenshots go to
+# target/ios-next/shots. A perf run checks the budget of
+# specs/ios-native/README.md ("Performance budget") from its result bundle,
+# target/ios-next/perf-<port>.xcresult; a simulator's numbers are printed,
+# a phone's are checked (BLOOM_PERF_GATE=1 checks a simulator's too).
+set -e
+dir=$(cd "$(dirname "$0")/.." && pwd)
+cd "$dir"
+project=ios/app/BloomNext.xcodeproj
+# An agent that builds beside another build gives a folder of its own.
+derived=${BLOOM_IOS_NEXT_DERIVED:-target/ios-next/DerivedData}
+shots=$dir/target/ios-next/shots
+clip=$dir/target/ios-next/clip.mp4
+
+sim() {
+  [ -n "${BLOOM_IOS_NEXT_SIM:-}" ] && { echo "$BLOOM_IOS_NEXT_SIM"; return; }
+  xcrun simctl list devices available | sed -n 's/^ *iPhone 17 Pro (iOS 27) (\([0-9A-F-]*\)).*/\1/p' | head -1
+}
+
+# The mock with a clip (made once with ffmpeg), Quick Connect and a
+# controllable session; nothing of Daniel's server. Strict
+# (BLOOM_MOCK_STRICT): a path it does not know answers 404 and a request
+# without the token 401, as Jellyfin does; BLOOM_MOCK_STRICT=0 turns it off.
+port=${BLOOM_MOCK_PORT:-8099}
+mock_pid=""
+mock() {
+  if [ ! -f "$clip" ]; then
+    mkdir -p "$(dirname "$clip")"
+    ffmpeg -loglevel error -y -f lavfi -i "testsrc2=size=1920x1080:rate=24" -f lavfi -i "sine=frequency=440:sample_rate=48000" \
+      -t 180 -c:v libx264 -pix_fmt yuv420p -preset veryfast -crf 30 -c:a aac -b:a 96k -movflags +faststart "$clip"
+  fi
+  # Each run owns its mock: an agent beside another sets BLOOM_MOCK_PORT,
+  # or the second run stops the first one's mock.
+  pkill -f "mock-jellyfin .*--port $port\$" 2>/dev/null || true
+  BLOOM_MOCK_EXTRA_MOVIES=${MOCK_EXTRA_MOVIES:-0} BLOOM_MOCK_CLIP=$clip BLOOM_MOCK_QUICKCONNECT=1 BLOOM_MOCK_SESSION=1 BLOOM_MOCK_SOCKET=1 BLOOM_MOCK_ENHANCED=1 BLOOM_MOCK_DOWNLOADS=1 \
+    BLOOM_MOCK_STRICT=${BLOOM_MOCK_STRICT:-1} \
+    python3 dev/mock-jellyfin --host "${MOCK_HOST:-127.0.0.1}" --port $port >"$dir/target/ios-next/mock-$port.log" 2>&1 &
+  mock_pid=$!
+  # The run stops its mock, however it ends.
+  trap 'kill $mock_pid 2>/dev/null || true' EXIT
+  trap 'exit 130' INT TERM
+  # Ready when it answers (a slow machine takes more than a second).
+  tries=0
+  until curl -sf -o /dev/null "http://127.0.0.1:$port/System/Info/Public"; do
+    tries=$((tries + 1))
+    if [ $tries -ge 100 ] || ! kill -0 $mock_pid 2>/dev/null; then
+      echo "dev/ios-next: the mock did not start (target/ios-next/mock-$port.log)" >&2
+      exit 1
+    fi
+    sleep 0.1
+  done
+}
+
+build() {
+  # Under the lock: several agents build at once, and the XCFramework is
+  # one shared place.
+  dev/ios-core-locked
+  (cd ios/app && xcodegen generate --spec project.yml --quiet)
+  # The first build after new bindings can fail with "exit code 0 but
+  # produced no further output" (an Xcode hiccup); the second one builds.
+  for try in 1 2; do
+    xcodebuild -project $project -scheme BloomNext -configuration Debug \
+      -destination 'generic/platform=iOS Simulator' -derivedDataPath $derived build -quiet && return 0
+    [ $try = 1 ] && echo "dev/ios-next: the build failed; once more" >&2
+  done
+  return 1
+}
+
+# A perf run (PERF=1) sets these: the destination (DEVICE, a phone), the
+# server's address as the app sees it (SERVER_HOST), and xcodebuild's
+# extra arguments (XCODE_ARGS: the configuration, the result bundle).
+run_tests() { # [only]
+  if [ -n "${DEVICE:-}" ]; then
+    destination="id=$DEVICE"
+  else
+    id=$(sim)
+    [ -n "$id" ] || { echo "dev/ios-next: no iOS 27 iPhone simulator; make one with xcrun simctl create" >&2; exit 1; }
+    destination="id=$id"
+  fi
+  mock
+  [ -n "${DEVICE:-}" ] || xcrun simctl uninstall "$id" dev.bloom.ios.next 2>/dev/null || true
+  # The whole run leaves out the performance tests (slow, and noisy beside
+  # other work); `perf` runs them.
+  only="-skip-testing:BloomShots/Performance"
+  [ -n "${1:-}" ] && only="-only-testing:BloomShots/$1"
+  mkdir -p "$shots"
+  # The whole output goes to a log; the lines that matter show here, and
+  # the run ends with xcodebuild's status (a failed test fails the run).
+  log=$dir/target/ios-next/test-$port.log
+  status=$dir/target/ios-next/test-$port.status
+  rm -f "$status"
+  { if TEST_RUNNER_SHOT_DIR=$shots TEST_RUNNER_SHOT_QUICKCONNECT=1 TEST_RUNNER_SHOT_SESSION=1 TEST_RUNNER_SHOT_SOCKET=1 TEST_RUNNER_SHOT_SYNCPLAY=${SHOT_SYNCPLAY:-} \
+  TEST_RUNNER_BLOOM_SERVER=http://${SERVER_HOST:-127.0.0.1}:$port \
+  TEST_RUNNER_MONKEY_STEPS=${MONKEY_STEPS:-120} TEST_RUNNER_MONKEY_SEED=${MONKEY_SEED:-} \
+  TEST_RUNNER_PERF_ITERATIONS=${PERF_ITERATIONS:-} \
+    xcodebuild test -project $project -scheme BloomNext -destination "$destination" -derivedDataPath $derived \
+    -collect-test-diagnostics never $only ${XCODE_ARGS:-}; then echo 0 >"$status"; else echo $? >"$status"; fi; } 2>&1 | tee "$log" \
+    | grep --line-buffered -E "MONKEY|error:|' (passed|failed|skipped)|\*\* TEST" || true
+  code=$(cat "$status" 2>/dev/null || echo 1)
+  [ "$code" = 0 ] || echo "dev/ios-next: the tests failed (exit $code); the whole output: $log" >&2
+  return "$code"
+}
+
+# The budget (specs/ios-native/README.md, "Performance budget"), checked
+# from the result bundle: the mean of the measured runs of each metric.
+# GATE=1 fails a metric over its budget; otherwise the numbers are printed.
+perf_check() { # xcresult gate
+  xcrun xcresulttool get test-results metrics --path "$1" --compact >"$1.metrics.json" || {
+    echo "dev/ios-next: no metrics in $1" >&2; return 1; }
+  python3 - "$1.metrics.json" "$2" <<'PY'
+import json, sys
+# displayName substring -> (budget, unit as printed); None: watched, no gate.
+BUDGET = {
+    "Hitch Time Ratio": 5.0,          # ms per s of scroll; Apple: < 5 good, 5-10 warning, > 10 critical
+    "Duration (AppLaunch)": 0.4,      # s to the first frame (Apple's launch target)
+}
+data, gate = json.load(open(sys.argv[1])), sys.argv[2] == "1"
+failed, seen = 0, 0
+for test in data if isinstance(data, list) else data.get("testsWithMetrics", data.get("tests", [])):
+    for run in test.get("testRuns", []):
+        for m in run.get("metrics", []):
+            values = m.get("measurements") or []
+            if not values:
+                continue
+            mean = sum(values) / len(values)
+            budget = next((b for k, b in BUDGET.items() if k in m["displayName"]), None)
+            over = budget is not None and mean > budget
+            mark = "" if budget is None else (" OVER %g" % budget if over else " ok (%g)" % budget)
+            print("PERF %s | %s: %.3f %s (max %.3f, n=%d)%s" % (test["testIdentifier"], m["displayName"],
+                  mean, m.get("unitOfMeasurement", ""), max(values), len(values), mark))
+            failed += over
+            seen += 1
+if not seen:
+    print("PERF: no measurement in the result bundle (did a test run?)")
+    sys.exit(1)
+if failed and gate:
+    print("PERF: %d metric(s) over the budget" % failed)
+    sys.exit(1)
+PY
+}
+
+perf() { # [only]
+  result=$dir/target/ios-next/perf-$port.xcresult
+  rm -rf "$result"
+  # (run_tests sets `status` and `code` of its own.)
+  perf_code=0
+  MOCK_EXTRA_MOVIES=${MOCK_EXTRA_MOVIES:-200} XCODE_ARGS="-configuration Release -resultBundlePath $result ${XCODE_ARGS:-}" \
+    run_tests "Performance${1:+/$1}" || perf_code=$?
+  [ -d "$result" ] && { perf_check "$result" "${GATE:-0}" || perf_code=$((perf_code ? perf_code : 1)); }
+  return $perf_code
+}
+
+case ${1:-} in
+  build) build ;;
+  test) shift; run_tests "${1:-}" || exit $? ;;
+  perf) shift
+    # A new test file is in the project only once xcodegen has seen it.
+    (cd ios/app && xcodegen generate --spec project.yml --quiet)
+    GATE=${BLOOM_PERF_GATE:-0} perf "${1:-}" || exit $? ;;
+  perf-device)
+    # The first phone connected (as `device`), the mock on every interface,
+    # and the app pointed at this Mac's address on the house network. The
+    # test build has an id and a name of its own ("BloomPerf"), so the
+    # installed app and its account are left alone.
+    device=${2:-$(xcrun devicectl list devices 2>/dev/null | grep physical | grep -v unavailable | grep -o '[0-9A-F]\{8\}-[0-9A-F]\{16\}' | head -1)}
+    [ -n "$device" ] || { echo "dev/ios-next: no phone connected" >&2; exit 1; }
+    lan=${BLOOM_PERF_HOST:-$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)}
+    [ -n "$lan" ] || { echo "dev/ios-next: no address on the house network (set BLOOM_PERF_HOST)" >&2; exit 1; }
+    echo "dev/ios-next: perf on $device against http://$lan:$port (the phone must be on the same network)"
+    dev/ios-core-locked
+    (cd ios/app && xcodegen generate --spec project.yml --quiet)
+    DEVICE=$device MOCK_HOST=0.0.0.0 SERVER_HOST=$lan derived=target/ios-next/DevicePerfData GATE=${BLOOM_PERF_GATE:-1} \
+      XCODE_ARGS="-allowProvisioningUpdates DEVELOPMENT_TEAM=${BLOOM_IOS_TEAM:-T46QDHL88N} CODE_SIGN_STYLE=Automatic BLOOM_APP_ID=dev.bloom.ios.perf BLOOM_APP_NAME=BloomPerf" \
+      perf "${3:-}" || exit $?
+    ;;
+  monkey) MONKEY_STEPS=${2:-120} MONKEY_SEED=${3:-} run_tests Monkey/testRandomWalk || exit $? ;;
+  device)
+    # The first phone connected: its id is 8 and 16 hex digits.
+    device=${2:-$(xcrun devicectl list devices 2>/dev/null | grep physical | grep -v unavailable | grep -o '[0-9A-F]\{8\}-[0-9A-F]\{16\}' | head -1)}
+    [ -n "$device" ] || { echo "dev/ios-next: no phone connected" >&2; exit 1; }
+    dev/ios-core-locked
+    (cd ios/app && xcodegen generate --spec project.yml --quiet)
+    xcodebuild -project $project -scheme BloomNext -configuration Release -sdk iphoneos -destination "id=$device" \
+      -derivedDataPath target/ios-next/DeviceData -allowProvisioningUpdates \
+      DEVELOPMENT_TEAM=${BLOOM_IOS_TEAM:-T46QDHL88N} CODE_SIGN_STYLE=Automatic build -quiet
+    xcrun devicectl device install app --device "$device" target/ios-next/DeviceData/Build/Products/Release-iphoneos/BloomNext.app
+    ;;
+  *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

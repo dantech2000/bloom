@@ -1,0 +1,97 @@
+#!/bin/sh
+# Builds bloom-core's Swift face for the native iOS app (specs/ios-native):
+# the crate ffi/ (bloom-ffi, UniFFI) for the device and the Apple Silicon
+# simulator, the Swift bindings, and a local Swift package that holds both.
+#
+#   dev/ios-core            release build
+#   dev/ios-core --debug    debug build (faster to make, slower to run)
+#
+# Out: ios/BloomCore/ (a Swift package: Package.swift, the generated
+# Sources/BloomCore/bloom_ffi.swift, and BloomFFI.xcframework). The app's
+# Xcode project depends on that package. The library is a dynamic
+# framework, so its Rust runtime stays private next to MPVKit's Libdovi,
+# which is a Rust library of its own (two static Rust runtimes clash on
+# `rust_eh_personality`). The Mac app does not use any of this.
+set -e
+dir=$(cd "$(dirname "$0")/.." && pwd)
+cd "$dir"
+profile=release; flag=--release
+[ "${1:-}" = --debug ] && { profile=debug; flag=; }
+# The minimum iOS: the app's (27.0). BLOOM_IOS_MIN=26.0 for a simulator
+# that has no iOS 27 runtime yet.
+min=${BLOOM_IOS_MIN:-27.0}
+name=bloom_ffiFFI
+out=target/ios-core
+pkg=ios/BloomCore
+
+echo "== cargo build -p bloom-ffi ($profile; device, simulator, and the Mac for the bindings)"
+for target in aarch64-apple-ios aarch64-apple-ios-sim; do
+  IPHONEOS_DEPLOYMENT_TARGET=$min cargo build -q $flag -p bloom-ffi --lib --target $target
+done
+# The bindings generator reads the library's metadata; the Mac build of
+# the same crate carries it.
+cargo build -q $flag -p bloom-ffi
+bindgen=target/$profile/uniffi-bindgen-swift
+hostlib=target/$profile/libbloom_ffi.dylib
+
+echo "== uniffi-bindgen-swift"
+rm -rf "$out"
+mkdir -p "$out/headers"
+"$bindgen" --swift-sources "$hostlib" "$out/swift"
+"$bindgen" --headers "$hostlib" "$out/headers"
+"$bindgen" --modulemap --xcframework --module-name $name --modulemap-filename module.modulemap "$hostlib" "$out/headers"
+
+# One framework per platform: the dylib renamed, its install name set,
+# the header and the module map, an Info.plist. iOS loads embedded code
+# from a framework only.
+framework() { # <target> <platform name> <dir>
+  fw=$3/$name.framework
+  mkdir -p "$fw/Headers" "$fw/Modules"
+  cp "target/$1/$profile/libbloom_ffi.dylib" "$fw/$name"
+  install_name_tool -id "@rpath/$name.framework/$name" "$fw/$name"
+  cp "$out/headers/$name.h" "$fw/Headers/"
+  cp "$out/headers/module.modulemap" "$fw/Modules/"
+  cat > "$fw/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>$name</string>
+  <key>CFBundleIdentifier</key><string>dev.bloom.ffi</string>
+  <key>CFBundleName</key><string>$name</string>
+  <key>CFBundlePackageType</key><string>FMWK</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleSupportedPlatforms</key><array><string>$2</string></array>
+  <key>MinimumOSVersion</key><string>$min</string>
+</dict></plist>
+PLIST
+}
+echo "== frameworks and the XCFramework"
+framework aarch64-apple-ios iPhoneOS "$out/device"
+framework aarch64-apple-ios-sim iPhoneSimulator "$out/simulator"
+# Made beside the package, then swapped in by one rename: an Xcode build
+# of another agent that reads the package meanwhile sees the old
+# XCFramework or the new one, never none (the lock serializes the
+# writers, not the readers).
+mkdir -p "$pkg/Sources/BloomCore"
+xcodebuild -create-xcframework \
+  -framework "$out/device/$name.framework" \
+  -framework "$out/simulator/$name.framework" \
+  -output "$out/BloomFFI.xcframework" >/dev/null
+# rename(2) cannot put a folder over a full one; renamex_np's RENAME_SWAP
+# exchanges the two in one step, and the old one leaves afterwards.
+python3 -I - "$out/BloomFFI.xcframework" "$pkg/BloomFFI.xcframework" <<'PY'
+import ctypes, os, shutil, sys
+new, dest = (os.fsencode(p) for p in sys.argv[1:])
+if not os.path.isdir(dest):
+    os.rename(new, dest)
+    sys.exit(0)
+libc = ctypes.CDLL(None, use_errno=True)
+RENAME_SWAP = 0x2
+if libc.renamex_np(new, dest, RENAME_SWAP) != 0:
+    sys.exit(f"dev/ios-core: the swap failed: {os.strerror(ctypes.get_errno())}")
+shutil.rmtree(new)
+PY
+cp "$out/swift/bloom_ffi.swift" "$pkg/Sources/BloomCore/.bloom_ffi.swift.new"
+mv -f "$pkg/Sources/BloomCore/.bloom_ffi.swift.new" "$pkg/Sources/BloomCore/bloom_ffi.swift"
+echo "== $pkg ($(du -sh "$pkg/BloomFFI.xcframework" | cut -f1))"
