@@ -328,6 +328,10 @@ impl Bloom {
                 item.display_title(),
             ),
             Dialog::Rename { list } => ("Rename playlist".to_string(), list.name.clone()),
+            Dialog::New { kind } => (
+                format!("New {}", kind.noun()),
+                "Add titles later from the menu of a title.".to_string(),
+            ),
         };
         // A phone: the width of the window less the margins.
         let mut card = crate::ui::dialog::card("lists.card", (self.viewport_w - 32.).min(440.))
@@ -487,6 +491,11 @@ impl Bloom {
                 card = card
                     .child(field("Name"))
                     .child(buttons("Rename".into(), ButtonKind::Primary, cx));
+            }
+            Dialog::New { .. } => {
+                card = card
+                    .child(field("Name"))
+                    .child(buttons("Create".into(), ButtonKind::Primary, cx));
             }
         }
 

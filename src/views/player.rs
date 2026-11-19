@@ -303,13 +303,15 @@ impl Bloom {
                 .items_center()
                 .gap(px(6.))
                 .when(m.extras, |el| el.child(
+                    // Filled when the item is a favourite, an outline when
+                    // not: a filled white heart read as "a favourite".
                     button(
                         "player.favorite",
-                        filled(
-                            Filled::Heart,
-                            24.,
-                            if favorite { rgb(0xf92672) } else { white },
-                        ),
+                        if favorite {
+                            filled(Filled::Heart, 24., rgb(0xf92672))
+                        } else {
+                            icon(LucideIcon::Heart, 22., white)
+                        },
                     )
                     .tooltip(tip(if favorite {
                         "Remove from favorites"
@@ -1121,7 +1123,12 @@ impl Bloom {
                 .text_size(px(44.))
                 .font_weight(gpui_kit::FontWeight::BOLD)
                 .text_color(white)
-                .child(item.display_title()),
+                // The year is in the line of details under it.
+                .child(if item.kind == crate::jellyfin::ItemKind::Movie {
+                    item.name.clone()
+                } else {
+                    item.display_title()
+                }),
         };
 
         let mut details: Vec<String> = Vec::new();
@@ -1286,11 +1293,13 @@ impl Bloom {
             for track in tracks {
                 let id = track.id;
                 let handle = this.clone();
+                let name = track.name();
                 items.push(
                     MenuItem::new(
                         gpui_kit::SharedString::from(format!("track.{kind}.{id}")),
-                        track.label(),
+                        name.name,
                     )
+                    .detail(name.detail)
                     .radio(track.selected)
                     .on_click(move |_, _, cx| {
                         handle.update(cx, |t, _| set(&t.player, Some(id))).ok();
@@ -1305,7 +1314,7 @@ impl Bloom {
                         continue;
                     }
                     let (index, handle) = (sub.index, this.clone());
-                    let detail = if status.pending_subs.contains(&index) { "Loading…" } else { "" };
+                    let detail = if status.pending_subs.contains(&index) { "Loading…" } else { "External file" };
                     items.push(
                         MenuItem::new(
                             gpui_kit::SharedString::from(format!("track.sub.file.{index}")),
@@ -1355,7 +1364,7 @@ impl Bloom {
         settings.push(self.quality_menu_item(cx));
         settings.push(MenuItem::separator());
         settings.push(MenuItem::label("settings.speed", "Playback speed"));
-        for speed in [0.5_f32, 0.75, 1., 1.25, 1.5, 2.] {
+        for speed in crate::player::SPEEDS {
             let handle = this.clone();
             settings.push(
                 MenuItem::new(

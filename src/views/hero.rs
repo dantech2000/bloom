@@ -31,6 +31,33 @@ const HERO_FADE: Duration = Duration::from_millis(500);
 const HERO_HEIGHT: f32 = 0.90;
 /// Share of the window height where the rows below the hero start.
 pub const HERO_ROWS_START: f32 = 0.68;
+/// The most room a title without a logo takes in a narrow window.
+const HERO_TEXT_W: f32 = 640.;
+/// The width of a bold glyph of the hero title, as a share of its size: a
+/// little over the average, so an estimate errs toward a smaller title.
+const TITLE_GLYPH_EM: f32 = 0.6;
+
+/// The size of a hero title without a logo: the web's steps by length
+/// (84 points for a short name, down to 36), made smaller until the
+/// longest word fits the box on one line and the name fits two lines
+/// (`line_clamp(2)`, 1.2 line height) of `w` by `h` points.
+fn hero_title_size(name: &str, w: f32, h: f32) -> f32 {
+    let chars = name.chars().count().max(1) as f32;
+    let step: f32 = match name.chars().count() {
+        0..=12 => 84.,
+        13..=25 => 56.,
+        26..=44 => 42.,
+        _ => 36.,
+    };
+    let longest = name.split_whitespace().map(|word| word.chars().count()).max().unwrap_or(1).max(1) as f32;
+    let word_fits = w / (longest * TITLE_GLYPH_EM);
+    // Two lines hold about twice the characters of one; a wrap at a word
+    // wastes some of the second, which the margin of the em covers.
+    let lines_fit = 2. * w / (chars * TITLE_GLYPH_EM);
+    let height_fits = h / (2. * 1.2);
+    step.min(word_fits).min(lines_fit).min(height_fits).max(24.).floor()
+}
+
 /// Time a trailer may take to start before the slide timer runs anyway.
 const TRAILER_GRACE: Duration = Duration::from_secs(5);
 
@@ -469,24 +496,29 @@ impl Bloom {
                 )
         });
 
+        // The title box: 40% of a wide window, and in a narrow one the room
+        // the text column has (a long title fit 360 points of a 900-point
+        // window and was cut, "Big B…", beside empty room, 2026-11-18).
+        let title_w = if compact {
+            vw * 0.85
+        } else {
+            (vw * 0.4).max((vw - left * 2.).min(HERO_TEXT_W))
+        };
+        let title_h = vh * 0.315;
         let title = match item.logo_url(&client, 900) {
             Some(url) => div().size_full().child(
                 crate::images::remote_logo(url)
-                    .w_full()
+                    .w(px((vw * 0.4).min(title_w)))
                     .h(relative(0.7))
-                    .mt(px(vh * 0.315 * 0.15)),
+                    .mt(px(title_h * 0.15)),
             ),
             None => {
-                let size = match item.name.chars().count() {
-                    0..=12 => 84.,
-                    13..=25 => 56.,
-                    26..=44 => 42.,
-                    _ => 36.,
-                };
+                let size = hero_title_size(&item.name, title_w, title_h);
                 div().size_full().flex().items_center().child(
                     div()
+                        .w_full()
                         .text_size(px(size))
-                        .line_height(relative(1.3))
+                        .line_height(relative(1.2))
                         .font_weight(gpui_kit::FontWeight::BOLD)
                         .text_color(white)
                         .line_clamp(2)
@@ -514,15 +546,26 @@ impl Bloom {
         };
         let chip = || chip_with(8.);
         let mut chips = div().flex().items_center().gap(px(4.));
+        // The two scores say what they are: a bare "95%" beside the star
+        // left a user guessing (2026-11-18). The critics' score is the
+        // share of good reviews (Rotten Tomatoes, through the server's
+        // metadata), the star the audience's rating out of ten.
         if let Some(score) = item.community_rating {
             chips = chips.child(
                 chip()
+                    .id("hero.rating")
+                    .tooltip(tip(format!("Audience rating: {score:.1} out of 10")))
                     .child(filled(Filled::Star, 15., rgb(0xf2b01e)))
                     .child(format!("{score:.1}")),
             );
         }
         if let Some(score) = item.critic_rating {
-            chips = chips.child(chip().child(format!("{score:.0}%")));
+            chips = chips.child(
+                chip()
+                    .id("hero.critics")
+                    .tooltip(tip(format!("{score:.0}% of critics liked it")))
+                    .child(format!("Critics {score:.0}%")),
+            );
         }
         if let Some(year) = item.production_year {
             chips = chips.child(chip().child(year.to_string()));
@@ -756,8 +799,8 @@ impl Bloom {
                         .absolute()
                         .left(px(left))
                         .top(px(vh * 0.15))
-                        .w(relative(if compact { 0.85 } else { 0.4 }))
-                        .h(px(vh * 0.315))
+                        .w(px(title_w))
+                        .h(px(title_h))
                         .child(title),
                 )
                 .child(
@@ -882,5 +925,20 @@ mod tests {
         assert_eq!(slide_shown(TRAILER_GRACE + two, true), two);
         // No trailer: the slide's time is the time on screen.
         assert_eq!(slide_shown(two, false), two);
+    }
+
+    #[test]
+    fn a_hero_title_fits_its_box() {
+        // A short title in a wide box keeps the web's size.
+        assert_eq!(hero_title_size("Sintel", 768., 300.), 84.);
+        // One long word shrinks until it fits on a line.
+        let size = hero_title_size("Northbound", 360., 300.);
+        assert!(size * 10. * TITLE_GLYPH_EM <= 360., "{size}");
+        // A long name fits two lines.
+        let name = "The Curious Incident of the Dog in the Night-Time";
+        let size = hero_title_size(name, 640., 300.);
+        assert!(size * name.len() as f32 * TITLE_GLYPH_EM <= 2. * 640., "{size}");
+        // A short window: two lines fit its height.
+        assert!(hero_title_size("Big Buck Bunny", 640., 100.) * 2.4 <= 100.);
     }
 }

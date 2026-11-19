@@ -150,6 +150,7 @@ def build():
         position = runtime // 3 if n in (1, 2) else 0
         add({"Id": ident(name), "Name": name, "Type": "Movie", "ParentId": movies["Id"],
              "ProductionYear": year, "RunTimeTicks": runtime, "CommunityRating": 6.0 + (n % 30) / 10,
+             "CriticRating": 60 + (n * 7) % 40,
              "OfficialRating": ["PG", "PG-13", "R"][n % 3], "Genres": [GENRES[n % 6], GENRES[(n + 2) % 6]],
              "Overview": f"{name} is a film of the mock library. It has no file, only this text.",
              "DateCreated": f"2026-09-{28 - n:02d}T10:00:00Z",
@@ -254,6 +255,13 @@ def query_items(q):
         found = [i for i in found if not i["UserData"]["Played"]]
     if "IsResumable" in filters:
         found = [i for i in found if i["UserData"]["PlaybackPositionTicks"]]
+    genre_ids = [g for g in one("genreIds").split("|") if g]
+    if genre_ids:
+        names = [name for name in GENRES if ident("genre " + name) in genre_ids]
+        found = [i for i in found if any(name in i.get("Genres", []) for name in names)]
+    years = [int(y) for y in one("years").split(",") if y]
+    if years:
+        found = [i for i in found if i.get("ProductionYear") in years]
     if "IsPlayed" in filters:
         found = [i for i in found if i["UserData"]["Played"]]
     person = one("personIds")
@@ -262,9 +270,6 @@ def query_items(q):
     genres = [g for g in one("genres").split("|") if g]
     if genres:
         found = [i for i in found if any(g in i.get("Genres", []) for g in genres)]
-    years = [int(y) for y in one("years").split(",") if y]
-    if years:
-        found = [i for i in found if i.get("ProductionYear") in years]
     if one("minCommunityRating"):
         lowest = float(one("minCommunityRating"))
         found = [i for i in found if i.get("CommunityRating", 0) >= lowest]
@@ -533,7 +538,11 @@ class Handler(BaseHTTPRequestHandler):
                 names = sorted({g for i in titles for g in i.get("Genres", [])})
             else:
                 names = [str(y) for y in sorted({i["ProductionYear"] for i in titles if i.get("ProductionYear")})]
-            found = [{"Name": n, "Id": ident(lower + n), "Type": "Genre" if lower == "/genres" else "Year"} for n in names]
+            # A genre's id is the one the genreIds filter of /Items reads.
+            found = [{"Name": n, "Id": ident("genre " + n) if lower == "/genres" else ident(lower + n),
+                      "Type": "Genre" if lower == "/genres" else "Year",
+                      "ChildCount": sum(1 for i in titles if n in i.get("Genres", []) or str(i.get("ProductionYear")) == n)}
+                     for n in names]
             return self.send(200, {"Items": found, "TotalRecordCount": len(found)})
         match = re.fullmatch(r"(?:/users/[^/]+)?/items/([0-9a-f]{32})", lower)
         if match and match[1] in PERSONS:

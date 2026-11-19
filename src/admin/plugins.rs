@@ -359,6 +359,7 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
             actions = actions.child(div().flex_1()).child(
                 super::more_button(
                     SharedString::from(format!("admin.plugins.more.{}.{}", plugin.id, plugin.version)),
+                    "More actions for this plugin",
                     cx,
                 )
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {

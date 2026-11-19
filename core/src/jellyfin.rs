@@ -373,16 +373,16 @@ impl Client {
             "/DisplayPreferences/usersettings",
             &[("userId", user), ("client", "emby".to_string())],
         )?;
-        Ok(DEFAULT_HOME_SECTIONS
-            .iter()
-            .enumerate()
-            .map(|(i, default)| {
+        // All ten slots the web client keeps; past its defaults a slot is
+        // empty ("none").
+        Ok((0..HOME_SECTION_SLOTS)
+            .map(|i| {
                 prefs
                     .custom_prefs
                     .get(&format!("homesection{i}"))
                     .cloned()
                     .flatten()
-                    .unwrap_or_else(|| default.to_string())
+                    .unwrap_or_else(|| DEFAULT_HOME_SECTIONS.get(i).copied().unwrap_or("none").to_string())
             })
             .collect())
     }
@@ -452,9 +452,13 @@ impl Client {
         if let Some(person) = &q.person_id {
             params.push(("personIds", person.clone()));
         }
+        if let Some(studio) = &q.studio_id {
+            params.push(("studioIds", studio.clone()));
+        }
         if !q.ids.is_empty() {
             params.push(("ids", q.ids.join(",")));
         }
+        params.extend(narrowing_params(q));
         self.get("/Items", &params)
     }
 
@@ -494,6 +498,24 @@ impl Client {
                 ("enableImageTypes", "Primary,Backdrop,Thumb".to_string()),
             ],
         )
+    }
+
+    /// The genres of the items of these kinds, inside a library or (with
+    /// no parent) on the whole server, by name.
+    pub fn genres(&self, parent_id: Option<&str>, include_types: &[&str]) -> Result<Vec<Item>> {
+        // The sort goes first: the app's race tests know the title index by
+        // "includeItemTypes=Movie,Series&recursive=true&sortBy=SortName",
+        // and a genre request with that text counted as one.
+        let mut params = vec![
+            ("sortBy", "SortName".to_string()),
+            ("includeItemTypes", include_types.join(",")),
+            ("recursive", "true".to_string()),
+            ("enableImageTypes", "Primary".to_string()),
+        ];
+        if let Some(parent) = parent_id {
+            params.push(("parentId", parent.to_string()));
+        }
+        self.item_list("/Genres", &params)
     }
 
     pub fn seasons(&self, series_id: &str) -> Result<Vec<Item>> {
@@ -879,6 +901,9 @@ pub struct QuickConnect {
     pub code: String,
 }
 
+/// Slots of home sections the server keeps (`homesection0` to `9`).
+pub const HOME_SECTION_SLOTS: usize = 10;
+
 /// The web client's default home section order.
 pub const DEFAULT_HOME_SECTIONS: [&str; 7] = [
     "smalllibrarytiles",
@@ -1128,6 +1153,8 @@ pub struct ItemQuery {
     pub name_starts_with: Option<String>,
     pub name_less_than: Option<String>,
     pub person_id: Option<String>,
+    /// The items of a studio, by its id (a genre's go in `genre_ids`).
+    pub studio_id: Option<String>,
     /// Only the items with these ids, in one request.
     pub ids: Vec<String>,
     /// The fields of each item, as the server names them; none for the
@@ -1135,6 +1162,37 @@ pub struct ItemQuery {
     pub fields: Option<String>,
     pub limit: Option<usize>,
     pub start: Option<usize>,
+    /// Only the items of these genres, by id.
+    pub genre_ids: Vec<String>,
+    /// Only the items of these production years.
+    pub years: Vec<i32>,
+    /// Only the items with (true) or without (false) a 4K video stream.
+    pub is_4k: Option<bool>,
+    /// Only the items with (true) or without (false) an HD video stream;
+    /// a 4K item is HD too.
+    pub is_hd: Option<bool>,
+    /// Only the items with (true) or without (false) a subtitle track.
+    pub has_subtitles: Option<bool>,
+}
+
+/// The parameters of `/Items` that narrow a query by genre, year,
+/// resolution and subtitles. The server takes genre ids with a pipe
+/// between two and years with a comma (checked on Jellyfin 12.2).
+pub fn narrowing_params(q: &ItemQuery) -> Vec<(&'static str, String)> {
+    let mut params = Vec::new();
+    if !q.genre_ids.is_empty() {
+        params.push(("genreIds", q.genre_ids.join("|")));
+    }
+    if !q.years.is_empty() {
+        let years: Vec<String> = q.years.iter().map(i32::to_string).collect();
+        params.push(("years", years.join(",")));
+    }
+    for (name, value) in [("is4K", q.is_4k), ("isHd", q.is_hd), ("hasSubtitles", q.has_subtitles)] {
+        if let Some(value) = value {
+            params.push((name, value.to_string()));
+        }
+    }
+    params
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1287,6 +1345,9 @@ pub struct Item {
     pub official_rating: Option<String>,
     #[serde(default)]
     pub genres: Vec<String>,
+    /// The genres with their ids, for a page of a genre.
+    #[serde(default)]
+    pub genre_items: Vec<NamedRef>,
     pub original_title: Option<String>,
     pub series_name: Option<String>,
     pub series_id: Option<String>,
@@ -1508,6 +1569,8 @@ pub struct Person {
 pub struct NamedRef {
     pub name: Option<String>,
     pub url: Option<String>,
+    /// The id of a studio or a genre.
+    pub id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -1530,6 +1593,8 @@ pub struct MediaSource {
     pub bitrate: Option<u64>,
     pub default_audio_stream_index: Option<i64>,
     pub default_subtitle_stream_index: Option<i64>,
+    /// Size of the file in bytes.
+    pub size: Option<u64>,
 }
 
 /// What a stream of a media source carries (the server's `Type`).
@@ -1598,6 +1663,10 @@ pub struct MediaStream {
     pub path: Option<String>,
     /// A subtitle of text (SubRip, ASS, VTT); false for an image track.
     pub is_text_subtitle_stream: bool,
+    /// A forced subtitle (signs and foreign speech only).
+    pub is_forced: bool,
+    /// Subtitles for the deaf and hard of hearing (SDH).
+    pub is_hearing_impaired: bool,
     /// How a subtitle gets to the player; only in an answer to
     /// `PlaybackInfo`.
     pub delivery_method: Option<SubtitleDelivery>,
@@ -1825,6 +1894,10 @@ pub fn format_duration(secs: i64) -> String {
 }
 
 pub fn format_runtime(secs: i64) -> String {
+    // A clip under a minute: "20 s", not "0m".
+    if (1..60).contains(&secs) {
+        return format!("{secs} s");
+    }
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
     if h > 0 {
@@ -2380,5 +2453,9 @@ mod tests {
         );
         assert_eq!(format_duration(3725), "1:02:05");
         assert_eq!(format_runtime(5400), "1h 30m");
+        assert_eq!(format_runtime(20), "20 s");
+        assert_eq!(format_runtime(59), "59 s");
+        assert_eq!(format_runtime(60), "1m");
+        assert_eq!(format_runtime(0), "0m");
     }
 }

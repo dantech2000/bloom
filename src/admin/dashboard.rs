@@ -42,7 +42,60 @@ pub struct Data {
     info: Info,
     counts: Counts,
     storage: Storage,
+    /// The newest items, for "Recently added".
+    recent: Vec<Recent>,
     pub live: Live,
+}
+
+/// Days "Recently added" looks back.
+const RECENT_DAYS: i64 = 7;
+/// Items "Recently added" asks for; the count says "N+" past it.
+const RECENT_LIMIT: usize = 50;
+/// Items "Recently added" lists.
+const RECENT_SHOWN: usize = 6;
+/// Groups of alerts the overview shows.
+const ALERT_GROUPS: usize = 7;
+
+/// An item of "Recently added".
+#[derive(Default, Deserialize, PartialEq)]
+#[serde(rename_all = "PascalCase", default)]
+struct Recent {
+    id: String,
+    name: String,
+    #[serde(rename = "Type")]
+    kind: String,
+    series_name: Option<String>,
+    index_number: Option<i32>,
+    parent_index_number: Option<i32>,
+    production_year: Option<i32>,
+    date_created: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct RecentPage {
+    items: Vec<Recent>,
+}
+
+#[easy_ext::ext(DashboardApi)]
+impl Client {
+    /// The newest items of the libraries: films, episodes, albums, books.
+    fn recently_added(&self) -> Result<Vec<Recent>> {
+        let page: RecentPage = self.get(
+            "/Items",
+            &[
+                ("recursive", "true".to_string()),
+                ("sortBy", "DateCreated".to_string()),
+                ("sortOrder", "Descending".to_string()),
+                ("includeItemTypes", "Movie,Episode,MusicAlbum,Book,MusicVideo".to_string()),
+                ("isMissing", "false".to_string()),
+                ("fields", "DateCreated".to_string()),
+                ("enableImages", "false".to_string()),
+                ("limit", RECENT_LIMIT.to_string()),
+            ],
+        )?;
+        Ok(page.items)
+    }
 }
 
 /// What the page loads again while it stays open.
@@ -51,7 +104,38 @@ pub struct Live {
     sessions: Vec<Session>,
     running: Vec<Task>,
     activity: Vec<Entry>,
-    alerts: Vec<Entry>,
+    alerts: Vec<AlertGroup>,
+}
+
+/// Alerts with the same kind and text, newest first: eight failed sign-ins
+/// of one name are one line, "× 8".
+#[derive(Clone, Default, PartialEq)]
+pub(super) struct AlertGroup {
+    pub entries: Vec<Entry>,
+}
+
+impl AlertGroup {
+    /// What tells this group from the others, also after a reload.
+    pub fn key(&self) -> String {
+        self.entries.first().map(|e| format!("{}|{}", e.kind, e.name)).unwrap_or_default()
+    }
+}
+
+/// Puts alerts with the same kind and text together, in the order of their
+/// newest entry, and keeps the first `max` groups.
+pub(super) fn group_alerts(entries: Vec<Entry>, max: usize) -> Vec<AlertGroup> {
+    let mut groups: Vec<AlertGroup> = Vec::new();
+    for entry in entries {
+        match groups
+            .iter_mut()
+            .find(|g| g.entries[0].kind == entry.kind && g.entries[0].name == entry.name)
+        {
+            Some(group) => group.entries.push(entry),
+            None => groups.push(AlertGroup { entries: vec![entry] }),
+        }
+    }
+    groups.truncate(max);
+    groups
 }
 
 #[derive(Default, Deserialize)]
@@ -158,6 +242,49 @@ struct Session {
     now_playing_item: Option<Item>,
     play_state: PlayState,
     transcoding_info: Option<Transcoding>,
+    /// Other idle sessions of the same device, folded into this row
+    /// ([`one_row_per_device`]).
+    #[serde(skip)]
+    others: usize,
+    /// The session of this app.
+    #[serde(skip)]
+    own: bool,
+}
+
+/// One row for each device. Rows with the same device name, app and user
+/// that play nothing are one row: the newest, which counts the others.
+/// They are sessions of one device: a second copy of the app, or a sign-in
+/// the server still remembers. A session that plays keeps its own row.
+/// `own_device` is the device id of this app; its row is marked.
+fn one_row_per_device(sessions: Vec<Session>, own_device: &str) -> Vec<Session> {
+    let mut rows: Vec<Session> = Vec::new();
+    for mut session in sessions {
+        session.own = session.device_id == own_device;
+        let same = |row: &Session| {
+            row.now_playing_item.is_none()
+                && row.device_name == session.device_name
+                && row.client == session.client
+                && row.user_id == session.user_id
+        };
+        if session.now_playing_item.is_some() {
+            rows.push(session);
+            continue;
+        }
+        match rows.iter_mut().find(|row| same(row)) {
+            Some(row) => {
+                // The row shows this app when one of them is this app,
+                // else the newest; the other counts.
+                let (others, own) = (row.others + 1 + session.others, row.own || session.own);
+                if session.own || (!row.own && session.last_activity_date > row.last_activity_date) {
+                    *row = session;
+                }
+                row.others = others;
+                row.own = own;
+            }
+            None => rows.push(session),
+        }
+    }
+    rows
 }
 
 #[derive(Default, Deserialize)]
@@ -198,6 +325,7 @@ struct Task {
 pub fn load(client: &Client) -> Result<Data> {
     std::thread::scope(|scope| {
         let info = scope.spawn(|| client.system_info::<Info>());
+        let recent = scope.spawn(|| client.recently_added());
         let counts = scope.spawn(|| client.item_counts::<Counts>());
         let storage = scope.spawn(|| client.storage_info::<Storage>());
         let live = refresh(client)?;
@@ -205,6 +333,7 @@ pub fn load(client: &Client) -> Result<Data> {
             info: info.join().expect("info thread")?,
             counts: counts.join().expect("counts thread").unwrap_or_default(),
             storage: storage.join().expect("storage thread").unwrap_or_default(),
+            recent: recent.join().expect("recent thread").unwrap_or_default(),
             live,
         })
     })
@@ -219,11 +348,12 @@ pub fn refresh(client: &Client) -> Result<Live> {
             .map(|page| collapse(page.items).into_iter().take(7).collect::<Vec<_>>())
             .unwrap_or_default()
     };
-    // What the server did by itself: no user is named.
+    // What the server did by itself: no user is named. Repeated alerts
+    // are one line, so more are read than shown.
     let alerts = || {
         client
-            .activity_log::<ActivityPage>(&[("Limit", "7".to_string()), ("HasUserId", "false".to_string())])
-            .map(|e| e.items)
+            .activity_log::<ActivityPage>(&[("Limit", "40".to_string()), ("HasUserId", "false".to_string())])
+            .map(|e| group_alerts(e.items, ALERT_GROUPS))
             .unwrap_or_default()
     };
     std::thread::scope(|scope| {
@@ -271,6 +401,7 @@ pub fn refresh(client: &Client) -> Result<Live> {
             }
         }
         // Sessions that play come first, then the most recent ones.
+        let mut sessions = one_row_per_device(sessions, &client.device_id);
         sessions.sort_by(|a, b| {
             (b.now_playing_item.is_some(), &b.last_activity_date)
                 .cmp(&(a.now_playing_item.is_some(), &a.last_activity_date))
@@ -317,13 +448,11 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
         .gap(px(GAP))
         .child(server_card(data, wide, cx))
         .child(count_tiles(data, width, cx))
-        .when(!live.running.is_empty(), |el| {
-            el.child(running_tasks(&live.running, cx))
-        })
+        .child(pair(now(live, cx), recently_added(&data.recent, cx)))
         .child(sessions(app, &live.sessions, width, cx))
         .child(pair(
             entries("Activity", &live.activity, "No activity yet.", cx),
-            entries("Alerts", &live.alerts, "No alerts.", cx),
+            alerts(app, &live.alerts, cx),
         ))
         .child(pair(storage(&data.storage, cx), paths(&data.info, cx)))
 }
@@ -382,50 +511,15 @@ fn server_card(data: &Data, wide: bool, cx: &mut Context<Bloom>) -> Div {
             })
         })),
     };
-    let name = info.server_name.clone();
-    let restart = button("admin.dash.restart", "Restart", ButtonKind::Plain, cx).on_click(
-        cx.listener({
-            let name = name.clone();
-            move |this, _: &ClickEvent, _, cx| {
-                this.ask_confirm(
-                    Confirm {
-                        title: "Restart the server?".to_string(),
-                        message: format!(
-                            "{name} stops all playback and is not available until it starts again."
-                        ),
-                        action: "Restart".to_string(),
-                        danger: true,
-                        run: Rc::new(|this, cx| {
-                            this.admin_action("The server restarts", cx, |client| {
-                                client.restart_server()
-                            })
-                        }),
-                    },
-                    cx,
-                )
+    let power = super::more_button("admin.dash.power", "Restart or shut down the server", cx)
+        .on_click(cx.listener({
+            let (name, can_restart) = (info.server_name.clone(), info.can_self_restart);
+            move |this, event: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                let items = power_menu(&name, can_restart, cx);
+                this.open_admin_menu(items, event.position(), window, cx);
             }
-        }),
-    );
-    let shutdown = button("admin.dash.shutdown", "Shut Down", ButtonKind::Danger, cx).on_click(
-        cx.listener(move |this, _: &ClickEvent, _, cx| {
-            this.ask_confirm(
-                Confirm {
-                    title: "Shut down the server?".to_string(),
-                    message: format!(
-                        "{name} stops all playback. You must start it again by hand on the host."
-                    ),
-                    action: "Shut Down".to_string(),
-                    danger: true,
-                    run: Rc::new(|this, cx| {
-                        this.admin_action("The server shuts down", cx, |client| {
-                            client.shutdown_server()
-                        })
-                    }),
-                },
-                cx,
-            )
-        }),
-    );
+        }));
 
     let identity = div()
         .flex()
@@ -475,9 +569,9 @@ fn server_card(data: &Data, wide: bool, cx: &mut Context<Bloom>) -> Div {
         .flex_wrap()
         .flex_shrink_0()
         .gap(px(10.))
+        .items_center()
         .child(scan_button)
-        .when(info.can_self_restart, |el| el.child(restart))
-        .child(shutdown);
+        .child(power);
 
     card(cx)
         .p(px(22.))
@@ -490,6 +584,61 @@ fn server_card(data: &Data, wide: bool, cx: &mut Context<Bloom>) -> Div {
                 .child(identity)
                 .child(actions),
         )
+}
+
+/// The entries of the server's "…" menu: the power actions, each behind
+/// its question.
+pub(crate) fn power_menu(name: &str, can_restart: bool, cx: &Context<Bloom>) -> Vec<crate::ui::menu::MenuItem> {
+    use crate::ui::menu::MenuItem;
+    let handle = cx.weak_entity();
+    let mut items = Vec::new();
+    if can_restart {
+        let (handle, name) = (handle.clone(), name.to_string());
+        items.push(
+            MenuItem::new("admin.dash.restart", "Restart server…")
+                .icon(LucideIcon::RotateCw)
+                .detail("Stops all playback for a minute")
+                .on_click(move |_, _, cx| {
+                    handle.update(cx, |this, cx| ask_power(this, &name, true, cx)).ok();
+                }),
+        );
+    }
+    let name = name.to_string();
+    items.push(
+        MenuItem::new("admin.dash.shutdown", "Shut down server…")
+            .icon(LucideIcon::Power)
+            .detail("Must be started again on the host")
+            .on_click(move |_, _, cx| {
+                handle.update(cx, |this, cx| ask_power(this, &name, false, cx)).ok();
+            }),
+    );
+    items
+}
+
+/// Asks before the server restarts (`restart`) or shuts down.
+fn ask_power(app: &mut Bloom, name: &str, restart: bool, cx: &mut Context<Bloom>) {
+    let confirm = if restart {
+        Confirm {
+            title: "Restart the server?".to_string(),
+            message: format!("{name} stops all playback and is not available until it starts again."),
+            action: "Restart".to_string(),
+            danger: true,
+            run: Rc::new(|this, cx| {
+                this.admin_action("The server restarts", cx, |client| client.restart_server())
+            }),
+        }
+    } else {
+        Confirm {
+            title: "Shut down the server?".to_string(),
+            message: format!("{name} stops all playback. You must start it again by hand on the host."),
+            action: "Shut Down".to_string(),
+            danger: true,
+            run: Rc::new(|this, cx| {
+                this.admin_action("The server shuts down", cx, |client| client.shutdown_server())
+            }),
+        }
+    };
+    app.ask_confirm(confirm, cx);
 }
 
 // ----- counts -----------------------------------------------------------------
@@ -622,6 +771,7 @@ fn session_card(
         _ => None,
     };
     let avatar = avatar(&user, image, 36.);
+    let own = session.own;
     let device = format!(
         "{} {} · {}",
         session.client, session.application_version, session.device_name
@@ -657,7 +807,9 @@ fn session_card(
                         ))
                         .child(div().min_w_0().truncate().child(device)),
                 ),
-        );
+        )
+        // The session of the app that shows this page.
+        .when(own, |el| el.child(div().flex_shrink_0().child(badge("This app", None))));
     let base = div()
         .id(SharedString::from(format!("admin.dash.session.{}", session.id)))
         .relative()
@@ -686,16 +838,7 @@ fn session_card(
                     .truncate()
                     .text_size(px(13.))
                     .text_color(t.colors.foreground.opacity(0.6))
-                    // A device without a session has no address.
-                    .child(if session.remote_end_point.is_empty() {
-                        format!("Idle · last seen {}", ago(&session.last_activity_date))
-                    } else {
-                        format!(
-                            "Idle · last seen {} · {}",
-                            ago(&session.last_activity_date),
-                            session.remote_end_point
-                        )
-                    }),
+                    .child(idle_line(session)),
             )
             .into_any_element();
     };
@@ -818,8 +961,31 @@ fn session_card(
         .into_any_element()
 }
 
+/// The line of a device that plays nothing: when it was last seen, its
+/// address, and the other sessions of the same device that the row holds.
+fn idle_line(session: &Session) -> String {
+    let mut parts = vec![format!("Idle · last seen {}", ago(&session.last_activity_date))];
+    // A device without a session has no address.
+    if !session.remote_end_point.is_empty() {
+        parts.push(session.remote_end_point.clone());
+    }
+    match session.others {
+        0 => {}
+        1 => parts.push("1 more session on this device".to_string()),
+        n => parts.push(format!("{n} more sessions on this device")),
+    }
+    parts.join(" · ")
+}
+
 /// What a transcode does and why: "Video h264 1080p · Audio aac · 8.0 Mbps · …".
 fn transcode_line(info: &Transcoding) -> String {
+    let reasons = transcode_reasons(info);
+    let what = transcode_what(info);
+    if reasons.is_empty() { what } else { format!("{what} · {}", reasons.join(", ")) }
+}
+
+/// What a transcode makes: "Video H264 1080p · Audio AAC · TS · 8.0 Mbps".
+fn transcode_what(info: &Transcoding) -> String {
     let mut parts: Vec<String> = Vec::new();
     let codec = |direct: bool, codec: &Option<String>| match (direct, codec) {
         (true, _) => "direct".to_string(),
@@ -850,8 +1016,13 @@ fn transcode_line(info: &Transcoding) -> String {
     if let Some(done) = info.completion_percentage.filter(|d| *d > 0.) {
         parts.push(format!("{done:.0}% converted"));
     }
+    parts.join(" · ")
+}
+
+/// Why the server transcodes, in words: "Video codec not supported".
+fn transcode_reasons(info: &Transcoding) -> Vec<String> {
     // The reasons are a list of names on new servers, one text on old ones.
-    let reasons: Vec<String> = match &info.transcode_reasons {
+    match &info.transcode_reasons {
         serde_json::Value::Array(list) => list
             .iter()
             .filter_map(|r| r.as_str())
@@ -859,11 +1030,7 @@ fn transcode_line(info: &Transcoding) -> String {
             .collect(),
         serde_json::Value::String(text) => text.split(',').map(|r| plugin_config::label(r.trim())).collect(),
         _ => Vec::new(),
-    };
-    if !reasons.is_empty() {
-        parts.push(reasons.join(", "));
     }
-    parts.join(" · ")
 }
 
 fn device_glyph(client: &str, device: &str) -> LucideIcon {
@@ -884,33 +1051,277 @@ fn device_glyph(client: &str, device: &str) -> LucideIcon {
 
 // ----- tasks, activity --------------------------------------------------------
 
-fn running_tasks(tasks: &[Task], cx: &mut Context<Bloom>) -> Div {
+/// What the server does at this moment: the tasks that run (a library
+/// scan among them) and the transcodes, with what, for whom and why.
+fn now(live: &Live, cx: &mut Context<Bloom>) -> Div {
     let t = UiTheme::read(cx).clone();
-    panel("Running Tasks", cx)
-        .gap(px(10.))
-        .children(tasks.iter().map(|task| {
-            let percent = task.current_progress_percentage.unwrap_or(0.);
+    let quiet = t.colors.foreground.opacity(0.6);
+    let mut list = panel("Now", cx).gap(px(12.));
+    let transcodes: Vec<(&Session, &Item, &Transcoding)> = live
+        .sessions
+        .iter()
+        .filter(|s| s.play_state.play_method.as_deref() == Some("Transcode"))
+        .filter_map(|s| Some((s, s.now_playing_item.as_ref()?, s.transcoding_info.as_ref()?)))
+        .collect();
+    if live.running.is_empty() && transcodes.is_empty() {
+        return list.child(
+            div()
+                .text_size(px(14.))
+                .text_color(t.colors.muted_foreground)
+                .child("The server is idle. No scan, task or transcode runs."),
+        );
+    }
+    for task in &live.running {
+        let percent = task.current_progress_percentage.unwrap_or(0.);
+        list = list.child(
             div()
                 .flex()
                 .items_center()
-                .gap(px(14.))
+                .gap(px(12.))
                 .text_size(px(14.))
                 .text_color(t.colors.foreground)
-                .child(icon(LucideIcon::RefreshCw, 15., t.colors.foreground.opacity(0.7)))
-                .child(div().w(px(260.)).flex_shrink_0().truncate().child(task.name.clone()))
-                .child(bar(percent as f32 / 100., tone::INK).flex_1())
+                .child(icon_disc(LucideIcon::RefreshCw, None, 30.))
+                .child(div().flex_1().min_w_0().truncate().child(task.name.clone()))
+                .child(bar(percent as f32 / 100., tone::INK).w(px(110.)).flex_shrink_0())
                 .child(
                     div()
-                        .w(px(96.))
+                        .w(px(64.))
                         .flex_shrink_0()
-                        .text_color(t.colors.foreground.opacity(0.7))
+                        .text_color(quiet)
                         .child(if task.state == super::tasks::TaskState::Cancelling {
                             "Stopping…".to_string()
                         } else {
                             format!("{percent:.0}%")
                         }),
+                ),
+        );
+    }
+    for (session, item, info) in transcodes {
+        let title = match (&item.series_name, item.episode_code()) {
+            (Some(series), Some(code)) => format!("{series} {code}"),
+            (Some(series), None) => format!("{series}: {}", item.name),
+            _ => item.name.clone(),
+        };
+        let user = session.user_name.clone().unwrap_or_default();
+        let reasons = transcode_reasons(info);
+        let why = if reasons.is_empty() {
+            "The server gave no reason.".to_string()
+        } else {
+            format!("Why: {}", reasons.join(", "))
+        };
+        let line = |text: String, color| div().text_size(px(12.)).text_color(color).child(text);
+        list = list.child(
+            div()
+                .flex()
+                .items_start()
+                .gap(px(12.))
+                .child(icon_disc(LucideIcon::Cpu, Some(State::Warn), 30.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(14.))
+                                .text_color(t.colors.foreground)
+                                .child(format!("Transcoding {title} for {user}")),
+                        )
+                        .child(line(format!("On {} · {}", session.device_name, transcode_what(info)), quiet))
+                        .child(line(why, quiet)),
+                ),
+        );
+    }
+    list
+}
+
+/// The items added in the last days: the count, and the newest few.
+fn recently_added(recent: &[Recent], cx: &mut Context<Bloom>) -> Div {
+    let t = UiTheme::read(cx).clone();
+    let now = jiff::Timestamp::now().as_second();
+    let fresh = recent
+        .iter()
+        .take_while(|item| {
+            parse_date(&item.date_created).is_some_and(|at| now - at.as_second() <= RECENT_DAYS * 86_400)
+        })
+        .count();
+    let count = if fresh >= RECENT_LIMIT { format!("{RECENT_LIMIT}+") } else { fresh.to_string() };
+    let summary = match fresh {
+        0 if recent.is_empty() => "The libraries have no items yet.".to_string(),
+        0 => format!("Nothing new in the last {RECENT_DAYS} days. The newest:"),
+        1 => format!("1 item in the last {RECENT_DAYS} days."),
+        _ => format!("{count} items in the last {RECENT_DAYS} days."),
+    };
+    let shown = if fresh == 0 { 3 } else { RECENT_SHOWN.min(fresh) };
+    let mut list = panel("Recently added", cx).child(
+        div()
+            .pb(px(4.))
+            .text_size(px(14.))
+            .text_color(t.colors.foreground.opacity(0.7))
+            .child(summary),
+    );
+    for (at, item) in recent.iter().take(shown).enumerate() {
+        let (glyph, detail) = match item.kind.as_str() {
+            "Episode" => {
+                let code = match (item.parent_index_number, item.index_number) {
+                    (Some(season), Some(episode)) => format!("S{season:02}E{episode:02} · "),
+                    _ => String::new(),
+                };
+                (LucideIcon::Tv, format!("{code}{}", item.name))
+            }
+            "MusicAlbum" => (LucideIcon::Disc3, "Album".to_string()),
+            "Book" => (LucideIcon::Library, "Book".to_string()),
+            "MusicVideo" => (LucideIcon::CirclePlay, "Music video".to_string()),
+            _ => (
+                LucideIcon::Film,
+                item.production_year.map_or_else(|| "Film".to_string(), |year| format!("Film · {year}")),
+            ),
+        };
+        let title = item.series_name.clone().unwrap_or_else(|| item.name.clone());
+        let id = item.id.clone();
+        list = list.child(
+            div()
+                .id(SharedString::from(format!("admin.dash.recent.{at}")))
+                .py(px(7.))
+                .px(px(8.))
+                .mx(px(-8.))
+                .rounded(px(12.))
+                .cursor_pointer()
+                .hover(|s| s.bg(tone::HOVER))
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .child(icon_disc(glyph, None, 30.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().truncate().text_size(px(14.)).text_color(t.colors.foreground).child(title))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(12.))
+                                .text_color(t.colors.foreground.opacity(0.6))
+                                .child(detail),
+                        ),
                 )
-        }))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(12.))
+                        .text_color(t.colors.foreground.opacity(0.55))
+                        .child(ago(&item.date_created)),
+                )
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_item_id(&id, cx))),
+        );
+    }
+    list
+}
+
+/// The alerts, repeated ones as one line ("× 8") that opens to the list.
+fn alerts(app: &Bloom, groups: &[AlertGroup], cx: &mut Context<Bloom>) -> Div {
+    let t = UiTheme::read(cx).clone();
+    let mut list = panel("Alerts", cx);
+    if groups.is_empty() {
+        return list.child(div().text_size(px(14.)).text_color(t.colors.muted_foreground).child("No alerts."));
+    }
+    let opened = app.admin_data().map(|data| &data.alerts_open);
+    for (i, group) in groups.iter().enumerate() {
+        let first = &group.entries[0];
+        let times = group.entries.len();
+        let key = group.key();
+        let open = times > 1 && opened.is_some_and(|set| set.contains(&key));
+        let (glyph, state) = first.look();
+        let overview = if times > 1 {
+            let oldest = group.entries.last().map(|e| ago(&e.date)).unwrap_or_default();
+            Some(format!("{times} times, the first {oldest}"))
+        } else {
+            first.short_overview.clone().filter(|o| !o.is_empty())
+        };
+        let mut row = div()
+            .id(SharedString::from(format!("admin.dash.alert.{i}")))
+            .py(px(9.))
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .child(icon_disc(glyph, state, 30.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .text_size(px(14.))
+                            .text_color(t.colors.foreground)
+                            .child(div().min_w_0().child(first.name.clone()))
+                            .when(times > 1, |el| {
+                                el.child(div().flex_shrink_0().child(badge(format!("× {times}"), None)))
+                            }),
+                    )
+                    .when_some(overview, |el, overview| {
+                        el.child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(t.colors.foreground.opacity(0.6))
+                                .child(overview),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(12.))
+                    .text_color(t.colors.foreground.opacity(0.55))
+                    .child(ago(&first.date)),
+            );
+        if times > 1 {
+            row = row
+                .cursor_pointer()
+                .child(icon(
+                    if open { LucideIcon::ChevronUp } else { LucideIcon::ChevronDown },
+                    16.,
+                    t.colors.foreground.opacity(0.7),
+                ))
+                .tooltip(crate::ui::tip::tip(if open { "Hide the list" } else { "Show each one" }))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    if let Some(data) = this.admin_data_mut()
+                        && !data.alerts_open.remove(&key)
+                    {
+                        data.alerts_open.insert(key.clone());
+                    }
+                    cx.notify();
+                }));
+        }
+        let mut item = div()
+            .when(i > 0, |el| el.border_t_1().border_color(rgba(0xffffff14)))
+            .child(row);
+        if open {
+            item = item.child(div().pl(px(42.)).pb(px(8.)).flex().flex_col().gap(px(4.)).children(
+                group.entries.iter().map(|entry| {
+                    div()
+                        .flex()
+                        .gap(px(12.))
+                        .text_size(px(12.))
+                        .text_color(t.colors.foreground.opacity(0.7))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(entry.short_overview.clone().filter(|o| !o.is_empty()).unwrap_or_else(|| entry.name.clone())),
+                        )
+                        .child(div().flex_shrink_0().text_color(t.colors.foreground.opacity(0.55)).child(ago(&entry.date)))
+                }),
+            ));
+        }
+        list = list.child(item);
+    }
+    list
 }
 
 fn entries(title: &'static str, entries: &[Entry], empty: &'static str, cx: &mut Context<Bloom>) -> Div {
@@ -1145,5 +1556,94 @@ fn bytes(n: i64) -> String {
         format!("{value:.0} {}", UNITS[unit])
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Opens every group of repeated alerts (the debug channel).
+pub(crate) fn open_alert_groups(app: &mut Bloom, cx: &mut Context<Bloom>) {
+    let Some(data) = app.admin_data_mut() else {
+        return;
+    };
+    let keys: Vec<String> = data
+        .dashboard
+        .as_ref()
+        .map(|d| d.live.alerts.iter().filter(|g| g.entries.len() > 1).map(AlertGroup::key).collect())
+        .unwrap_or_default();
+    data.alerts_open.extend(keys);
+    cx.notify();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alert(kind: &str, name: &str, date: &str) -> Entry {
+        Entry { kind: kind.into(), name: name.into(), date: date.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn repeated_alerts_are_one_group() {
+        let failed = "Failed login attempt from bob";
+        let mut entries: Vec<Entry> =
+            (0..8).map(|i| alert("AuthenticationFailed", failed, &format!("2026-11-18T10:0{i}:00Z"))).collect();
+        entries.insert(3, alert("PluginUpdated", "Plugin X was updated", "2026-11-18T10:02:30Z"));
+        entries.push(alert("AuthenticationFailed", "Failed login attempt from eve", "2026-11-18T09:00:00Z"));
+        let groups = group_alerts(entries, 7);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].entries.len(), 8);
+        // The group is where its newest entry is, and keeps the order.
+        assert_eq!(groups[0].entries[0].date, "2026-11-18T10:00:00Z");
+        assert_eq!(groups[1].entries[0].kind, "PluginUpdated");
+        assert_eq!(groups[2].entries[0].name, "Failed login attempt from eve");
+        assert_ne!(groups[0].key(), groups[2].key());
+        assert_eq!(group_alerts(vec![alert("A", "a", ""), alert("B", "b", "")], 1).len(), 1);
+    }
+
+    fn session(device_id: &str, name: &str, date: &str) -> Session {
+        Session {
+            id: device_id.into(),
+            device_id: device_id.into(),
+            user_id: Some("u".into()),
+            client: "Bloom".into(),
+            device_name: name.into(),
+            last_activity_date: date.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn one_row_for_the_sessions_of_a_device() {
+        let sessions = vec![
+            session("test-copy", "Mac", "2026-11-18T10:05:00Z"),
+            session("own", "Mac", "2026-11-18T10:00:00Z"),
+            session("old", "Mac", "2026-11-18T09:00:00Z"),
+            session("tv", "Living Room", "2026-11-18T10:00:00Z"),
+        ];
+        let rows = one_row_per_device(sessions, "own");
+        assert_eq!(rows.len(), 2);
+        // This app's row stands for the device, newer or not, and counts
+        // the other two.
+        assert_eq!(rows[0].device_id, "own");
+        assert!(rows[0].own);
+        assert_eq!(rows[0].others, 2);
+        assert_eq!(rows[1].device_name, "Living Room");
+        assert!(!rows[1].own);
+    }
+
+    #[test]
+    fn a_device_that_plays_keeps_its_row() {
+        let mut playing = session("b", "Mac", "2026-11-18T10:00:00Z");
+        playing.now_playing_item = Some(Item { id: "i".into(), ..Default::default() });
+        let mut other_user = session("c", "Mac", "2026-11-18T10:00:00Z");
+        other_user.user_id = Some("v".into());
+        let rows = one_row_per_device(vec![session("a", "Mac", "2026-11-18T09:00:00Z"), playing, other_user], "x");
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.others == 0));
+        // Without this app among them, the newest idle row stands.
+        let rows = one_row_per_device(
+            vec![session("a", "Mac", "2026-11-18T09:00:00Z"), session("b", "Mac", "2026-11-18T10:00:00Z")],
+            "x",
+        );
+        assert_eq!((rows.len(), rows[0].device_id.as_str(), rows[0].others), (1, "b", 1));
     }
 }

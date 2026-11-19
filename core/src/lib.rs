@@ -30,6 +30,7 @@ pub mod search_index;
 pub mod subtitles;
 pub mod syncplay;
 pub mod test_time;
+pub mod track_names;
 pub mod trailers;
 #[cfg(test)]
 mod test_net;

@@ -53,6 +53,7 @@ mod tests {
         NamedRef {
             name: Some(name.into()),
             url: Some(url.into()),
+            ..Default::default()
         }
     }
 

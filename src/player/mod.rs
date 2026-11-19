@@ -82,6 +82,19 @@ impl std::fmt::Display for TrackKind {
     }
 }
 
+/// The speeds the player offers, slowest first.
+pub const SPEEDS: [f32; 7] = [0.5, 0.75, 1., 1.25, 1.5, 1.75, 2.];
+
+/// The speed one step faster (`up`) or slower than `now` on [`SPEEDS`]; a
+/// speed between two steps goes to the next one. None past either end.
+pub fn speed_step(now: f32, up: bool) -> Option<f32> {
+    if up {
+        SPEEDS.iter().copied().find(|s| *s > now + 0.001)
+    } else {
+        SPEEDS.iter().rev().copied().find(|s| *s < now - 0.001)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct Track {
@@ -102,28 +115,34 @@ pub struct Track {
     pub forced: bool,
     #[serde(default)]
     pub external: bool,
+    /// Subtitles for the deaf and hard of hearing, as the file marks them.
+    #[serde(default)]
+    pub hearing_impaired: bool,
+    /// Audio channels, as the file names them.
+    #[serde(default)]
+    pub demux_channel_count: Option<i64>,
 }
 
 impl Track {
+    /// The name of the track in the words of the detail page ("English",
+    /// "English (Forced)", "English · 5.1") with its format as the quiet
+    /// detail (`bloom_core::track_names`).
+    pub fn name(&self) -> bloom_core::track_names::Name {
+        bloom_core::track_names::name(&bloom_core::track_names::Facts {
+            audio: self.kind == TrackKind::Audio,
+            language: self.lang.as_deref(),
+            title: self.title.as_deref(),
+            codec: self.codec.as_deref(),
+            channels: self.demux_channel_count,
+            forced: self.forced,
+            hearing_impaired: self.hearing_impaired,
+            external: self.external,
+            display: None,
+        })
+    }
+
     pub fn label(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(title) = &self.title {
-            parts.push(title.clone());
-        }
-        if let Some(lang) = &self.lang {
-            parts.push(lang.to_uppercase());
-        }
-        if let Some(codec) = &self.codec {
-            parts.push(codec.to_uppercase());
-        }
-        if self.forced {
-            parts.push("forced".into());
-        }
-        if parts.is_empty() {
-            format!("Track {}", self.id)
-        } else {
-            parts.join(" · ")
-        }
+        self.name().name
     }
 }
 

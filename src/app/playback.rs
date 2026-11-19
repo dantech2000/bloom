@@ -12,15 +12,7 @@ impl Bloom {
             return;
         };
         let (item_id, played) = (data.item.id.clone(), !data.item.user_data.played);
-        self.set_user_data(&item_id, Mark::Played, played, true, cx, |this, user_data, cx| {
-            if let Page::Detail(data) = &mut this.nav.page {
-                data.item.user_data = user_data;
-                if data.item.is_series() {
-                    // Episodes and season counts changed server-side too.
-                    this.load_page(cx);
-                }
-            }
-        });
+        self.mark_now(item_id, Mark::Played, played, cx);
     }
 
     /// Flips the favorite state of the item shown on the detail page.
@@ -29,11 +21,69 @@ impl Bloom {
             return;
         };
         let (item_id, favorite) = (data.item.id.clone(), !data.item.user_data.is_favorite);
-        self.set_user_data(&item_id, Mark::Favorite, favorite, true, cx, |this, user_data, _| {
-            if let Page::Detail(data) = &mut this.nav.page {
-                data.item.user_data = user_data;
-            }
-        });
+        self.mark_now(item_id, Mark::Favorite, favorite, cx);
+    }
+
+    /// Sets the watched or the favourite state of an item: the buttons of
+    /// the detail page and the player show it at once, the answer of the
+    /// server replaces it, and a failure puts the state of before back.
+    fn mark_now(&mut self, item_id: String, mark: Mark, on: bool, cx: &mut Context<Self>) {
+        self.apply_mark(&item_id, mark, on);
+        cx.notify();
+        let request_id = item_id.clone();
+        self.fetch(
+            cx,
+            move |client| match mark {
+                Mark::Played => client.set_played(&request_id, on),
+                Mark::Favorite => client.set_favorite(&request_id, on),
+            },
+            move |this, result, cx| {
+                match result {
+                    Ok(user_data) => {
+                        let mut series = false;
+                        if let Page::Detail(data) = &mut this.nav.page
+                            && data.item.id == item_id
+                        {
+                            data.item.user_data = user_data.clone();
+                            series = data.item.is_series() || data.item.kind == ItemKind::Season;
+                        }
+                        if let Some(item) = this.playback.playing.as_mut().filter(|i| i.id == item_id) {
+                            item.user_data = user_data;
+                        }
+                        // Episodes and season counts changed server-side too.
+                        if series && matches!(mark, Mark::Played) {
+                            this.load_page(cx);
+                        }
+                    }
+                    Err(err) => {
+                        this.apply_mark(&item_id, mark, !on);
+                        let title = match mark {
+                            Mark::Played => "Could not update watched state",
+                            Mark::Favorite => "Could not update favorites",
+                        };
+                        this.toast(title, format!("{err:#}"), cx)
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Puts a watched or favourite state on the item of the detail page
+    /// and on the item in the player, where the id is theirs.
+    fn apply_mark(&mut self, item_id: &str, mark: Mark, on: bool) {
+        let set = |item: &mut Item| match mark {
+            Mark::Played => item.user_data.played = on,
+            Mark::Favorite => item.user_data.is_favorite = on,
+        };
+        if let Page::Detail(data) = &mut self.nav.page
+            && data.item.id == item_id
+        {
+            set(&mut data.item);
+        }
+        if let Some(item) = self.playback.playing.as_mut().filter(|i| i.id == item_id) {
+            set(item);
+        }
     }
 
     // ----- playback ---------------------------------------------------------
@@ -241,11 +291,47 @@ impl Bloom {
             return;
         };
         let (item_id, favorite) = (item.id.clone(), !item.user_data.is_favorite);
-        self.set_user_data(&item_id.clone(), Mark::Favorite, favorite, false, cx, move |this, user_data, _| {
-            if let Some(item) = this.playback.playing.as_mut().filter(|i| i.id == item_id) {
-                item.user_data = user_data;
+        self.mark_now(item_id, Mark::Favorite, favorite, cx);
+    }
+
+    /// One speed step faster or slower ([`crate::player::SPEEDS`]), from
+    /// the menu bar.
+    pub fn step_speed(&mut self, up: bool, cx: &mut Context<Self>) {
+        if let Some(speed) = crate::player::speed_step(self.playback.speed, up) {
+            self.set_speed(speed, cx);
+        }
+    }
+
+    /// Plays the episodes of the season on the detail page: from the
+    /// first one not watched (resumed when started), or all of them in a
+    /// random order.
+    pub fn play_season(&mut self, shuffle: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Page::Detail(data) = &self.nav.page else {
+            return;
+        };
+        let mut episodes = data.episodes.clone();
+        if shuffle {
+            use std::hash::{BuildHasher as _, Hasher as _};
+            episodes.sort_by_cached_key(|_| std::collections::hash_map::RandomState::new().build_hasher().finish());
+            // A shuffle starts each episode at its beginning.
+            for episode in &mut episodes {
+                episode.user_data.playback_position_ticks = 0;
             }
-        });
+        } else {
+            let Some((at, resume)) = crate::queue::episodes_start(&episodes) else {
+                self.toast("Nothing to play", "This season has no episodes.", cx);
+                return;
+            };
+            episodes.drain(..at);
+            if !resume && let Some(first) = episodes.first_mut() {
+                first.user_data.playback_position_ticks = 0;
+            }
+        }
+        if episodes.is_empty() {
+            self.toast("Nothing to play", "This season has no episodes.", cx);
+            return;
+        }
+        self.start_queue(episodes, window, cx);
     }
 
     /// The marked range the playback position is in, if any.
@@ -496,6 +582,43 @@ impl Bloom {
 /// it is full screen now and was not before the item started.
 fn leaves_fullscreen_with_the_player(fullscreen_before: bool, fullscreen_now: bool) -> bool {
     fullscreen_now && !fullscreen_before
+}
+
+impl Bloom {
+    /// The listeners of the Playback menu of the menu bar (`menus.rs`).
+    /// Each acts on the player while it is open, and does nothing on the
+    /// pages.
+    pub(super) fn playback_menu_actions<E: gpui_kit::InteractiveElement>(el: E, cx: &mut Context<Self>) -> E {
+        use crate::menus::*;
+        use crate::player::TrackKind;
+        fn on<E: gpui_kit::InteractiveElement, A: gpui_kit::Action>(
+            el: E,
+            cx: &mut Context<Bloom>,
+            run: fn(&mut Bloom, &mut Window, &mut Context<Bloom>),
+        ) -> E {
+            el.on_action(cx.listener(move |this, _: &A, window, cx| {
+                if this.playback.open {
+                    run(this, window, cx);
+                    this.show_controls();
+                    cx.notify();
+                }
+            }))
+        }
+        let el = on::<_, SkipBack>(el, cx, |this, _, cx| this.request_seek_by(-this.prefs.skip_back_secs(), cx));
+        let el = on::<_, SkipForward>(el, cx, |this, _, cx| this.request_seek_by(this.prefs.skip_forward_secs(), cx));
+        let el = on::<_, PreviousItem>(el, cx, |this, _, cx| this.request_previous(cx));
+        let el = on::<_, NextItem>(el, cx, |this, _, cx| {
+            this.request_next(cx);
+        });
+        let el = on::<_, CycleSubtitles>(el, cx, |this, _, _| this.stream_cycle(TrackKind::Sub));
+        let el = on::<_, CycleAudio>(el, cx, |this, _, _| this.stream_cycle(TrackKind::Audio));
+        let el = on::<_, ToggleMute>(el, cx, |this, _, cx| this.toggle_mute(cx));
+        let el = on::<_, VolumeUp>(el, cx, |this, window, cx| this.nudge_volume(5., window, cx));
+        let el = on::<_, VolumeDown>(el, cx, |this, window, cx| this.nudge_volume(-5., window, cx));
+        let el = on::<_, Faster>(el, cx, |this, _, cx| this.step_speed(true, cx));
+        let el = on::<_, Slower>(el, cx, |this, _, cx| this.step_speed(false, cx));
+        on::<_, NormalSpeed>(el, cx, |this, _, cx| this.set_speed(1., cx))
+    }
 }
 
 #[cfg(test)]
