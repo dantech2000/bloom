@@ -4,6 +4,10 @@ import SwiftUI
 struct HomeView: View {
     @Environment(AppModel.self) private var model
     @Namespace private var namespace
+    /// The page has gone up past the hero's picture: the bar behind the
+    /// clock and the account button turns solid, so a row's heading never
+    /// runs under the clock.
+    @State private var scrolled = false
 
     var body: some View {
         ScrollView {
@@ -12,21 +16,33 @@ struct HomeView: View {
                     if !home.hero.isEmpty {
                         Hero(items: Array(home.hero.prefix(20)))
                     }
+                    // A user with nothing started: titles to pick from and
+                    // the genres, in place of the personal rows.
+                    if newcomer(home) {
+                        BrowseStarter()
+                    }
                     // The rows in the user's order (Settings › Home, or the
                     // web client); a kind this app has no row for is skipped.
                     ForEach(sections(home), id: \.self) { kind in
                         switch kind {
                         case .resume:
-                            WideRow(title: "Continue Watching", items: home.resume, row: .continueWatching)
+                            WideRow(title: "Continue Watching", items: home.resume, row: .continueWatching,
+                                    seeAll: home.resume.count > WideRow.shown
+                                        ? AnyView(BrowseRowGrid(title: "Continue Watching", first: home.resume, full: .continueWatching)) : nil)
                         case .nextUp:
-                            WideRow(title: "Next Up", items: home.nextUp, row: .nextUp)
+                            WideRow(title: "Next Up", items: home.nextUp, row: .nextUp,
+                                    seeAll: home.nextUp.count > WideRow.shown
+                                        ? AnyView(BrowseRowGrid(title: "Next Up", first: home.nextUp, full: .nextUp)) : nil)
                         case .latestMedia:
                             // By the library's id: two libraries may share a name.
                             ForEach(home.latest, id: \.id) { row in
-                                PosterRow(title: "Recently Added in \(row.title)", items: row.items)
+                                PosterRow(title: "Recently Added in \(row.title)", items: row.items,
+                                          seeAll: row.items.count > PosterRow.shown ? latestGrid(row) : nil)
                             }
                         case .smallLibraryTiles, .libraryButtons:
-                            WideRow(title: "My Media", items: model.libraries)
+                            WideRow(title: "My Media", items: model.libraries,
+                                    seeAll: model.libraries.count > WideRow.shown
+                                        ? AnyView(BrowseRowGrid(title: "My Media", first: model.libraries, full: nil)) : nil)
                         default:
                             EmptyView()
                         }
@@ -39,10 +55,33 @@ struct HomeView: View {
             .padding(.bottom, 32)
         }
         .background(Color.page)
-        .ignoresSafeArea(edges: .top)
+        // The hero runs under the clock; a Home without one starts under
+        // the bar.
+        .ignoresSafeArea(edges: model.home?.hero.isEmpty == false ? .top : [])
+        .onScrollGeometryChange(for: Bool.self) { geometry in
+            geometry.contentOffset.y + geometry.contentInsets.top > 160
+        } action: { _, past in
+            withAnimation(.easeOut(duration: 0.2)) { scrolled = past }
+        }
+        .toolbarBackground(Color.page, for: .navigationBar)
+        // A Home with no hero starts with a heading: solid at once.
+        .toolbarBackgroundVisibility(scrolled || model.home?.hero.isEmpty != false ? .visible : .hidden, for: .navigationBar)
         .refreshable { await model.reload() }
         .toolbar { ToolbarItem(placement: .topBarTrailing) { AccountButton() } }
         .modifier(Destinations(namespace: namespace))
+    }
+
+    /// No Continue Watching and no Next Up: a new user, or one who has
+    /// finished everything.
+    private func newcomer(_ home: Home) -> Bool {
+        HiddenTitles.shared.visible(home.resume, on: .continueWatching).isEmpty
+            && HiddenTitles.shared.visible(home.nextUp, on: .nextUp).isEmpty
+    }
+
+    /// Recently Added in full: its library, newest first.
+    private func latestGrid(_ row: Row) -> AnyView? {
+        guard let library = model.libraries.first(where: { $0.id == row.id }) else { return nil }
+        return AnyView(LibraryPage(source: GridSource(library), sort: .dateAdded, descending: true))
     }
 
     /// Each kind once, in order.
@@ -75,6 +114,10 @@ struct Hero: View {
                         Picture(url: item.backdrop, corner: 0, symbol: nil)
                             .frame(height: Self.height)
                             .backgroundExtensionEffect()
+                            // The picture and its mirrored copies take no
+                            // touch: the copies of the next slide lay over
+                            // this one's info button.
+                            .allowsHitTesting(false)
                         HeroShade()
                         slide(item)
                     }
@@ -130,6 +173,7 @@ struct Hero: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("More info")
+                    .accessibilityIdentifier("hero.info")
                     Spacer(minLength: 12)
                     counter(item)
                 }
@@ -168,10 +212,14 @@ struct Hero: View {
 struct PosterRow: View {
     let title: String
     let items: [MediaItem]
+    var seeAll: AnyView? = nil
+
+    /// The posters a phone shows across: a row with more has "See all".
+    static let shown = 3
 
     var body: some View {
         if !items.isEmpty {
-            Shelf(title: title) {
+            Shelf(title: title, seeAll: seeAll) {
                 ForEach(items, id: \.id) { item in
                     CardLink(item: item) { PosterCard(item: item) }
                         .containerRelativeFrame(.horizontal) { width, _ in Metrics.cardWidth(width, minimum: 110) }
@@ -185,10 +233,15 @@ struct WideRow: View {
     let title: String
     let items: [MediaItem]
     var row: CardLink<WideCard>.Row? = nil
+    var seeAll: AnyView? = nil
+
+    /// A phone shows one wide card and the edge of the next; a row of more
+    /// than two has "See all".
+    static let shown = 2
 
     var body: some View {
         if !items.isEmpty {
-            Shelf(title: title) {
+            Shelf(title: title, seeAll: seeAll) {
                 ForEach(items, id: \.id) { item in
                     CardLink(item: item, row: row) { WideCard(item: item) }
                         .containerRelativeFrame(.horizontal) { width, _ in

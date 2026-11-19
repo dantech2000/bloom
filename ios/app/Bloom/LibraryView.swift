@@ -49,12 +49,24 @@ struct LibraryPage: View {
     /// Bumped by a new sort or filter: a page asked for before it is dropped.
     @State private var generation = 0
     @State private var error: String?
-    @State private var sort = LibrarySort.name
-    @State private var descending = false
+    @State private var sort: LibrarySort
+    @State private var descending: Bool
     /// None shows every item.
     @State private var filter: LibraryFilter?
+    /// Genre, decade and rating (BrowseFilters.swift).
+    @State private var narrow = BrowseFilters()
+    /// What the library can be narrowed to; loaded with the page.
+    @State private var choices: FilterChoices?
 
     private let pageSize: UInt32 = 100
+
+    /// `sort` and `descending` set the first order: Recently Added's
+    /// "See all" opens its library newest first.
+    init(source: GridSource, sort: LibrarySort = .name, descending: Bool = false) {
+        self.source = source
+        _sort = State(initialValue: sort)
+        _descending = State(initialValue: descending)
+    }
 
     private static let sorts: [LibrarySort] = [.name, .dateAdded, .releaseDate, .communityRating, .datePlayed, .random]
     private static let filters: [LibraryFilter?] = [nil, .unplayed, .played, .favorite, .resumable]
@@ -76,12 +88,27 @@ struct LibraryPage: View {
         case .unplayed: "Unplayed"
         case .played: "Played"
         case .favorite: "Favorites"
-        case .resumable: "Resumable"
+        case .resumable: "In progress"
         }
+    }
+
+    /// The grid narrows by genre, decade and rating: a library, a folder
+    /// of films and shows, the favourites and a genre's grid; not the
+    /// playlists or a collection's few titles.
+    private var narrows: Bool {
+        source.id != "playlists" && source.kind != .boxSet && source.kind != .folder
+    }
+
+    /// The page's order and filters, as one key: a change loads again.
+    private var key: String {
+        "\(sort)|\(descending)|\(String(describing: filter))|\(narrow.key)"
     }
 
     var body: some View {
         ScrollView {
+            if narrow.active || filter != nil {
+                BrowseActiveFilters(narrow: $narrow, filter: filter.map { Self.title($0) }) { filter = nil }
+            }
             LazyVGrid(columns: Metrics.posterGrid, spacing: Metrics.gridRowSpacing) {
                 // A title hidden a moment ago goes at once (Jellyfin Enhanced).
                 ForEach(HiddenTitles.shared.visible(items, on: .library), id: \.id) { item in
@@ -107,7 +134,17 @@ struct LibraryPage: View {
             if let error {
                 ContentUnavailableView("The library could not load", systemImage: "exclamationmark.triangle", description: Text(error))
             } else if loaded, !loading, items.isEmpty, total == 0 {
-                ContentUnavailableView("No items found", systemImage: "film")
+                if narrow.active || filter != nil {
+                    ContentUnavailableView {
+                        Label("Nothing matches", systemImage: "line.3.horizontal.decrease")
+                    } description: {
+                        Text("No title matches these filters.")
+                    } actions: {
+                        Button("Clear filters") { narrow = BrowseFilters(); filter = nil }.quietButton()
+                    }
+                } else {
+                    ContentUnavailableView("No items found", systemImage: "film")
+                }
             }
         }
         .background(Color.page)
@@ -139,22 +176,40 @@ struct LibraryPage: View {
                     Picker("Show", selection: $filter) {
                         ForEach(Self.filters, id: \.self) { Text(Self.title($0)).tag($0) }
                     }
+                    if narrows {
+                        BrowseFilterMenus(narrow: $narrow, choices: choices, genreFixed: source.id.hasPrefix("genre:"))
+                    }
+                    if narrow.active || filter != nil {
+                        Divider()
+                        Button("Clear filters", systemImage: "xmark.circle") { narrow = BrowseFilters(); filter = nil }
+                    }
                 } label: {
-                    Label("Filter", systemImage: filter == nil ? "line.3.horizontal.decrease" : "line.3.horizontal.decrease.circle.fill")
+                    Label("Filter", systemImage: narrow.active || filter != nil ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease")
                 }
                 .accessibilityIdentifier("library.filter")
             }
         }
-        .task(id: "\(sort)|\(descending)|\(String(describing: filter))") { await reload() }
+        .task(id: key) { await reload() }
+        .task {
+            guard narrows, choices == nil, let server = model.server else { return }
+            let library = source.id.contains(":") || source.id == "favorites" ? nil : source.id
+            choices = try? await server.filterChoices(libraryId: library, collectionType: source.collectionType)
+        }
         .refreshable { await reload() }
+    }
+
+    /// One page of the grid in the page's order and filters.
+    private func page(start: UInt32, limit: UInt32) async throws -> Page? {
+        guard let server = model.server else { return nil }
+        return try await server.browsePage(libraryId: source.id, collectionType: source.collectionType, start: start, limit: limit,
+                                           sortBy: sort, descending: descending, filter: filter,
+                                           genres: narrow.genre.map { [$0] } ?? [], years: narrow.years(choices?.years ?? []),
+                                           minRating: narrow.minRating)
     }
 
     /// Every item of the folder, in the page's order, into the queue.
     private func playAll(shuffled: Bool) async {
-        guard let server = model.server else { return }
-        let all = (try? await server.libraryPage(libraryId: source.id, collectionType: source.collectionType, start: 0, limit: 500,
-                                                 sortBy: sort, descending: descending,
-                                                 filter: filter))?.items ?? items
+        let all = (try? await page(start: 0, limit: 500))?.items ?? items
         model.play(all: all, shuffled: shuffled)
     }
 
@@ -172,16 +227,14 @@ struct LibraryPage: View {
     /// their ids. A random order keeps its page (a new one would shuffle
     /// it); a failure keeps what shows.
     private func refreshInPlace() async {
-        guard sort != .random, !loading, let server = model.server else { return }
+        guard sort != .random, !loading else { return }
         loading = true
         // A reload meanwhile owns `loading` and the items (as in `loadMore`).
         let asked = generation
         defer { if generation == asked { loading = false } }
-        let order = (sort, descending, filter)
-        guard let page = try? await server.libraryPage(libraryId: source.id, collectionType: source.collectionType, start: 0,
-                                                       limit: UInt32(max(items.count, Int(pageSize))), sortBy: sort,
-                                                       descending: descending, filter: filter),
-              generation == asked, order == (sort, descending, filter) else { return }
+        let order = key
+        guard let page = try? await page(start: 0, limit: UInt32(max(items.count, Int(pageSize)))),
+              generation == asked, order == key else { return }
         items = page.items
         total = Int(page.total)
         error = nil
@@ -189,7 +242,7 @@ struct LibraryPage: View {
     }
 
     private func loadMore() async {
-        guard !loading, let server = model.server else { return }
+        guard !loading, model.server != nil else { return }
         loading = true
         let asked = generation
         defer { if generation == asked { loading = false } }
@@ -197,9 +250,7 @@ struct LibraryPage: View {
             // Random keeps one fixed page: the server shuffles again for
             // each page, which would repeat titles (spec §8.2).
             let limit = sort == .random ? 200 : pageSize
-            let page = try await server.libraryPage(libraryId: source.id, collectionType: source.collectionType,
-                                                    start: UInt32(items.count), limit: limit, sortBy: sort,
-                                                    descending: descending, filter: filter)
+            guard let page = try await page(start: UInt32(items.count), limit: limit) else { return }
             guard generation == asked else { return }
             if sort == .random, !items.isEmpty { return }
             items += page.items

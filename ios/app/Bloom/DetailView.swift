@@ -20,6 +20,8 @@ struct DetailView: View {
     @State private var bookmarks: [Bookmark] = []
     /// Its audio and subtitle tracks, and the ones chosen for the next play.
     @State private var streams: [StreamOption] = []
+    /// The file: its video, sound, tracks with their flags, and size.
+    @State private var file: MediaFile?
     @State private var audio: Int64?
     @State private var subtitle: Int64?
     /// The show and the season of an episode or a season page, for the
@@ -28,6 +30,8 @@ struct DetailView: View {
     @State private var seasonItem: MediaItem?
 
     private var shown: MediaItem { detail?.item ?? item }
+    /// The page is scrolled past its backdrop: the bar takes the page's black.
+    @State private var scrolledPast = false
 
     var body: some View {
         ScrollView {
@@ -39,6 +43,10 @@ struct DetailView: View {
                         Picture(url: shown.backdrop ?? shown.wide, corner: 0, symbol: nil)
                             .frame(height: width == .regular ? 300 : 360)
                             .backgroundExtensionEffect()
+                            // The extended copy takes taps meant for the
+                            // links and buttons over it (the Home hero's
+                            // "i" button, 2026-11-18); the picture has none.
+                            .allowsHitTesting(false)
                         HeroShade()
                         if width != .regular {
                             titles.padding(.horizontal, Metrics.gutter)
@@ -62,9 +70,12 @@ struct DetailView: View {
                             }
                             actions
                                 .padding(.top, 4)
-                            TrackPickers(streams: streams, audio: $audio, subtitle: $subtitle)
+                            TrackPickers(choices: trackChoices, audio: $audio, subtitle: $subtitle)
                             if let overview = shown.overview {
                                 Overview(text: overview)
+                            }
+                            if let file, shown.playable {
+                                FileSection(file: file)
                             }
                             if let error {
                                 Text(error).font(.subheadline).foregroundStyle(Color.fail)
@@ -95,9 +106,30 @@ struct DetailView: View {
             }
             .padding(.bottom, 32)
         }
+        // Past the backdrop the page goes under a bar of the page's black
+        // with the title in it: nothing of the page sits under the clock
+        // and the buttons (the tester saw Play pinned under them).
+        .onScrollGeometryChange(for: Bool.self) { geometry in
+            // The title reaches the bar: the backdrop is 300 or 360 tall
+            // and the bar ends about 110 points down.
+            geometry.contentOffset.y + geometry.contentInsets.top > (width == .regular ? 170 : 210)
+        } action: { _, past in
+            withAnimation(.easeOut(duration: 0.15)) { scrolledPast = past }
+        }
         .background(Color.page)
+        .background(ZoomDismissGuard().frame(width: 0, height: 0).accessibilityHidden(true))
         .ignoresSafeArea(edges: .top)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(Color.page, for: .navigationBar)
+        .toolbarBackgroundVisibility(scrolledPast ? .visible : .hidden, for: .navigationBar)
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                Text(shown.name).font(.headline).lineLimit(1)
+                    .opacity(scrolledPast ? 1 : 0)
+                    .accessibilityHidden(!scrolledPast)
+            }
+            castAndSync
+        }
         .task { await load() }
         .confirmationDialog("Request the missing seasons of \(shown.name)?", isPresented: Binding(get: { askMore != nil }, set: { if !$0 { askMore = nil } }),
                             titleVisibility: .visible) {
@@ -106,6 +138,25 @@ struct DetailView: View {
             }
         } message: {
             Text("Seerr asks the server's tools to download them.")
+        }
+    }
+
+    /// Play on (another Jellyfin app, a Chromecast) and SyncPlay at the
+    /// top right, where a cast button sits in most video apps; each opens
+    /// the sheet the account menu opens.
+    @ToolbarContentBuilder
+    private var castAndSync: some ToolbarContent {
+        ToolbarItemGroup(placement: .topBarTrailing) {
+            if shown.playable || shown.isSeries || shown.kind == .season {
+                let elsewhere = model.castDevice != nil || model.remote != nil
+                Button("Play on", systemImage: elsewhere ? "tv.fill" : "tv") { model.showPlayOn = true }
+                    .accessibilityValue(model.castDevice?.name ?? model.remote?.deviceName ?? "This device")
+                    .accessibilityIdentifier("detail.play-on")
+                if SyncBridge.shared.group != nil || model.syncAllowed {
+                    Button("SyncPlay", systemImage: SyncBridge.shared.group != nil ? "person.2.fill" : "person.2") { model.showSyncPlay = true }
+                        .accessibilityIdentifier("detail.syncplay")
+                }
+            }
         }
     }
 
@@ -211,6 +262,9 @@ struct DetailView: View {
                     }
                     .buttonStyle(MainButtonStyle(wide: true))
                     .accessibilityIdentifier("detail.play")
+                    if let left = remainingSecs(next) {
+                        EndsAt(remainingSecs: left).padding(.top, -6)
+                    }
                 }
                 HStack(alignment: .top, spacing: 0) {
                     if let next = playTarget, next.resumeSecs > 0 {
@@ -268,6 +322,12 @@ struct DetailView: View {
         }
     }
 
+    /// The seconds a play of `target` lasts from where it starts.
+    private func remainingSecs(_ target: MediaItem) -> Int64? {
+        guard let runtime = target.runtimeSecs, runtime > target.resumeSecs else { return nil }
+        return runtime - target.resumeSecs
+    }
+
     /// "37m left" beside Resume.
     private func timeLeft(_ target: MediaItem) -> String? {
         guard target.resumeSecs > 0, let runtime = target.runtimeSecs, runtime > target.resumeSecs,
@@ -306,6 +366,14 @@ struct DetailView: View {
         .buttonStyle(.plain)
         .accessibilityLabel("More")
         .accessibilityIdentifier("detail.more")
+    }
+
+    /// The tracks of the pickers in friendly words.
+    private var trackChoices: [TrackChoice] {
+        if let file {
+            return file.tracks.map { TrackChoice(index: $0.index, kind: $0.kind, name: TrackName($0), isDefault: $0.isDefault) }
+        }
+        return streams.map { TrackChoice(index: $0.index, kind: $0.kind, name: TrackName(name: $0.title, detail: nil), isDefault: $0.isDefault) }
     }
 
     private var playTarget: MediaItem? {
@@ -347,8 +415,11 @@ struct DetailView: View {
         do {
             let detail = try await server.detail(itemId: item.id)
             self.detail = detail
-            if detail.item.playable, streams.isEmpty {
-                streams = (try? await server.streams(itemId: item.id)) ?? []
+            if detail.item.playable, streams.isEmpty, file == nil {
+                // The file with its tracks' flags; the plain list when the
+                // bridge cannot read it.
+                file = (try? await server.mediaFile(itemId: item.id)) ?? nil
+                if file == nil { streams = (try? await server.streams(itemId: item.id)) ?? [] }
             }
             if model.enhanced?.bookmarks == true, detail.item.playable {
                 bookmarks = (try? await server.bookmarks(itemId: item.id)) ?? []
@@ -401,26 +472,56 @@ struct DetailView: View {
     }
 }
 
+/// A track a picker offers, in friendly words.
+struct TrackChoice: Identifiable {
+    let index: Int64
+    let kind: TrackKind
+    let name: TrackName
+    let isDefault: Bool
+    var id: Int64 { index }
+}
+
+/// A menu entry for a track: its name, the format as a quiet second line,
+/// and a checkmark when chosen. The menu takes the image as the entry's
+/// icon, the first text as its title and the second as its second line
+/// (a `Label` with both texts lost the second line).
+struct TrackEntry: View {
+    let name: TrackName
+    let on: Bool
+    let choose: () -> Void
+
+    var body: some View {
+        Button(action: choose) {
+            if on { Image(systemName: "checkmark") }
+            Text(name.name)
+            if let detail = name.detail { Text(detail) }
+        }
+        // The name and its detail, read as one ("English · SRT").
+        .accessibilityLabel(name.full)
+        .accessibilityAddTraits(on ? .isSelected : [])
+    }
+}
+
 /// Audio and subtitles for the next play (the Mac's track rows): a row
 /// each in one quiet pane, the choice at the right.
 struct TrackPickers: View {
-    let streams: [StreamOption]
+    let choices: [TrackChoice]
     @Binding var audio: Int64?
     @Binding var subtitle: Int64?
 
     var body: some View {
-        let audios = streams.filter { $0.kind == .audio }
-        let subtitles = streams.filter { $0.kind == .subtitle }
+        let audios = choices.filter { $0.kind == .audio }
+        let subtitles = choices.filter { $0.kind == .subtitle }
         if audios.count > 1 || !subtitles.isEmpty {
             VStack(spacing: 0) {
                 if audios.count > 1 {
                     Menu {
-                        Picker("Audio", selection: $audio) {
-                            Text("Default").tag(Int64?.none)
-                            ForEach(audios, id: \.index) { Text($0.title).tag(Int64?.some($0.index)) }
+                        TrackEntry(name: TrackName(name: "Default", detail: Self.defaultName(audios)), on: audio == nil) { audio = nil }
+                        ForEach(audios) { choice in
+                            TrackEntry(name: choice.name, on: audio == choice.index) { audio = choice.index }
                         }
                     } label: {
-                        row("Audio", symbol: "speaker.wave.2", value: audios.first { $0.index == audio }?.title ?? "Default")
+                        row("Audio", symbol: "speaker.wave.2", value: audios.first { $0.index == audio }?.name.name ?? "Default")
                     }
                     .accessibilityIdentifier("detail.audio")
                 }
@@ -429,22 +530,27 @@ struct TrackPickers: View {
                 }
                 if !subtitles.isEmpty {
                     Menu {
-                        Picker("Subtitles", selection: $subtitle) {
-                            Text("Default").tag(Int64?.none)
-                            Text("Off").tag(Int64?.some(-1))
-                            ForEach(subtitles, id: \.index) { Text($0.title).tag(Int64?.some($0.index)) }
+                        TrackEntry(name: TrackName(name: "Default", detail: Self.defaultName(subtitles)), on: subtitle == nil) { subtitle = nil }
+                        TrackEntry(name: TrackName(name: "Off", detail: nil), on: subtitle == -1) { subtitle = -1 }
+                        ForEach(subtitles) { choice in
+                            TrackEntry(name: choice.name, on: subtitle == choice.index) { subtitle = choice.index }
                         }
                     } label: {
                         row("Subtitles", symbol: "captions.bubble",
-                            value: subtitle == -1 ? "Off" : (subtitles.first { $0.index == subtitle }?.title ?? "Default"))
+                            value: subtitle == -1 ? "Off" : (subtitles.first { $0.index == subtitle }?.name.name ?? "Default"))
                     }
                     .accessibilityIdentifier("detail.subtitles")
                 }
             }
             .buttonStyle(.plain)
-            .background(Color.ink.opacity(0.06), in: .rect(cornerRadius: 14))
+            .background(Color.ink.opacity(0.06), in: .rect(cornerRadius: Metrics.controlCorner))
             .frame(maxWidth: 480)
         }
+    }
+
+    /// What "Default" plays: the track the file marks as its default.
+    private static func defaultName(_ list: [TrackChoice]) -> String? {
+        list.first(where: \.isDefault)?.name.name
     }
 
     private func row(_ title: String, symbol: String, value: String) -> some View {

@@ -38,6 +38,11 @@ final class PlayerModel {
     /// mpv's tracks, apart from the state that changes with the time: the
     /// menus read these, and a menu that is redrawn closes.
     private(set) var tracks: [Mpv.Track] = []
+    /// The server's tracks of the item that plays, with their flags.
+    private(set) var fileTracks: [TrackInfo] = []
+    @ObservationIgnored private var fileTracksFor: String?
+    /// The Play on sheet over the video.
+    var showPlayOn = false
     var scrubbing: Double?
     /// A server subtitle being fetched, by its index.
     var fetchingSubtitle: Int64?
@@ -254,6 +259,12 @@ final class PlayerModel {
         autoSkipped = []
         liftSubtitles()
         Task { await loadSeason(info) }
+        // Another item's tracks name nothing here; a reload keeps them.
+        if fileTracksFor != info.itemId {
+            fileTracks = []
+            fileTracksFor = info.itemId
+            Task { await loadFile(info) }
+        }
         Task { await loadBookmarks() }
         Task { await loadTimeline(info) }
         report(.start)
@@ -931,6 +942,34 @@ final class PlayerModel {
 
     var audioTracks: [Mpv.Track] { tracks.filter { $0.kind == .audio } }
     var subtitleTracks: [Mpv.Track] { tracks.filter { $0.kind == .sub } }
+
+    /// A track of mpv in friendly words. A file the server sent is named
+    /// by the server's track (its flags: forced, SDH); a track of the file
+    /// by what mpv reads in it.
+    func name(of track: Mpv.Track) -> TrackName {
+        if track.external, let subtitle = info?.externalSubtitles.first(where: { $0.title == track.name }) {
+            return name(of: subtitle)
+        }
+        let name = TrackName(kind: track.kind == .audio ? .audio : .subtitle, language: track.language, codec: track.codec,
+                             title: track.name, forced: track.forced, isDefault: track.isDefault)
+        return name.name == "Unknown language" && track.language == nil && track.name.isEmpty
+            ? TrackName(name: "Track \(track.id)", detail: name.detail) : name
+    }
+
+    func name(of subtitle: ExternalSubtitle) -> TrackName {
+        if let track = fileTracks.first(where: { $0.index == subtitle.index && $0.kind == .subtitle }) {
+            return TrackName(track)
+        }
+        return TrackName(kind: .subtitle, language: subtitle.language, codec: subtitle.codec, title: nil)
+    }
+
+    /// The tracks of the item's file with their flags, for the names.
+    private func loadFile(_ info: PlayInfo) async {
+        guard let server else { return }
+        let file = (try? await server.mediaFile(itemId: info.itemId)) ?? nil
+        guard isCurrent(info) else { return }
+        fileTracks = file?.tracks ?? []
+    }
 
     /// The server's subtitle files not yet in mpv.
     var serverSubtitles: [ExternalSubtitle] {

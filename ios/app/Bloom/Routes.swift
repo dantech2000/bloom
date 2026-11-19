@@ -57,9 +57,9 @@ struct Destinations: ViewModifier {
             case .favorites:
                 LibraryPage(source: .favorites)
             case .playlists:
-                LibraryPage(source: .playlists)
+                PlaylistsPage()
             case .person(let id, let name):
-                LibraryPage(source: .person(id, name))
+                BrowsePersonPage(id: id, name: name)
             }
         }
     }

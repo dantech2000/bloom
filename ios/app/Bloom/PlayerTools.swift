@@ -33,22 +33,23 @@ struct DelayChoices: View {
 struct PlayerTools: View {
     @Environment(AppModel.self) private var app
     let model: PlayerModel
+    /// The word under each tool, for the first few plays (`ToolWords`).
+    @State private var words = ToolWords.shown()
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: words ? 4 : 8) {
             Menu {
-                Button { model.selectSubtitle(nil) } label: {
-                    Checked(title: "Off", on: !model.subtitleTracks.contains(where: \.selected))
+                TrackEntry(name: TrackName(name: "Off", detail: nil), on: !model.subtitleTracks.contains(where: \.selected)) {
+                    model.selectSubtitle(nil)
                 }
                 ForEach(model.subtitleTracks) { track in
-                    Button { model.selectSubtitle(track) } label: {
-                        Checked(title: track.title, on: track.selected)
-                    }
+                    TrackEntry(name: model.name(of: track), on: track.selected) { model.selectSubtitle(track) }
                 }
                 if !model.serverSubtitles.isEmpty {
                     Section("From the server") {
                         ForEach(model.serverSubtitles, id: \.index) { subtitle in
-                            Button(subtitle.title + (model.fetchingSubtitle == subtitle.index ? " · Loading…" : "")) {
+                            let name = model.name(of: subtitle)
+                            TrackEntry(name: model.fetchingSubtitle == subtitle.index ? TrackName(name: name.name, detail: "Loading…") : name, on: false) {
                                 model.releaseControls(); Task { await model.selectServerSubtitle(subtitle) }
                             }
                         }
@@ -67,9 +68,7 @@ struct PlayerTools: View {
             if model.audioTracks.count > 1 {
                 Menu {
                     ForEach(model.audioTracks) { track in
-                        Button { model.selectAudio(track) } label: {
-                            Checked(title: track.title, on: track.selected)
-                        }
+                        TrackEntry(name: model.name(of: track), on: track.selected) { model.selectAudio(track) }
                     }
                 } label: {
                     Label("Audio", systemImage: "speaker.wave.2").toolTarget()
@@ -87,13 +86,23 @@ struct PlayerTools: View {
             // The small player over the pages (the Mac's small window).
             Button("Small player", systemImage: "rectangle.inset.bottomright.filled") { app.minimizePlayer() }
                 .accessibilityIdentifier("player.minimize")
+            // Play on another Jellyfin app or a Chromecast: the sheet of the
+            // account menu; a choice hands the film over at this place.
+            Button("Play on", systemImage: "tv") { model.holdControls(); model.showPlayOn = true }
+                .accessibilityIdentifier("player.play-on")
             // AirPlay: the system's route button. MPVUI prepares the stream
             // for the receiver (the file as it is, or packaged on the phone).
             if let engine = model.engine {
-                MPVRoutePicker(player: engine)
-                    .frame(width: 44, height: 44)
-                    .accessibilityLabel("AirPlay")
-                    .accessibilityIdentifier("player.airplay")
+                VStack(spacing: 2) {
+                    MPVRoutePicker(player: engine)
+                        .frame(width: 44, height: words ? 28 : 44)
+                        .accessibilityLabel("AirPlay")
+                        .accessibilityIdentifier("player.airplay")
+                    if words {
+                        Text("AirPlay").font(.caption2).foregroundStyle(.secondary).lineLimit(1).fixedSize()
+                            .accessibilityHidden(true)
+                    }
+                }
             }
             if let engine = model.engine, engine.pictureInPicture.isSupported {
                 Button("Picture in Picture", systemImage: engine.pictureInPicture.isActive ? "pip.exit" : "pip.enter") {
@@ -112,7 +121,7 @@ struct PlayerTools: View {
             }
             settings
         }
-        .labelStyle(.iconOnly)
+        .labelStyle(ToolLabelStyle(words: words))
         .font(.title3)
         .buttonStyle(ToolButtonStyle())
     }
@@ -170,6 +179,44 @@ struct PlayerTools: View {
         }
         .simultaneousGesture(TapGesture().onEnded { model.holdControls() })
         .accessibilityIdentifier("player.settings")
+    }
+}
+
+/// A tool's icon, with its word under it while `words` is on; the icon
+/// alone keeps the word as its accessibility label.
+struct ToolLabelStyle: LabelStyle {
+    let words: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        if words {
+            VStack(spacing: 2) {
+                configuration.icon.frame(height: 28)
+                configuration.title.font(.caption2).foregroundStyle(.secondary).lineLimit(1).fixedSize()
+            }
+        } else {
+            Label(configuration).labelStyle(.iconOnly)
+        }
+    }
+}
+
+/// The words under the player's tools show for the first three plays on
+/// this device, then the icons stand alone (their names stay for
+/// VoiceOver). `BLOOM_TOOL_WORDS=1` or `0` sets it for a test.
+enum ToolWords {
+    private static let key = "player.toolWordsPlays"
+    static let plays = 3
+
+    static func shown() -> Bool {
+        switch ProcessInfo.processInfo.environment["BLOOM_TOOL_WORDS"] {
+        case "1": return true
+        case "0": return false
+        default: return UserDefaults.standard.integer(forKey: key) < plays
+        }
+    }
+
+    /// A player opened.
+    static func opened() {
+        UserDefaults.standard.set(UserDefaults.standard.integer(forKey: key) + 1, forKey: key)
     }
 }
 

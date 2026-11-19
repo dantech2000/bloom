@@ -386,7 +386,7 @@ final class AppModel {
     }
 
     /// The name the offline words use.
-    var serverName: String { active?.serverName ?? "The server" }
+    var serverName: String { active.map(ServerNames.shared.shown) ?? "The server" }
 
     /// The pages loaded after being offline: a toast, and the tab the user
     /// was on before (the Downloads tab was the app's choice).

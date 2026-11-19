@@ -75,8 +75,19 @@ struct PlayerView: View {
         .background(.black)
         .persistentSystemOverlays(.hidden)
         .statusBarHidden()
-        .onAppear { landscape(true) }
+        .onAppear {
+            landscape(true)
+            ToolWords.opened()
+        }
         .onDisappear { landscape(false) }
+        // A target chosen in the Play on sheet over the video takes the
+        // film at this place, and this device stops.
+        .onChange(of: app.castDevice?.id) { _, id in
+            if id != nil, model.showPlayOn { Task { await handOff() } }
+        }
+        .onChange(of: app.remote?.id) { _, id in
+            if id != nil, model.showPlayOn { Task { await handOff() } }
+        }
         .animation(.easeOut(duration: 0.15), value: model.controls)
         .animation(.easeOut(duration: 0.15), value: model.skippable?.kind)
         .accessibilityAction(.escape) { close() }
@@ -90,6 +101,7 @@ struct PlayerView: View {
                 case .bookmarks: BookmarksSheet(model: model)
                 case .subtitleSearch: SubtitleSearchSheet(model: model)
                 case .syncPlay: SyncPlaySheet()
+                case .playOn: PlayOnSheet()
                 }
             }
             .bloomTheme()
@@ -100,8 +112,27 @@ struct PlayerView: View {
 
     /// A sheet over the video.
     enum PlayerSheet: String, Identifiable {
-        case episodes, bookmarks, subtitleSearch, syncPlay
+        case episodes, bookmarks, subtitleSearch, syncPlay, playOn
         var id: String { rawValue }
+    }
+
+    /// Hands the film to the target just chosen: the Chromecast once it
+    /// is connected (10 s at most), another Jellyfin app at once. The play
+    /// goes through the app's own path (`AppModel.play`), which sends it to
+    /// the target; this player closes.
+    private func handOff() async {
+        let item = model.info?.item ?? request.item
+        let at = model.state.position
+        if model.state.paused == false { model.togglePause() }
+        if let device = app.castDevice {
+            for _ in 0..<50 where app.castStatus?.connected != true && app.castDevice?.id == device.id {
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+        }
+        guard app.castDevice != nil || app.remote != nil else { return }
+        model.showPlayOn = false
+        app.closePlayer()
+        app.play(item, startSecs: at)
     }
 
     /// The player's switch that is on, as one sheet; a dismissal turns it
@@ -117,6 +148,9 @@ struct PlayerView: View {
                 Task { await model.loadBookmarks() }
             case .subtitleSearch: model.showSubtitleSearch = false
             case .syncPlay: model.showSyncPlay = false
+            case .playOn:
+                model.showPlayOn = false
+                model.releaseControls()
             case nil: break
             }
         }
@@ -127,6 +161,7 @@ struct PlayerView: View {
         if model.showBookmarks { return .bookmarks }
         if model.showSubtitleSearch { return .subtitleSearch }
         if model.showSyncPlay { return .syncPlay }
+        if model.showPlayOn { return .playOn }
         return nil
     }
 

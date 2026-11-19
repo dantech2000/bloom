@@ -49,6 +49,8 @@ from urllib.parse import parse_qs, urlparse
 SERVER_ID = "mock"
 # The polls of a Quick Connect code (BLOOM_MOCK_QUICKCONNECT).
 QUICK = {"polls": 0}
+# POST /mock/fresh: a user who has watched nothing (no Next Up).
+FRESH = {"on": False}
 USER_ID = "u1"
 USER_NAME = "tester"
 TOKEN = "mock-token"
@@ -64,6 +66,19 @@ MOVIES = [
     ("Amber Signal", 2023), ("Kite Season", 2013), ("Harbour Lights", 2019),
 ]
 SHOWS = [("Station Eleven North", 2022, 2, 4), ("The Night Desk", 2020, 1, 6)]
+# People of the films (cast and crew), for the search's people and a
+# person's page: name, kind, the films (by number) with the role, the
+# biography, the birth date and place.
+PEOPLE = [
+    ("Mara Bokma", "Actor", {0: "Ilse Varga", 2: "The Pilot", 5: "June", 9: "Herself"},
+     "Mara Bokma is an actor of the mock library. She grew up on the coast, trained at a small theatre school, "
+     "and played on stage for ten years before her first film. Critics note her quiet manner and her long takes. "
+     "She lives by the sea and still acts on stage each winter.",
+     "1984-05-02T00:00:00.0000000Z", "Harlingen, Netherlands"),
+    ("Tomas Reed", "Actor", {0: "Captain Hale", 1: "Mr. Lantern", 3: "Owen"}, None, None, None),
+    ("Ines Okafor", "Director", {0: None, 2: None, 9: None}, "Ines Okafor directs the films of the mock library.",
+     "1979-11-20T00:00:00.0000000Z", None),
+]
 EXTRA_MOVIES = int(os.environ.get("BLOOM_MOCK_EXTRA_MOVIES") or 0)
 
 
@@ -74,6 +89,42 @@ def ident(text):
 def user_data(n, played=False, position=0):
     return {"Played": played, "PlaybackPositionTicks": position, "IsFavorite": n % 5 == 0,
             "PlayCount": 1 if played else 0}
+
+
+def person_id(name):
+    return ident("person " + name)
+
+
+def build_people():
+    people = {}
+    for name, kind, films, bio, born, place in PEOPLE:
+        person = {"Id": person_id(name), "Name": name, "Type": "Person", "ServerId": SERVER_ID,
+                  "ImageTags": {"Primary": "p"} if name != "Tomas Reed" else {}}
+        if bio:
+            person["Overview"] = bio
+        if born:
+            person["PremiereDate"] = born
+        if place:
+            person["ProductionLocations"] = [place]
+        people[person["Id"]] = person
+    return people
+
+
+PERSONS = build_people()
+
+
+def credits_of(n):
+    """The People of the n-th film."""
+    out = []
+    for name, kind, films, _, _, _ in PEOPLE:
+        if n in films:
+            entry = {"Id": person_id(name), "Name": name, "Type": kind}
+            if films[n]:
+                entry["Role"] = films[n]
+            if name != "Tomas Reed":
+                entry["PrimaryImageTag"] = "p"
+            out.append(entry)
+    return out
 
 
 def build():
@@ -102,7 +153,7 @@ def build():
              "OfficialRating": ["PG", "PG-13", "R"][n % 3], "Genres": [GENRES[n % 6], GENRES[(n + 2) % 6]],
              "Overview": f"{name} is a film of the mock library. It has no file, only this text.",
              "DateCreated": f"2026-09-{28 - n:02d}T10:00:00Z",
-             "ProviderIds": {"Tmdb": str(1000 + n)},
+             "ProviderIds": {"Tmdb": str(1000 + n)}, "People": credits_of(n),
              "UserData": user_data(n, played=n == 3, position=position)})
     for n in range(EXTRA_MOVIES):
         name = f"The Extra Reel {n + 1}"
@@ -203,6 +254,20 @@ def query_items(q):
         found = [i for i in found if not i["UserData"]["Played"]]
     if "IsResumable" in filters:
         found = [i for i in found if i["UserData"]["PlaybackPositionTicks"]]
+    if "IsPlayed" in filters:
+        found = [i for i in found if i["UserData"]["Played"]]
+    person = one("personIds")
+    if person:
+        found = [i for i in found if any(p["Id"] == person for p in i.get("People", []))]
+    genres = [g for g in one("genres").split("|") if g]
+    if genres:
+        found = [i for i in found if any(g in i.get("Genres", []) for g in genres)]
+    years = [int(y) for y in one("years").split(",") if y]
+    if years:
+        found = [i for i in found if i.get("ProductionYear") in years]
+    if one("minCommunityRating"):
+        lowest = float(one("minCommunityRating"))
+        found = [i for i in found if i.get("CommunityRating", 0) >= lowest]
     starts = one("nameStartsWith").lower()
     if starts:
         found = [i for i in found if i["Name"].lower().startswith(starts)]
@@ -376,6 +441,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(204)
         if method == "GET" and lower == "/mock/remote":
             return self.send(200, REMOTE)
+        if method == "POST" and lower == "/mock/fresh":
+            # A new user: nothing played or started, so Continue Watching
+            # and Next Up are empty (until the next reset).
+            for item in ITEMS.values():
+                if "UserData" in item:
+                    item["UserData"].update(Played=False, PlaybackPositionTicks=0, PlayCount=0)
+            FRESH["on"] = True
+            return self.send(204)
         if method == "GET" and lower == "/mock/counts":
             return self.send(200, COUNTS)
         if method == "POST" and lower == "/mock/search":
@@ -396,6 +469,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.refused("GET"):
             return
         match = re.fullmatch(r"/items/([0-9a-f]{32})/images/(\w+)(/\d+)?", lower)
+        if match and match[1] in PERSONS:
+            if not PERSONS[match[1]]["ImageTags"]:
+                return self.send(404)
+            return self.send(200, png(200, 300, match[1]), "image/png")
         if match:
             if match[1] not in ITEMS:
                 return self.send(404)
@@ -404,6 +481,9 @@ class Handler(BaseHTTPRequestHandler):
             if match[2] == "logo":
                 return self.send(404)
             return self.send(200, png(width, height, match[1] + match[2]), "image/png")
+        # The user's picture, for the profiles of the sign-in screen.
+        if lower == f"/users/{USER_ID}/images/primary":
+            return self.send(200, png(240, 240, "user " + USER_ID), "image/png")
         if "/images/" in lower or lower.endswith("/splashscreen"):
             return self.send(404)
         # A file to play, for the native iOS app's tests: BLOOM_MOCK_CLIP
@@ -423,7 +503,7 @@ class Handler(BaseHTTPRequestHandler):
         if lower == "/users/me" or lower == f"/users/{USER_ID}":
             return self.send(200, USER)
         if lower == "/users/public":
-            return self.send(200, [{"Id": USER_ID, "Name": USER_NAME, "HasPassword": False}])
+            return self.send(200, [{"Id": USER_ID, "Name": USER_NAME, "HasPassword": False, "PrimaryImageTag": "up"}])
         if lower in ("/userviews", f"/users/{USER_ID}/views"):
             views = [i for i in all_items() if i["Type"] == "CollectionFolder"]
             return self.send(200, {"Items": [public(i) for i in views], "TotalRecordCount": len(views)})
@@ -440,19 +520,47 @@ class Handler(BaseHTTPRequestHandler):
             elif (q.get("parentId") or q.get("ParentId")):
                 COUNTS["LibraryPages"] += 1
             return self.send(200, page(found, q))
+        if lower == "/persons":
+            text = (q.get("searchTerm") or [""])[0].lower()
+            found = [p for p in PERSONS.values() if text in p["Name"].lower()]
+            return self.send(200, {"Items": found, "TotalRecordCount": len(found)})
+        if lower in ("/genres", "/years"):
+            # The genres or the years of a library's (or every) film and show.
+            parent = (q.get("parentId") or [""])[0]
+            kinds = (q.get("includeItemTypes") or ["Movie,Series"])[0].split(",")
+            titles = [i for i in all_items() if i["Type"] in kinds and (not parent or descends_from(i, parent))]
+            if lower == "/genres":
+                names = sorted({g for i in titles for g in i.get("Genres", [])})
+            else:
+                names = [str(y) for y in sorted({i["ProductionYear"] for i in titles if i.get("ProductionYear")})]
+            found = [{"Name": n, "Id": ident(lower + n), "Type": "Genre" if lower == "/genres" else "Year"} for n in names]
+            return self.send(200, {"Items": found, "TotalRecordCount": len(found)})
         match = re.fullmatch(r"(?:/users/[^/]+)?/items/([0-9a-f]{32})", lower)
+        if match and match[1] in PERSONS:
+            return self.send(200, PERSONS[match[1]])
         if match:
             item = ITEMS.get(match[1])
             if item and os.environ.get("BLOOM_MOCK_CLIP") and item["Type"] in ("Movie", "Episode"):
                 # With a clip, the streams a detail page offers: two audio
                 # tracks and the subtitle file of PlaybackInfo.
+                # The file facts of the detail page (resolution, range,
+                # channels, size) and an image track with its flags, for the
+                # friendly track names.
                 streams = [
-                    {"Type": "Video", "Index": 0, "Codec": "h264", "IsDefault": True},
-                    {"Type": "Audio", "Index": 1, "Codec": "aac", "Language": "eng", "DisplayTitle": "English · AAC", "IsDefault": True},
-                    {"Type": "Subtitle", "Index": 2, "Codec": "subrip", "Language": "eng", "DisplayTitle": "English · SRT", "IsExternal": True},
-                    {"Type": "Audio", "Index": 3, "Codec": "aac", "Language": "fre", "DisplayTitle": "French · AAC"},
+                    {"Type": "Video", "Index": 0, "Codec": "hevc", "IsDefault": True, "Width": 3840, "Height": 2160,
+                     "VideoRangeType": "DOVIWithHDR10"},
+                    {"Type": "Audio", "Index": 1, "Codec": "eac3", "Language": "eng", "DisplayTitle": "English · AAC", "IsDefault": True,
+                     "Channels": 6, "ChannelLayout": "5.1"},
+                    {"Type": "Subtitle", "Index": 2, "Codec": "subrip", "Language": "eng", "DisplayTitle": "English · SRT", "IsExternal": True,
+                     "IsTextSubtitleStream": True},
+                    {"Type": "Audio", "Index": 3, "Codec": "aac", "Language": "fre", "DisplayTitle": "French · AAC", "Channels": 2},
+                    {"Type": "Subtitle", "Index": 4, "Codec": "PGSSUB", "Language": "eng", "DisplayTitle": "English · PGSSUB · Forced",
+                     "IsForced": True},
+                    {"Type": "Subtitle", "Index": 5, "Codec": "subrip", "Language": "spa", "Title": "SDH", "DisplayTitle": "Spanish · SDH · SRT",
+                     "IsHearingImpaired": True, "IsTextSubtitleStream": True},
                 ]
-                return self.send(200, dict(public(item), MediaSources=[{"Id": item["Id"], "MediaStreams": streams}]))
+                return self.send(200, dict(public(item), MediaSources=[{"Id": item["Id"], "Container": "mkv", "Size": 18_400_000_000,
+                                                                        "MediaStreams": streams}]))
             return self.send(200, public(item)) if item else self.send(404)
         if lower == "/useritems/resume" or lower.endswith("/items/resume"):
             resumable = [i for i in all_items() if i.get("UserData", {}).get("PlaybackPositionTicks")]
@@ -460,6 +568,8 @@ class Handler(BaseHTTPRequestHandler):
         if lower == "/shows/nextup":
             series = (q.get("seriesId") or [""])[0]
             episodes = [i for i in all_items() if i["Type"] == "Episode" and not i["UserData"]["Played"]]
+            if FRESH["on"]:
+                episodes = []
             if series:
                 episodes = [i for i in episodes if i["SeriesId"] == series]
             first = {}
@@ -754,6 +864,7 @@ def reset():
     for key in COUNTS:
         COUNTS[key] = 0
     QUICK["polls"] = 0
+    FRESH["on"] = False
     SEARCH_GATE.set()
 
 
@@ -848,6 +959,26 @@ def serve_socket(self):
 Handler.serve_socket = serve_socket
 
 
+def discovery(host, port):
+    """Jellyfin's discovery answer ("who is JellyfinServer?"), on UDP at the
+    HTTP port number and the same address, never on 7359: the app's test
+    asks it directly (BLOOM_DISCOVERY_TARGETS), and no device on the
+    network finds the mock."""
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind((host, port))
+    except OSError as error:
+        print(f"mock-jellyfin: no discovery ({error})", file=sys.stderr, flush=True)
+        return
+    while True:
+        data, sender = sock.recvfrom(1024)
+        if data.strip().lower() == b"who is jellyfinserver?":
+            answer = {"Address": f"http://{host}:{port}", "Id": SERVER_ID, "Name": "Mock Jellyfin", "EndpointAddress": None}
+            sock.sendto(json.dumps(answer).encode(), sender)
+            print("mock-jellyfin: discovery answered", file=sys.stderr, flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--host", default="127.0.0.1", help="0.0.0.0 listens on every interface")
@@ -860,6 +991,7 @@ def main():
         with open(args.port_file, "w") as out:
             out.write(str(port))
     print(f"mock-jellyfin: http://{args.host}:{port} ({len(ITEMS)} items)", file=sys.stderr, flush=True)
+    threading.Thread(target=discovery, args=(args.host, port), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

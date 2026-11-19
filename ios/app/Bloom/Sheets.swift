@@ -8,13 +8,20 @@ struct AccountSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var confirmSignOut = false
     @State private var authorize = false
+    /// The server being renamed, and the name typed.
+    @State private var renaming: Account?
+    @State private var newName = ""
 
     var body: some View {
+        let names = ServerNames.shared
         NavigationStack {
             List {
-                ForEach(Dictionary(grouping: model.accounts, by: \.serverName).sorted(by: { $0.key < $1.key }), id: \.key) { server, accounts in
-                    Section(server) {
-                        ForEach(accounts, id: \.self) { account in
+                // By the server's id: two servers can share a name.
+                ForEach(Dictionary(grouping: model.accounts, by: \.serverId)
+                    .map { (id: $0.key, accounts: $0.value, name: names.shown($0.value[0])) }
+                    .sorted(by: { $0.name.localizedStandardCompare($1.name) == .orderedAscending }), id: \.id) { server in
+                    Section {
+                        ForEach(server.accounts, id: \.self) { account in
                             Button {
                                 dismiss()
                                 Task { await model.open(account) }
@@ -25,6 +32,19 @@ struct AccountSheet: View {
                                     if account == model.active { Image(systemName: "checkmark") }
                                 }
                             }
+                        }
+                    } header: {
+                        HStack {
+                            Text(server.name)
+                            Spacer()
+                            Button("Rename") {
+                                renaming = server.accounts[0]
+                                newName = names.names[server.id] ?? ""
+                            }
+                            .font(.footnote.weight(.medium))
+                            .textCase(nil)
+                            .accessibilityLabel("Rename \(server.name)")
+                            .accessibilityIdentifier("account.rename")
                         }
                     }
                 }
@@ -65,7 +85,17 @@ struct AccountSheet: View {
             .navigationTitle("Account")
             .navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $authorize) { AuthorizeSheet().bloomTheme().toastHost().environment(model) }
-            .confirmationDialog("Sign out of \(model.active?.serverName ?? "the server")?", isPresented: $confirmSignOut, titleVisibility: .visible) {
+            .alert("Rename server", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
+                TextField(renaming?.serverName ?? "Name", text: $newName)
+                    .accessibilityIdentifier("account.rename.field")
+                Button("Cancel", role: .cancel) {}
+                Button("Save") {
+                    if let renaming { names.set(newName, for: renaming.serverId) }
+                }
+            } message: {
+                Text("The name on this device only. Leave it empty for the server's own name, \(renaming?.serverName ?? "").")
+            }
+            .confirmationDialog("Sign out of \(model.active.map(names.shown) ?? "the server")?", isPresented: $confirmSignOut, titleVisibility: .visible) {
                 Button("Sign Out", role: .destructive) {
                     dismiss()
                     Task { await model.signOut() }
@@ -336,28 +366,30 @@ struct HomeSettings: View {
     var body: some View {
         ServerSection(title: "Home", editable: true) {
             let rows = (0..<Self.slots).map { model.prefs.homeSection($0) }.filter { $0 != "none" }
+            // What Bloom shows reads first; the rows only Jellyfin Web has a
+            // page for come after, quiet, in the place the list keeps them.
+            let shown = rows.filter { !Self.webOnly.contains($0) }
+            let webOnly = rows.filter { Self.webOnly.contains($0) }
             Section {
-                ForEach(Array(rows.enumerated()), id: \.offset) { _, kind in
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(Self.name(kind))
-                        if Self.webOnly.contains(kind) {
-                            Text("Jellyfin Web only; Bloom skips it").font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                    .accessibilityIdentifier("home.row.\(kind)")
+                ForEach(Array(shown.enumerated()), id: \.offset) { _, kind in
+                    Text(Self.name(kind))
+                        .accessibilityIdentifier("home.row.\(kind)")
                 }
                 .onMove { from, to in
-                    var moved = rows
+                    var moved = shown
                     moved.move(fromOffsets: from, toOffset: to)
-                    save(moved)
+                    save(Self.merge(rows, shown: moved))
                 }
                 .onDelete { gone in
-                    var kept = rows
+                    var kept = shown
                     kept.remove(atOffsets: gone)
-                    save(kept)
+                    save(Self.merge(rows, shown: kept))
+                }
+                if shown.isEmpty {
+                    Text("None. Add a row below.").foregroundStyle(.secondary)
                 }
             } header: {
-                Text("Rows, top to bottom")
+                Text("On Home, top to bottom")
             } footer: {
                 Text("Tap Edit to move or remove a row. Jellyfin Web uses the same list.")
             }
@@ -372,7 +404,41 @@ struct HomeSettings: View {
                     }
                 }
             }
+            if !webOnly.isEmpty {
+                Section {
+                    ForEach(webOnly, id: \.self) { kind in
+                        Text(Self.name(kind))
+                            .foregroundStyle(.secondary)
+                            .accessibilityIdentifier("home.row.\(kind)")
+                    }
+                    .onDelete { gone in
+                        let removed = Set(gone.map { webOnly[$0] })
+                        save(rows.filter { !removed.contains($0) })
+                    }
+                } header: {
+                    Text("Only in Jellyfin Web")
+                } footer: {
+                    Text("Bloom has no page for these rows and leaves them out. They keep their place for Jellyfin Web.")
+                }
+            }
         }
+    }
+
+    /// The whole list after a change to the rows Bloom shows: each web-only
+    /// row keeps its slot, the shown rows fill the other slots in their new
+    /// order, and an added one goes at the end.
+    static func merge(_ rows: [String], shown: [String]) -> [String] {
+        var next = shown.makeIterator()
+        var merged: [String] = []
+        for kind in rows {
+            if webOnly.contains(kind) {
+                merged.append(kind)
+            } else if let kind = next.next() {
+                merged.append(kind)
+            }
+        }
+        while let kind = next.next() { merged.append(kind) }
+        return merged
     }
 
     /// The list in its slots, the rest empty, in one save.
@@ -452,14 +518,14 @@ struct AccountSettings: View {
                     .clipShape(.circle)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(model.active?.userName ?? "—").font(.title3.weight(.semibold))
-                        Text(model.active?.serverName ?? "").foregroundStyle(.secondary)
+                        Text(model.active.map(ServerNames.shared.shown) ?? "").foregroundStyle(.secondary)
                     }
                 }
                 .listRowBackground(Color.clear)
             }
             Section("Profile") {
                 LabeledContent("Signed in as", value: model.active?.userName ?? "—")
-                LabeledContent("Server", value: model.active?.serverName ?? "—")
+                LabeledContent("Server", value: model.active.map(ServerNames.shared.shown) ?? "—")
                 LabeledContent("Address", value: model.active?.url ?? "—")
                 if model.prefs.isAdmin { LabeledContent("Role", value: "Administrator") }
             }

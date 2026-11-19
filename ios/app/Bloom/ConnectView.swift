@@ -12,7 +12,7 @@ struct ConnectView: View {
         let server: Server
         let info: ServerInfo
         let url: String
-        let users: [PublicUser]
+        let users: [PublicProfile]
         let quickConnect: Bool
         let branding: LoginBranding?
     }
@@ -22,9 +22,16 @@ struct ConnectView: View {
     @State private var username = ""
     @State private var password = ""
     @State private var busy = false
+    /// Why the last step failed; it shows by the fields it is about and
+    /// goes when the user types again.
     @State private var error: String?
+    /// The profile tapped on the sign-in screen.
+    @State private var chosen: String?
     /// The Quick Connect code shown while another device approves it.
     @State private var code: QuickConnectCode?
+    @State private var quickError: String?
+    /// Servers that answered on the local network; nil while looking.
+    @State private var nearby: [ServerDiscovery.Found]?
     @FocusState private var field: Field?
 
     var body: some View {
@@ -33,10 +40,8 @@ struct ConnectView: View {
                 if let found {
                     signIn(found)
                 } else {
+                    nearbySection
                     addressSection
-                }
-                if let error {
-                    Section { Text(error).foregroundStyle(Color.fail) }
                 }
                 if !model.accounts.isEmpty, found == nil {
                     Section("Your profiles") {
@@ -44,7 +49,7 @@ struct ConnectView: View {
                             Button {
                                 Task { await model.open(account) }
                             } label: {
-                                LabeledContent(account.userName, value: account.serverName)
+                                LabeledContent(account.userName, value: ServerNames.shared.shown(account))
                             }
                             .swipeActions {
                                 Button("Forget", role: .destructive) { Task { await model.forget(account) } }
@@ -53,7 +58,10 @@ struct ConnectView: View {
                     }
                 }
             }
-            .navigationTitle(found == nil ? "Connect to a server" : "Who is watching?")
+            .navigationTitle(title)
+            // The server's name under the title: a long one (a machine id)
+            // would be cut short in a large title.
+            .navigationSubtitle(found.map { ServerNames.shared.shown(id: $0.info.id, reported: $0.info.name) } ?? "")
             .toolbar {
                 // "Servers & profiles…" keeps the session: the way back to it.
                 if let active = model.active, model.server != nil, found == nil {
@@ -64,8 +72,59 @@ struct ConnectView: View {
             }
             .disabled(busy)
             .overlay { if busy { ProgressView() } }
+            .onChange(of: username) { error = nil }
+            .onChange(of: password) { error = nil }
+            .onChange(of: address) { error = nil }
         }
         .onAppear { field = .address }
+        .task { await lookNearby() }
+    }
+
+    /// Profiles to pick from ask who watches; a bare form asks to sign in
+    /// (the server's name is the subtitle).
+    private var title: String {
+        guard let found else { return "Connect to a server" }
+        return found.users.isEmpty ? "Sign in" : "Who is watching?"
+    }
+
+    /// The servers that answered on this network, above the address field.
+    @ViewBuilder
+    private var nearbySection: some View {
+        Section {
+            if let nearby {
+                ForEach(nearby, id: \.id) { server in
+                    Button {
+                        address = server.address
+                        Task { await connect() }
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "server.rack").foregroundStyle(.secondary).frame(width: 24)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(ServerNames.shared.shown(id: server.id, reported: server.name)).foregroundStyle(Color.ink)
+                                Text(server.address).font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
+                        }
+                    }
+                    .accessibilityIdentifier("connect.nearby.\(server.id)")
+                }
+                if nearby.isEmpty {
+                    HStack {
+                        Text("No server answered.").foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Look again") { Task { await lookNearby() } }
+                    }
+                }
+            } else {
+                HStack(spacing: 10) {
+                    ProgressView()
+                    Text("Looking for servers…").foregroundStyle(.secondary)
+                }
+            }
+        } header: {
+            Text("On this network")
+        }
     }
 
     @ViewBuilder
@@ -80,8 +139,17 @@ struct ConnectView: View {
                 .focused($field, equals: .address)
                 .onSubmit { Task { await connect() } }
                 .accessibilityIdentifier("connect.address")
+        } header: {
+            Text("Address")
         } footer: {
-            Text("Enter the address of your Jellyfin server.")
+            if let error {
+                Label(error, systemImage: "exclamationmark.circle")
+                    .font(.body)
+                    .foregroundStyle(Color.fail)
+                    .accessibilityIdentifier("connect.error")
+            } else {
+                Text("Enter the address of your Jellyfin server.")
+            }
         }
         mainAction("Connect", disabled: address.trimmingCharacters(in: .whitespaces).isEmpty) { await connect() }
     }
@@ -109,15 +177,8 @@ struct ConnectView: View {
             }
         }
         if !found.users.isEmpty {
-            Section("Users on \(found.info.name)") {
-                ForEach(found.users, id: \.id) { user in
-                    Button {
-                        username = user.name
-                        field = .password
-                    } label: {
-                        Label(user.name, systemImage: "person.crop.circle").foregroundStyle(Color.ink)
-                    }
-                }
+            Section {
+                profiles(found)
             }
         }
         Section {
@@ -127,6 +188,7 @@ struct ConnectView: View {
                 .submitLabel(.next)
                 .focused($field, equals: .username)
                 .onSubmit { field = .password }
+                .onChange(of: username) { if username != found.users.first(where: { $0.id == chosen })?.name { chosen = nil } }
                 .accessibilityIdentifier("connect.username")
             SecureField("Password", text: $password)
                 .textContentType(.password)
@@ -134,11 +196,22 @@ struct ConnectView: View {
                 .focused($field, equals: .password)
                 .onSubmit { Task { await signIn() } }
                 .accessibilityIdentifier("connect.password")
+        } header: {
+            if !found.users.isEmpty { Text("Or another account") }
         } footer: {
-            // The server's own words for its sign-in page (Markdown, as the
-            // web client reads it).
-            if let disclaimer = found.branding?.disclaimer {
-                Text((try? AttributedString(markdown: disclaimer)) ?? AttributedString(disclaimer))
+            VStack(alignment: .leading, spacing: 8) {
+                if let error {
+                    // Body text under the group (DESIGN.md, "Inputs").
+                    Label(error, systemImage: "exclamationmark.circle")
+                        .font(.body)
+                        .foregroundStyle(Color.fail)
+                        .accessibilityIdentifier("connect.error")
+                }
+                // The server's own words for its sign-in page (Markdown, as
+                // the web client reads it).
+                if let disclaimer = found.branding?.disclaimer {
+                    Text((try? AttributedString(markdown: disclaimer)) ?? AttributedString(disclaimer))
+                }
             }
         }
         mainAction("Sign In", disabled: username.isEmpty) { await signIn() }
@@ -159,6 +232,8 @@ struct ConnectView: View {
                 }
             } header: {
                 Text("Quick Connect")
+            } footer: {
+                if let quickError { Text(quickError).foregroundStyle(Color.fail) }
             }
             .task(id: code?.secret) { await pollQuickConnect(found) }
         }
@@ -166,8 +241,52 @@ struct ConnectView: View {
             Button("Change server") {
                 self.found = nil
                 error = nil
+                quickError = nil
+                chosen = nil
             }
         }
+    }
+
+    /// The server's users as pictures to tap, three across: a user with no
+    /// password signs in at the tap, as in Jellyfin Web.
+    private func profiles(_ found: Found) -> some View {
+        // One or two users sit in the middle; more go three across.
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12, alignment: .top), count: min(max(found.users.count, 1), 3)),
+                  spacing: 16) {
+            ForEach(found.users, id: \.id) { user in
+                Button {
+                    chosen = user.id
+                    username = user.name
+                    password = ""
+                    if user.hasPassword {
+                        field = .password
+                    } else {
+                        Task { await signIn() }
+                    }
+                } label: {
+                    VStack(spacing: 8) {
+                        ProfileDisc(name: user.name, picture: user.picture, size: 72)
+                            .overlay {
+                                Circle().strokeBorder(Color.ink, lineWidth: chosen == user.id ? 2.5 : 0).padding(-4)
+                            }
+                        Text(user.name)
+                            .font(.subheadline.weight(chosen == user.id ? .semibold : .regular))
+                            .foregroundStyle(Color.ink)
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 4)
+                    .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(user.name)
+                .accessibilityAddTraits(chosen == user.id ? .isSelected : [])
+                .accessibilityIdentifier("connect.profile.\(user.name)")
+            }
+        }
+        .padding(.vertical, 8)
+        .listRowBackground(Color.clear)
+        .listRowInsets(EdgeInsets())
     }
 
     /// The address as the server list keeps it: a scheme, no trailing slash.
@@ -178,6 +297,11 @@ struct ConnectView: View {
         return url
     }
 
+    private func lookNearby() async {
+        nearby = nil
+        nearby = await ServerDiscovery.search()
+    }
+
     private func connect() async {
         let url = normalized(address)
         busy = true
@@ -186,24 +310,27 @@ struct ConnectView: View {
         let server = Server(url: url, deviceId: model.deviceId, secrets: model.keychain)
         do {
             let info = try await server.publicInfo()
-            let users = (try? await server.publicUsers()) ?? []
+            let users = (try? await server.publicProfiles()) ?? []
             let quick = await server.quickConnectEnabled()
             let branding = try? await server.loginBranding()
+            username = ""
+            password = ""
+            chosen = nil
             found = Found(server: server, info: info, url: url, users: users, quickConnect: quick, branding: branding)
-            field = .username
+            field = users.isEmpty ? .username : nil
         } catch {
             self.error = Words.error(error)
         }
     }
 
     private func startQuickConnect(_ found: Found) async {
-        error = nil
+        quickError = nil
         // The code must not sit under the keyboard.
         field = nil
         do {
             code = try await found.server.quickConnectStart()
         } catch {
-            self.error = Words.error(error)
+            quickError = Words.error(error)
         }
     }
 
@@ -221,7 +348,7 @@ struct ConnectView: View {
                     self.code = nil
                     await model.signedIn(server: found.server, info: found.info, url: found.url, me: me)
                 } catch {
-                    self.error = Words.error(error)
+                    quickError = Words.error(error)
                     self.code = nil
                 }
                 return
@@ -229,7 +356,7 @@ struct ConnectView: View {
         }
         if self.code?.secret == code.secret {
             self.code = nil
-            error = "The code expired. Start Quick Connect again."
+            quickError = "The code expired. Start Quick Connect again."
         }
     }
 
@@ -241,15 +368,51 @@ struct ConnectView: View {
         }
         busy = true
         error = nil
-        defer { busy = false }
         do {
             let me = try await found.server.signIn(username: username, password: password)
             password = ""
+            busy = false
             await model.signedIn(server: found.server, info: found.info, url: found.url, me: me)
         } catch BloomError.SignInAgain {
+            busy = false
             error = "Wrong username or password."
+            // Back in the password field once the form takes input again
+            // (the busy form had dropped the focus).
+            Task { field = .password }
         } catch {
+            busy = false
             self.error = Words.error(error)
         }
+    }
+}
+
+/// A user's picture on a disc, or the first letters of the name when there
+/// is none (or it fails to load).
+struct ProfileDisc: View {
+    let name: String
+    let picture: String?
+    var size: CGFloat = 72
+
+    var body: some View {
+        ZStack {
+            Circle().fill(Color.ink.opacity(0.12))
+            Text(initials).font(.system(size: size * 0.36, weight: .semibold)).foregroundStyle(Color.ink)
+            if let picture, let url = URL(string: picture) {
+                AsyncImage(url: url, transaction: Transaction(animation: .easeOut(duration: 0.2))) { phase in
+                    if case .success(let image) = phase {
+                        image.resizable().scaledToFill().transition(.opacity)
+                    }
+                }
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(.circle)
+        .accessibilityHidden(true)
+    }
+
+    private var initials: String {
+        let words = name.split(whereSeparator: { $0 == " " || $0 == "." || $0 == "_" || $0 == "-" })
+        let letters = words.prefix(2).compactMap(\.first)
+        return String(letters.isEmpty ? Array(name.prefix(1)) : letters).uppercased()
     }
 }

@@ -27,7 +27,10 @@ use bloom_core::{
 
 uniffi::setup_scaffolding!();
 
+mod account;
 mod admin;
+mod browse;
+mod detail;
 mod enhanced;
 mod kinds;
 mod link;

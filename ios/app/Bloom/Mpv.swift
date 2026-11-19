@@ -32,6 +32,11 @@ final class Mpv {
         let external: Bool
         /// The title the file or `sub-add` gave, as it is.
         var name: String = ""
+        /// What the friendly name is made of (`TrackName`).
+        var language: String? = nil
+        var codec: String? = nil
+        var forced = false
+        var isDefault = false
     }
 
     /// What SyncPlay listens to.
@@ -182,7 +187,8 @@ final class Mpv {
         var seen = Set<String>()
         let title = parts.filter { seen.insert($0.lowercased()).inserted }.joined(separator: " · ")
         return Track(id: track.mpvID, kind: kind, title: title.isEmpty ? "Track \(track.mpvID)" : title,
-                     selected: track.isSelected, external: track.isExternal, name: track.title ?? "")
+                     selected: track.isSelected, external: track.isExternal, name: track.title ?? "",
+                     language: track.language, codec: track.codec, forced: track.isForced, isDefault: track.isDefault)
     }
 
     /// Software decoding while mpv draws a subtitle (see the type's note).

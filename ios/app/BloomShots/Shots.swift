@@ -148,7 +148,7 @@ final class Shots: XCTestCase {
         for line in app.debugDescription.split(separator: "\n") where line.contains("SRT") || line.contains("Off") {
             print("SHOTS-TREE: \(line)")
         }
-        app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'English · SRT'")).firstMatch.tap()
+        app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH 'English'")).firstMatch.tap()
         sleep(2)
         shot("09-player-subtitle-shown")
         // Skip the intro: the position passes 12 s.
@@ -327,7 +327,8 @@ final class Shots: XCTestCase {
         pause.tap()
         app.buttons["player.subtitles"].tap()
         // The menu is open: its entry for the file is there.
-        let entry = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'English · SRT'")).firstMatch
+        // The player names a track in words ("English"), its format as a detail.
+        let entry = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'English'")).firstMatch
         XCTAssertTrue(entry.waitForExistence(timeout: 5), "The subtitle menu did not open")
         shot("38-player-tracks")
         XCTAssertFalse(app.staticTexts["From the server"].exists, "The chosen subtitle file was not loaded")
@@ -427,7 +428,10 @@ final class Shots: XCTestCase {
         let id = card.identifier.replacingOccurrences(of: "card.", with: "")
         card.tap()
         let download = app.buttons["download.\(id)"]
-        XCTAssertTrue(download.waitForExistence(timeout: 15), "No download button")
+        if !download.waitForExistence(timeout: 15) {
+            shot("13x-no-download")
+        }
+        XCTAssertTrue(download.exists, "No download button")
         sleep(2)
         download.tap()
         let done = app.descendants(matching: .any).matching(NSPredicate(format: "label == 'Downloaded'")).firstMatch

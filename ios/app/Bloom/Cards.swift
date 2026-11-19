@@ -220,11 +220,29 @@ extension MediaItem {
 /// Like This, Cast & Crew, the rows of Seerr.
 struct Shelf<Content: View>: View {
     let title: String
+    /// The page a "See all" at the right of the heading opens: the whole
+    /// row as a grid. None when the row shows all it has.
+    var seeAll: AnyView? = nil
     @ViewBuilder let content: () -> Content
 
     var body: some View {
         VStack(alignment: .leading, spacing: Metrics.shelfSpacing) {
-            Text(title).font(.title3.weight(.semibold)).padding(.horizontal, Metrics.gutter)
+            HStack(alignment: .firstTextBaseline) {
+                Text(title).font(.title3.weight(.semibold)).accessibilityAddTraits(.isHeader)
+                Spacer(minLength: 12)
+                if let seeAll {
+                    NavigationLink { seeAll } label: {
+                        Text("See all").font(.subheadline.weight(.medium)).foregroundStyle(Color.ink.opacity(0.7))
+                            .frame(minHeight: 44).contentShape(.rect)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("See all, \(title)")
+                    .accessibilityIdentifier("seeall.\(title)")
+                }
+            }
+            .padding(.horizontal, Metrics.gutter)
+            // The 44-point target of "See all" must not push the cards down.
+            .frame(height: 28)
             ScrollView(.horizontal) {
                 LazyHStack(alignment: .top, spacing: Metrics.cardSpacing) { content() }
                     .scrollTargetLayout()
@@ -278,6 +296,9 @@ struct Picture: View {
 /// A poster: the width from the container, the height from the 2:3 picture.
 struct PosterCard: View {
     let item: MediaItem
+    /// The line under the title in place of the year: a person's role on
+    /// the person's page.
+    var detail: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -289,11 +310,20 @@ struct PosterCard: View {
                 .overlay(alignment: .topTrailing) { Badge(item: item) }
                 .overlay(alignment: .bottom) { ProgressLine(progress: item.progress) }
             Text(item.cardTitle).font(.footnote.weight(.medium)).lineLimit(1)
-            Text(item.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            Text(detail ?? item.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
         }
         .accessibilityElement(children: .combine)
-        .accessibilityValue(item.qualityTags.joined(separator: ", "))
+        .accessibilityValue(([item.watchState] + item.qualityTags).compactMap { $0 }.joined(separator: ", "))
         .accessibilityIdentifier(item.kind == .collectionFolder ? "library.\(item.id)" : "card.\(item.id)")
+    }
+}
+
+extension MediaItem {
+    /// Watched or how far, for VoiceOver: the tick and the line are pictures.
+    var watchState: String? {
+        if played { return "Watched" }
+        if let progress, progress > 0 { return "\(Int((progress * 100).rounded()))% watched" }
+        return nil
     }
 }
 
@@ -307,6 +337,7 @@ struct WideCard: View {
             Picture(url: item.wideArt, symbol: item.kind == .collectionFolder ? item.librarySymbol : "film")
                 .aspectRatio(16 / 9, contentMode: .fit)
                 .overlay(alignment: .topLeading) { QualityTags(labels: item.qualityTags) }
+                .overlay(alignment: .topTrailing) { Badge(item: item) }
                 .overlay(alignment: .bottom) { ProgressLine(progress: item.progress) }
             Text(item.cardTitle).font(.footnote.weight(.medium)).lineLimit(1)
             // A library has its name alone: no empty line under it.
@@ -316,7 +347,7 @@ struct WideCard: View {
             }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityValue(item.qualityTags.joined(separator: ", "))
+        .accessibilityValue(([item.watchState] + item.qualityTags).compactMap { $0 }.joined(separator: ", "))
         .accessibilityIdentifier(item.kind == .collectionFolder ? "library.\(item.id)" : "card.\(item.id)")
     }
 }

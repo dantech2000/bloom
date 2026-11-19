@@ -90,7 +90,12 @@ run_tests() { # [only]
     destination="id=$id"
   fi
   mock
-  [ -n "${DEVICE:-}" ] || xcrun simctl uninstall "$id" dev.bloom.ios.next 2>/dev/null || true
+  # A shut-down simulator ignores the uninstall, and the app's data (its
+  # downloads, its settings) would carry into this run: boot it first.
+  if [ -z "${DEVICE:-}" ]; then
+    xcrun simctl boot "$id" 2>/dev/null || true
+    xcrun simctl uninstall "$id" dev.bloom.ios.next 2>/dev/null || true
+  fi
   # The whole run leaves out the performance tests (slow, and noisy beside
   # other work); `perf` runs them.
   only="-skip-testing:BloomShots/Performance"
