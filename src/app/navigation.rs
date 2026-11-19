@@ -40,8 +40,14 @@ impl Bloom {
         // Keep the place in the page, so Back returns to it.
         let place = self.nav.scroll.offset();
         self.nav.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+        // The page on screen opened again (a second click on the same
+        // episode): it loads again in place and adds no step, so Back
+        // leaves it at once.
+        let again = same_place(&self.nav.page, &page);
         let previous = std::mem::replace(&mut self.nav.page, page);
-        self.nav.history.push((previous, place));
+        if !again {
+            self.nav.history.push((previous, place));
+        }
         self.nav.back = false;
         if self.nav.history.len() > 40 {
             self.nav.history.remove(0);
@@ -207,6 +213,19 @@ impl Bloom {
                 id: id.to_string(),
                 name: name.to_string(),
                 collection_type: Some(PERSON_VIEW.into()),
+                ..Default::default()
+            },
+            cx,
+        );
+    }
+
+    /// Lists the movies and series of a genre, as a page Back leaves.
+    pub fn open_genre(&mut self, genre: &Item, cx: &mut Context<Self>) {
+        self.open_folder(
+            Item {
+                id: genre.id.clone(),
+                name: genre.name.clone(),
+                collection_type: Some(crate::pages::GENRE_VIEW.into()),
                 ..Default::default()
             },
             cx,
@@ -521,7 +540,12 @@ impl Bloom {
             cx,
             move |client| {
                 let started = std::time::Instant::now();
-                let loaded = crate::pages::load_home(&client, libraries, need_views, need_hero)?;
+                let mut loaded = crate::pages::load_home(&client, libraries, need_views, need_hero)?;
+                // A user with nothing to continue gets titles to pick and
+                // the genres in the place of the rows of his own.
+                if loaded.1.nothing_started() {
+                    (loaded.1.discover, loaded.1.genres) = crate::pages::load_discover(&client);
+                }
                 log::info!(
                     "home data loaded in {} ms ({} ms after start)",
                     started.elapsed().as_millis(),
@@ -564,25 +588,50 @@ impl Bloom {
         };
         data.loading = true;
         let query = library_query(data);
+        // The genres of the library, for its filter menu, load once with
+        // its first page, in the same pass. A genre's own page has no
+        // genre filter.
+        let genres_of = (data.genres.is_none()
+            && data.can_narrow_by_genre()
+            && data.view.collection_type.as_deref() != Some(crate::pages::GENRE_VIEW))
+        .then(|| {
+            let parent = (!query.parent_id.as_deref().unwrap_or("").is_empty()).then(|| data.view.id.clone());
+            (parent, query.include_types.clone())
+        });
         self.fetch_for_page(
             cx,
             move |client| {
                 let started = std::time::Instant::now();
-                let page = client.items(&query)?;
+                let (page, genres) = std::thread::scope(|scope| {
+                    let genres = scope.spawn(|| {
+                        genres_of.map(|(parent, kinds)| {
+                            let kinds: Vec<&str> = kinds.iter().map(String::as_str).collect();
+                            // The menu is optional; the page loads without it.
+                            client.genres(parent.as_deref(), &kinds).unwrap_or_default()
+                        })
+                    });
+                    let page = client.items(&query);
+                    (page, genres.join().unwrap_or_default())
+                });
+                let page = page?;
                 log::info!(
                     "library data loaded in {} ms ({} items)",
                     started.elapsed().as_millis(),
                     page.items.len()
                 );
-                Ok(page)
+                Ok((page, genres))
             },
             move |this, result, cx| {
                 if let Page::Library(data) = &mut this.nav.page {
                     data.loading = false;
                     match result {
-                        Ok(page) => {
+                        Ok((page, genres)) => {
                             data.total = page.total_record_count;
                             data.items = page.items;
+                            if genres.is_some() {
+                                data.genres = genres;
+                                this.rebuild_library_menus(cx);
+                            }
                         }
                         Err(err) => {
                             if !this.request_failed(&err, cx) {
@@ -716,5 +765,39 @@ impl Bloom {
                 cx.notify();
             },
         );
+    }
+}
+
+/// Whether two pages show the same thing: the same item, library view,
+/// playlist or settings section, or Home or Downloads.
+fn same_place(a: &Page, b: &Page) -> bool {
+    match (a, b) {
+        (Page::Detail(a), Page::Detail(b)) => a.item.id == b.item.id,
+        (Page::Library(a), Page::Library(b)) => {
+            a.view.id == b.view.id && a.view.collection_type == b.view.collection_type
+        }
+        (Page::Playlist(a), Page::Playlist(b)) => a.list.id == b.list.id,
+        (Page::Settings(a), Page::Settings(b)) => a == b,
+        (Page::Home(_), Page::Home(_)) | (Page::Downloads, Page::Downloads) => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod same_place_tests {
+    use super::*;
+
+    fn detail(id: &str) -> Page {
+        let mut data = DetailData::default();
+        data.item.id = id.into();
+        Page::Detail(Box::new(data))
+    }
+
+    #[test]
+    fn the_same_item_twice_is_one_place() {
+        assert!(same_place(&detail("e1"), &detail("e1")));
+        assert!(!same_place(&detail("e1"), &detail("e2")));
+        assert!(!same_place(&detail("e1"), &Page::Downloads));
+        assert!(same_place(&Page::Downloads, &Page::Downloads));
     }
 }

@@ -275,7 +275,15 @@ fn layer(radius: Pixels, tint: Rgba, surface: Surface) -> Canvas<()> {
                     // not a card over posters: with the half-clear middle
                     // and the sharp lens of the bezel the text read through
                     // (2026-10-22). The sheet frosts over, bezel included.
-                    if surface == Surface::Popup && crate::views::shell::compact_now() {
+                    // On the Mac the same holds for a popup of text in the
+                    // tint of the popups (a menu, a panel, a dialog, a
+                    // toast): over a bright poster or a playing film the
+                    // half-clear middle let the picture through the words
+                    // (2026-11-18). Cards, bars and the player's controls
+                    // keep their lens.
+                    if surface == Surface::Popup
+                        && (crate::views::shell::compact_now() || tint == POPUP_TINT)
+                    {
                         set.frost = 1.;
                         set.blur = 1.;
                     }

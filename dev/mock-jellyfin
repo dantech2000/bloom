@@ -75,6 +75,7 @@ def build():
         position = runtime // 3 if n in (1, 2) else 0
         add({"Id": ident(name), "Name": name, "Type": "Movie", "ParentId": movies["Id"],
              "ProductionYear": year, "RunTimeTicks": runtime, "CommunityRating": 6.0 + (n % 30) / 10,
+             "CriticRating": 60 + (n * 7) % 40,
              "OfficialRating": ["PG", "PG-13", "R"][n % 3], "Genres": [GENRES[n % 6], GENRES[(n + 2) % 6]],
              "Overview": f"{name} is a film of the mock library. It has no file, only this text.",
              "DateCreated": f"2026-09-{28 - n:02d}T10:00:00Z",
@@ -160,6 +161,13 @@ def query_items(q):
         found = [i for i in found if not i["UserData"]["Played"]]
     if "IsResumable" in filters:
         found = [i for i in found if i["UserData"]["PlaybackPositionTicks"]]
+    genre_ids = [g for g in one("genreIds").split("|") if g]
+    if genre_ids:
+        names = [name for name in GENRES if ident("genre " + name) in genre_ids]
+        found = [i for i in found if any(name in i.get("Genres", []) for name in names)]
+    years = [int(y) for y in one("years").split(",") if y]
+    if years:
+        found = [i for i in found if i.get("ProductionYear") in years]
     starts = one("nameStartsWith").lower()
     if starts:
         found = [i for i in found if i["Name"].lower().startswith(starts)]
@@ -268,6 +276,13 @@ class Handler(BaseHTTPRequestHandler):
         if match:
             item = ITEMS.get(match[1])
             return self.send(200, public(item)) if item else self.send(404)
+        if lower == "/genres":
+            titles = query_items({**q, "genreIds": [""], "years": [""]})
+            genres = [{"Id": ident("genre " + name), "Name": name, "Type": "Genre",
+                       "ChildCount": sum(1 for i in titles if name in i.get("Genres", []))}
+                      for name in sorted(GENRES)]
+            genres = [g for g in genres if g["ChildCount"]]
+            return self.send(200, {"Items": genres, "TotalRecordCount": len(genres)})
         if lower == "/useritems/resume" or lower.endswith("/items/resume"):
             resumable = [i for i in all_items() if i.get("UserData", {}).get("PlaybackPositionTicks")]
             return self.send(200, page(resumable, q))

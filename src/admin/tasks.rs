@@ -482,7 +482,7 @@ fn row(
                     .justify_end()
                     .gap(px(8.))
                     .child(
-                        super::more_button(SharedString::from(format!("admin.tasks.more.{}", task.id)), cx)
+                        super::more_button(SharedString::from(format!("admin.tasks.more.{}", task.id)), "More actions for this task", cx)
                             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                                 cx.stop_propagation();
                                 let handle = cx.weak_entity();

@@ -503,10 +503,19 @@ impl Bloom {
                     cx.notify();
                 }
                 "close" => self.close_admin_dialog(window, cx),
+                // The "…" menu of the server card (Restart, Shut Down); a
+                // menu entry still asks before it acts.
+                "power" => {
+                    let items = crate::admin::dashboard::power_menu("the server", true, cx);
+                    let at = gpui_kit::point(px(self.viewport_w - 80.), px(160.));
+                    self.open_admin_menu(items, at, window, cx);
+                }
+                // Opens every group of repeated alerts on the overview.
+                "alerts" => crate::admin::dashboard::open_alert_groups(self, cx),
                 other => match other.strip_prefix("edit ") {
                     Some(key) if self.config_ask_key(key, cx) => {}
                     _ => {
-                        return "error: admin-dialog newkey | newuser | secret | edit <key> | close"
+                        return "error: admin-dialog newkey | newuser | secret | power | alerts | edit <key> | close"
                             .to_string();
                     }
                 },
@@ -590,6 +599,12 @@ impl Bloom {
             // Opens a page of the settings; "password" opens that form.
             "settings" => match rest {
                 "password" => self.ask_new_password(cx),
+                // The list of home rows: `home-rows` prints the ten slots;
+                // `home-rows up|down|remove <n>`, `add <kind>` and
+                // `web-remove <slot>` change it as its buttons do (a save).
+                rows if rows.starts_with("home-rows") => {
+                    return self.debug_home_rows(rows.trim_start_matches("home-rows").trim(), cx);
+                }
                 _ => match crate::settings::Section::from_name(if rest.is_empty() {
                     "profile"
                 } else {
@@ -621,6 +636,7 @@ impl Bloom {
             "syncplay" => return self.debug_syncplay(rest, window, cx),
             // Playlists and collections; see `lists.rs`.
             "lists" => return self.debug_lists(rest, window, cx),
+            "browse" => return self.debug_browse(rest, window, cx),
             // Counters of the news of the server, and a way to feed a
             // message into the same handler as a real one.
             "events" => return self.news_describe(),

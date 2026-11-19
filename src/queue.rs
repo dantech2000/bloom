@@ -337,6 +337,25 @@ impl Bloom {
             && self.play_next(cx)
     }
 
+    /// Puts an item in the queue of the player: right after the item that
+    /// plays (`next`), or at its end. Nothing plays: false, and the
+    /// caller plays the item instead.
+    pub fn enqueue(&mut self, item: Item, next: bool, cx: &mut Context<Self>) -> bool {
+        if self.playback.playing.is_none() {
+            return false;
+        }
+        let name = item.name.clone();
+        if next {
+            self.queue.upcoming.insert(0, item);
+            self.toast("Plays next", name, cx);
+        } else {
+            self.queue.upcoming.push(item);
+            self.toast("Added to the queue", name, cx);
+        }
+        cx.notify();
+        true
+    }
+
     /// The next item and the seconds until it starts, in the time the
     /// "Up next" card shows: the last half minute, or the credits.
     pub fn up_next(&self) -> Option<(&Item, i64)> {
@@ -409,5 +428,63 @@ fn frame_at(trickplay: &Trickplay, secs: f64) -> u32 {
     match trickplay.thumbnail_count {
         0 => index,
         count => index.min(count - 1),
+    }
+}
+
+/// Where Play starts in a list of episodes in order: the first one not
+/// watched, else the first; and whether it goes on from its resume point.
+pub fn episodes_start(episodes: &[Item]) -> Option<(usize, bool)> {
+    let at = episodes.iter().position(|e| !e.user_data.played).unwrap_or(0);
+    let episode = episodes.get(at)?;
+    Some((at, !episode.user_data.played && episode.resume_secs() > 0))
+}
+
+/// The words of the Play button for an episode: "Play S1:E1", "Resume
+/// S1:E3"; "Play" or "Resume" when it has no numbers.
+pub fn play_label(episode: Option<&Item>, resume: bool) -> String {
+    let verb = if resume { "Resume" } else { "Play" };
+    match episode.and_then(Item::episode_code) {
+        Some(code) => format!("{verb} {code}"),
+        None => verb.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn episode(n: i32, played: bool, resume_secs: i64) -> Item {
+        let mut item = Item {
+            id: format!("e{n}"),
+            kind: "Episode".into(),
+            parent_index_number: Some(1),
+            index_number: Some(n),
+            ..Default::default()
+        };
+        item.user_data.played = played;
+        item.user_data.playback_position_ticks = resume_secs * 10_000_000;
+        item
+    }
+
+    #[test]
+    fn play_starts_at_the_first_episode_not_watched() {
+        let season = [episode(1, true, 0), episode(2, false, 0), episode(3, false, 0)];
+        assert_eq!(episodes_start(&season), Some((1, false)));
+        assert_eq!(play_label(Some(&season[1]), false), "Play S1:E2");
+    }
+
+    #[test]
+    fn a_started_episode_resumes() {
+        let season = [episode(1, true, 0), episode(2, true, 0), episode(3, false, 600)];
+        assert_eq!(episodes_start(&season), Some((2, true)));
+        assert_eq!(play_label(Some(&season[2]), true), "Resume S1:E3");
+    }
+
+    #[test]
+    fn a_season_watched_through_starts_again_at_its_first_episode() {
+        let season = [episode(1, true, 0), episode(2, true, 30)];
+        assert_eq!(episodes_start(&season), Some((0, false)));
+        assert_eq!(episodes_start(&[]), None);
+        assert_eq!(play_label(None, false), "Play");
     }
 }

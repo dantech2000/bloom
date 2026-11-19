@@ -5,6 +5,7 @@
 //! the left, a title ribbon with the actions, then details and rows.
 
 use crate::jellyfin::{PersonKind, StreamKind};
+use bloom_core::track_names;
 use crate::ui::tone;
 use gpui_icons::LucideIcon;
 use gpui_kit::{
@@ -174,7 +175,7 @@ impl Bloom {
                     .child(self.render_name(item, cx))
                     .child(meta_line(item, cx)),
             )
-            .child(self.render_actions(item, cx));
+            .child(self.render_actions(data, cx));
 
         let mut body = div()
             .pl(px(l.content_left))
@@ -205,6 +206,7 @@ impl Bloom {
         }
         body = body.children(tags_and_links(item, cx));
         body = body.children(self.enhanced_detail_lines(item, cx));
+        body = body.children(facts(item, cx));
         body = body.children(credits(item, cx));
 
         let mut rows: Vec<Div> = Vec::new();
@@ -443,15 +445,30 @@ impl Bloom {
     }
 
     /// Play pill and the icon actions at the right of the title ribbon.
-    fn render_actions(&self, item: &Item, cx: &mut Context<Self>) -> Div {
+    fn render_actions(&self, data: &DetailData, cx: &mut Context<Self>) -> Div {
+        let item = &data.item;
         let fg = rgba(0xffffffde);
         let round = |id: &'static str, glyph: gpui_kit::Svg| {
             icon_button(id, last_part(id), glyph, 46., ACTION_HOVER)
         };
         let mut row = div().flex_shrink_0().flex().items_center().gap(px(8.));
 
-        if item.is_playable() || item.is_series() {
+        // What Play does, in its words: a film resumes or plays; a show
+        // and a season name the episode ("Resume S1:E3").
+        let season = item.kind == ItemKind::Season;
+        let play = if season {
+            crate::queue::episodes_start(&data.episodes)
+                .map(|(at, resume)| (crate::queue::play_label(data.episodes.get(at), resume), false))
+        } else if item.is_series() {
+            let next = data.next_up.as_ref();
+            Some((crate::queue::play_label(next, next.is_some_and(|e| e.resume_secs() > 0)), false))
+        } else if item.is_playable() {
             let resumable = item.resume_secs() > 0;
+            Some((if resumable { "Resume" } else { "Play" }.to_string(), resumable))
+        } else {
+            None
+        };
+        if let Some((label, resumable)) = play {
             row = row.child(
                 div()
                     .id("detail.play")
@@ -470,22 +487,34 @@ impl Bloom {
                     .text_color(rgb(0x111111))
                     .text_size(px(16.))
                     .font_weight(gpui_kit::FontWeight::BOLD)
+                    .whitespace_nowrap()
                     .hover(|s| s.bg(rgb(0xffffff)))
                     .child(filled(Filled::Play, 24., rgb(0x111111)))
-                    .child(if resumable { "Resume" } else { "Play" })
+                    .child(label)
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.play_detail(resumable, window, cx)
+                        if season {
+                            this.play_season(false, window, cx)
+                        } else {
+                            this.play_detail(resumable, window, cx)
+                        }
                     })),
             );
             if resumable {
                 row = row.child(
                     round("detail.restart", icon(LucideIcon::RotateCcw, 25., fg))
                         .tooltip(tip("Play from the beginning"))
-                        .on_click(
-                        cx.listener(|this, _: &ClickEvent, window, cx| {
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                             this.play_detail(false, window, cx)
-                        }),
-                    ),
+                        })),
+                );
+            }
+            if season && data.episodes.len() > 1 {
+                row = row.child(
+                    round("detail.shuffle", icon(LucideIcon::Shuffle, 24., fg))
+                        .tooltip(tip("Shuffle the season"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.play_season(true, window, cx)
+                        })),
                 );
             }
         }
@@ -504,24 +533,28 @@ impl Bloom {
         // Download for offline use; see `downloads::ui`.
         row = row.children(self.render_download_action(item, cx));
         row.child(
+            // Watched: a light disc with a dark check; not watched: the
+            // check alone, drawn as the other actions are.
             round(
                 "detail.watched",
-                icon(LucideIcon::Check, 25., if played { tone::INK } else { fg }),
+                icon(LucideIcon::Check, 25., if played { rgb(0x111111) } else { fg }),
             )
-            .when(played, |el| el.bg(tone::EDGE))
-                .tooltip(tip(if played { "Mark unplayed" } else { "Mark played" }))
+            .when(played, |el| el.bg(rgba(0xf5f5f7e6)).hover(|s| s.bg(rgb(0xffffff))))
+            .tooltip(tip(if played { "Watched (click to mark unwatched)" } else { "Mark watched" }))
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_played(cx))),
         )
         .child(
+            // Filled when a favourite, an outline when not: the filled
+            // white heart read as "a favourite" (2026-11-18).
             round(
                 "detail.favorite",
-                filled(Filled::Heart, 25., if favorite { rgb(0xf92672) } else { fg }),
+                if favorite {
+                    filled(Filled::Heart, 25., rgb(0xf92672))
+                } else {
+                    icon(LucideIcon::Heart, 23., fg)
+                },
             )
-            .tooltip(tip(if favorite {
-                "Remove from favorites"
-            } else {
-                "Add to favorites"
-            }))
+            .tooltip(tip(if favorite { "Remove from favorites" } else { "Add to favorites" }))
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_favorite(cx))),
         )
         .child(
@@ -549,17 +582,13 @@ impl Bloom {
         let title = |streams: &[&MediaStream], n: usize| {
             streams
                 .get(n)
-                .and_then(|s| s.display_title.clone())
+                .map(|s| track_names::stream_name(s).name)
                 .unwrap_or_else(|| format!("Track {}", n + 1))
         };
         let longest = |streams: &[&MediaStream]| {
             streams
                 .iter()
-                .enumerate()
-                .map(|(n, s)| match &s.display_title {
-                    Some(title) => title.chars().count(),
-                    None => format!("Track {}", n + 1).len(),
-                })
+                .map(|s| track_names::stream_name(s).name.chars().count())
                 .max()
                 .unwrap_or(0)
         };
@@ -572,7 +601,7 @@ impl Bloom {
                 .when(compact, |el| el.flex_wrap().gap_y(px(6.)))
                 .items_center()
                 .text_size(px(15.))
-                .child(div().w(px(93.)).flex_shrink_0().text_color(label).child(name))
+                .child(div().w(px(TRACK_LABEL_W)).flex_shrink_0().text_color(label).child(name))
         };
         // The box is as wide as its longest option needs, within limits.
         let select = |state: &gpui_kit::Entity<crate::ui::menu::MenuState>,
@@ -609,10 +638,7 @@ impl Bloom {
         }
         let audio = item.streams(StreamKind::Audio);
         if !audio.is_empty() {
-            let current = data
-                .audio
-                .or_else(|| audio.iter().position(|s| s.is_default))
-                .unwrap_or(0);
+            let current = data.audio.unwrap_or_else(|| default_audio(item));
             rows = rows.child(if audio.len() > 1 {
                 row("Audio").child(select(
                     &self.popups.detail_audio_menu,
@@ -628,9 +654,7 @@ impl Bloom {
         }
         let subtitles = item.streams(StreamKind::Subtitle);
         if !subtitles.is_empty() {
-            let current = data
-                .subtitle
-                .unwrap_or_else(|| subtitles.iter().position(|s| s.is_default));
+            let current = data.subtitle.unwrap_or_else(|| default_subtitle(item));
             let text = match current {
                 Some(n) => title(&subtitles, n),
                 None => "Off".to_string(),
@@ -686,6 +710,10 @@ impl Bloom {
         rows
     }
 }
+
+/// Width of the label column of the track rows, the facts and the
+/// credits, so their values line up.
+const TRACK_LABEL_W: f32 = 100.;
 
 /// The fill under the pointer of an action of the title ribbon.
 const ACTION_HOVER: u32 = 0x00000066;
@@ -747,25 +775,6 @@ fn meta_line(item: &Item, cx: &Context<Bloom>) -> Div {
         let left = (secs - item.resume_secs()).max(0);
         line = line.child(format!("Ends at {}", crate::macos::ends_at(left)));
     }
-    // Audio languages, as the Jellyfin Enhanced plugin lists them.
-    let mut languages: Vec<&'static str> = Vec::new();
-    for stream in item.streams(StreamKind::Audio) {
-        if let Some(name) = stream.language.as_deref().and_then(bloom_core::languages::name)
-            && !languages.contains(&name)
-        {
-            languages.push(name);
-        }
-    }
-    if !languages.is_empty() {
-        line = line.child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .child(icon(LucideIcon::Languages, 16., color))
-                .child(languages.join(", ")),
-        );
-    }
     line
 }
 
@@ -804,58 +813,252 @@ fn tags_and_links(item: &Item, cx: &Context<Bloom>) -> Option<Div> {
     Some(block)
 }
 
-/// Director, writer, studio and genre rows.
-fn credits(item: &Item, cx: &Context<Bloom>) -> Option<Div> {
-    let t = UiTheme::read(cx);
+/// Where a name of the credits leads.
+#[derive(Clone)]
+enum Credit {
+    /// The page of a person: their titles.
+    Person(String),
+    /// The titles of a genre, or of a studio, by its id.
+    Genre(String),
+    Studio(String),
+}
+
+/// The people of a kind, each once, with their ids.
+fn people(item: &Item, kind: &PersonKind) -> Vec<(String, Option<Credit>)> {
+    let mut out: Vec<(String, Option<Credit>)> = Vec::new();
+    for person in item.people.iter().filter(|p| &p.kind == kind) {
+        if !out.iter().any(|(name, _)| name == &person.name) {
+            out.push((person.name.clone(), Some(Credit::Person(person.id.clone()))));
+        }
+    }
+    out
+}
+
+/// Director, writer, studio and genre rows. A name with a page of its
+/// own (a person, a genre, a studio) opens it.
+fn credits(item: &Item, cx: &mut Context<Bloom>) -> Option<Div> {
+    let t = UiTheme::read(cx).clone();
     let plural = |one: &'static str, many: &'static str, n: usize| if n == 1 { one } else { many };
-    let directors = item.people_of(&PersonKind::Director);
-    let writers = item.people_of(&PersonKind::Writer);
-    let creators = item.people_of(&PersonKind::Creator);
-    let studios: Vec<String> = item.studios.iter().filter_map(|s| s.name.clone()).collect();
+    let directors = people(item, &PersonKind::Director);
+    let writers = people(item, &PersonKind::Writer);
+    let creators = people(item, &PersonKind::Creator);
+    let studios: Vec<(String, Option<Credit>)> = item
+        .studios
+        .iter()
+        .filter_map(|s| Some((s.name.clone()?, s.id.clone().map(Credit::Studio))))
+        .collect();
+    // The genres with ids when the server sent them, else the names alone.
+    let genres: Vec<(String, Option<Credit>)> = if item.genre_items.is_empty() {
+        item.genres.iter().map(|g| (g.clone(), None)).collect()
+    } else {
+        item.genre_items
+            .iter()
+            .filter_map(|g| Some((g.name.clone()?, g.id.clone().map(Credit::Genre))))
+            .collect()
+    };
     let rows = [
         (plural("Creator", "Creators", creators.len()), creators),
         (plural("Director", "Directors", directors.len()), directors),
         (plural("Writer", "Writers", writers.len()), writers),
         (plural("Studio", "Studios", studios.len()), studios),
-        (
-            plural("Genre", "Genres", item.genres.len()),
-            item.genres.clone(),
-        ),
+        (plural("Genre", "Genres", genres.len()), genres),
     ];
     if rows.iter().all(|(_, values)| values.is_empty()) {
         return None;
     }
-    Some(
-        div().mt(px(14.)).flex().flex_col().gap(px(9.)).children(
-            rows.into_iter()
-                .filter(|(_, values)| !values.is_empty())
-                .map(|(name, values)| {
+    let fg = t.colors.foreground;
+    let mut block = div().mt(px(14.)).flex().flex_col().gap(px(9.));
+    for (label, values) in rows.into_iter().filter(|(_, values)| !values.is_empty()) {
+        let count = values.len();
+        let names = values.into_iter().enumerate().map(|(i, (name, link))| {
+            let text = if i + 1 < count { format!("{name},") } else { name.clone() };
+            let el = div()
+                .id(SharedString::from(format!("detail.credit.{label}.{i}")))
+                .mr(px(4.))
+                .child(text);
+            match link {
+                None => el,
+                Some(link) => {
+                    let hint = match &link {
+                        Credit::Person(_) => format!("Titles with {name}"),
+                        Credit::Genre(_) => format!("All {name} titles"),
+                        Credit::Studio(_) => format!("Titles from {name}"),
+                    };
+                    el.cursor_pointer()
+                        .hover(|s| s.underline())
+                        .tooltip(tip(hint))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.open_credit(&link, &name, cx)
+                        }))
+                }
+            }
+        });
+        block = block.child(
+            div()
+                .flex()
+                .items_start()
+                .text_size(px(15.))
+                .child(
                     div()
+                        .w(px(TRACK_LABEL_W))
+                        .flex_shrink_0()
+                        .text_color(fg.opacity(0.82))
+                        .child(label),
+                )
+                .child(
+                    // The room left beside the label, up to 560: a long
+                    // studio list wraps instead of running off a phone's
+                    // page.
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .max_w(px(560.))
                         .flex()
-                        .items_start()
-                        .text_size(px(15.))
-                        .child(
-                            div()
-                                .w(px(100.))
-                                .flex_shrink_0()
-                                .text_color(t.colors.foreground.opacity(0.82))
-                                .child(name),
-                        )
-                        .child(
-                            // The room left beside the label, up to 560: a
-                            // long studio list wraps instead of running off
-                            // a phone's page.
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .max_w(px(560.))
-                                .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                .text_color(t.colors.foreground)
-                                .child(values.join(", ")),
-                        )
-                }),
-        ),
+                        .flex_wrap()
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .text_color(fg)
+                        .children(names),
+                ),
+        );
+    }
+    Some(block)
+}
+
+impl Bloom {
+    /// Opens the page a name of the credits leads to.
+    fn open_credit(&mut self, link: &Credit, name: &str, cx: &mut Context<Self>) {
+        let (id, kind) = match link {
+            Credit::Person(id) => return self.open_person(id, name, cx),
+            Credit::Genre(id) => (id, bloom_core::pages::GENRE_VIEW),
+            Credit::Studio(id) => (id, bloom_core::pages::STUDIO_VIEW),
+        };
+        self.open_folder(
+            Item {
+                id: id.clone(),
+                name: name.to_string(),
+                collection_type: Some(kind.into()),
+                ..Default::default()
+            },
+            cx,
+        );
+    }
+}
+
+/// Size, languages, subtitles and how far the user got: the facts of a
+/// film or an episode, from the media source the page loaded.
+fn facts(item: &Item, cx: &Context<Bloom>) -> Option<Div> {
+    let t = UiTheme::read(cx);
+    let rows = fact_rows(item);
+    if rows.is_empty() {
+        return None;
+    }
+    Some(
+        div().mt(px(14.)).flex().flex_col().gap(px(9.)).children(rows.into_iter().map(|(label, value)| {
+            div()
+                .flex()
+                .items_start()
+                .text_size(px(15.))
+                .child(
+                    div()
+                        .w(px(TRACK_LABEL_W))
+                        .flex_shrink_0()
+                        .text_color(t.colors.foreground.opacity(0.82))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .max_w(px(560.))
+                        .text_color(t.colors.foreground)
+                        .child(value),
+                )
+        })),
     )
+}
+
+/// The rows of [`facts`], as label and text.
+fn fact_rows(item: &Item) -> Vec<(&'static str, String)> {
+    let mut rows = Vec::new();
+    if !item.is_playable() {
+        return rows;
+    }
+    let resume = item.resume_secs();
+    if resume > 0 {
+        let mut text = format!("Resume from {}", crate::jellyfin::format_duration(resume));
+        if let Some(total) = item.runtime_secs().filter(|t| *t > resume) {
+            text.push_str(&format!(" · {} left", format_runtime(total - resume)));
+        }
+        rows.push(("Progress", text));
+    } else if item.user_data.played {
+        rows.push(("Progress", "Watched".to_string()));
+    }
+    if let Some(size) = item.media_sources.first().and_then(|s| s.size).filter(|s| *s > 0) {
+        rows.push(("File size", file_size(size)));
+    }
+    let mut languages: Vec<&'static str> = Vec::new();
+    for stream in item.streams(StreamKind::Audio) {
+        if let Some(name) = stream.language.as_deref().and_then(bloom_core::languages::name)
+            && !languages.contains(&name)
+        {
+            languages.push(name);
+        }
+    }
+    if !languages.is_empty() {
+        rows.push(("Languages", languages.join(", ")));
+    }
+    let mut subtitles: Vec<String> = Vec::new();
+    for stream in item.streams(StreamKind::Subtitle) {
+        // The language and its kind; the format is the menu's detail.
+        let name = track_names::stream_name(stream).name.replace(" · image", "");
+        if !subtitles.contains(&name) {
+            subtitles.push(name);
+        }
+    }
+    if !subtitles.is_empty() {
+        rows.push(("Subtitles", subtitles.join(", ")));
+    }
+    rows
+}
+
+/// "6.5 MB", "1.4 GB": the size of a file in bytes, in the units of
+/// Finder (powers of 1000).
+fn file_size(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b >= 1e9 {
+        format!("{:.1} GB", b / 1e9)
+    } else if b >= 1e6 {
+        format!("{:.1} MB", b / 1e6)
+    } else {
+        format!("{} KB", (b / 1e3).round().max(1.))
+    }
+}
+
+/// The place among the audio streams the player starts with when the
+/// page chose none: the one the server names for the user (it weighs the
+/// language of the user), else the default of the file, else the first.
+fn default_audio(item: &Item) -> usize {
+    let streams = item.streams(StreamKind::Audio);
+    item.media_sources
+        .first()
+        .and_then(|s| s.default_audio_stream_index)
+        .and_then(|index| streams.iter().position(|s| s.index == index))
+        .or_else(|| streams.iter().position(|s| s.is_default))
+        .unwrap_or(0)
+}
+
+/// The same for the subtitle; none is Off. The page showed the file's
+/// default (SubRip) while the server started its own choice, an image
+/// file beside the film, which can fail to come: the player then showed
+/// Off under a page that said English (2026-11-18). The page now shows
+/// what the server will start.
+fn default_subtitle(item: &Item) -> Option<usize> {
+    let streams = item.streams(StreamKind::Subtitle);
+    match item.media_sources.first().and_then(|s| s.default_subtitle_stream_index) {
+        Some(index) if index >= 0 => streams.iter().position(|s| s.index == index),
+        Some(_) => None,
+        None => streams.iter().position(|s| s.is_default),
+    }
 }
 
 /// Heading with a wrapping row of cards and no arrows.
@@ -1054,24 +1257,17 @@ impl Bloom {
             return;
         };
         let this = cx.weak_entity();
-        let title = |stream: &crate::jellyfin::MediaStream, n: usize| {
-            stream
-                .display_title
-                .clone()
-                .unwrap_or_else(|| format!("Track {}", n + 1))
-        };
 
         let audio_streams = data.item.streams(StreamKind::Audio);
-        let current_audio = data
-            .audio
-            .or_else(|| audio_streams.iter().position(|s| s.is_default))
-            .unwrap_or(0);
+        let current_audio = data.audio.unwrap_or_else(|| default_audio(&data.item));
         let audio: Vec<MenuItem> = audio_streams
             .iter()
             .enumerate()
             .map(|(n, stream)| {
                 let handle = this.clone();
-                MenuItem::new(SharedString::from(format!("detail.audio.{n}")), title(stream, n))
+                let name = track_names::stream_name(stream);
+                MenuItem::new(SharedString::from(format!("detail.audio.{n}")), name.name)
+                    .detail(name.detail)
                     .radio(n == current_audio)
                     .on_click(move |_, _, cx| {
                         handle
@@ -1088,16 +1284,15 @@ impl Bloom {
             .collect();
 
         let subtitle_streams = data.item.streams(StreamKind::Subtitle);
-        let current_subtitle = data
-            .subtitle
-            .unwrap_or_else(|| subtitle_streams.iter().position(|s| s.is_default));
-        let pick_subtitle = |choice: Option<usize>, label: String| {
+        let current_subtitle = data.subtitle.unwrap_or_else(|| default_subtitle(&data.item));
+        let pick_subtitle = |choice: Option<usize>, label: String, detail: String| {
             let handle = this.clone();
             let id = match choice {
                 Some(n) => format!("detail.subtitle.{n}"),
                 None => "detail.subtitle.off".to_string(),
             };
             MenuItem::new(SharedString::from(id), label)
+                .detail(detail)
                 .radio(choice == current_subtitle)
                 .on_click(move |_, _, cx| {
                     handle
@@ -1111,13 +1306,11 @@ impl Bloom {
                         .ok();
                 })
         };
-        let mut subtitles = vec![pick_subtitle(None, "Off".to_string())];
-        subtitles.extend(
-            subtitle_streams
-                .iter()
-                .enumerate()
-                .map(|(n, stream)| pick_subtitle(Some(n), title(stream, n))),
-        );
+        let mut subtitles = vec![pick_subtitle(None, "Off".to_string(), String::new())];
+        subtitles.extend(subtitle_streams.iter().enumerate().map(|(n, stream)| {
+            let name = track_names::stream_name(stream);
+            pick_subtitle(Some(n), name.name, name.detail)
+        }));
 
         if let Some(search) = self.subs_search_item(&data.item.id, &data.item.display_title(), cx) {
             subtitles.push(MenuItem::separator());
@@ -1128,27 +1321,58 @@ impl Bloom {
             .session
             .as_ref()
             .map(|s| s.client.web_url(&data.item.id));
+        let item = data.item.clone();
+        // The viewer's actions first; the tools of an administrator wait
+        // in a submenu at the end.
+        let mut more = Vec::new();
+        if item.is_playable() {
+            for (id, label, next) in [
+                ("detail.play-next", "Play next", true),
+                ("detail.queue", "Add to queue", false),
+            ] {
+                let (handle, target) = (this.clone(), item.clone());
+                more.push(MenuItem::new(id, label).on_click(move |_, window, cx| {
+                    handle
+                        .update(cx, |this, cx| {
+                            // With nothing playing, it plays now.
+                            if !this.enqueue(target.clone(), next, cx) {
+                                this.play_detail(target.resume_secs() > 0, window, cx);
+                            }
+                        })
+                        .ok();
+                }));
+            }
+        }
+        let list_items = self.list_menu_items(&item, cx);
+        if !list_items.is_empty() {
+            if !more.is_empty() {
+                more.push(MenuItem::separator());
+            }
+            more.extend(list_items);
+        }
+        more.extend(self.hide_menu_items(&item, true, cx));
+        if !more.is_empty() {
+            more.push(MenuItem::separator());
+        }
+        // "Reload page" reads the page from the server again; "Refresh
+        // metadata…" (under Manage) asks the server to scan the item.
         let handle = this.clone();
-        let mut more = vec![MenuItem::new("detail.refresh", "Refresh").on_click(
-            move |_, _, cx| {
+        more.push(
+            MenuItem::new("detail.refresh", "Reload page").on_click(move |_, _, cx| {
                 handle.update(cx, |this, cx| this.load_page(cx)).ok();
-            },
-        )];
+            }),
+        );
         if let Some(url) = web {
             more.push(
                 MenuItem::new("detail.web", "Open in Jellyfin Web")
                     .on_click(move |_, _, cx| cx.open_url(&url)),
             );
         }
-
-        let item = data.item.clone();
-        let list_items = self.list_menu_items(&item, cx);
-        if !list_items.is_empty() {
+        let manage = self.metadata_entries(&item.id, &item.name, &item.kind, cx);
+        if !manage.is_empty() {
             more.push(MenuItem::separator());
-            more.extend(list_items);
+            more.push(MenuItem::submenu("detail.manage", "Manage", manage));
         }
-        more.extend(self.hide_menu_items(&item, true, cx));
-        more.extend(self.metadata_menu_items(&item.id, &item.name, &item.kind, cx));
 
         self.popups.detail_audio_menu
             .update(cx, |menu, cx| menu.set_items(audio, cx));
@@ -1173,5 +1397,56 @@ impl Bloom {
         self.stream.wanted_subtitle = subtitle;
         self.play(&item, resume, window, cx);
         self.stream_choice_left(&item);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jellyfin::{MediaSource, MediaStream};
+
+    fn item(default_subtitle: Option<i64>, default_audio: Option<i64>) -> Item {
+        let stream = |index, kind, default| MediaStream { index, kind, is_default: default, ..Default::default() };
+        Item {
+            kind: "Movie".into(),
+            media_sources: vec![MediaSource {
+                media_streams: vec![
+                    stream(0, StreamKind::Subtitle, false),
+                    stream(1, StreamKind::Video, true),
+                    stream(2, StreamKind::Audio, true),
+                    stream(3, StreamKind::Audio, false),
+                    stream(4, StreamKind::Subtitle, true),
+                ],
+                default_subtitle_stream_index: default_subtitle,
+                default_audio_stream_index: default_audio,
+                size: Some(6_540_779),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_page_shows_the_tracks_the_server_starts() {
+        // The server names stream 0 (a file beside the film), not the
+        // file's default subtitle, stream 4.
+        assert_eq!(default_subtitle(&item(Some(0), None)), Some(0));
+        assert_eq!(default_subtitle(&item(Some(-1), None)), None, "-1 is Off");
+        assert_eq!(default_subtitle(&item(None, None)), Some(1), "no word from the server: the file's default");
+        assert_eq!(default_audio(&item(None, Some(3))), 1);
+        assert_eq!(default_audio(&item(None, None)), 0);
+    }
+
+    #[test]
+    fn facts_read_in_plain_words() {
+        assert_eq!(file_size(6_540_779), "6.5 MB");
+        assert_eq!(file_size(1_400_000_000), "1.4 GB");
+        assert_eq!(file_size(800), "1 KB");
+        let mut film = item(None, None);
+        film.run_time_ticks = Some(6_000 * 10_000_000);
+        film.user_data.playback_position_ticks = 2_530 * 10_000_000;
+        let rows = fact_rows(&film);
+        assert_eq!(rows[0], ("Progress", "Resume from 42:10 · 57m left".to_string()));
+        assert_eq!(rows[1], ("File size", "6.5 MB".to_string()));
     }
 }
