@@ -1,0 +1,58 @@
+# Spike S2 (specs/ios-native/plan.md): mpv through MPVUI with the
+# AVFoundation sample-buffer output, for Picture in Picture. A project of
+# its own: MPVUI and MPVKit both declare a Libmpv-GPL target, which SwiftPM
+# refuses in one package graph. MPVUI is MIT; its mpv build is GPL.
+name: PiPSpike
+options:
+  bundleIdPrefix: dev.bloom
+  deploymentTarget:
+    iOS: "27.0"
+packages:
+  MPVUI:
+    url: https://github.com/LePips/MPVUI.git
+    from: 0.10.0
+targets:
+  PiPSpike:
+    type: application
+    platform: iOS
+    sources:
+      - path: PiPSpike
+    dependencies:
+      - package: MPVUI
+        product: MPVUI
+    info:
+      path: PiPSpike/Info.plist
+      properties:
+        CFBundleDisplayName: PiP Spike
+        UILaunchScreen: {}
+        UIBackgroundModes:
+          - audio
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.bloom.ios.pipspike
+        SWIFT_VERSION: "6.0"
+        SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+        ARCHS: arm64
+        GENERATE_INFOPLIST_FILE: NO
+  PiPSpikeTests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: PiPSpikeTests
+    dependencies:
+      - target: PiPSpike
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.bloom.ios.pipspike.tests
+        SWIFT_VERSION: "6.0"
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  PiPSpike:
+    build:
+      targets:
+        PiPSpike: all
+    test:
+      targets:
+        - PiPSpikeTests

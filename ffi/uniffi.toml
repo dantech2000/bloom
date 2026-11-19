@@ -1,0 +1,4 @@
+# Swift bindings of bloom-ffi (dev/ios-core). Codable records: the iOS app
+# keeps downloaded items in its own index.
+[bindings.swift]
+generate_codable_conformance = true
