@@ -110,7 +110,44 @@ impl Bloom {
         };
 
         let toolbar_h = if compact { 98. } else { 54. };
-        let views = !LibraryShow::of(data.view.collection_type.as_deref()).is_empty();
+        let views = !shows_of(&data.view).is_empty();
+        // Each filter that narrows the page as a pill; a click on it drops
+        // that filter. The Mac only: a phone's toolbar has no room.
+        let pills = (!compact).then(|| {
+            div()
+                .flex()
+                .flex_shrink(1.)
+                .min_w_0()
+                .overflow_hidden()
+                .items_center()
+                .gap(px(6.))
+                .children(filter_pills(data).into_iter().map(|(n, label, clear)| {
+                    div()
+                        .id(("library.pill", n))
+                        .role(gpui_kit::Role::Button)
+                        .aria_label(format!("Remove filter {label}"))
+                        .flex_shrink_0()
+                        .h(px(30.))
+                        .pl(px(12.))
+                        .pr(px(8.))
+                        .rounded_full()
+                        .bg(tone::HOVER)
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .cursor_pointer()
+                        .text_size(px(13.))
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .text_color(fg)
+                        .hover(|s| s.bg(rgba(0xffffff33)))
+                        .tooltip(tip(format!("Remove the filter “{label}”")))
+                        .child(label)
+                        .child(icon(LucideIcon::X, 14., soft))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.update_library(clear, cx)
+                        }))
+                }))
+        });
         let toolbar = div()
             .px(px(m.side))
             .h(px(toolbar_h))
@@ -177,6 +214,7 @@ impl Bloom {
                         range.clone()
                     }),
             )
+            .children(pills)
             .child(div().flex_1())
             .when(compact, |el| {
                 el.child(page_arrow("library.previous", LucideIcon::ChevronLeft, has_previous, false))
@@ -206,7 +244,7 @@ impl Bloom {
                         &self.popups.filter_menu,
                         "Filter",
                         LucideIcon::Funnel,
-                        data.filter.is_some(),
+                        !filter_pills(data).is_empty(),
                     ))
                     .child(menu(
                         &self.popups.sort_menu,
@@ -261,11 +299,7 @@ impl Bloom {
                 cx,
             )
         } else if data.items.is_empty() {
-            empty_state(
-                "No items found",
-                "Change the filter or the letter to see more.",
-                cx,
-            )
+            self.library_empty(data, cx)
         } else {
             // The grid starts under the toolbar and its gap. A new page of
             // it lifts into place (`ui::motion`); the key names the page,
@@ -277,7 +311,9 @@ impl Bloom {
 
         // Letter picker at the right edge, as on the web. It needs a tall
         // window and a sort by name.
-        let picker = (data.sort == "SortName" && self.viewport_h >= 610. && !compact).then(|| {
+        // An empty page with no letter picked has nothing to pick from.
+        let has_titles = !data.items.is_empty() || data.letter.is_some();
+        let picker = (data.sort == "SortName" && self.viewport_h >= 610. && !compact && has_titles).then(|| {
             div()
                 .absolute()
                 .top_0()
@@ -350,9 +386,193 @@ impl Bloom {
 
 use crate::{
     app::{LIBRARY_FILTERS, LIBRARY_SORTS, LibraryData, library_query},
+    jellyfin::Item,
+    lists::{ListKind, PLAYLISTS_ID},
+    pages::{DECADES, GENRE_VIEW, Resolution, decade_label},
     ui::menu::MenuItem,
 };
 use gpui_kit::Window;
+
+/// The views of a library for the menu of its title. The page of the
+/// playlists has the collections as its second view, so both lists are
+/// one tab of the bar away.
+pub(crate) fn shows_of(view: &Item) -> &'static [LibraryShow] {
+    if view.id == PLAYLISTS_ID {
+        return &[LibraryShow::All, LibraryShow::Collections];
+    }
+    LibraryShow::of(view.collection_type.as_deref())
+}
+
+/// A filter's name in the menu and on its pill, by its server key.
+fn filter_label(key: &str) -> &'static str {
+    LIBRARY_FILTERS
+        .iter()
+        .find(|(_, k)| *k == key)
+        .map_or("", |(label, _)| label)
+}
+
+/// What drops one filter of a pill.
+type Clear = fn(&mut LibraryData);
+
+/// The filters that narrow the page, as pills: a number for the id, the
+/// label, and what drops it. The letter has the rail; it is no pill.
+pub(crate) fn filter_pills(data: &LibraryData) -> Vec<(usize, String, Clear)> {
+    let mut pills: Vec<(usize, String, Clear)> = Vec::new();
+    if let Some(key) = data.filter {
+        pills.push((0, filter_label(key).to_string(), |d| d.filter = None));
+    }
+    if let Some((_, name)) = &data.genre {
+        pills.push((1, name.clone(), |d| d.genre = None));
+    }
+    if let Some(decade) = data.decade {
+        pills.push((2, decade_label(decade), |d| d.decade = None));
+    }
+    if let Some(resolution) = data.resolution {
+        pills.push((3, resolution.label().to_string(), |d| d.resolution = None));
+    }
+    if data.subtitles {
+        pills.push((4, "Subtitles".to_string(), |d| d.subtitles = false));
+    }
+    pills
+}
+
+/// The entries of the filter menu: the watch state as before, then the
+/// genre, the decade and the resolution as submenus and "Has subtitles"
+/// as a check, each where it fits the page, and "Clear filters".
+fn filter_menu_items(data: &LibraryData, this: &gpui_kit::WeakEntity<Bloom>) -> Vec<MenuItem> {
+    // An entry that changes the page and reloads it.
+    let entry = |id: String, label: String, change: Box<dyn Fn(&mut LibraryData)>| {
+        let handle = this.clone();
+        let change: std::rc::Rc<dyn Fn(&mut LibraryData)> = change.into();
+        MenuItem::new(SharedString::from(id), label).on_click(move |_, _, cx| {
+            let change = change.clone();
+            handle.update(cx, move |this, cx| this.update_library(|d| change(d), cx)).ok();
+        })
+    };
+    let mut items = vec![entry("library.filter.none".into(), "All".into(), Box::new(|d| d.filter = None))
+        .radio(data.filter.is_none())];
+    for (label, key) in LIBRARY_FILTERS {
+        items.push(
+            entry(format!("library.filter.{key}"), label.into(), Box::new(move |d| d.filter = Some(key)))
+                .radio(data.filter == Some(key)),
+        );
+    }
+    let genre_page = data.view.collection_type.as_deref() == Some(GENRE_VIEW);
+    let mut more = Vec::new();
+    if data.can_narrow_by_genre() && !genre_page {
+        let genres = data.genres.as_deref().unwrap_or_default();
+        let mut entries = vec![entry("library.genre.any".into(), "Any genre".into(), Box::new(|d| d.genre = None))
+            .radio(data.genre.is_none())];
+        for genre in genres {
+            let picked = (genre.id.clone(), genre.name.clone());
+            let selected = data.genre.as_ref().is_some_and(|(id, _)| *id == genre.id);
+            entries.push(
+                entry(format!("library.genre.{}", genre.id), genre.name.clone(), Box::new(move |d| d.genre = Some(picked.clone())))
+                    .radio(selected),
+            );
+        }
+        let label = match &data.genre {
+            Some((_, name)) => format!("Genre: {name}"),
+            None if data.genres.is_none() => "Genre (loading…)".to_string(),
+            None => "Genre".to_string(),
+        };
+        more.push(MenuItem::submenu("library.genre", label, entries).icon(LucideIcon::Tag));
+    }
+    if data.can_narrow_by_genre() {
+        let mut entries = vec![entry("library.decade.any".into(), "Any decade".into(), Box::new(|d| d.decade = None))
+            .radio(data.decade.is_none())];
+        for decade in DECADES {
+            entries.push(
+                entry(format!("library.decade.{decade}"), decade_label(decade), Box::new(move |d| d.decade = Some(decade)))
+                    .radio(data.decade == Some(decade)),
+            );
+        }
+        let label = match data.decade {
+            Some(decade) => format!("Decade: {}", decade_label(decade)),
+            None => "Decade".to_string(),
+        };
+        more.push(MenuItem::submenu("library.decade", label, entries).icon(LucideIcon::CalendarDays));
+    }
+    if data.can_narrow_by_streams() {
+        let mut entries = vec![entry("library.resolution.any".into(), "Any resolution".into(), Box::new(|d| d.resolution = None))
+            .radio(data.resolution.is_none())];
+        for resolution in Resolution::ALL {
+            let detail = match resolution {
+                Resolution::Uhd => "2160p",
+                Resolution::Hd => "720p and up, 4K too",
+                Resolution::Sd => "Below 720p",
+            };
+            entries.push(
+                entry(
+                    format!("library.resolution.{resolution:?}"),
+                    resolution.label().into(),
+                    Box::new(move |d| d.resolution = Some(resolution)),
+                )
+                .detail(detail)
+                .radio(data.resolution == Some(resolution)),
+            );
+        }
+        let label = match data.resolution {
+            Some(resolution) => format!("Resolution: {}", resolution.label()),
+            None => "Resolution".to_string(),
+        };
+        more.push(MenuItem::submenu("library.resolution", label, entries).icon(LucideIcon::MonitorPlay));
+        let subtitles = data.subtitles;
+        more.push(
+            entry("library.subtitles".into(), "Has subtitles".into(), Box::new(move |d| d.subtitles = !subtitles))
+                .icon(LucideIcon::Captions)
+                .checked(subtitles),
+        );
+    }
+    if !more.is_empty() {
+        items.push(MenuItem::separator());
+        items.extend(more);
+    }
+    if !filter_pills(data).is_empty() {
+        items.push(MenuItem::separator());
+        items.push(entry("library.filter.clear".into(), "Clear filters".into(), Box::new(|d| {
+            let letter = d.letter;
+            d.clear_filters();
+            d.letter = letter;
+        })));
+    }
+    items
+}
+
+/// The words of an empty page: a title, a hint, and the button that helps,
+/// if one does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum EmptyAction {
+    ClearFilters,
+    NewList(ListKind),
+}
+
+pub(crate) fn empty_words(data: &LibraryData, can_collect: bool) -> (&'static str, &'static str, Option<EmptyAction>) {
+    if data.narrowed() {
+        return (
+            "Nothing matches",
+            "Remove a filter or the letter to see more.",
+            Some(EmptyAction::ClearFilters),
+        );
+    }
+    match data.show {
+        LibraryShow::Collections => (
+            "No collections yet",
+            "A collection groups titles that belong together, such as a film series.",
+            can_collect.then_some(EmptyAction::NewList(ListKind::Collection)),
+        ),
+        _ if data.view.id == PLAYLISTS_ID => (
+            "No playlists yet",
+            "A playlist plays titles in the order you choose. Make one here, or use Add to playlist in the menu of a title.",
+            Some(EmptyAction::NewList(ListKind::Playlist)),
+        ),
+        LibraryShow::Favorites => ("No favorites yet", "Click the heart of a title to keep it here.", None),
+        _ if data.view.id == crate::app::FAVORITES_ID => {
+            ("No favorites yet", "Click the heart of a title to keep it here.", None)
+        }
+        _ => ("Nothing here yet", "This library has no titles yet.", None),
+    }
+}
 
 // The menus of the toolbar, and Play of the library.
 impl Bloom {
@@ -407,32 +627,9 @@ impl Bloom {
                     }),
             );
         }
-        let mut filters: Vec<MenuItem> = vec![{
-            let handle = this.clone();
-            MenuItem::new("library.filter.none", "All")
-                .radio(data.filter.is_none())
-                .on_click(move |_, _, cx| {
-                    handle
-                        .update(cx, |this, cx| this.update_library(|d| d.filter = None, cx))
-                        .ok();
-                })
-        }];
-        for (label, key) in LIBRARY_FILTERS {
-            let handle = this.clone();
-            filters.push(
-                MenuItem::new(SharedString::from(format!("library.filter.{key}")), label)
-                    .radio(data.filter == Some(key))
-                    .on_click(move |_, _, cx| {
-                        handle
-                            .update(cx, |this, cx| {
-                                this.update_library(|d| d.filter = Some(key), cx)
-                            })
-                            .ok();
-                    }),
-            );
-        }
+        let filters = filter_menu_items(data, &this);
         let library = data.title.clone();
-        let shows: Vec<MenuItem> = LibraryShow::of(data.view.collection_type.as_deref())
+        let shows: Vec<MenuItem> = shows_of(&data.view)
             .iter()
             .map(|show| {
                 let (show, handle) = (*show, this.clone());
@@ -453,6 +650,121 @@ impl Bloom {
         self.popups.filter_menu
             .update(cx, |menu, cx| menu.set_items(filters, cx));
         self.rebuild_collection_menu(cx);
+    }
+
+    /// The `browse` debug command: the tab the bar lights, and the filters,
+    /// genres and lists of the browsing pages, without the pointer.
+    ///   browse tab | pills
+    ///   browse filter genre <name> | decade <year> | resolution 4k|hd|sd
+    ///                 | subtitles on|off | watch <server key>|none | clear
+    ///   browse genre <name>          open the titles of a genre
+    ///   browse playlists [collections]
+    ///   browse new-list playlist|collection   (opens the dialog only)
+    pub(crate) fn debug_browse(&mut self, rest: &str, window: &mut Window, cx: &mut Context<Self>) -> String {
+        let mut words = rest.split_whitespace();
+        let verb = words.next().unwrap_or("");
+        let arg: Vec<&str> = words.collect();
+        let text = arg.join(" ");
+        let pills = |this: &Self| match &this.nav.page {
+            Page::Library(data) => filter_pills(data).into_iter().map(|(_, label, _)| label).collect::<Vec<_>>().join(", "),
+            _ => String::new(),
+        };
+        match verb {
+            "tab" => return self.active_tab().unwrap_or_else(|| "none".into()),
+            "pills" => return pills(self),
+            "filter" => {
+                let Page::Library(data) = &self.nav.page else {
+                    return "error: not on a library page".into();
+                };
+                let value = arg.get(1..).map(|rest| rest.join(" ")).unwrap_or_default();
+                let genre = data
+                    .genres
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .find(|g| g.name.eq_ignore_ascii_case(&value))
+                    .map(|g| (g.id.clone(), g.name.clone()));
+                match arg.first().copied().unwrap_or("") {
+                    "genre" => match genre {
+                        Some(genre) => self.update_library(|d| d.genre = Some(genre), cx),
+                        None => return format!("error: no genre {value:?} in this library"),
+                    },
+                    "decade" => match value.parse::<i32>() {
+                        Ok(year) => self.update_library(|d| d.decade = Some(year - year % 10), cx),
+                        Err(_) => return "error: usage: browse filter decade <year>".into(),
+                    },
+                    "resolution" => {
+                        let resolution = match value.to_lowercase().as_str() {
+                            "4k" => Resolution::Uhd,
+                            "hd" => Resolution::Hd,
+                            "sd" => Resolution::Sd,
+                            _ => return "error: usage: browse filter resolution 4k|hd|sd".into(),
+                        };
+                        self.update_library(|d| d.resolution = Some(resolution), cx)
+                    }
+                    "subtitles" => self.update_library(|d| d.subtitles = value != "off", cx),
+                    "watch" => {
+                        let key = LIBRARY_FILTERS.iter().map(|(_, k)| *k).find(|k| *k == value);
+                        self.update_library(|d| d.filter = key, cx)
+                    }
+                    "clear" => self.update_library(|d| d.clear_filters(), cx),
+                    _ => return "error: usage: browse filter genre|decade|resolution|subtitles|watch|clear ...".into(),
+                }
+                return pills(self);
+            }
+            "genre" => {
+                let Page::Home(data) = &self.nav.page else {
+                    return "error: open home first".into();
+                };
+                match data.genres.iter().find(|g| g.name.eq_ignore_ascii_case(&text)).cloned() {
+                    Some(genre) => self.open_genre(&genre, cx),
+                    None => return format!("error: no genre {text:?} on the home page"),
+                }
+            }
+            "playlists" => {
+                self.open_playlists(cx);
+                if text == "collections" {
+                    self.update_library(|d| d.show = LibraryShow::Collections, cx);
+                }
+            }
+            // With a name (a test name only), the dialog's Create runs too.
+            "new-list" => {
+                let kind = if arg.first() == Some(&"collection") { ListKind::Collection } else { ListKind::Playlist };
+                match arg.get(1) {
+                    None => self.ask_new_list(kind, window, cx),
+                    Some(name) if crate::lists::is_test_name(name) => {
+                        self.create_empty_list(kind, name.to_string(), cx)
+                    }
+                    Some(_) => return format!("error: the name must start with {}", crate::lists::TEST_PREFIX),
+                }
+            }
+            _ => return "error: usage: browse tab|pills|filter|genre|playlists|new-list ...".into(),
+        }
+        cx.notify();
+        "ok".into()
+    }
+
+    /// The empty page of a library: why it is empty, in plain words, and
+    /// the button that helps (clear the filters, make a list).
+    fn library_empty(&self, data: &LibraryData, cx: &mut Context<Self>) -> gpui_kit::Div {
+        let (title, hint, action) = empty_words(data, self.lists.can_collect);
+        let mut state = empty_state(title, hint, cx);
+        if let Some(action) = action {
+            let (id, label) = match action {
+                EmptyAction::ClearFilters => ("library.clear-filters", "Clear filters"),
+                EmptyAction::NewList(ListKind::Playlist) => ("library.new-playlist", "New playlist"),
+                EmptyAction::NewList(ListKind::Collection) => ("library.new-collection", "New collection"),
+            };
+            state = state.child(
+                div().mt(px(12.)).child(crate::ui::button::raised(id, label, cx).on_click(cx.listener(
+                    move |this, _: &ClickEvent, window, cx| match action {
+                        EmptyAction::ClearFilters => this.update_library(|d| d.clear_filters(), cx),
+                        EmptyAction::NewList(kind) => this.ask_new_list(kind, window, cx),
+                    },
+                ))),
+            );
+        }
+        state
     }
 
     /// Plays the first item of the current library view, or a random one.
@@ -493,5 +805,50 @@ impl Bloom {
             .ok();
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(id: &str, collection: &str) -> LibraryData {
+        LibraryData::new(Item { id: id.into(), collection_type: Some(collection.into()), ..Default::default() })
+    }
+
+    #[test]
+    fn each_filter_is_a_pill_that_drops_it() {
+        let mut movies = page("m", "movies");
+        assert!(filter_pills(&movies).is_empty());
+        movies.filter = Some("IsUnplayed");
+        movies.genre = Some(("g".into(), "Drama".into()));
+        movies.decade = Some(1990);
+        movies.resolution = Some(Resolution::Uhd);
+        movies.subtitles = true;
+        movies.letter = Some('K');
+        let labels: Vec<String> = filter_pills(&movies).into_iter().map(|(_, label, _)| label).collect();
+        assert_eq!(labels, ["Unplayed", "Drama", "1990s", "4K", "Subtitles"], "the letter has the rail");
+        for (_, _, clear) in filter_pills(&movies) {
+            clear(&mut movies);
+        }
+        assert!(filter_pills(&movies).is_empty());
+        assert_eq!(movies.letter, Some('K'));
+    }
+
+    /// The page of the playlists said "Change the filter or the letter to
+    /// see more" with no playlist on the server (2026-11-18).
+    #[test]
+    fn an_empty_page_says_why_and_offers_what_helps() {
+        let playlists = page(PLAYLISTS_ID, PLAYLISTS_ID);
+        let (title, _, action) = empty_words(&playlists, false);
+        assert_eq!((title, action), ("No playlists yet", Some(EmptyAction::NewList(ListKind::Playlist))));
+        let mut collections = page(PLAYLISTS_ID, PLAYLISTS_ID);
+        collections.show = LibraryShow::Collections;
+        assert_eq!(empty_words(&collections, false).2, None, "no right to make one");
+        assert_eq!(empty_words(&collections, true).2, Some(EmptyAction::NewList(ListKind::Collection)));
+        let mut movies = page("m", "movies");
+        movies.decade = Some(1920);
+        assert_eq!(empty_words(&movies, true).2, Some(EmptyAction::ClearFilters));
+        assert_eq!(shows_of(&playlists.view), [LibraryShow::All, LibraryShow::Collections]);
     }
 }

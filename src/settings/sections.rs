@@ -11,10 +11,10 @@ use gpui_kit::{
 };
 use serde_json::Value;
 
-use super::Choice;
+use super::{Choice, home_rows::{self, HomeRows}};
 use crate::ui::{
     button::raised,
-    form::{card, checkbox, control_max_w, field, group, row_icon as icon_button, select, select_capped},
+    form::{card, checkbox, field, group, row_icon as icon_button, select},
 };
 use crate::{
     app::Bloom,
@@ -49,21 +49,6 @@ const SUBTITLE_MODES: [(&str, &str, &str); 5] = [
         "None",
         "Shows no subtitles at the start. You can turn them on in the player.",
     ),
-];
-
-/// Kinds of home sections, as the web client names them. The last three
-/// have no row in this app; a slot that holds one stays as it is.
-const HOME_SECTIONS: [(&str, &str); 10] = [
-    ("none", "None"),
-    ("latestmedia", "Recently Added"),
-    ("smalllibrarytiles", "My Media"),
-    ("librarybuttons", "My Media (small)"),
-    ("resume", "Continue Watching"),
-    ("nextup", "Next Up"),
-    ("resumeaudio", "Continue Listening (web only)"),
-    ("resumebook", "Continue Reading (web only)"),
-    ("livetv", "Live TV (web only)"),
-    ("activerecordings", "Active Recordings (web only)"),
 ];
 
 /// Lengths of the skip buttons of the player, in seconds.
@@ -580,99 +565,138 @@ impl Bloom {
         div().flex().flex_col().gap(px(18.)).child(language).child(appearance)
     }
 
+    /// The rows of the home page as the server keeps them in its ten
+    /// slots ([`HomeRows`]).
+    fn home_rows(&self) -> HomeRows {
+        let slots: Vec<String> = (0..home_rows::SLOTS).map(|slot| self.prefs.home_section(slot)).collect();
+        HomeRows::from_slots(&slots)
+    }
+
+    /// Changes the list of home rows and saves the ten slots, in one save.
+    fn change_home_rows(&mut self, change: impl FnOnce(&mut HomeRows), cx: &mut Context<Self>) {
+        let mut rows = self.home_rows();
+        change(&mut rows);
+        let changes = rows
+            .to_slots()
+            .into_iter()
+            .enumerate()
+            .map(|(slot, kind)| (format!("homesection{slot}"), kind))
+            .collect();
+        self.set_custom_prefs(changes, cx);
+    }
+
+    /// The debug channel's `settings home-rows`: the ten slots, after the
+    /// change `op` names, if any.
+    pub(crate) fn debug_home_rows(&mut self, op: &str, cx: &mut Context<Self>) -> String {
+        let (verb, arg) = op.split_once(' ').unwrap_or((op, ""));
+        let at = arg.trim().parse::<usize>();
+        match (verb, at) {
+            ("", _) => {}
+            ("up", Ok(at)) => self.change_home_rows(|rows| rows.shift(at, true), cx),
+            ("down", Ok(at)) => self.change_home_rows(|rows| rows.shift(at, false), cx),
+            ("remove", Ok(at)) => self.change_home_rows(|rows| rows.remove(at), cx),
+            ("web-remove", Ok(slot)) => self.change_home_rows(|rows| rows.remove_web(slot), cx),
+            ("add", _) => {
+                let kind = arg.trim().to_string();
+                self.change_home_rows(|rows| rows.add(&kind), cx)
+            }
+            _ => return "error: settings home-rows [up|down|remove|web-remove <n> | add <kind>]".to_string(),
+        }
+        (0..home_rows::SLOTS).map(|slot| self.prefs.home_section(slot)).collect::<Vec<_>>().join(",")
+    }
+
     pub(super) fn render_settings_home(&self, cx: &mut Context<Self>) -> Div {
         let t = UiTheme::read(cx).clone();
-        let longest = HOME_SECTIONS
-            .iter()
-            .map(|(_, name)| *name)
-            .max_by_key(|name| name.len())
-            .unwrap_or("");
-        let name_of = |kind: &str| {
-            HOME_SECTIONS
-                .iter()
-                .find(|(known, _)| *known == kind)
-                .map_or_else(|| kind.to_string(), |(_, name)| name.to_string())
-        };
-        let mut sections = group("Sections of the home page", cx).child(
+        let list = self.home_rows();
+        let quiet = |text: &'static str| {
             div()
                 .pb(px(6.))
                 .text_size(px(13.))
+                .line_height(px(18.))
                 .text_color(t.colors.foreground.opacity(0.6))
-                .child("The home page shows them from top to bottom. The web client uses the same list."),
-        );
-        const SLOTS: usize = 10;
-        let kinds: [String; SLOTS] = std::array::from_fn(|slot| self.prefs.home_section(slot));
-        for (slot, kind) in kinds.iter().enumerate() {
-            // A move changes places with the neighbour, in one save.
-            let swap = |other: usize| {
-                let (here, there) = (kind.clone(), kinds[other].clone());
-                move |this: &mut Bloom, _: &ClickEvent, _: &mut gpui_kit::Window, cx: &mut Context<Bloom>| {
-                    this.set_custom_prefs(
-                        vec![
-                            (format!("homesection{slot}"), there.clone()),
-                            (format!("homesection{other}"), here.clone()),
-                        ],
-                        cx,
-                    )
-                }
-            };
-            let (first, last) = (slot == 0, slot + 1 == SLOTS);
-            let mut up = icon_button(
-                SharedString::from(format!("settings.home.up.{slot}")),
-                LucideIcon::ChevronUp,
-                !first,
-                cx,
-            )
-            .tooltip(tip("Move up"));
+                .child(text)
+        };
+        let count = list.rows.len();
+        let mut rows = group("Rows of the home page", cx)
+            .child(quiet("The home page shows these rows from top to bottom. Jellyfin Web uses the same list."));
+        if count == 0 {
+            rows = rows.child(field("No rows", "The home page shows only the top of the page. Add a row below.", div(), cx));
+        }
+        for (at, kind) in list.rows.iter().enumerate() {
+            let name = home_rows::name(kind);
+            let (first, last) = (at == 0, at + 1 == count);
+            let mut up = icon_button(SharedString::from(format!("settings.home.up.{at}")), LucideIcon::ChevronUp, !first, cx)
+                .tooltip(tip("Move up"));
             if !first {
-                up = up.on_click(cx.listener(swap(slot - 1)));
+                up = up.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.change_home_rows(|rows| rows.shift(at, true), cx)
+                }));
             }
-            let mut down = icon_button(
-                SharedString::from(format!("settings.home.down.{slot}")),
-                LucideIcon::ChevronDown,
-                !last,
-                cx,
-            )
-            .tooltip(tip("Move down"));
+            let mut down =
+                icon_button(SharedString::from(format!("settings.home.down.{at}")), LucideIcon::ChevronDown, !last, cx)
+                    .tooltip(tip("Move down"));
             if !last {
-                down = down.on_click(cx.listener(swap(slot + 1)));
+                down = down.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.change_home_rows(|rows| rows.shift(at, false), cx)
+                }));
             }
-            // A phone: the choice leaves room for the two arrows beside it.
-            let pick_max = if crate::views::shell::compact_now() {
-                control_max_w() - 84.
-            } else {
-                340.
-            };
-            let pick = select_capped(
-                SharedString::from(format!("settings.home.{slot}")),
-                name_of(kind),
-                longest,
-                pick_max,
-                cx,
-            )
-            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                let current = this.prefs.home_section(slot);
-                let choices = HOME_SECTIONS
-                    .iter()
-                    .map(|(kind, name)| {
-                        Choice::new(*name, current == *kind, move |this, cx| {
-                            this.set_custom_prefs(
-                                vec![(format!("homesection{slot}"), kind.to_string())],
-                                cx,
-                            )
-                        })
-                    })
-                    .collect();
-                this.open_choices(choices, event.position(), window, cx);
-            }));
-            sections = sections.child(field(
-                format!("Section {}", slot + 1),
+            let remove = icon_button(SharedString::from(format!("settings.home.remove.{at}")), LucideIcon::X, true, cx)
+                .tooltip(tip("Remove from the home page"))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.change_home_rows(|rows| rows.remove(at), cx)
+                }));
+            rows = rows.child(field(
+                name,
                 "",
-                div().flex().items_center().gap(px(6.)).child(pick).child(up).child(down),
+                div().flex().items_center().gap(px(4.)).child(up).child(down).child(remove),
                 cx,
             ));
         }
-        div().flex().flex_col().gap(px(18.)).child(sections)
+
+        let addable = list.addable();
+        let room = list.has_room();
+        let mut add = group("Add a row", cx);
+        if addable.is_empty() {
+            add = add.child(quiet("Every row is on the home page."));
+        } else if !room {
+            add = add.child(quiet("The list is full. Remove a row to add another."));
+        }
+        if room {
+            for kind in addable {
+                add = add.child(field(
+                    home_rows::name(kind),
+                    "",
+                    raised(SharedString::from(format!("settings.home.add.{kind}")), "Add", cx)
+                        .tooltip(tip("Add at the bottom of the home page"))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.change_home_rows(|rows| rows.add(kind), cx)
+                        })),
+                    cx,
+                ));
+            }
+        }
+
+        let mut page = div().flex().flex_col().gap(px(18.)).child(rows).child(add);
+        if !list.web.is_empty() {
+            let mut web = group("Only in Jellyfin Web", cx)
+                .opacity(0.8)
+                .child(quiet("This app does not show these rows. They keep their place on the home page of Jellyfin Web."));
+            for (slot, kind) in &list.web {
+                let slot = *slot;
+                web = web.child(field(
+                    home_rows::name(kind),
+                    "",
+                    icon_button(SharedString::from(format!("settings.home.web-remove.{slot}")), LucideIcon::X, true, cx)
+                        .tooltip(tip("Remove from the home page of Jellyfin Web"))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.change_home_rows(|rows| rows.remove_web(slot), cx)
+                        })),
+                    cx,
+                ));
+            }
+            page = page.child(web);
+        }
+        page
     }
 
     pub(super) fn render_settings_display(&self, cx: &mut Context<Self>) -> Div {

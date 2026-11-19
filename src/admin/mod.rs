@@ -25,7 +25,7 @@ pub mod users;
 
 use crate::ui::tone::{self, State};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -238,6 +238,9 @@ pub struct AdminData {
     pub plugin_open: Option<crate::app::Revision>,
     /// The user whose page is open on the Users section (the id).
     pub user_open: Option<String>,
+    /// The groups of repeated alerts on the overview that show each entry
+    /// (`dashboard::AlertGroup::key`).
+    pub alerts_open: HashSet<String>,
     /// When the live reload last asked for a redraw.
     redrawn: Instant,
 }
@@ -266,6 +269,7 @@ impl AdminData {
             plugin_editor: None,
             plugin_open: None,
             user_open: None,
+            alerts_open: HashSet::new(),
             redrawn: Instant::now(),
         }
     }
@@ -1071,7 +1075,8 @@ pub fn nothing_found(what: &str, query: &str, cx: &Context<Bloom>) -> Div {
 /// The "…" button of a row or a card: the actions that are not the main
 /// one go into its menu (`Bloom::open_admin_menu`). Add `.on_click(...)`
 /// that builds the entries and opens the menu at `event.position()`.
-pub fn more_button(id: impl Into<SharedString>, cx: &Context<Bloom>) -> Stateful<Div> {
+/// `tip` says in plain words what the menu holds.
+pub fn more_button(id: impl Into<SharedString>, tip: &'static str, cx: &Context<Bloom>) -> Stateful<Div> {
     let t = UiTheme::read(cx);
     div()
         .id(id.into())
@@ -1086,7 +1091,7 @@ pub fn more_button(id: impl Into<SharedString>, cx: &Context<Bloom>) -> Stateful
         .cursor_pointer()
         .bg(tone::RAISED)
         .hover(|s| s.bg(rgba(0xffffff2e)))
-        .tooltip(crate::ui::tip::tip("More"))
+        .tooltip(crate::ui::tip::tip(tip))
         .child(crate::icons::icon(LucideIcon::Ellipsis, 16., t.colors.foreground))
 }
 

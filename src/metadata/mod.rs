@@ -553,6 +553,17 @@ impl Bloom {
     /// Menu entries of the metadata manager for an item. Empty for a user
     /// who is not an administrator.
     pub fn metadata_menu_items(&self, id: &str, name: &str, kind: &ItemKind, cx: &mut Context<Self>) -> Vec<MenuItem> {
+        let entries = self.metadata_entries(id, name, kind, cx);
+        if entries.is_empty() {
+            return entries;
+        }
+        std::iter::once(MenuItem::separator()).chain(entries).collect()
+    }
+
+    /// The entries of the metadata manager alone, with no separator: the
+    /// "Manage" submenu of the detail page. Each opens a dialog, so each
+    /// ends in an ellipsis.
+    pub fn metadata_entries(&self, id: &str, name: &str, kind: &ItemKind, cx: &mut Context<Self>) -> Vec<MenuItem> {
         if !self.is_admin() {
             return Vec::new();
         }
@@ -567,11 +578,10 @@ impl Bloom {
             })
         };
         vec![
-            MenuItem::separator(),
-            entry("meta.menu.edit", "Edit metadata", Tab::Details),
-            entry("meta.menu.images", "Edit images", Tab::Images),
-            entry("meta.menu.identify", "Identify", Tab::Identify),
-            entry("meta.menu.refresh", "Refresh metadata", Tab::Refresh),
+            entry("meta.menu.edit", "Edit metadata…", Tab::Details),
+            entry("meta.menu.images", "Edit images…", Tab::Images),
+            entry("meta.menu.identify", "Identify…", Tab::Identify),
+            entry("meta.menu.refresh", "Refresh metadata…", Tab::Refresh),
         ]
     }
 

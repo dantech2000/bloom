@@ -28,7 +28,7 @@ use crate::{
 
 pub use bloom_core::bitrate::{LADDER, bitrate_label, ladder};
 pub use bloom_core::playback::{
-    Load, PlayMethod, PlaybackInfo, Target, mpv_id, stream_title,
+    Load, PlayMethod, PlaybackInfo, Target, mpv_id,
 };
 use bloom_core::playback::{next_track, query_value, request_body, without_key};
 
@@ -355,7 +355,7 @@ pub fn resolve(
             Some(SubtitleFile {
                 index: s.index,
                 url: format!("{}{}", client.base, without_key(url)),
-                title: stream_title(s),
+                title: bloom_core::track_names::stream_name(s).name,
                 lang: s.language.clone().unwrap_or_default(),
                 select: false,
                 graphical: !s.is_text_subtitle_stream,
@@ -797,11 +797,10 @@ impl Bloom {
         if kind == TrackKind::Audio {
             for stream in resolved.embedded(StreamKind::Audio) {
                 let (index, handle) = (stream.index, this.clone());
+                let name = bloom_core::track_names::stream_name(stream);
                 items.push(
-                    MenuItem::new(
-                        SharedString::from(format!("track.audio.{index}")),
-                        stream_title(stream),
-                    )
+                    MenuItem::new(SharedString::from(format!("track.audio.{index}")), name.name)
+                    .detail(name.detail)
                     .radio(resolved.audio_index == Some(index))
                     .on_click(move |_, _, cx| {
                         handle.update(cx, |t, _| t.stream_audio(index)).ok();
@@ -830,8 +829,10 @@ impl Bloom {
                     true if status.pending_subs.contains(&index) && resolved.sid_of_external(index, status).is_none() => "Loading…",
                     true => "",
                 };
+                let name = bloom_core::track_names::stream_name(stream);
+                let detail = if detail.is_empty() { name.detail } else { detail.to_string() };
                 items.push(
-                    MenuItem::new(SharedString::from(format!("track.sub.{index}")), stream_title(stream))
+                    MenuItem::new(SharedString::from(format!("track.sub.{index}")), name.name)
                         .detail(detail)
                         .radio(shown == Some(index))
                         .on_click(move |_, _, cx| {
@@ -1213,7 +1214,8 @@ mod tests {
         assert_eq!(indexes, vec![2, 3]);
         let pgs = &resolved.external_subs[1];
         assert_eq!(pgs.url, format!("https://media.example.com/Videos/{ITEM}/{ITEM}/Subtitles/3/0/Stream.pgssub?"));
-        assert_eq!(pgs.title, "English - PGSSUB");
+        // The name of the menus, in the words of the detail page.
+        assert_eq!(pgs.title, "English · image");
         assert!(pgs.graphical);
         assert_eq!(resolved.selected_external, Some(3));
         let file = resolved.external_file(3).unwrap();

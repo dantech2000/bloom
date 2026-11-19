@@ -220,6 +220,24 @@ pub fn indicator(item: &Item) -> Option<Div> {
     None
 }
 
+/// What the badge of [`indicator`] means, in words: "3 unwatched
+/// episodes", "Watched". The hover layer shows it in the badge's place,
+/// since the number alone left a user guessing (2026-11-18).
+pub fn watch_state(item: &Item) -> Option<String> {
+    match item.user_data.unplayed_item_count {
+        Some(n) if n > 0 => {
+            let noun = match (item.kind.clone(), n) {
+                (ItemKind::Series | ItemKind::Season, 1) => " episode",
+                (ItemKind::Series | ItemKind::Season, _) => " episodes",
+                _ => "",
+            };
+            Some(format!("{n} unwatched{noun}"))
+        }
+        _ if item.user_data.played => Some("Watched".to_string()),
+        _ => None,
+    }
+}
+
 /// The two text lines under a card image.
 fn card_text(title: String, subtitle: Option<String>, cx: &App) -> Div {
     card_text_with(title, subtitle.map(|s| card_second_line(cx).truncate().child(s)), cx)
@@ -299,7 +317,25 @@ fn hover_overlay(item: &Rc<Item>, row: CardRow, cx: &mut Context<Bloom>) -> Div 
         .border_color(tone::EDGE)
         .flex()
         .items_center()
-        .justify_center();
+        .justify_center()
+        // The badge's meaning in words, over the badge.
+        .children(watch_state(item).map(|text| {
+            div()
+                .absolute()
+                .top(px(5.))
+                .right(px(5.))
+                .h(px(26.))
+                .px(px(9.))
+                .rounded(px(10.))
+                .bg(tone::INK_80)
+                .flex()
+                .items_center()
+                .text_color(tone::ON_ACCENT)
+                .text_size(px(12.))
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                .whitespace_nowrap()
+                .child(text)
+        }));
     if item.is_playable() || item.is_series() {
         overlay = overlay.child(
             div()
@@ -343,11 +379,13 @@ fn hover_overlay(item: &Rc<Item>, row: CardRow, cx: &mut Context<Bloom>) -> Div 
             .child(
                 small(
                     "card.favorite",
-                    filled(
-                        Filled::Heart,
-                        20.,
-                        if favorite { rgb(0xf92672) } else { dim },
-                    ),
+                    // Filled when a favourite, an outline when not, as on
+                    // the detail page.
+                    if favorite {
+                        filled(Filled::Heart, 20., rgb(0xf92672))
+                    } else {
+                        icon(LucideIcon::Heart, 18., dim)
+                    },
                 )
                 .tooltip(tip(if favorite {
                     "Remove from favorites"
@@ -602,6 +640,50 @@ pub fn library_tile(
         .on_click(cx.listener(move |this, _, _, cx| this.open_library(target.clone(), cx)))
 }
 
+/// Height of a genre tile ([`genre_tile`]).
+pub const GENRE_TILE_H: f32 = 64.;
+
+/// A genre as a quiet tile of the theme's glass colour: its name, and how
+/// many titles it has. A click opens its titles.
+pub fn genre_tile(genre: &Item, w: f32, cx: &mut Context<Bloom>) -> Stateful<Div> {
+    let colors = UiTheme::read(cx).colors;
+    let target = genre.clone();
+    // The server counts the movies and the series of a genre; a missing
+    // count is no "0 titles".
+    let count = genre.child_count.filter(|n| *n > 0).map(|n| {
+        if n == 1 { "1 title".to_string() } else { format!("{n} titles") }
+    });
+    card_frame(card_id("genre", genre), w)
+        .role(gpui_kit::Role::Button)
+        .aria_label(genre.name.clone())
+        .h(px(GENRE_TILE_H))
+        .px(px(16.))
+        .rounded(px(CARD_RADIUS))
+        .bg(tone::CARD)
+        .border_1()
+        .border_color(tone::EDGE)
+        .justify_center()
+        .hover(|s| s.border_color(tone::INK_40))
+        .child(
+            div()
+                .text_size(px(17.))
+                .line_height(px(22.))
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                .text_color(colors.foreground)
+                .truncate()
+                .child(genre.name.clone()),
+        )
+        .children(count.map(|text| {
+            div()
+                .text_size(px(13.))
+                .line_height(px(18.))
+                .text_color(colors.muted_foreground)
+                .child(text)
+        }))
+        .tooltip(tip(format!("Movies and shows in {}", genre.name)))
+        .on_click(cx.listener(move |this, _, _, cx| this.open_genre(&target, cx)))
+}
+
 /// The two lines under a card: an episode has its series over its own
 /// line, a season its name alone, anything else its name over its year.
 fn card_titles(item: &Item) -> (String, Option<String>) {
@@ -821,7 +903,7 @@ pub fn section_padded(
             .cursor_pointer()
             .hover(|s| s.bg(rgba(0x00000066)))
             .child(icon(glyph, 22., fg))
-            .tooltip(tip(if direction < 0. { "Previous" } else { "Next" }))
+            .tooltip(tip(if direction < 0. { "Scroll the row left" } else { "Scroll the row right" }))
             .on_click(cx.listener(move |this, _, window, cx| {
                 page_row(this, &row, &handle, direction, window, cx)
             }))
@@ -829,9 +911,13 @@ pub fn section_padded(
 
     // A phone pans the row with a finger: no arrows there, and the heading
     // has the whole width (they cut "Recently Added in Movies" short).
+    // A row whose cards all fit has nothing to scroll to: no arrows either
+    // (My Media with two tiles showed two that did nothing, 2026-11-18).
     let compact = this.compact_w();
+    let content_w = left + (cards.count as f32 * stride - gap).max(0.) + right;
+    let overflows = row_overflows(content_w, this.viewport_w - clip);
     // The arrows are made before the row takes the id.
-    let arrows = (!compact).then(|| {
+    let arrows = (!compact && overflows).then(|| {
         div()
             .flex()
             .gap(px(8.))
@@ -886,6 +972,12 @@ pub fn section_padded(
                         ),
                 ),
         )
+}
+
+/// True when a row `content_w` wide (its padding and its cards, without
+/// the gap after the last card) has more than its `visible_w` shows.
+fn row_overflows(content_w: f32, visible_w: f32) -> bool {
+    content_w > visible_w + 1.
 }
 
 /// Wrapping grid of portrait cards. `top` is where the grid starts in the
@@ -1232,5 +1324,25 @@ mod tests {
         let season = Item { kind: "Season".into(), name: "Season 1".into(), ..Default::default() };
         assert_eq!(card_titles(&season), ("Season 1".to_string(), None));
         assert_eq!(numbered_name(&season), "Season 1");
+    }
+
+    #[test]
+    fn the_badge_of_a_card_in_words() {
+        let mut show = Item { kind: "Series".into(), ..Default::default() };
+        assert_eq!(watch_state(&show), None);
+        show.user_data.unplayed_item_count = Some(3);
+        assert_eq!(watch_state(&show).as_deref(), Some("3 unwatched episodes"));
+        show.user_data.unplayed_item_count = Some(1);
+        assert_eq!(watch_state(&show).as_deref(), Some("1 unwatched episode"));
+        let mut movie = Item { kind: "Movie".into(), ..Default::default() };
+        movie.user_data.played = true;
+        assert_eq!(watch_state(&movie).as_deref(), Some("Watched"));
+    }
+
+    #[test]
+    fn a_row_shows_arrows_only_when_its_cards_do_not_fit() {
+        assert!(!row_overflows(900., 1000.));
+        assert!(!row_overflows(1000.5, 1000.), "half a point is rounding, not a card");
+        assert!(row_overflows(1300., 1000.));
     }
 }

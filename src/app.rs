@@ -973,6 +973,7 @@ impl Render for Bloom {
                     this.toggle_pip(window, cx)
                 }
             }))
+            .map(|el| Self::playback_menu_actions(el, cx))
             // On iOS the player page is a hole over the video layer of
             // the window: nothing under it may paint.
             .when(!(cfg!(target_os = "ios") && self.playback.open), |el| el.bg(theme.colors.background))
@@ -1035,5 +1036,7 @@ impl Render for Bloom {
 pub(crate) mod race_harness;
 #[cfg(test)]
 mod race_tests;
+#[cfg(test)]
+mod detail_tests;
 #[cfg(test)]
 mod shell_tests;

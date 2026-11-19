@@ -14,10 +14,16 @@ use crate::{
     ui::scroll_area::ScrollArea,
     views::{hero::HERO_ROWS_START, shell::TOPBAR_H},
     views::cards::{
-        CARD_TEXT_H, Cards, empty_state, library_tile, poster_card, section as section_row,
-        section_height, skeleton_row, wide_card,
+        CARD_TEXT_H, Cards, GENRE_TILE_H, empty_state, genre_tile, library_tile, poster_card,
+        section as section_row, section_height, skeleton_row, wide_card,
     },
 };
+
+/// The width of a genre tile: a poster's and a half, so a name such as
+/// "Science Fiction" fits on one line.
+fn genre_tile_w(portrait_w: f32) -> f32 {
+    (portrait_w * 1.5).round()
+}
 
 /// Space between two home rows.
 const SECTION_GAP: f32 = 18.;
@@ -32,6 +38,10 @@ enum HomeSection<'a> {
     Media,
     Resume,
     NextUp,
+    /// Random unwatched titles, for a user with nothing to continue.
+    Pick,
+    /// The genres of the server, for the same user.
+    Genres,
 }
 
 /// The rows under the home hero as their own view, so GPUI can keep them
@@ -87,6 +97,17 @@ impl Bloom {
         let portrait = m.portrait_h() + CARD_TEXT_H;
         let wide = m.backdrop_h() + CARD_TEXT_H;
         let mut sections = Vec::new();
+        // A user with nothing watched has no Continue Watching and no Next
+        // Up: the page starts with titles to pick and the genres instead,
+        // so it offers a way in. They go once the user has started one.
+        if data.nothing_started() {
+            if !data.discover.is_empty() {
+                sections.push((HomeSection::Pick, portrait));
+            }
+            if !data.genres.is_empty() {
+                sections.push((HomeSection::Genres, GENRE_TILE_H));
+            }
+        }
         for kind in &data.order {
             match kind.as_str() {
                 "latestmedia" => sections.extend(
@@ -233,6 +254,28 @@ impl Bloom {
                 row_h,
                 Cards::new(m.backdrop_w, data.resume.len(), |i, cx| {
                     wide_card(&data.resume[i], client, m.backdrop_w, CardRow::Resume, self.nav.hovered_card.as_ref(), cx)
+                }),
+                cx,
+            ),
+            HomeSection::Pick => section_row(
+                self,
+                "home.pick",
+                "Pick something to watch",
+                None,
+                row_h,
+                Cards::new(m.portrait_w, data.discover.len(), |i, cx| {
+                    poster_card(&data.discover[i], client, m.portrait_w, self.nav.hovered_card.as_ref(), cx)
+                }),
+                cx,
+            ),
+            HomeSection::Genres => section_row(
+                self,
+                "home.genres",
+                "Browse by genre",
+                None,
+                row_h,
+                Cards::new(genre_tile_w(m.portrait_w), data.genres.len(), |i, cx| {
+                    genre_tile(&data.genres[i], genre_tile_w(m.portrait_w), cx)
                 }),
                 cx,
             ),

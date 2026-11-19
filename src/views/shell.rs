@@ -171,6 +171,85 @@ fn library_glyph(view: &crate::jellyfin::Item) -> LucideIcon {
     }
 }
 
+/// Room the offline chip of the bar takes, about.
+const OFFLINE_CHIP_W: f32 = 230.;
+
+/// True when the tabs with their labels, centred in a bar `vw` wide,
+/// keep clear of the round buttons at the right: `buttons` of them, the
+/// account's avatar, and `chips` points of chips. The widths are
+/// estimates, measured on a shot (13-point medium text is about 6.5
+/// points a character, a button with its gap 36); the home tab shows the
+/// server's name, `server_chars` long, in any case. At 900 points the
+/// mock's six tabs ran into the buttons (2026-11-18).
+fn labels_fit(vw: f32, server_chars: usize, labels: &[&str], buttons: usize, chips: f32) -> bool {
+    const CHAR_W: f32 = 6.5;
+    // Padding 14 at each side, the glyph, the gap to the label.
+    let tab = |chars: usize| 28. + 16. + 8. + chars as f32 * CHAR_W;
+    let tabs: f32 = 10. + tab(server_chars)
+        + labels.iter().map(|label| tab(label.chars().count()) + 2.).sum::<f32>();
+    let right = 20. + (buttons as f32 + 1.) * 36. + chips;
+    vw / 2. - tabs / 2. >= right + 12.
+}
+
+/// The id of the search tab (the search button of the Mac's bar).
+pub const SEARCH_TAB: &str = "search";
+
+/// The tab a page belongs to: the library it is in, the search, the
+/// playlists, or none. `root` is the first page of the history (the page
+/// of a tab the user started from), `views` the libraries of the bar.
+///
+/// A page of a library lights that library. A movie, a show, a season or
+/// an episode lights the library of its kind: the one it was opened from
+/// when that is of its kind, else the only library of its kind. With two
+/// libraries of that kind and no way to tell, nothing lights: a wrong tab
+/// told the user he was in Movies on a show's page (2026-11-18).
+pub(crate) fn tab_of(page: &Page, root: Option<&Page>, views: &[crate::jellyfin::Item]) -> Option<String> {
+    use crate::app::FAVORITES_ID;
+    use crate::lists::PLAYLISTS_ID;
+    let root_view = match root {
+        Some(Page::Library(data)) => views.iter().find(|v| v.id == data.view.id),
+        _ => None,
+    };
+    let of_type = |collection: &str| -> Option<String> {
+        if let Some(view) = root_view.filter(|v| v.collection_type.as_deref() == Some(collection)) {
+            return Some(view.id.clone());
+        }
+        let mut found = views.iter().filter(|v| v.collection_type.as_deref() == Some(collection));
+        match (found.next(), found.next()) {
+            (Some(only), None) => Some(only.id.clone()),
+            _ => None,
+        }
+    };
+    // A collection lives in the library of collections, or with the
+    // playlists when the server has none.
+    let collection = || of_type("boxsets").or_else(|| Some(PLAYLISTS_ID.to_string()));
+    match page {
+        Page::Search(_) => Some(SEARCH_TAB.to_string()),
+        Page::Playlist(_) => Some(PLAYLISTS_ID.to_string()),
+        Page::Library(data) => {
+            let id = data.view.id.as_str();
+            if id == FAVORITES_ID || id == PLAYLISTS_ID || views.iter().any(|v| v.id == id) {
+                return Some(id.to_string());
+            }
+            match data.view.kind {
+                ItemKind::BoxSet => collection(),
+                // A folder inside a library.
+                ItemKind::Folder | ItemKind::CollectionFolder => root_view.map(|v| v.id.clone()),
+                // A person's or a genre's titles belong to no library.
+                _ => None,
+            }
+        }
+        Page::Detail(data) => match data.item.kind {
+            ItemKind::Movie => of_type("movies"),
+            ItemKind::Series | ItemKind::Season | ItemKind::Episode => of_type("tvshows"),
+            ItemKind::BoxSet => collection(),
+            // A home video and the like: the library it was opened from.
+            _ => root_view.map(|v| v.id.clone()),
+        },
+        Page::Home(_) | Page::Admin(_) | Page::Settings(_) | Page::Downloads => None,
+    }
+}
+
 /// Height of the tab bar of a compact window, and the room the page
 /// keeps under it: the bar floats 10 px over the bottom inset.
 pub const TABBAR_H: f32 = 62.;
@@ -282,21 +361,24 @@ impl Bloom {
                             .left_0()
                             .right_0()
                             // A shade keeps the bar readable over the artwork.
-                            // A phone: the bar turns to glass instead once
-                            // the page scrolls under it, as the bars of iOS do.
-                            .when(overlay && !(scrolled && compact), |el| {
+                            // Once the page scrolls under it the bar turns to
+                            // glass, as the bars of iOS and macOS do: the rows
+                            // that pass under it blur there, and their text
+                            // no longer crosses the tabs (it did on the Mac
+                            // under the old shade, 2026-11-18).
+                            .when(overlay && !scrolled, |el| {
                                 el.bg(linear_gradient(
                                     180.,
                                     linear_color_stop(gpui_kit::black().alpha(0.55), 0.0),
                                     linear_color_stop(gpui_kit::black().alpha(0.0), 1.0),
                                 ))
                             })
-                            // Content scrolls under the bar; fade it out there.
-                            .when(overlay && scrolled && !compact, |el| el.pb(px(28.)))
-                            .when(overlay && scrolled && compact, |el| {
+                            .when(overlay && scrolled, |el| {
                                 el.child(glass(px(0.), crate::ui::glass::POPUP_TINT))
+                                    .border_b_1()
+                                    .border_color(tone::EDGE)
                             })
-                            .child(self.render_topbar(scrolled, compact, cx)),
+                            .child(self.render_topbar(scrolled, overlay && scrolled, compact, cx)),
                     )
                     .when(compact && keyboard == 0., |el| el.child(self.render_tabbar(cx))),
             )
@@ -334,12 +416,9 @@ impl Bloom {
         let fg = UiTheme::read(cx).colors.foreground;
         // A page that is no library and has no library behind it lights no
         // tab but its own (search), as the tab bars of iOS do.
-        let active = match &self.nav.page {
-            Page::Search(_) | Page::Settings(_) | Page::Admin(_) | Page::Downloads => None,
-            _ => self.active_tab(),
-        };
+        let active = self.active_tab();
         let is_home = matches!(self.nav.page, Page::Home(_)) && self.nav.history.is_empty();
-        let is_search = matches!(self.nav.page, Page::Search(_));
+        let is_search = active.as_deref() == Some(SEARCH_TAB);
         let item = |id: SharedString, label: String, glyph: LucideIcon, selected: bool| {
             let color = if selected { fg } else { fg.opacity(0.6) };
             div()
@@ -539,28 +618,10 @@ impl Bloom {
         cx.stop_propagation();
     }
 
-    /// The library a page belongs to, which decides the highlighted tab.
-    fn active_tab(&self) -> Option<String> {
-        let by_type = |collection: &str| {
-            self.views
-                .iter()
-                .find(|v| v.collection_type.as_deref() == Some(collection))
-                .map(|v| v.id.clone())
-        };
-        let root = self.nav.history.first().map_or(&self.nav.page, |(page, _)| page);
-        if let Page::Library(data) = root {
-            return Some(data.view.id.clone());
-        }
-        match &self.nav.page {
-            Page::Detail(data) => match data.item.kind {
-                ItemKind::Movie => by_type("movies"),
-                ItemKind::Series | ItemKind::Season | ItemKind::Episode => by_type("tvshows"),
-                ItemKind::BoxSet => by_type("boxsets"),
-                _ => None,
-            },
-            Page::Playlist(_) => Some(crate::lists::PLAYLISTS_ID.to_string()),
-            _ => None,
-        }
+    /// The tab the page belongs to, which the bar lights.
+    pub(crate) fn active_tab(&self) -> Option<String> {
+        let root = self.nav.history.first().map(|(page, _)| page);
+        tab_of(&self.nav.page, root, &self.views)
     }
 
     /// Rebuilds the profile dropdown entries from the current config.
@@ -761,10 +822,13 @@ impl Bloom {
             .update(cx, |menu, cx| menu.set_items(items, cx));
     }
 
-    fn render_topbar(&self, scrolled: bool, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The bar at the top. `glass_bar`: the bar itself is glass (a page
+    /// scrolled under it), so the tabs draw no glass pill of their own.
+    fn render_topbar(&self, scrolled: bool, glass_bar: bool, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = UiTheme::read(cx).colors;
         let fg = colors.foreground;
         let active = self.active_tab();
+        let searching = active.as_deref() == Some(SEARCH_TAB);
         let is_home = matches!(self.nav.page, Page::Home(_)) && self.nav.history.is_empty();
         let server = self
             .session
@@ -772,16 +836,29 @@ impl Bloom {
             .map(|s| s.server_name.clone())
             .unwrap_or_default();
 
-        // An iPad held upright (834 px) has no room for the labels beside
-        // the buttons at the right: the tabs show their glyph alone there.
-        let icon_only = self.viewport_w < 900.;
+        // A bar without room for the labels beside the buttons at the right
+        // (an iPad held upright, 834 px; a narrow Mac window with many
+        // libraries) shows the glyphs of the tabs alone.
+        let mut labels: Vec<&str> = vec!["Favorites"];
+        labels.extend(self.views.iter().map(|v| v.name.as_str()));
+        if self.session.is_some() {
+            labels.push("Playlists");
+        }
+        let buttons = 2 + usize::from(self.session.is_some()) + usize::from(self.sync.allowed() && self.sync.session.is_some());
+        let chips = if self.connection.core.is_offline() { OFFLINE_CHIP_W } else { 0. };
+        let icon_only = self.viewport_w < 900.
+            || !labels_fit(self.viewport_w, server.chars().count(), &labels, buttons, chips);
         let tab = move |id: SharedString, label: String, glyph: Glyph, selected: bool| {
             let color = if selected { colors.primary_foreground } else { fg };
             let logo = matches!(glyph, Glyph::Logo);
+            // The tooltip says where a tab goes: the server's name stands
+            // on the home tab, and a narrow bar shows the glyphs alone.
+            let hint = if logo { "Home".to_string() } else { label.clone() };
             div()
                 .id(id)
                 .role(gpui_kit::Role::Tab)
                 .aria_label(label.clone())
+                .when(icon_only || logo, |el| el.tooltip(tip(hint)))
                 .h(px(36.))
                 .px(px(14.))
                 .rounded_full()
@@ -809,10 +886,8 @@ impl Bloom {
             .border_1()
             .border_color(gpui_kit::transparent_black())
             .relative()
-            .when(scrolled, |el| {
-                el.child(glass(px(999.), tone::CARD))
-                    .border_color(gpui_kit::rgba(0x5757574d))
-            })
+            .when(scrolled && !glass_bar, |el| el.child(glass(px(999.), tone::CARD)))
+            .when(scrolled, |el| el.border_color(gpui_kit::rgba(0x5757574d)))
             .flex()
             .items_center()
             .gap(px(2.))
@@ -842,8 +917,10 @@ impl Bloom {
             );
         }
 
-        // The web shows the Playlists library only when there is a playlist.
-        if !self.lists.playlists.is_empty() {
+        // The playlists, and the collections in the menu of their page. The
+        // web shows the tab only when there is a playlist; here it stays,
+        // so a new user finds where a playlist would go and can make one.
+        if self.session.is_some() {
             tabs = tabs.child(
                 tab(
                     "nav.playlists".into(),
@@ -973,7 +1050,11 @@ impl Bloom {
                         el.child(
                             round("top.cast", "Play on", filled(Filled::Cast, 22., fg))
                                 .when(casting, |el| el.bg(lit))
-                                .tooltip(tip(if casting { "Play on: another device plays" } else { "Play on" }))
+                                .tooltip(tip(if casting {
+                                    "Play on another device: one plays now"
+                                } else {
+                                    "Play on another device (TV, Chromecast, AirPlay)"
+                                }))
                                 .on_click(cx.listener(|this, _, window, cx| this.toggle_cast_panel(window, cx))),
                         )
                     })
@@ -983,27 +1064,39 @@ impl Bloom {
                             round("top.syncplay", "SyncPlay", filled(Filled::Groups, 22., fg))
                                 .when(in_group, |el| el.bg(lit))
                                 .tooltip(tip(if in_group {
-                                    "SyncPlay: in a group"
+                                    "Watch together (SyncPlay): you are in a group"
                                 } else {
-                                    "SyncPlay"
+                                    "Watch together with others (SyncPlay)"
                                 }))
                                 .on_click(cx.listener(|this, _, window, cx| this.toggle_sync_panel(window, cx))),
                         )
                     })
                     .child(
                         round("top.random", "Random item", icon(LucideIcon::Dices, 18., fg))
-                            .tooltip(tip("Random item (R)"))
+                            .tooltip(tip("Surprise me: open a random movie or show (R)"))
                             .on_click(cx.listener(|this, _, _, cx| this.open_random(cx))),
                     )
                     .child(
-                        round("top.search", "Search", icon(LucideIcon::Search, 18., fg))
+                        round(
+                            "top.search",
+                            "Search",
+                            icon(LucideIcon::Search, 18., if searching { colors.primary_foreground } else { fg }),
+                        )
+                        // On the search page the button is its tab, lit as
+                        // a tab is.
+                        .when(searching, |el| el.bg(colors.primary))
                             .tooltip(tip("Search (/)"))
                             .on_click(cx.listener(|this, _, window, cx| this.focus_search(window, cx))),
                     )
                     .child(
                         Menu::new(&self.popups.profile_menu, "Account")
                             // The avatar is the whole button; no frame around it.
-                            .trigger(div().id("top.account").tooltip(tip("Account")).child(avatar)),
+                            .trigger(
+                                div()
+                                    .id("top.account")
+                                    .tooltip(tip("Account, settings and servers"))
+                                    .child(avatar),
+                            ),
                     ),
             )
             // The tabs sit at the centre of the window, not of the space the
@@ -1193,5 +1286,85 @@ impl Bloom {
                     )
                 }),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{DetailData, LibraryData, SearchData};
+    use crate::jellyfin::Item;
+
+    fn view(id: &str, collection: &str) -> Item {
+        Item { id: id.into(), name: id.into(), collection_type: Some(collection.into()), ..Default::default() }
+    }
+
+    fn library(view: Item) -> Page {
+        Page::Library(LibraryData::new(view))
+    }
+
+    fn detail(kind: &str) -> Page {
+        Page::Detail(Box::new(DetailData {
+            item: Item { id: "x".into(), kind: kind.into(), ..Default::default() },
+            ..Default::default()
+        }))
+    }
+
+    /// A first-time user saw "Movies" lit on the search page, a show's
+    /// page and a season's page (2026-11-18): the tab of the page the
+    /// history started from stayed lit.
+    #[test]
+    fn the_tab_of_a_page_is_its_own_library() {
+        let views = [view("m", "movies"), view("s", "tvshows")];
+        let movies = library(views[0].clone());
+        let search = Page::Search(SearchData::default());
+        assert_eq!(tab_of(&search, Some(&movies), &views).as_deref(), Some(SEARCH_TAB));
+        for kind in ["Series", "Season", "Episode"] {
+            assert_eq!(tab_of(&detail(kind), Some(&movies), &views).as_deref(), Some("s"), "{kind}");
+        }
+        assert_eq!(tab_of(&detail("Movie"), None, &views).as_deref(), Some("m"));
+        assert_eq!(tab_of(&movies, None, &views).as_deref(), Some("m"));
+        assert_eq!(tab_of(&Page::Home(Default::default()), Some(&movies), &views), None);
+        assert_eq!(tab_of(&Page::Downloads, Some(&movies), &views), None);
+    }
+
+    /// Measured on shots: the container's five tabs fit a 1000-point bar
+    /// with four buttons; the mock's six ran into its three at 900.
+    #[test]
+    fn the_labels_of_the_tabs_go_when_they_would_meet_the_buttons() {
+        let container = ["Favorites", "Movies", "Shows", "Playlists"];
+        assert!(labels_fit(1000., "Local Jellyfin".len(), &container, 4, 0.));
+        let mock = ["Favorites", "Movies", "Shows", "Collections", "Playlists"];
+        assert!(!labels_fit(900., "Mock Jellyfin".len(), &mock, 3, 0.));
+        assert!(labels_fit(1200., "Mock Jellyfin".len(), &mock, 3, 0.));
+        // The offline chip takes room of its own.
+        assert!(!labels_fit(1000., "Local Jellyfin".len(), &container, 4, OFFLINE_CHIP_W));
+    }
+
+    #[test]
+    fn two_libraries_of_a_kind_light_the_one_the_user_came_from_or_none() {
+        let views = [view("m1", "movies"), view("m2", "movies")];
+        let second = library(views[1].clone());
+        assert_eq!(tab_of(&detail("Movie"), Some(&second), &views).as_deref(), Some("m2"));
+        assert_eq!(tab_of(&detail("Movie"), None, &views), None);
+    }
+
+    #[test]
+    fn lists_people_and_genres() {
+        let views = [view("m", "movies")];
+        let playlists = library(view(crate::lists::PLAYLISTS_ID, crate::lists::PLAYLISTS_ID));
+        assert_eq!(tab_of(&playlists, None, &views).as_deref(), Some(crate::lists::PLAYLISTS_ID));
+        // A collection goes with the playlists when the server has no
+        // library of collections, and to that library when it has one.
+        let boxset = library(Item { id: "b".into(), kind: "BoxSet".into(), ..Default::default() });
+        assert_eq!(tab_of(&boxset, None, &views).as_deref(), Some(crate::lists::PLAYLISTS_ID));
+        let with_boxsets = [view("m", "movies"), view("c", "boxsets")];
+        assert_eq!(tab_of(&boxset, None, &with_boxsets).as_deref(), Some("c"));
+        let person = library(view("p", crate::pages::PERSON_VIEW));
+        assert_eq!(tab_of(&person, Some(&library(views[0].clone())), &views), None);
+        let genre = library(view("g", crate::pages::GENRE_VIEW));
+        assert_eq!(tab_of(&genre, None, &views), None);
+        let favorites = library(view(crate::app::FAVORITES_ID, crate::app::FAVORITES_ID));
+        assert_eq!(tab_of(&favorites, None, &views).as_deref(), Some(crate::app::FAVORITES_ID));
     }
 }

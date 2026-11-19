@@ -66,14 +66,36 @@ fn a_frame_is_read_with_its_own_tick_and_its_number_never_goes_back() {
 }
 
 #[test]
+fn speed_steps_walk_the_list_and_stop_at_its_ends() {
+    use crate::player::speed_step;
+    assert_eq!(speed_step(1., true), Some(1.25));
+    assert_eq!(speed_step(1.5, true), Some(1.75));
+    assert_eq!(speed_step(1.75, true), Some(2.));
+    assert_eq!(speed_step(2., true), None);
+    assert_eq!(speed_step(1., false), Some(0.75));
+    assert_eq!(speed_step(0.5, false), None);
+    // A speed between two steps goes to the next one.
+    assert_eq!(speed_step(1.1, true), Some(1.25));
+    assert_eq!(speed_step(1.1, false), Some(1.));
+}
+
+#[test]
 fn parses_track_list_json() {
     let json = r#"[{"id":1,"type":"video","selected":true},
         {"id":1,"type":"audio","lang":"eng","codec":"aac","selected":true,"default":true},
         {"id":2,"type":"sub","title":"English SDH","lang":"eng","codec":"subrip","selected":false}]"#;
     let tracks: Vec<Track> = serde_json::from_str(json).unwrap();
     assert_eq!(tracks.len(), 3);
-    assert_eq!(tracks[1].label(), "ENG · AAC");
-    assert_eq!(tracks[2].label(), "English SDH · ENG · SUBRIP");
+    assert_eq!(tracks[1].label(), "English");
+    assert_eq!(tracks[1].name().detail, "AAC");
+    assert_eq!(tracks[2].label(), "English (SDH)");
+    assert_eq!(tracks[2].name().detail, "SubRip");
+    let json = r#"[{"id":1,"type":"audio","lang":"eng","codec":"ac3","demux-channel-count":6},
+        {"id":2,"type":"sub","lang":"ger","codec":"hdmv_pgs_subtitle","forced":true,"external":true}]"#;
+    let tracks: Vec<Track> = serde_json::from_str(json).unwrap();
+    assert_eq!(tracks[0].label(), "English · 5.1");
+    assert_eq!(tracks[1].label(), "German (Forced) · image");
+    assert_eq!(tracks[1].name().detail, "PGS · external file");
 }
 
 /// Plays a synthetic clip through the embedded core, checks frames arrive

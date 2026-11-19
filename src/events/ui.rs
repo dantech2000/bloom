@@ -10,7 +10,7 @@ impl Bloom {
     /// The Automation page of the settings: the switch of the stream, what
     /// an event may say, where a program reads it, and how.
     pub(crate) fn render_settings_automation(&self, cx: &mut Context<Self>) -> gpui_kit::Div {
-        use gpui_kit::{ClickEvent, ParentElement as _, Styled as _, div, px};
+        use gpui_kit::{ClickEvent, ParentElement as _, StatefulInteractiveElement as _, Styled as _, div, px};
 
         use crate::{
             ui::{button::raised, form::{checkbox, field, group}},
@@ -19,72 +19,79 @@ impl Bloom {
 
         let on = self.events_on();
         let titles = self.config.events_titles == Some(true);
+        let colours = self.config.events_colours == Some(true);
         let path = socket_path();
-        let mut events = group("Events for other programs", cx).child(field(
-            "Send events (experimental)",
-            if on {
-                format!("On. A program on {THIS_DEVICE} can read what the player does, as it happens. It cannot control the app.")
-            } else {
-                format!("Off. When on, a program on {THIS_DEVICE} can read what the player does, as it happens: for lights that dim at the start of a film, a status, a notice. It cannot control the app.")
-            },
-            checkbox("automation.events", on, cx)
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_events(!on, cx))),
-            cx,
-        ));
+        let t = crate::ui::theme::UiTheme::read(cx).clone();
+        let quiet = |text: String| {
+            div()
+                .text_size(px(13.))
+                .line_height(px(18.))
+                .text_color(t.colors.foreground.opacity(0.6))
+                .child(text)
+        };
+        let mut events = group("Events for other programs", cx)
+            .child(quiet(format!(
+                "Bloom can tell other programs on {THIS_DEVICE} what the player does: a film starts, pauses, reaches its credits or ends. Use it for lights that dim when a film starts, a status in the menu bar, or a notice. These programs can only listen. They cannot control Bloom."
+            )).pb(px(6.)))
+            .child(field(
+                "Send events (experimental)",
+                if on {
+                    "On. Programs that you set up can now follow the player."
+                } else {
+                    "Off. When on, this page shows the address to give the program."
+                },
+                checkbox("automation.events", on, cx)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_events(!on, cx))),
+                cx,
+            ));
         if on {
             events = events
                 .child(field(
-                    "Name the title in events",
+                    "Include titles",
                     if titles {
-                        "On. An event has the title, the series and the episode of what plays. A program that reads the events can keep them."
+                        "On. Events name the film or the episode that plays."
                     } else {
-                        "Off. An event has the id and the kind of the item only; a program that reads the events learns no title."
+                        "Off. Events say what kind of item plays, but not its title."
                     },
                     checkbox("automation.titles", titles, cx)
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_events_titles(!titles, cx))),
                     cx,
                 ))
                 .child(field(
-                    "Tell the colours of the picture",
-                    if self.config.events_colours == Some(true) {
-                        "On. While a film plays and a program reads, an event has the colours of the picture, from its top to its bottom, 12 times a second. For a light that follows the film."
+                    "Include the colours of the picture",
+                    if colours {
+                        "On. While a film plays, events carry its colours 12 times a second, for a light that follows the picture."
                     } else {
-                        "Off. When on, an event has the colours of the picture 12 times a second, for a light that follows the film."
+                        "Off. Turn it on for a light that follows the colours of the picture."
                     },
-                    checkbox("automation.colours", self.config.events_colours == Some(true), cx).on_click(cx.listener({
-                        let on = self.config.events_colours == Some(true);
-                        move |this, _: &ClickEvent, _, cx| this.set_events_colours(!on, cx)
-                    })),
+                    checkbox("automation.colours", colours, cx)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_events_colours(!colours, cx))),
                     cx,
                 ))
                 .child(field(
-                    "Where a program reads them",
-                    format!("{path}. Programs that read now: {}.", hub().readers()),
-                    raised("automation.copy", "Copy the path", cx).on_click(cx.listener({
-                        let path = path.clone();
-                        move |this, _: &ClickEvent, _, cx| {
-                            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(path.clone()));
-                            this.toast("Automation", "The path is copied.", cx);
-                        }
-                    })),
+                    "Address for programs",
+                    format!("Programs that listen now: {}.", hub().readers()),
+                    raised("automation.copy", "Copy address", cx)
+                        .tooltip(crate::ui::tip::tip("Copy the address for a program to read the events"))
+                        .on_click(cx.listener({
+                            let path = path.clone();
+                            move |this, _: &ClickEvent, _, cx| {
+                                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(path.clone()));
+                                this.toast("Automation", "The address is copied.", cx);
+                            }
+                        })),
                     cx,
                 ));
         }
-        let how = group("What a program gets", cx)
-            .child(field(
-                "One line for each event",
-                "Each event is one line of JSON: the start, a pause, a seek, the end of an item, the start of the credits, full screen, picture in picture. The access token, the address of the server and the paths of files are never in an event.",
-                div(),
-                cx,
-            ))
-            .child(field(
-                "Try it",
-                format!("In a terminal: nc -U \"{path}\" . Then play something. The format is in specs/outbound-events.md; the lights helper (lights/) is a program that reads it."),
-                div(),
-                cx,
-            ));
-        let page = div().flex().flex_col().gap(px(18.)).child(events).child(how);
-        let Some(panel) = &self.events.lights else { return page };
+        // For developers, out of the way: what an event is and where it is.
+        let footnote = quiet(format!(
+            "For developers: each event is one line of JSON on the Unix socket {path}. Events never hold the access token, the server address or file paths. The format is in specs/outbound-events.md of Bloom's source."
+        ))
+        .px(px(22.))
+        .text_size(px(12.))
+        .opacity(0.8);
+        let page = div().flex().flex_col().gap(px(18.)).child(events);
+        let Some(panel) = &self.events.lights else { return page.child(footnote) };
         // The lights (experimental): a helper program that Bloom starts
         // reads the events and tells the lights. Its settings are here.
         let settings = self.lights_json(cx);
@@ -108,7 +115,7 @@ impl Bloom {
             cx,
         ));
         if !lights_on {
-            return page.child(lights);
+            return page.child(lights).child(footnote);
         }
         lights = lights.child(field(
             "Find lights",
@@ -255,6 +262,6 @@ impl Bloom {
             div(),
             cx,
         ));
-        page.child(lights)
+        page.child(lights).child(footnote)
     }
 }

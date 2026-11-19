@@ -16,8 +16,15 @@ pub const HERO_ITEMS: usize = 20;
 pub const FAVORITES_ID: &str = "favorites";
 /// Id prefix of the synthetic library that lists a person's titles.
 pub const PERSON_VIEW: &str = "person";
+/// Collection type of the synthetic library that lists the titles of a
+/// genre, and of one that lists those of a studio; the view's id is the
+/// genre's or the studio's.
+pub const GENRE_VIEW: &str = "genre";
+pub const STUDIO_VIEW: &str = "studio";
 /// Id of the synthetic library that lists the playlists.
 pub const PLAYLISTS_ID: &str = "playlists";
+/// Titles in the "Pick something" row of a home page with nothing watched.
+pub const DISCOVER_ITEMS: usize = 16;
 
 #[derive(Default)]
 pub struct HomeData {
@@ -29,6 +36,19 @@ pub struct HomeData {
     pub resume: Vec<Item>,
     pub next_up: Vec<Item>,
     pub latest: Vec<(Item, Vec<Item>)>,
+    /// Random unwatched titles, for a user with nothing to continue or
+    /// watch next ([`load_discover`]); empty otherwise.
+    pub discover: Vec<Item>,
+    /// The genres of the server, for the same user.
+    pub genres: Vec<Item>,
+}
+
+impl HomeData {
+    /// True when the rows of the user's own (Continue Watching, Next Up)
+    /// are empty: a new user, who gets [`load_discover`]'s rows instead.
+    pub fn nothing_started(&self) -> bool {
+        self.resume.is_empty() && self.next_up.is_empty()
+    }
 }
 
 pub struct LibraryData {
@@ -48,6 +68,48 @@ pub struct LibraryData {
     pub letter: Option<char>,
     /// What of the library shows; picked in the menu of the title.
     pub show: LibraryShow,
+    /// The genre the page is narrowed to: its id and name.
+    pub genre: Option<(String, String)>,
+    /// The decade the page is narrowed to, by its first year (1990).
+    pub decade: Option<i32>,
+    /// The resolution the page is narrowed to.
+    pub resolution: Option<Resolution>,
+    /// Only the titles with a subtitle track.
+    pub subtitles: bool,
+    /// The genres of the library, for the filter menu; `None` until they
+    /// load.
+    pub genres: Option<Vec<Item>>,
+}
+
+/// A resolution a library page can be narrowed to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resolution {
+    /// 4K (the server's `is4K`).
+    Uhd,
+    /// HD, 4K included (`isHd`).
+    Hd,
+    /// Below HD.
+    Sd,
+}
+
+impl Resolution {
+    pub const ALL: [Resolution; 3] = [Resolution::Uhd, Resolution::Hd, Resolution::Sd];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Resolution::Uhd => "4K",
+            Resolution::Hd => "HD",
+            Resolution::Sd => "SD",
+        }
+    }
+}
+
+/// The decades of the filter menu, newest first, by their first year.
+pub const DECADES: [i32; 11] = [2020, 2010, 2000, 1990, 1980, 1970, 1960, 1950, 1940, 1930, 1920];
+
+/// "1990s" for 1990.
+pub fn decade_label(decade: i32) -> String {
+    format!("{decade}s")
 }
 
 /// The views of a library, as in the title menu of the web client.
@@ -105,7 +167,56 @@ impl LibraryData {
             filter: None,
             letter: None,
             show: LibraryShow::All,
+            genre: None,
+            decade: None,
+            resolution: None,
+            subtitles: false,
+            genres: None,
         }
+    }
+
+    /// True when a filter, a genre, a decade, a resolution, subtitles or
+    /// a letter narrows the page.
+    pub fn narrowed(&self) -> bool {
+        self.filter.is_some()
+            || self.genre.is_some()
+            || self.decade.is_some()
+            || self.resolution.is_some()
+            || self.subtitles
+            || self.letter.is_some()
+    }
+
+    /// Drops every filter and the letter; the sort and the view stay.
+    pub fn clear_filters(&mut self) {
+        self.filter = None;
+        self.genre = None;
+        self.decade = None;
+        self.resolution = None;
+        self.subtitles = false;
+        self.letter = None;
+    }
+
+    /// The kinds of item the page lists (`Movie`, `Series`, ...); empty
+    /// for a folder, which lists what is in it.
+    pub fn kinds(&self) -> Vec<String> {
+        library_query(self).include_types
+    }
+
+    /// Whether the genre and decade filters fit the page: movies or
+    /// series of a library, or the titles of a genre (decade only).
+    pub fn can_narrow_by_genre(&self) -> bool {
+        let kinds = self.kinds();
+        !kinds.is_empty()
+            && kinds.iter().all(|k| k == "Movie" || k == "Series")
+            && self.view.collection_type.as_deref() != Some(PERSON_VIEW)
+    }
+
+    /// Whether the resolution and subtitle filters fit the page: they
+    /// read the video streams, which a movie or an episode has and a
+    /// series does not.
+    pub fn can_narrow_by_streams(&self) -> bool {
+        let kinds = self.kinds();
+        !kinds.is_empty() && kinds.iter().all(|k| k == "Movie" || k == "Episode")
     }
 }
 
@@ -194,10 +305,12 @@ pub fn library_query(data: &LibraryData) -> ItemQuery {
     let view = &data.view;
     let favorites = view.collection_type.as_deref() == Some(FAVORITES_ID);
     let person = view.collection_type.as_deref() == Some(PERSON_VIEW);
+    let genre = view.collection_type.as_deref() == Some(GENRE_VIEW);
+    let studio = view.collection_type.as_deref() == Some(STUDIO_VIEW);
     let include_types = match view.collection_type.as_deref() {
         Some("movies") => vec!["Movie".to_string()],
         Some("tvshows") => vec!["Series".to_string()],
-        Some(FAVORITES_ID) | Some(PERSON_VIEW) => {
+        Some(FAVORITES_ID) | Some(PERSON_VIEW) | Some(GENRE_VIEW) | Some(STUDIO_VIEW) => {
             vec!["Movie".to_string(), "Series".to_string()]
         }
         Some(PLAYLISTS_ID) => vec!["Playlist".to_string()],
@@ -217,9 +330,27 @@ pub fn library_query(data: &LibraryData) -> ItemQuery {
         .into_iter()
         .chain(data.filter.filter(|f| *f != "IsFavorite" || data.show != LibraryShow::Favorites))
         .collect();
+    let genre_ids: Vec<String> = genre
+        .then(|| view.id.clone())
+        .into_iter()
+        .chain(data.genre.as_ref().map(|(id, _)| id.clone()))
+        .collect();
+    let years: Vec<i32> = data.decade.map(|first| (first..first + 10).collect()).unwrap_or_default();
+    let resolution = data.resolution;
     ItemQuery {
-        parent_id: (!favorites && !person && !collections && !playlists).then(|| view.id.clone()),
+        parent_id: (!favorites && !person && !genre && !studio && !collections && !playlists)
+            .then(|| view.id.clone()),
+        genre_ids,
+        years,
+        is_4k: (resolution == Some(Resolution::Uhd)).then_some(true),
+        is_hd: match resolution {
+            Some(Resolution::Hd) => Some(true),
+            Some(Resolution::Sd) => Some(false),
+            _ => None,
+        },
+        has_subtitles: data.subtitles.then_some(true),
         person_id: person.then(|| view.id.clone()),
+        studio_id: studio.then(|| view.id.clone()),
         filters: (!filters.is_empty()).then(|| filters.join(",")),
         include_types,
         recursive: Some(recursive),
@@ -340,9 +471,35 @@ pub fn load_home(client: &Client, libraries: Vec<Item>, need_views: bool, need_h
                 next_up: next_up.join().map_err(|_| join("next up"))??,
                 latest,
                 hero: hero.join().map_err(|_| join("hero"))?,
+                discover: Vec::new(),
+                genres: Vec::new(),
             },
         ))
     })
+}
+
+/// The rows of a home page with nothing to continue: random unwatched
+/// movies and series ("Pick something"), and the genres of the server.
+/// Both are optional; a failed request gives an empty row.
+pub fn load_discover(client: &Client) -> (Vec<Item>, Vec<Item>) {
+    let query = discover_query();
+    std::thread::scope(|scope| {
+        let picks = scope.spawn(|| client.items(&query).map(|page| page.items).unwrap_or_default());
+        let genres = scope.spawn(|| client.genres(None, &["Movie", "Series"]).unwrap_or_default());
+        (picks.join().unwrap_or_default(), genres.join().unwrap_or_default())
+    })
+}
+
+/// The query of "Pick something": unwatched movies and series at random.
+pub fn discover_query() -> ItemQuery {
+    ItemQuery {
+        include_types: vec!["Movie".into(), "Series".into()],
+        recursive: Some(true),
+        filters: Some("IsUnplayed".into()),
+        sort_by: Some("Random".into()),
+        limit: Some(DISCOVER_ITEMS),
+        ..Default::default()
+    }
 }
 
 /// Loads the item of a detail page and the rows under it. `known` is the
@@ -509,6 +666,11 @@ mod tests {
             assert_eq!(library_query(&library(kind)).parent_id, None, "{kind}");
         }
         assert_eq!(library_query(&library(PERSON_VIEW)).person_id.as_deref(), Some("lib"));
+        let genre = library_query(&library(GENRE_VIEW));
+        assert_eq!((genre.genre_ids.as_slice(), genre.parent_id), (["lib".to_string()].as_slice(), None));
+        assert_eq!(genre.include_types, ["Movie", "Series"]);
+        let studio = library_query(&library(STUDIO_VIEW));
+        assert_eq!((studio.studio_id.as_deref(), studio.parent_id), (Some("lib"), None));
         assert_eq!(library_query(&library(FAVORITES_ID)).filters.as_deref(), Some("IsFavorite"));
         assert_eq!(library_query(&library(PLAYLISTS_ID)).include_types, ["Playlist"]);
         // The collections are not inside the movie library.
@@ -526,6 +688,87 @@ mod tests {
         assert_eq!(library_query(&shows).filters.as_deref(), Some("IsFavorite"));
         shows.filter = Some("IsUnplayed");
         assert_eq!(library_query(&shows).filters.as_deref(), Some("IsFavorite,IsUnplayed"));
+    }
+
+    #[test]
+    fn a_genre_a_decade_a_resolution_and_subtitles_narrow_the_page() {
+        let mut movies = library("movies");
+        assert!(!movies.narrowed());
+        movies.genre = Some(("g1".into(), "Drama".into()));
+        movies.decade = Some(1990);
+        movies.resolution = Some(Resolution::Uhd);
+        movies.subtitles = true;
+        assert!(movies.narrowed());
+        let query = library_query(&movies);
+        assert_eq!(query.parent_id.as_deref(), Some("lib"));
+        assert_eq!(query.genre_ids, ["g1"]);
+        assert_eq!(query.years, (1990..=1999).collect::<Vec<_>>());
+        assert_eq!((query.is_4k, query.is_hd, query.has_subtitles), (Some(true), None, Some(true)));
+        movies.resolution = Some(Resolution::Sd);
+        assert_eq!((library_query(&movies).is_4k, library_query(&movies).is_hd), (None, Some(false)));
+        movies.clear_filters();
+        assert!(!movies.narrowed());
+        let query = library_query(&movies);
+        assert!(query.genre_ids.is_empty() && query.years.is_empty());
+        assert_eq!((query.is_4k, query.is_hd, query.has_subtitles), (None, None, None));
+    }
+
+    #[test]
+    fn the_page_of_a_genre_asks_the_whole_server_for_its_titles() {
+        let mut genre = library(GENRE_VIEW);
+        let query = library_query(&genre);
+        assert_eq!((query.parent_id, query.genre_ids.clone()), (None, vec!["lib".to_string()]));
+        assert_eq!(query.include_types, ["Movie", "Series"]);
+        genre.decade = Some(2010);
+        assert_eq!(library_query(&genre).years.first(), Some(&2010));
+    }
+
+    #[test]
+    fn the_filters_that_fit_a_page() {
+        let movies = library("movies");
+        assert!(movies.can_narrow_by_genre() && movies.can_narrow_by_streams());
+        let mut shows = library("tvshows");
+        assert!(shows.can_narrow_by_genre() && !shows.can_narrow_by_streams(), "a series has no streams");
+        shows.show = LibraryShow::Episodes;
+        assert!(!shows.can_narrow_by_genre() && shows.can_narrow_by_streams());
+        let playlists = library(PLAYLISTS_ID);
+        assert!(!playlists.can_narrow_by_genre() && !playlists.can_narrow_by_streams());
+        assert!(!library(PERSON_VIEW).can_narrow_by_genre());
+        assert_eq!(decade_label(1990), "1990s");
+    }
+
+    #[test]
+    fn the_narrowing_parameters_of_a_query() {
+        let query = ItemQuery {
+            genre_ids: vec!["a".into(), "b".into()],
+            years: vec![2001, 2002],
+            is_hd: Some(false),
+            ..Default::default()
+        };
+        let params = crate::jellyfin::narrowing_params(&query);
+        assert_eq!(
+            params,
+            [("genreIds", "a|b".to_string()), ("years", "2001,2002".to_string()), ("isHd", "false".to_string())]
+        );
+        assert!(crate::jellyfin::narrowing_params(&ItemQuery::default()).is_empty());
+    }
+
+    #[test]
+    fn a_new_user_gets_titles_to_pick_and_the_genres() {
+        let server = Routes::start(|_, path| match path {
+            p if p.starts_with("/Genres?") => (200, items(&["g1", "g2", "g3"], "Genre", "")),
+            p if p.starts_with("/Items?") && p.contains("filters=IsUnplayed") && p.contains("sortBy=Random") => {
+                (200, items(&["m1", "m2"], "Movie", ""))
+            }
+            _ => (404, String::new()),
+        });
+        let (picks, genres) = load_discover(&client(&server));
+        assert_eq!((picks.len(), genres.len()), (2, 3));
+        // A server that fails gives empty rows, not an error.
+        let down = Routes::start(|_, _| (500, String::new()));
+        assert_eq!(load_discover(&client(&down)), (Vec::new(), Vec::new()));
+        let home = HomeData::default();
+        assert!(home.nothing_started());
     }
 
     #[test]

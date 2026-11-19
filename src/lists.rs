@@ -178,8 +178,12 @@ pub(crate) impl Client {
     }
 
     fn create_collection(&self, name: &str, ids: &[String]) -> Result<String> {
-        let created: Created =
-            self.send(Method::Post, "/Collections", &[("name", name.to_string()), ("ids", ids.join(","))])?;
+        // An empty collection names no ids.
+        let mut query = vec![("name", name.to_string())];
+        if !ids.is_empty() {
+            query.push(("ids", ids.join(",")));
+        }
+        let created: Created = self.send(Method::Post, "/Collections", &query)?;
         ensure!(!created.id.is_empty(), "the server sent no id for the collection");
         Ok(created.id)
     }
@@ -240,6 +244,11 @@ pub enum Dialog {
     },
     Rename {
         list: Item,
+    },
+    /// Name a new, empty list (the "New playlist" button of an empty
+    /// page of the lists).
+    New {
+        kind: ListKind,
     },
 }
 
@@ -473,6 +482,7 @@ impl Bloom {
         let (value, placeholder) = match &dialog {
             Dialog::Add { kind, .. } => (String::new(), format!("New {} name", kind.noun())),
             Dialog::Rename { list } => (list.name.clone(), "Name".to_string()),
+            Dialog::New { kind } => (String::new(), format!("Name of the {}", kind.noun())),
         };
         self.lists.input.update(cx, |input, cx| {
             input.set_value(value, window, cx);
@@ -545,7 +555,48 @@ impl Bloom {
                 self.close_lists_dialog(window, cx);
                 self.rename_playlist(list, name, cx);
             }
+            Dialog::New { kind } => {
+                if name.is_empty() {
+                    return;
+                }
+                self.close_lists_dialog(window, cx);
+                self.create_empty_list(kind, name, cx);
+            }
         }
+    }
+
+    /// Asks for the name of a new, empty list.
+    pub fn ask_new_list(&mut self, kind: ListKind, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_lists_dialog(Dialog::New { kind }, window, cx);
+    }
+
+    /// Makes an empty list and opens it, so the user sees where it is.
+    pub fn create_empty_list(&mut self, kind: ListKind, name: String, cx: &mut Context<Self>) {
+        let made = name.clone();
+        self.fetch(
+            cx,
+            move |client| match kind {
+                ListKind::Playlist => client.create_playlist(&made, &[]),
+                ListKind::Collection => client.create_collection(&made, &[]),
+            },
+            move |this, result, cx| match result {
+                Ok(id) => {
+                    this.toast(format!("Made the {} {name}", kind.noun()), "", cx);
+                    this.load_lists(cx);
+                    let list = Item {
+                        id,
+                        name,
+                        kind: match kind {
+                            ListKind::Playlist => ItemKind::Playlist,
+                            ListKind::Collection => ItemKind::BoxSet,
+                        },
+                        ..Default::default()
+                    };
+                    this.open_item(list, cx);
+                }
+                Err(err) => this.toast("Could not make the list", format!("{err:#}"), cx),
+            },
+        );
     }
 
     // ----- Actions ------------------------------------------------------------
@@ -989,6 +1040,7 @@ impl Bloom {
                     lists.as_ref().map_or("loading".into(), |l| l.iter().map(|i| format!("{:?}", i.name)).collect::<Vec<_>>().join(","))
                 ),
                 Some(Dialog::Rename { list }) => format!("rename {:?}", list.name),
+                Some(Dialog::New { kind }) => format!("new {}", kind.noun()),
             }),
             // Picks a row of the open dialog, as a click does (from 1).
             "dialog-pick" => {

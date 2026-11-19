@@ -5,6 +5,7 @@
 //! app and are in its config file. A change is saved at once. The look
 //! follows the Abyss theme's rules for the web client's settings pages.
 
+mod home_rows;
 mod sections;
 
 use std::{collections::HashSet, rc::Rc};
