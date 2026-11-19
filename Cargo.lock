@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "bloom"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -853,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-core"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-ffi"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -890,7 +890,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-ios"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "bloom",
  "gpui-pre",
