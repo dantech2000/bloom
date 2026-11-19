@@ -44,6 +44,7 @@ struct PluginsPage: View {
                     }
                 }
             }
+            .emptyState(plugins.isEmpty, "No plugins", symbol: "puzzlepiece.extension", "Plugins installed on the server show here.")
             .confirmationDialog("Uninstall \(removing?.name ?? "")?", isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }),
                                 titleVisibility: .visible, presenting: removing) { plugin in
                 Button("Uninstall", role: .destructive) {

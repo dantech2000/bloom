@@ -150,15 +150,45 @@ struct DetailView: View {
         }
     }
 
-    /// A season's episodes, a tap plays one (as on the show's page).
+    /// A season's episodes, a tap plays one, and the season's download
+    /// over them (as on the show's page).
     private func episodeList(_ list: [MediaItem]) -> some View {
-        LazyVStack(alignment: .leading, spacing: 14) {
-            ForEach(list, id: \.id) { episode in
-                Button { model.play(episode) } label: { EpisodeRow(episode: episode) }
-                    .buttonStyle(.plain)
+        VStack(alignment: .leading, spacing: 12) {
+            downloadSeason(shown.name, list)
+            LazyVStack(alignment: .leading, spacing: 14) {
+                ForEach(list, id: \.id) { episode in
+                    Button { model.play(episode) } label: { EpisodeRow(episode: episode) }
+                        .buttonStyle(.plain)
+                }
             }
+            .padding(.horizontal, Metrics.gutter)
         }
-        .padding(.horizontal, Metrics.gutter)
+    }
+
+    /// "Download Season 1": every episode of the list not downloaded yet.
+    @ViewBuilder
+    private func downloadSeason(_ name: String, _ list: [MediaItem]) -> some View {
+        if model.prefs.canDownload {
+            Button("Download \(name)", systemImage: "arrow.down.circle") {
+                Task {
+                    guard let server = model.server else { return }
+                    let wanted = list.filter { $0.playable && Downloads.shared.entry($0.id) == nil }
+                    // One toast for the lot (the Mac's rule), not one per episode.
+                    model.say(wanted.isEmpty ? "Every episode is downloaded already" : "Downloading \(wanted.count) episodes")
+                    var failed = 0
+                    for (index, episode) in wanted.enumerated() {
+                        // A switch of server mid-loop: the rest belong to the old one.
+                        guard model.server === server else { failed += wanted.count - index; break }
+                        if await Downloads.shared.download(episode, server: server) != nil { failed += 1 }
+                    }
+                    if failed > 0 { model.say("\(failed) of them did not start") }
+                }
+            }
+            .quietButton()
+            .controlSize(.small)
+            .padding(.horizontal, Metrics.gutter)
+            .accessibilityIdentifier("season.download")
+        }
     }
 
     /// Play or resume the whole width of the column; a series plays its
@@ -279,6 +309,10 @@ struct DetailView: View {
     }
 
     private var playTarget: MediaItem? {
+        if shown.kind == .season, let list = detail?.episodes, !list.isEmpty {
+            // The one begun, else the first not watched, else the first.
+            return list.first { $0.resumeSecs > 0 } ?? list.first { !$0.played } ?? list.first
+        }
         if shown.isSeries {
             let next = detail?.nextUp.flatMap { HiddenTitles.shared.isHidden($0, on: .nextUp) ? nil : $0 }
             return next ?? episodes.first
@@ -288,7 +322,7 @@ struct DetailView: View {
 
     private func playLabel(_ target: MediaItem) -> String {
         let verb = target.resumeSecs > 0 ? "Resume" : "Play"
-        if shown.isSeries, let code = target.episodeCode { return "\(verb) \(code)" }
+        if shown.isSeries || shown.kind == .season, let code = target.episodeCode { return "\(verb) \(code)" }
         return verb
     }
 
@@ -296,25 +330,7 @@ struct DetailView: View {
         VStack(alignment: .leading, spacing: 12) {
             SeasonChips(seasons: seasons, chosen: season?.id) { s in Task { await pick(s) } }
             if !episodes.isEmpty, let season, episodesOf == season.id {
-                Button("Download \(season.name)", systemImage: "arrow.down.circle") {
-                    Task {
-                        guard let server = model.server, episodesOf == season.id else { return }
-                        let wanted = episodes.filter { $0.playable && Downloads.shared.entry($0.id) == nil }
-                        // One toast for the lot (the Mac's rule), not one per episode.
-                        model.say(wanted.isEmpty ? "Every episode is downloaded already" : "Downloading \(wanted.count) episodes")
-                        var failed = 0
-                        for (index, episode) in wanted.enumerated() {
-                            // A switch of server mid-loop: the rest belong to the old one.
-                            guard model.server === server else { failed += wanted.count - index; break }
-                            if await Downloads.shared.download(episode, server: server) != nil { failed += 1 }
-                        }
-                        if failed > 0 { model.say("\(failed) of them did not start") }
-                    }
-                }
-                .buttonStyle(.glass)
-                .controlSize(.small)
-                .padding(.horizontal, Metrics.gutter)
-                .accessibilityIdentifier("season.download")
+                downloadSeason(season.name, episodes)
             }
             LazyVStack(alignment: .leading, spacing: 14) {
                 ForEach(episodes, id: \.id) { episode in
@@ -489,7 +505,7 @@ struct BookmarkStrip: View {
                         Button("\(Words.clock(bookmark.secs))\(bookmark.label.isEmpty ? "" : " · \(bookmark.label)")", systemImage: "bookmark.fill") {
                             play(bookmark)
                         }
-                        .buttonStyle(.glass)
+                        .quietButton()
                     }
                 }
             }
@@ -544,7 +560,7 @@ struct SeerrExtrasSection: View {
                     Button(link.name, systemImage: "arrow.up.right.square") {
                         if let url = URL(string: link.url) { openURL(url) }
                     }
-                    .buttonStyle(.glass)
+                    .quietButton()
                 }
             }
             .padding(.horizontal, Metrics.gutter)

@@ -200,6 +200,11 @@ final class Shots: XCTestCase {
         let show = app.buttons["detail.series-link"]
         XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label CONTAINS 'Chapter'")).firstMatch.waitForExistence(timeout: 15), "The season page shows no episodes")
         XCTAssertFalse(app.buttons["detail.season-link"].exists, "A season page links to itself")
+        // A season plays its next episode and downloads as a whole, as the show's page does.
+        let play = app.buttons["detail.play"]
+        XCTAssertTrue(play.waitForExistence(timeout: 5), "A season page has no Play")
+        XCTAssertTrue(play.label.contains("S1:E"), "The season's Play says \(play.label)")
+        XCTAssertTrue(app.buttons["season.download"].exists, "A season page has no Download")
         sleep(2)
         shot("16c-season-page")
         XCTAssertTrue(show.waitForExistence(timeout: 5))
@@ -531,11 +536,17 @@ final class Shots: XCTestCase {
         app.navigationBars.buttons.firstMatch.tap()
         // The settings list's Home, not the tab bar's under the sheet.
         app.collectionViews.buttons["Home"].firstMatch.tap()
-        let first = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Section 1'")).firstMatch
-        XCTAssertTrue(first.waitForExistence(timeout: 5))
-        first.tap()
-        app.buttons["Next Up"].firstMatch.tap()
-        XCTAssertTrue(becomes(first, "label CONTAINS 'Next Up'", timeout: 10), "Section 1 shows \(first.label)")
+        // The rows in order; Add a row offers only a kind not on the list.
+        XCTAssertTrue(app.descendants(matching: .any)["home.row.nextup"].waitForExistence(timeout: 5), "No Next Up row")
+        // Add a row lists only the kinds not on the list.
+        XCTAssertFalse(app.buttons["home.add.nextup"].exists, "Add a row offers a row already on the list")
+        let add = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'home.add.'")).firstMatch
+        for _ in 0..<2 where !add.exists { app.swipeUp() }
+        XCTAssertTrue(add.waitForExistence(timeout: 5), "Add a row offers nothing")
+        let key = String(add.identifier.dropFirst("home.add.".count))
+        add.tap()
+        XCTAssertTrue(app.descendants(matching: .any)["home.row.\(key)"].waitForExistence(timeout: 10), "The row was not added")
+        XCTAssertFalse(app.buttons["home.add.\(key)"].exists, "The added kind is still offered")
         shot("26-settings-home")
     }
 
@@ -742,6 +753,121 @@ final class Shots: XCTestCase {
         try brandingImage(app)
     }
 
+    /// A deeper walk of the dashboard on dev/jellyfin-local (SHOT_SYNCPLAY):
+    /// a user's page and its access editor, a task's page, a log file, and
+    /// the New user and New key prompts closed with Cancel. Read only: no
+    /// Run, Scan, Save, Delete, Revoke, Uninstall or power action is tapped.
+    func testDashboardWalk() throws {
+        guard let server = env["SHOT_SYNCPLAY"], !server.isEmpty else { throw XCTSkip("needs SHOT_SYNCPLAY=<dev/jellyfin-local address>") }
+        let app = XCUIApplication()
+        app.launchEnvironment = [
+            "BLOOM_SERVER": server, "BLOOM_USER": "bloom-test", "BLOOM_PASSWORD": "bloom-test",
+            "BLOOM_MUTED": "1", "BLOOM_NO_REPORT": "1", "BLOOM_CHROMECAST_MOCK": "1",
+        ]
+        app.launch()
+        XCTAssertTrue(app.descendants(matching: .any)["hero"].waitForExistence(timeout: 60), "Home did not load")
+        sleep(2)
+        app.buttons["account"].firstMatch.tap()
+        let dashboard = app.buttons["account.dashboard"]
+        if !dashboard.waitForExistence(timeout: 5) { app.swipeUp() }
+        XCTAssertTrue(dashboard.waitForExistence(timeout: 10), "No Dashboard for an administrator")
+        dashboard.tap()
+        sleep(1)
+        shot("40-walk-dashboard")
+        let back = { app.navigationBars.buttons.firstMatch.tap(); sleep(1) }
+        func open(_ section: String) {
+            let link = app.buttons[section].firstMatch
+            if !link.exists { app.swipeUp() }
+            XCTAssertTrue(link.waitForExistence(timeout: 5), "No \(section) section")
+            link.tap()
+            sleep(3)
+        }
+        func tap(_ text: XCUIElement) {
+            XCTAssertTrue(text.waitForExistence(timeout: 10), "No \(text)")
+            text.tap()
+            sleep(3)
+        }
+
+        open("Overview")
+        shot("41-walk-overview")
+        app.swipeUp(); sleep(1)
+        shot("41b-walk-overview-end")
+        back()
+
+        open("Users")
+        shot("42-walk-users")
+        app.buttons["New user"].firstMatch.tap()
+        XCTAssertTrue(app.buttons["Cancel"].waitForExistence(timeout: 5), "No New user prompt")
+        shot("42b-walk-new-user")
+        app.buttons["Cancel"].tap(); sleep(1)
+        app.staticTexts["bloom-test"].firstMatch.tap(); sleep(3)
+        shot("42c-walk-user")
+        let access = app.buttons["Access and permissions"].firstMatch
+        if access.waitForExistence(timeout: 5) {
+            access.tap(); sleep(3)
+            shot("42d-walk-access")
+            app.swipeUp(); sleep(1)
+            shot("42e-walk-access-end")
+            // Nothing changed, so Discard leaves at once.
+            let discard = app.buttons["Discard"].firstMatch
+            if discard.exists { discard.tap() } else { back() }
+            sleep(1)
+            let confirm = app.sheets.buttons["Discard"].firstMatch
+            if confirm.waitForExistence(timeout: 2) { confirm.tap(); sleep(1) }
+        }
+        back(); back()
+
+        open("Libraries"); shot("43-walk-libraries"); back()
+        open("Devices"); shot("44-walk-devices"); back()
+        open("Activity"); shot("45-walk-activity")
+        app.swipeUp(); sleep(1); shot("45b-walk-activity-more"); back()
+
+        open("Scheduled tasks")
+        shot("46-walk-tasks")
+        tap(app.staticTexts["Update Plugins"].firstMatch)
+        shot("46b-walk-task")
+        back(); back()
+
+        open("Plugins"); shot("47-walk-plugins"); back()
+
+        open("Logs")
+        shot("48-walk-logs")
+        tap(app.staticTexts.matching(NSPredicate(format: "label ENDSWITH '.log' OR label ENDSWITH '.txt'")).firstMatch)
+        shot("48b-walk-log")
+        app.swipeUp(); sleep(1)
+        shot("48c-walk-log-scrolled")
+        back()
+        let find = app.searchFields.firstMatch
+        XCTAssertTrue(find.waitForExistence(timeout: 5), "No log search")
+        find.tap(); find.typeText("zzzz"); sleep(1)
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'zzzz'")).firstMatch.waitForExistence(timeout: 5),
+                      "No empty search state")
+        shot("48d-walk-log-no-match")
+        // iOS 26 closes a search with an X ("Close"); older ones say Cancel.
+        // iOS 26 closes the search with an X beside the field, which has no
+        // label in the tree: tap the spot right of the field.
+        let field = find.frame
+        app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: field.maxX + 30, dy: field.midY)).tap()
+        sleep(1)
+        back()
+
+        open("API keys")
+        shot("49-walk-keys")
+        app.buttons["New key"].firstMatch.tap()
+        XCTAssertTrue(app.buttons["Cancel"].waitForExistence(timeout: 5), "No New key prompt")
+        shot("49b-walk-new-key")
+        app.buttons["Cancel"].tap(); sleep(1)
+        back()
+
+        open("Branding")
+        shot("50-walk-branding")
+        app.swipeUp(); sleep(1)
+        shot("50b-walk-branding-end")
+        back()
+        XCTAssertFalse(app.staticTexts.matching(NSPredicate(format: "label ENDSWITH 'could not load'")).firstMatch.exists)
+    }
+
     /// Branding: upload a splash image (the app's own, BLOOM_TEST_SPLASH)
     /// and remove it again, so the container server ends as it started.
     private func brandingImage(_ app: XCUIApplication) throws {
@@ -936,19 +1062,24 @@ final class Shots: XCTestCase {
 
         app.buttons["Home"].firstMatch.tap()
         XCTAssertTrue(app.descendants(matching: .any)["offline.home"].waitForExistence(timeout: 5), "Home is not the offline page")
+        // Home's page says it; the accessory would say it twice.
+        XCTAssertTrue(accessory.waitForNonExistence(timeout: 5), "The accessory shows over the offline Home")
         shot("31-offline-home")
 
         // Retry while the server is still away: still offline, and said.
-        let retry = app.buttons["offline.retry"].firstMatch
+        // Home's own Retry: the identifier does not reach the tree from
+        // inside ContentUnavailableView, so the label finds it.
+        let retry = app.buttons.matching(NSPredicate(format: "identifier == 'offline.retry' OR label == 'Retry'")).firstMatch
         retry.tap()
         let toast = app.descendants(matching: .any)["toast"]
         XCTAssertTrue(toast.waitForExistence(timeout: 10), "No word after a failed Retry")
-        XCTAssertTrue(accessory.exists, "A failed Retry ended the offline state")
+        XCTAssertTrue(app.descendants(matching: .any)["offline.home"].exists, "A failed Retry ended the offline state")
 
         XCTAssertTrue(relay.start(), "The relay did not listen again")
         XCTAssertTrue(retry.waitForExistence(timeout: 5))
         retry.tap()
         XCTAssertTrue(app.descendants(matching: .any)["hero"].waitForExistence(timeout: 15), "Home did not load again")
+        app.buttons["Downloads"].firstMatch.tap()
         XCTAssertTrue(accessory.waitForNonExistence(timeout: 5), "The accessory stayed after the return")
         shot("32-back-online")
     }

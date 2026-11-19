@@ -17,6 +17,7 @@ struct TasksPage: View {
                     }
                 }
             }
+            .emptyState(shown.isEmpty, "No scheduled tasks", symbol: "clock.arrow.circlepath", "The server reports no tasks.", search: find)
             .searchable(text: $find, prompt: "Find a task")
         }
     }

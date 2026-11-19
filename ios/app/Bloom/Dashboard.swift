@@ -151,3 +151,19 @@ enum When {
         return date.formatted(.relative(presentation: .named))
     }
 }
+
+extension View {
+    /// A list with nothing in it says so; with a search typed, that nothing
+    /// matched it.
+    func emptyState(_ empty: Bool, _ title: String, symbol: String, _ detail: String, search: String = "") -> some View {
+        overlay {
+            if empty {
+                if search.isEmpty {
+                    ContentUnavailableView(title, systemImage: symbol, description: Text(detail))
+                } else {
+                    ContentUnavailableView.search(text: search)
+                }
+            }
+        }
+    }
+}

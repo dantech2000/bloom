@@ -68,6 +68,7 @@ struct ConnectView: View {
         .onAppear { field = .address }
     }
 
+    @ViewBuilder
     private var addressSection: some View {
         Section {
             TextField("Server address", text: $address, prompt: Text("https://jellyfin.example.com"))
@@ -79,11 +80,23 @@ struct ConnectView: View {
                 .focused($field, equals: .address)
                 .onSubmit { Task { await connect() } }
                 .accessibilityIdentifier("connect.address")
-            Button("Connect") { Task { await connect() } }
-                .disabled(address.trimmingCharacters(in: .whitespaces).isEmpty)
         } footer: {
             Text("Enter the address of your Jellyfin server.")
         }
+        mainAction("Connect", disabled: address.trimmingCharacters(in: .whitespaces).isEmpty) { await connect() }
+    }
+
+    /// The one white button of the screen, in a section of its own so it
+    /// does not read as another field of the group above (DESIGN.md).
+    private func mainAction(_ title: String, disabled: Bool, _ action: @escaping () async -> Void) -> some View {
+        Section {
+            Button(title) { Task { await action() } }
+                .buttonStyle(MainButtonStyle(wide: true))
+                .disabled(disabled)
+                .listRowInsets(EdgeInsets())
+                .listRowBackground(Color.clear)
+        }
+        .listSectionSpacing(12)
     }
 
     @ViewBuilder
@@ -98,9 +111,11 @@ struct ConnectView: View {
         if !found.users.isEmpty {
             Section("Users on \(found.info.name)") {
                 ForEach(found.users, id: \.id) { user in
-                    Button(user.name) {
+                    Button {
                         username = user.name
                         field = .password
+                    } label: {
+                        Label(user.name, systemImage: "person.crop.circle").foregroundStyle(Color.ink)
                     }
                 }
             }
@@ -119,8 +134,6 @@ struct ConnectView: View {
                 .focused($field, equals: .password)
                 .onSubmit { Task { await signIn() } }
                 .accessibilityIdentifier("connect.password")
-            Button("Sign In") { Task { await signIn() } }
-                .disabled(username.isEmpty)
         } footer: {
             // The server's own words for its sign-in page (Markdown, as the
             // web client reads it).
@@ -128,6 +141,7 @@ struct ConnectView: View {
                 Text((try? AttributedString(markdown: disclaimer)) ?? AttributedString(disclaimer))
             }
         }
+        mainAction("Sign In", disabled: username.isEmpty) { await signIn() }
         if found.quickConnect {
             Section {
                 if let code {

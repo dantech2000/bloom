@@ -17,6 +17,7 @@ struct LogsPage: View {
                     }
                 }
             }
+            .emptyState(shown.isEmpty, "No logs", symbol: "doc.plaintext", "The server has written no log files.", search: find)
             .searchable(text: $find, prompt: "Find a log")
         }
     }

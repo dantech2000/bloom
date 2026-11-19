@@ -118,6 +118,8 @@ struct SettingsSheet: View {
 private struct ServerSection<Content: View>: View {
     @Environment(AppModel.self) private var model
     let title: String
+    /// An Edit button for a list of rows to move or remove.
+    var editable = false
     @ViewBuilder let content: () -> Content
 
     var body: some View {
@@ -125,6 +127,7 @@ private struct ServerSection<Content: View>: View {
             switch model.prefs.load {
             case .loaded:
                 List { content() }
+                    .toolbar { if editable { EditButton() } }
             case .failed(let why):
                 ContentUnavailableView {
                     Label("The settings could not load", systemImage: "wifi.exclamationmark")
@@ -317,49 +320,66 @@ struct SubtitleSettings: View {
 
 struct HomeSettings: View {
     @Environment(AppModel.self) private var model
-    /// The kinds of the web client; the last ones have no row here.
+    /// The kinds of the web client.
     static let kinds: [(key: String, name: String)] = [
-        ("none", "None"), ("latestmedia", "Recently Added"), ("smalllibrarytiles", "My Media"),
+        ("latestmedia", "Recently Added"), ("smalllibrarytiles", "My Media"),
         ("librarybuttons", "My Media (small)"), ("resume", "Continue Watching"), ("nextup", "Next Up"),
-        ("resumeaudio", "Continue Listening (web only)"), ("resumebook", "Continue Reading (web only)"),
-        ("livetv", "Live TV (web only)"), ("activerecordings", "Active Recordings (web only)"),
+        ("resumeaudio", "Continue Listening"), ("resumebook", "Continue Reading"),
+        ("livetv", "Live TV"), ("activerecordings", "Active Recordings"),
     ]
+    /// Rows Jellyfin Web shows and Bloom has no page for.
+    static let webOnly: Set<String> = ["resumeaudio", "resumebook", "livetv", "activerecordings"]
+    static let slots = 10
+
+    static func name(_ kind: String) -> String { kinds.first { $0.key == kind }?.name ?? kind }
 
     var body: some View {
-        ServerSection(title: "Home") {
-            let prefs = model.prefs
+        ServerSection(title: "Home", editable: true) {
+            let rows = (0..<Self.slots).map { model.prefs.homeSection($0) }.filter { $0 != "none" }
             Section {
-                ForEach(0..<10, id: \.self) { slot in
-                    let kind = prefs.homeSection(slot)
-                    HStack {
-                        Picker("Section \(slot + 1)", selection: Binding(get: { kind },
-                                                                        set: { prefs.setCustom(["homesection\(slot)": $0]) })) {
-                            ForEach(Self.kinds, id: \.key) { Text($0.name).tag($0.key) }
-                            if !Self.kinds.contains(where: { $0.key == kind }) { Text(kind).tag(kind) }
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, kind in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(Self.name(kind))
+                        if Self.webOnly.contains(kind) {
+                            Text("Jellyfin Web only; Bloom skips it").font(.caption).foregroundStyle(.secondary)
                         }
                     }
-                    .swipeActions(edge: .leading) {
-                        if slot > 0 {
-                            Button("Move up", systemImage: "arrow.up") { swap(slot, slot - 1) }.tint(.gray)
+                    .accessibilityIdentifier("home.row.\(kind)")
+                }
+                .onMove { from, to in
+                    var moved = rows
+                    moved.move(fromOffsets: from, toOffset: to)
+                    save(moved)
+                }
+                .onDelete { gone in
+                    var kept = rows
+                    kept.remove(atOffsets: gone)
+                    save(kept)
+                }
+            } header: {
+                Text("Rows, top to bottom")
+            } footer: {
+                Text("Tap Edit to move or remove a row. Jellyfin Web uses the same list.")
+            }
+            let free = Self.kinds.filter { !rows.contains($0.key) && !Self.webOnly.contains($0.key) }
+            if rows.count < Self.slots, !free.isEmpty {
+                Section("Add a row") {
+                    ForEach(free, id: \.key) { kind in
+                        Button { save(rows + [kind.key]) } label: {
+                            Label(kind.name, systemImage: "plus.circle.fill").foregroundStyle(Color.ink)
                         }
-                    }
-                    .swipeActions(edge: .trailing) {
-                        if slot < 9 {
-                            Button("Move down", systemImage: "arrow.down") { swap(slot, slot + 1) }.tint(.gray)
-                        }
+                        .accessibilityIdentifier("home.add.\(kind.key)")
                     }
                 }
-            } footer: {
-                Text("The home page shows them from top to bottom. The web client uses the same list. Swipe a row to move it.")
             }
         }
     }
 
-    /// A move changes places with the neighbour, in one save.
-    private func swap(_ slot: Int, _ other: Int) {
-        let prefs = model.prefs
-        let (here, there) = (prefs.homeSection(slot), prefs.homeSection(other))
-        prefs.setCustom(["homesection\(slot)": there, "homesection\(other)": here])
+    /// The list in its slots, the rest empty, in one save.
+    private func save(_ rows: [String]) {
+        var changes: [String: String] = [:]
+        for slot in 0..<Self.slots { changes["homesection\(slot)"] = slot < rows.count ? rows[slot] : "none" }
+        model.prefs.setCustom(changes)
     }
 }
 

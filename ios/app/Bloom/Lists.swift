@@ -125,7 +125,7 @@ struct PlaylistPage: View {
                         Button("Play", systemImage: "play.fill") { model.play(all: entries.map(\.item)) }
                             .primaryButton()
                         Button("Shuffle", systemImage: "shuffle") { model.play(all: entries.map(\.item), shuffled: true) }
-                            .buttonStyle(.glass)
+                            .quietButton()
                     }
                     .listRowBackground(Color.clear)
                     .listRowInsets(EdgeInsets())

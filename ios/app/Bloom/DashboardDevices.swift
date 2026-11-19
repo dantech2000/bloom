@@ -19,6 +19,7 @@ struct DevicesPage: View {
                     }
                 }
             }
+            .emptyState(devices.isEmpty, "No devices", symbol: "ipad.and.iphone", "A device shows here once it signs in.")
             .confirmationDialog("Delete \(deleting?.name ?? "")?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
                                 titleVisibility: .visible, presenting: deleting) { device in
                 Button("Delete device", role: .destructive) {
@@ -50,6 +51,7 @@ struct ActivityPage: View {
                     }
                 }
             }
+            .emptyState(entries.isEmpty, "No activity", symbol: "list.bullet.rectangle", "Sign-ins, playback and changes show here.")
         }
     }
 }

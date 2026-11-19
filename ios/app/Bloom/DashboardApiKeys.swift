@@ -24,6 +24,7 @@ struct ApiKeysPage: View {
                     Button("Revoke", role: .destructive) { revoking = key }
                 }
             }
+            .emptyState(keys.isEmpty, "No API keys", symbol: "key", "A key lets another app use this server. Tap + to make one.")
             .toolbar { Button("New key", systemImage: "plus") { naming = true } }
             .alert("New API key", isPresented: $naming) {
                 TextField("App name", text: $app)

@@ -50,7 +50,7 @@ struct PlayerView: View {
             if let error = model.error {
                 VStack(spacing: 12) {
                     Text(error).multilineTextAlignment(.center)
-                    Button("Close") { close() }.buttonStyle(.glass)
+                    Button("Close") { close() }.quietButton()
                 }
                 .padding(24)
                 .glassEffect(.regular, in: .rect(cornerRadius: 24))
@@ -311,7 +311,7 @@ struct PlayerView: View {
             upNextCard(next)
         } else if let segment = model.skippable {
             Button(Self.skipLabel(segment.kind)) { model.skipSegment() }
-                .buttonStyle(.glass)
+                .quietButton()
                 .controlSize(.large)
                 .accessibilityIdentifier("player.skip")
                 .transition(.opacity)
@@ -329,7 +329,7 @@ struct PlayerView: View {
                         .primaryButton()
                         .accessibilityIdentifier("player.upnext.play")
                     Button("Hide") { model.upNextHidden = true }
-                        .buttonStyle(.glass)
+                        .quietButton()
                         .accessibilityIdentifier("player.upnext.hide")
                 }
                 .controlSize(.small)

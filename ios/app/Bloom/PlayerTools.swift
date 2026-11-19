@@ -117,8 +117,29 @@ struct PlayerTools: View {
         .buttonStyle(ToolButtonStyle())
     }
 
+    /// The quality chosen, in the words of its row.
+    private var qualityName: String {
+        guard let chosen = model.quality, let rung = model.info?.rungs.first(where: { $0.bitrate == chosen }) else { return "Auto" }
+        return rung.label
+    }
+
     private var settings: some View {
         Menu {
+            // Quality first, as a row with its choice, like Speed: its
+            // list of rates would push every other entry down.
+            Menu {
+                Button { model.releaseControls(); Task { await model.setQuality(nil) } } label: {
+                    Checked(title: "Auto · " + (model.info?.transcoding == true ? "Lowered by the server" : "The file as it is"), on: model.quality == nil)
+                }
+                ForEach(model.info?.rungs ?? [], id: \.bitrate) { rung in
+                    Button { model.releaseControls(); Task { await model.setQuality(rung.bitrate) } } label: {
+                        Checked(title: "\(rung.label) · \(rung.height)", on: model.quality == rung.bitrate)
+                    }
+                }
+            } label: {
+                Label("Quality · \(qualityName)", systemImage: "sparkles.tv")
+            }
+            .accessibilityIdentifier("player.quality")
             Menu {
                 ForEach([0.5, 0.75, 1, 1.25, 1.5, 2], id: \.self) { speed in
                     Button { model.setSpeed(speed); model.releaseControls() } label: {
@@ -144,16 +165,6 @@ struct PlayerTools: View {
             }
             Button("Playback info", systemImage: "info.circle") { model.showInfo.toggle(); model.releaseControls() }
                 .accessibilityIdentifier("player.info")
-            Section("Quality") {
-                Button { model.releaseControls(); Task { await model.setQuality(nil) } } label: {
-                    Checked(title: "Auto · " + (model.info?.transcoding == true ? "Lowered by the server" : "The file as it is"), on: model.quality == nil)
-                }
-                ForEach(model.info?.rungs ?? [], id: \.bitrate) { rung in
-                    Button { model.releaseControls(); Task { await model.setQuality(rung.bitrate) } } label: {
-                        Checked(title: "\(rung.label) · \(rung.height)", on: model.quality == rung.bitrate)
-                    }
-                }
-            }
         } label: {
             Label("Settings", systemImage: "gearshape").toolTarget()
         }

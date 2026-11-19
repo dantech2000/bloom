@@ -26,6 +26,7 @@ struct LibrariesPage: View {
                     Text(library.locations.joined(separator: "\n")).font(.caption).foregroundStyle(.secondary)
                 }
             }
+            .emptyState(libraries.isEmpty, "No libraries", symbol: "books.vertical", "Add a library in the web dashboard.")
         }
     }
 }

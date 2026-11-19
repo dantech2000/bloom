@@ -372,10 +372,7 @@ struct SyncPlaySheet: View {
             Button("Leave the group", role: .destructive) { model.syncSession?.user(intent: .leave) }
                 .accessibilityIdentifier("syncplay.leave")
         } footer: {
-            // How well this player is in step (the Mac panel's last line).
-            Text(Self.stats(state))
-                .monospacedDigit()
-                .accessibilityIdentifier("syncplay.stats")
+            Text(Self.inStep(state))
         }
         Section {
             Toggle("Keep in step with the group", isOn: $keepInStep)
@@ -384,6 +381,12 @@ struct SyncPlaySheet: View {
                 ForEach(Self.delays, id: \.self) { ms in Text(Self.delayName(ms)).tag(ms) }
             }
             .onChange(of: delayMs) { model.syncSession?.setDelay(ms: delayMs) }
+            // The Mac panel's figures, for a look when something is off.
+            DisclosureGroup("Connection details") {
+                Text(Self.stats(state))
+                    .font(.footnote).monospacedDigit().foregroundStyle(.secondary)
+                    .accessibilityIdentifier("syncplay.stats")
+            }
         } header: {
             Text("This player")
         } footer: {
@@ -397,6 +400,22 @@ struct SyncPlaySheet: View {
     static func delayName(_ ms: Double) -> String {
         if ms == 0 { return "None" }
         return ms > 0 ? String(format: "%.0f ms later", ms) : String(format: "%.0f ms earlier", -ms)
+    }
+
+    /// How this player stands with the group, in plain words.
+    static func inStep(_ state: SyncState) -> String {
+        if !state.following { return "This device plays on its own; the group goes on without it." }
+        switch state.phase {
+        case .idle, .parked: return "Waiting for the group to play something."
+        case .loading, .starting, .advancing: return "Getting ready with the group…"
+        case .seeking, .catchingUp: return "Catching up with the group…"
+        case .playing:
+            // The drift is the group's place less this player's.
+            if let drift = state.driftMs, abs(drift) >= 250 {
+                return String(format: "%.1f s %@ the group.", abs(drift) / 1000, drift > 0 ? "behind" : "ahead of")
+            }
+            return "In step with the group."
+        }
     }
 
     static func stats(_ state: SyncState) -> String {

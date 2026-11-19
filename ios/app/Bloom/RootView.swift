@@ -102,9 +102,10 @@ struct RootView: View {
         .tabViewStyle(.sidebarAdaptable)
         .tabBarMinimizeBehavior(.onScrollDown)
         // What plays on another device, above the tab bar (spec §6.1);
-        // a server gone away comes first (spec §16.9).
-        .tabViewBottomAccessory(isEnabled: model.offline || model.remote != nil || model.castDevice != nil) {
-            if model.offline {
+        // a server gone away comes first (spec §16.9), except on Home,
+        // whose page says it already.
+        .tabViewBottomAccessory(isEnabled: (model.offline && model.tab != .home) || model.remote != nil || model.castDevice != nil) {
+            if model.offline && model.tab != .home {
                 OfflineAccessory()
             } else if model.castDevice != nil {
                 CastAccessory()
@@ -310,6 +311,7 @@ struct OfflineHome: View {
             Button("Retry") { Task { await model.retry() } }
                 .primaryButton()
                 .disabled(model.retrying)
+                .accessibilityIdentifier("offline.retry")
             Button("Open Downloads") { model.tab = .downloads }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

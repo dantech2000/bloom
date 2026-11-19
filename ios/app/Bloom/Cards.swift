@@ -15,6 +15,8 @@ enum Metrics {
     static let rowSpacing: CGFloat = 30
     /// A field or a main button on a phone (DESIGN.md).
     static let control: CGFloat = 50
+    /// The corners of a control, a field or a button (DESIGN.md, "Shapes").
+    static let controlCorner: CGFloat = 14
     /// A round icon button.
     static let disc: CGFloat = 48
     /// A grid of posters: as many as fit at 105 points or more.
@@ -31,7 +33,14 @@ enum Metrics {
 extension View {
     /// The one white primary button of a page (DESIGN.md).
     func primaryButton() -> some View {
-        buttonStyle(.glassProminent).foregroundStyle(.black)
+        buttonStyle(.glassProminent).buttonBorderShape(.roundedRectangle(radius: Metrics.controlCorner))
+            .foregroundStyle(.black)
+    }
+
+    /// A quiet glass button with a label (DESIGN.md, "Buttons"): the
+    /// second action beside a primary one, at the control radius.
+    func quietButton() -> some View {
+        buttonStyle(.glass).buttonBorderShape(.roundedRectangle(radius: Metrics.controlCorner))
     }
 
     /// An icon on a round pane of glass: the quiet actions beside a
@@ -63,8 +72,8 @@ struct MainButtonStyle: ButtonStyle {
             .foregroundStyle(Color.inkOnWhite)
             .padding(.horizontal, 24)
             .frame(maxWidth: wide ? .infinity : nil, minHeight: Metrics.control)
-            .background(Color.ink, in: .capsule)
-            .contentShape(.capsule)
+            .background(Color.ink, in: .rect(cornerRadius: Metrics.controlCorner))
+            .contentShape(.rect(cornerRadius: Metrics.controlCorner))
             .opacity(configuration.isPressed ? 0.88 : 1)
             .opacity(enabled ? 1 : 0.5)
     }
