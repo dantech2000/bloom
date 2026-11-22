@@ -2,16 +2,23 @@ import BloomCore
 import SwiftUI
 
 /// What a library's grid is narrowed to beside its Show filter: one genre,
-/// one decade, a lowest community rating. Empty shows everything.
+/// one decade, a lowest community rating, one audio and one subtitle
+/// language (Jellyfin 12.0). Empty shows everything.
 struct BrowseFilters: Hashable {
     var genre: String?
     /// The decade's first year: 1990 for the 1990s.
     var decade: Int?
     var minRating: Float?
+    var audioLanguage: Language?
+    var subtitleLanguage: Language?
 
-    var active: Bool { genre != nil || decade != nil || minRating != nil }
+    var active: Bool {
+        genre != nil || decade != nil || minRating != nil || audioLanguage != nil || subtitleLanguage != nil
+    }
 
-    var key: String { "\(genre ?? "")|\(decade ?? 0)|\(minRating ?? 0)" }
+    var key: String {
+        "\(genre ?? "")|\(decade ?? 0)|\(minRating ?? 0)|\(audioLanguage?.code ?? "")|\(subtitleLanguage?.code ?? "")"
+    }
 
     /// The years of the decade the server knows titles of (all ten when
     /// the choices have not come).
@@ -32,11 +39,13 @@ struct BrowseFilters: Hashable {
     }
 }
 
-/// The genre, decade and rating pickers of a grid's Filter menu, each a
-/// submenu.
+/// The genre, decade, rating and track language pickers of a grid's Filter
+/// menu, each a submenu. A language submenu shows when the server lists
+/// languages (Jellyfin 12.0 and later).
 struct BrowseFilterMenus: View {
     @Binding var narrow: BrowseFilters
     let choices: FilterChoices?
+    var languages: LanguageChoices? = nil
     /// A genre's own grid: its genre is the page, not a filter.
     var genreFixed = false
 
@@ -72,6 +81,30 @@ struct BrowseFilterMenus: View {
             Label("Rating", systemImage: "star")
             if let rating = narrow.minRating { Text("\(BrowseFilters.ratingTitle(rating)) stars") }
         }
+        if !(languages?.audio ?? []).isEmpty || narrow.audioLanguage != nil {
+            Menu {
+                entry("Any language", on: narrow.audioLanguage == nil) { narrow.audioLanguage = nil }
+                ForEach(languages?.audio ?? [], id: \.code) { language in
+                    entry(language.name, on: narrow.audioLanguage?.code == language.code) { narrow.audioLanguage = language }
+                }
+            } label: {
+                Label("Audio language", systemImage: "waveform")
+                if let language = narrow.audioLanguage { Text(language.name) }
+            }
+            .accessibilityIdentifier("filter.audioLanguage")
+        }
+        if !(languages?.subtitles ?? []).isEmpty || narrow.subtitleLanguage != nil {
+            Menu {
+                entry("Any language", on: narrow.subtitleLanguage == nil) { narrow.subtitleLanguage = nil }
+                ForEach(languages?.subtitles ?? [], id: \.code) { language in
+                    entry(language.name, on: narrow.subtitleLanguage?.code == language.code) { narrow.subtitleLanguage = language }
+                }
+            } label: {
+                Label("Subtitle language", systemImage: "captions.bubble")
+                if let language = narrow.subtitleLanguage { Text(language.name) }
+            }
+            .accessibilityIdentifier("filter.subtitleLanguage")
+        }
     }
 
     /// A choice with a tick when it is the one in use.
@@ -97,6 +130,8 @@ struct BrowseActiveFilters: View {
                 if let genre = narrow.genre { pill(genre) { narrow.genre = nil } }
                 if let decade = narrow.decade { pill("\(String(decade))s") { narrow.decade = nil } }
                 if let rating = narrow.minRating { pill("\(BrowseFilters.ratingTitle(rating)) stars") { narrow.minRating = nil } }
+                if let language = narrow.audioLanguage { pill("\(language.name) audio") { narrow.audioLanguage = nil } }
+                if let language = narrow.subtitleLanguage { pill("\(language.name) subtitles") { narrow.subtitleLanguage = nil } }
             }
         }
         .contentMargins(.horizontal, Metrics.gutter, for: .scrollContent)

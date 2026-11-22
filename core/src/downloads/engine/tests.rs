@@ -42,6 +42,8 @@ struct Mock {
     ranges: Arc<Mutex<Vec<Option<String>>>>,
     /// Requests of any kind.
     hits: Arc<std::sync::atomic::AtomicUsize>,
+    /// The path of each request to the file.
+    paths: Arc<Mutex<Vec<String>>>,
 }
 
 impl Mock {
@@ -53,15 +55,17 @@ impl Mock {
         let mode = Arc::new(Mutex::new(Mode::Normal));
         let ranges = Arc::new(Mutex::new(Vec::new()));
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let paths = Arc::new(Mutex::new(Vec::new()));
         let (served, shared_mode, shared_ranges, counted) = (file.clone(), mode.clone(), ranges.clone(), hits.clone());
+        let shared_paths = paths.clone();
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 counted.fetch_add(1, Ordering::SeqCst);
-                let (file, mode, ranges) = (served.clone(), shared_mode.clone(), shared_ranges.clone());
-                thread::spawn(move || serve(stream, file, mode, ranges));
+                let (file, mode, ranges, paths) = (served.clone(), shared_mode.clone(), shared_ranges.clone(), shared_paths.clone());
+                thread::spawn(move || serve(stream, file, mode, ranges, paths));
             }
         });
-        Self { port, file, mode, ranges, hits }
+        Self { port, file, mode, ranges, hits, paths }
     }
 
     fn hits(&self) -> usize {
@@ -82,7 +86,13 @@ impl Mock {
     }
 }
 
-fn serve(mut stream: TcpStream, file: Arc<Vec<u8>>, mode: Arc<Mutex<Mode>>, ranges: Arc<Mutex<Vec<Option<String>>>>) {
+fn serve(
+    mut stream: TcpStream,
+    file: Arc<Vec<u8>>,
+    mode: Arc<Mutex<Mode>>,
+    ranges: Arc<Mutex<Vec<Option<String>>>>,
+    paths: Arc<Mutex<Vec<String>>>,
+) {
     let Some(request) = Request::read(&mut stream) else { return };
     let path = request.path().to_string();
     let header = |name: &str| request.header(name);
@@ -93,6 +103,7 @@ fn serve(mut stream: TcpStream, file: Arc<Vec<u8>>, mode: Arc<Mutex<Mode>>, rang
     if path.ends_with("/Download") {
         let range = header("range");
         ranges.lock().unwrap().push(range.clone());
+        paths.lock().unwrap().push(path.clone());
         // The file has a validator; a range that names another one
         // gets the whole file, as a server answers `If-Range`.
         let tag = format!("\"file-{}\"", file.len());
@@ -180,11 +191,17 @@ fn serve(mut stream: TcpStream, file: Arc<Vec<u8>>, mode: Arc<Mutex<Mode>>, rang
             Mode::Oversend => file.len() - 1000,
             _ => file.len(),
         };
+        // An item named "multi..." has two versions, the other one first.
+        let own = serde_json::json!({ "Id": id, "Size": size, "Container": "bin", "MediaStreams": [] });
+        let sources = match id.starts_with("multi") {
+            true => serde_json::json!([{ "Id": format!("v2{id}"), "Size": size, "Container": "mkv", "MediaStreams": [] }, own]),
+            false => serde_json::json!([own]),
+        };
         let body = serde_json::json!({
             "Id": id, "Name": "Test episode", "Type": "Episode",
             "SeriesName": "Test show", "SeriesId": "series1",
             "ParentIndexNumber": 1, "IndexNumber": 2,
-            "MediaSources": [{ "Id": id, "Size": size, "Container": "bin", "MediaStreams": [] }],
+            "MediaSources": sources,
             // An item named "art..." has a poster (`POSTER`).
             "ImageTags": if id.starts_with("art") { serde_json::json!({"Primary": "t"}) } else { serde_json::json!({}) }
         });
@@ -306,6 +323,36 @@ fn wait_state(engine: &Engine, id: &str, state: EntryState) -> Entry {
         assert!(Instant::now() < deadline, "waited for {state:?}, got {entry:?}");
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// A version is the file of its own item: the download asks for that
+/// item's file, and the folder's `meta.json` names it first. Without a
+/// choice the item's own file comes, also when the server lists another
+/// version first.
+#[test]
+fn a_download_of_a_version_fetches_its_file() {
+    let mock = Mock::start(20_000);
+    let dir = temp_dir("version");
+    let engine = engine(&mock, dir.clone(), options());
+    engine.add_version(&item("multi1"), Some("v2multi1")).unwrap();
+    engine.add(&item("multi2")).unwrap();
+    let chosen = wait_state(&engine, "multi1", EntryState::Done);
+    let own = wait_state(&engine, "multi2", EntryState::Done);
+    assert_eq!(chosen.source_id.as_deref(), Some("v2multi1"));
+    assert_eq!(chosen.file.as_deref(), Some("video.mkv"));
+    assert_eq!(own.source_id, None);
+    assert_eq!(own.file.as_deref(), Some("video.bin"));
+    let paths = mock.paths.lock().unwrap().clone();
+    assert!(paths.contains(&"/Items/v2multi1/Download".to_string()), "{paths:?}");
+    assert!(paths.contains(&"/Items/multi2/Download".to_string()), "{paths:?}");
+    let meta = engine.meta("multi1").unwrap();
+    assert_eq!(meta["SourceId"], "v2multi1");
+    assert_eq!(meta["Item"]["MediaSources"][0]["Id"], "v2multi1");
+    assert_eq!(engine.meta("multi2").unwrap()["Item"]["MediaSources"][0]["Id"], "multi2");
+    // An id that is not one is refused before it reaches a path.
+    assert!(engine.add_version(&item("multi3"), Some("../x")).is_err());
+    drop(engine);
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

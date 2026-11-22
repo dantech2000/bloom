@@ -171,6 +171,8 @@ impl Session {
                         audio: None,
                         subtitle: None,
                         burn_in: false,
+                        // A group plays the item's own file on every member.
+                        media_source_id: None,
                     },
                 );
                 ui.push(Ui::NowPlaying { item_id });

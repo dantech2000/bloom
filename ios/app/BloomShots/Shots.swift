@@ -554,6 +554,35 @@ final class Shots: XCTestCase {
         shot("26-settings-home")
     }
 
+    /// Settings › Audio offers "Original language" (Jellyfin 12.0) after
+    /// "Any language"; the choice reaches the server as "OriginalLanguage".
+    func testOriginalLanguage() {
+        let app = launch()
+        app.buttons["account"].firstMatch.tap()
+        XCTAssertTrue(app.buttons["Settings"].firstMatch.waitForExistence(timeout: 5), "No account sheet")
+        app.buttons["Settings"].firstMatch.tap()
+        let audio = app.collectionViews.buttons["Audio"].firstMatch
+        XCTAssertTrue(audio.waitForExistence(timeout: 5), "No Audio in Settings")
+        audio.tap()
+        let picker = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Audio language'")).firstMatch
+        XCTAssertTrue(picker.waitForExistence(timeout: 10), "The audio settings did not load")
+        picker.tap()
+        let original = app.buttons["Original language"].firstMatch
+        XCTAssertTrue(original.waitForExistence(timeout: 5), "No Original language among the audio languages")
+        sleep(1)
+        shot("25b-audio-language-menu")
+        original.tap()
+        let saved = MockServer.wait(timeout: 10) {
+            let me = MockServer.json("/Users/Me") as? [String: Any]
+            return (me?["Configuration"] as? [String: Any])?["AudioLanguagePreference"] as? String == "OriginalLanguage"
+        }
+        XCTAssertTrue(saved, "The server did not get OriginalLanguage")
+        XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label CONTAINS 'Original language'")).firstMatch
+            .waitForExistence(timeout: 5), "The picker does not show the choice")
+        sleep(1)
+        shot("25c-audio-original")
+    }
+
     /// Playlists: a film goes into a new playlist from its page's More
     /// menu; the playlist page lists it and plays it.
     func testLists() {

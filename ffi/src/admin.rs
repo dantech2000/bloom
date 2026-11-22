@@ -108,7 +108,6 @@ pub struct AdminUser {
     pub name: String,
     pub admin: bool,
     pub disabled: bool,
-    pub has_password: bool,
     pub last_active: Option<String>,
 }
 
@@ -694,7 +693,6 @@ impl Server {
                     name: s(u, "Name"),
                     admin: flag(&u["Policy"], "IsAdministrator"),
                     disabled: flag(&u["Policy"], "IsDisabled"),
-                    has_password: u.get("HasPassword").and_then(Value::as_bool).unwrap_or(true),
                     last_active: opt(u, "LastActivityDate"),
                 })
                 .collect())

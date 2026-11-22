@@ -1086,8 +1086,8 @@ impl Bloom {
                 }
                 _ => return false,
             },
-            "FrameStepBack" => self.player.command("frame-back-step", &[]),
-            "FrameStepForward" => self.player.command("frame-step", &[]),
+            "FrameStepBack" => self.frame_step(false, cx),
+            "FrameStepForward" => self.frame_step(true, cx),
             "JumpToLastPosition" => match self.enhanced.before_jump {
                 Some(position) => self.request_seek_to(position, cx),
                 None => return false,

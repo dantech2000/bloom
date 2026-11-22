@@ -559,7 +559,10 @@ impl Bloom {
             .on_key_down(
                 cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
                     let shift = event.keystroke.modifiers.shift;
+                    this.still_watching_input();
                     match event.keystroke.key.as_str() {
+                        // "Are you still watching?" takes every key while it shows.
+                        key if this.still_watching_key(key, cx) => {}
                         // The label field of the bookmarks panel gets the typing.
                         "escape" if this.bookmarks_escape(window, cx) => {}
                         _ if this.bookmark_typing(window, cx) => return,
@@ -587,8 +590,12 @@ impl Bloom {
                                 this.request_stop(cx);
                             }
                         }
-                        // The player shortcuts of Jellyfin Enhanced.
+                        // The player shortcuts of Jellyfin Enhanced; a key the
+                        // plugin gives another action keeps it.
                         _ if this.enhanced_player_key(event, cx) => {}
+                        // One frame back or on, as in Jellyfin Web 12 and mpv.
+                        "," if !shift => this.frame_step(false, cx),
+                        "." if !shift => this.frame_step(true, cx),
                         _ if this.subs_key(event, cx) => {}
                         _ => return,
                     }
@@ -598,9 +605,11 @@ impl Bloom {
                 }),
             )
             .on_click(cx.listener(|this, _, window, cx| {
+                this.still_watching_input();
                 window.focus(&this.playback.focus, cx);
             }))
             .on_mouse_move(cx.listener(|this, _, _, cx| {
+                this.still_watching_input();
                 let was_hidden = !this.playback.controls_visible;
                 this.show_controls();
                 if was_hidden {
@@ -1362,6 +1371,7 @@ impl Bloom {
         settings.extend(audio.clone());
         settings.push(MenuItem::separator());
         settings.push(self.quality_menu_item(cx));
+        settings.extend(self.version_menu_item(cx));
         settings.push(MenuItem::separator());
         settings.push(MenuItem::label("settings.speed", "Playback speed"));
         for speed in crate::player::SPEEDS {

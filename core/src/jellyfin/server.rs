@@ -62,7 +62,8 @@ impl Client {
         self.get(&format!("/Localization/{list}"), &[])
     }
 
-    /// The newest entries of the activity log: `Limit`, `HasUserId`.
+    /// Entries of the activity log; `activity_query::Query::pairs` makes
+    /// the parameters of a page (`Limit`, `HasUserId` for a short list).
     pub fn activity_log<T: DeserializeOwned>(&self, query: &[(&str, String)]) -> Result<T> {
         self.get("/System/ActivityLog/Entries", query)
     }
@@ -76,6 +77,54 @@ impl Client {
     /// day is tens of megabytes, and a viewer shows its end.
     pub fn log_tail(&self, name: &str, max: usize) -> Result<(String, bool)> {
         self.get_text_tail("/System/Logs/Log", &[("name", name.to_string())], max)
+    }
+
+    /// The whole lines of a log file after byte `from`, at most `max`
+    /// bytes of them; `from` 0 reads the end of the file.
+    pub fn log_since(&self, name: &str, from: u64, max: usize) -> Result<crate::log_follow::LogGrowth> {
+        self.get_text_since("/System/Logs/Log", &[("name", name.to_string())], from, max)
+    }
+
+    /// The lines a log file got after byte `end`, or None when its size in
+    /// the list of log files has not moved (one small request for a quiet
+    /// log, as the server sends a file whole).
+    pub fn log_follow(&self, name: &str, end: u64, max: usize) -> Result<Option<crate::log_follow::LogGrowth>> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct File {
+            #[serde(default)]
+            name: String,
+            #[serde(default)]
+            size: u64,
+        }
+        let files: Vec<File> = self.log_files()?;
+        let size = files.iter().find(|f| f.name == name).map(|f| f.size);
+        if !crate::log_follow::changed(size, end) {
+            return Ok(None);
+        }
+        self.log_since(name, end, max).map(Some)
+    }
+
+    // ----- Backups (Jellyfin 10.11 and later) ---------------------------------
+
+    pub fn backups(&self) -> Result<Vec<crate::backups::Backup>> {
+        self.get("/Backup", &[]).map(crate::backups::newest_first)
+    }
+
+    /// Makes a backup with these contents (the database always); the
+    /// server answers when the archive is written.
+    pub fn create_backup(&self, contents: &crate::backups::Contents) -> Result<crate::backups::Backup> {
+        self.post_json("/Backup/Create", &crate::backups::create_body(contents))
+    }
+
+    /// The manifest of one archive, by its file name.
+    pub fn backup_manifest(&self, file_name: &str) -> Result<crate::backups::Backup> {
+        self.get("/Backup/Manifest", &[("path", file_name.to_string())])
+    }
+
+    /// Schedules the restore of an archive and restarts the server.
+    pub fn restore_backup(&self, file_name: &str) -> Result<()> {
+        self.post("/Backup/Restore", &crate::backups::Restore { archive_file_name: file_name }).map(drop)
     }
 
     // ----- Scheduled tasks ---------------------------------------------------

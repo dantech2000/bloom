@@ -151,6 +151,53 @@ final class BrowseShots: XCTestCase {
         shot("09c-in-progress-drama")
     }
 
+    /// The Movies grid narrowed by the languages of its tracks (Jellyfin
+    /// 12.0): Japanese audio keeps four films of the mock, Spanish
+    /// subtitles on top keep one; each shows as a pill. The requests carry
+    /// the simulator's languages as their Accept-Language.
+    func testLanguageFilters() {
+        let app = launch()
+        let accept = (MockServer.json("/mock/accept-language") as? [String: Any])?["AcceptLanguage"] as? String
+        XCTAssertNotNil(accept, "The app sent no Accept-Language")
+        XCTAssertTrue(accept?.contains("q=0.9") ?? false, "The Accept-Language has no weights: \(accept ?? "nil")")
+        openTab(app, "Library")
+        XCTAssertTrue(app.cells.firstMatch.waitForExistence(timeout: 10), "The Library tab lists no library")
+        app.cells.firstMatch.tap()
+        XCTAssertTrue(cards(app).firstMatch.waitForExistence(timeout: 10), "The library page has no card")
+        sleep(2)
+        let film = { (name: String) in self.cards(app).matching(NSPredicate(format: "label CONTAINS %@", name)).firstMatch }
+        app.buttons["library.filter"].firstMatch.tap()
+        let audio = app.buttons["filter.audioLanguage"].firstMatch
+        XCTAssertTrue(audio.waitForExistence(timeout: 5), "No audio language in the filter menu")
+        XCTAssertTrue(app.buttons["filter.subtitleLanguage"].firstMatch.exists, "No subtitle language in the filter menu")
+        shot("13-language-menu")
+        audio.tap()
+        XCTAssertTrue(app.buttons["Japanese"].firstMatch.waitForExistence(timeout: 5), "No Japanese in the audio languages")
+        sleep(1) // the submenu opens
+        shot("13b-audio-languages")
+        let japanese = app.buttons.matching(identifier: "Japanese").allElementsBoundByIndex.first(where: \.isHittable) ?? app.buttons["Japanese"].firstMatch
+        japanese.tap()
+        XCTAssertTrue(app.buttons["Japanese audio, remove filter"].waitForExistence(timeout: 10), "No pill for the audio language")
+        XCTAssertTrue(film("Nine Minutes North").waitForExistence(timeout: 10), "A film with Japanese audio is not listed")
+        XCTAssertTrue(MockServer.wait(timeout: 10) { !film("The Long Harbour").exists }, "A film without Japanese audio is still listed")
+        XCTAssertEqual(cards(app).count, 4, "Japanese audio keeps four films of the mock")
+        sleep(2)
+        shot("14-audio-japanese")
+        app.buttons["library.filter"].firstMatch.tap()
+        app.buttons["filter.subtitleLanguage"].firstMatch.tap()
+        XCTAssertTrue(app.buttons["Spanish"].firstMatch.waitForExistence(timeout: 5), "No Spanish in the subtitle languages")
+        sleep(1)
+        let spanish = app.buttons.matching(identifier: "Spanish").allElementsBoundByIndex.first(where: \.isHittable) ?? app.buttons["Spanish"].firstMatch
+        spanish.tap()
+        XCTAssertTrue(app.buttons["Spanish subtitles, remove filter"].waitForExistence(timeout: 10), "No pill for the subtitle language")
+        XCTAssertTrue(MockServer.wait(timeout: 10) { self.cards(app).count == 1 }, "Both languages keep one film, not \(cards(app).count)")
+        XCTAssertTrue(film("Low Tide Radio").exists, "Low Tide Radio has Japanese audio and Spanish subtitles")
+        sleep(2)
+        shot("15-audio-and-subtitles")
+        app.buttons["Japanese audio, remove filter"].tap()
+        XCTAssertTrue(MockServer.wait(timeout: 10) { self.cards(app).count > 1 }, "Taking the pill off did not widen the grid")
+    }
+
     /// "bokma" finds the person; the page has the photo, the biography
     /// (opened with More) and the roles.
     func testPeople() {

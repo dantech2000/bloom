@@ -289,12 +289,17 @@ impl Bloom {
         }
         let id = item.id.clone();
         let target = item.clone();
+        // The version the detail page chose.
+        let version = match &self.nav.page {
+            Page::Detail(data) if data.item.id == item.id => data.version.clone(),
+            _ => None,
+        };
         Some(match engine.entry(&item.id) {
             None => button()
                 .tooltip(tip("Download for offline use"))
                 .child(icon(LucideIcon::Download, 25., fg))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.download_item(&target, cx)
+                    this.download_version(&target, version.as_deref(), cx)
                 })),
             Some(entry) => match entry.state {
                 EntryState::Queued | EntryState::Downloading => button()

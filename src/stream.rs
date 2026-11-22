@@ -79,6 +79,9 @@ pub struct State {
     pub wanted_audio: Option<usize>,
     /// The same for the subtitle; `Some(None)` is none.
     pub wanted_subtitle: Option<Option<usize>>,
+    /// The version the detail page chose (a media source id); none plays
+    /// the item's own file.
+    pub wanted_source: Option<String>,
     /// Subtitle files of the item that did not come (server indexes): a
     /// choice of one of them burns it in at once.
     pub failed_files: Vec<i64>,
@@ -86,11 +89,16 @@ pub struct State {
     /// subtitle and the burn-in of `stream_reload_with`. It runs when the
     /// item plays (`stream_poll`).
     pending_reload: Option<(Option<i64>, Option<i64>, bool)>,
+    /// A change of the version asked for while a load was on its way.
+    pending_version: Option<String>,
     /// The user chose the audio track of the item in the player; the
     /// choice of the server does not replace it (`load_timeline`).
     pub explicit_audio: bool,
     /// The same for the subtitle.
     pub explicit_subtitle: bool,
+    /// The next item starts paused: "Are you still watching?" asks first
+    /// (src/still_watching.rs). Taken by the next `stream_begin`.
+    pub start_paused: bool,
 }
 
 /// A track the user chose, for [`State::chose`].
@@ -279,17 +287,30 @@ pub(crate) impl Client {
 
 /// Turns the answer of the server into what the player loads. `wanted`
 /// is the subtitle the user chose, as a server index, when there is one.
+#[cfg(test)]
 pub fn resolve(
     client: &Client,
     item_id: &str,
     info: &PlaybackInfo,
     wanted_subtitle: Option<i64>,
 ) -> Result<Resolved> {
+    resolve_version(client, item_id, info, wanted_subtitle, None)
+}
+
+/// The same for one version of the item (`wanted_source`, a media source
+/// id); none is the item's own file.
+pub fn resolve_version(
+    client: &Client,
+    item_id: &str,
+    info: &PlaybackInfo,
+    wanted_subtitle: Option<i64>,
+    wanted_source: Option<&str>,
+) -> Result<Resolved> {
     if let Some(code) = &info.error_code {
         return Err(anyhow!("the server cannot play this item: {code}"));
     }
     let source = info
-        .source(item_id)
+        .source_for(item_id, wanted_source)
         .ok_or_else(|| anyhow!("the server has no media source for this item"))?;
     let play_session_id = info
         .play_session_id
@@ -402,7 +423,8 @@ pub fn resolve(
 pub fn negotiate(client: &Client, load: &Load) -> Result<Resolved> {
     let mut max_bitrate = max_bitrate();
     let info = client.playback_info(load, max_bitrate)?;
-    let first = resolve(client, &load.item_id, &info, load.subtitle)?;
+    let version = load.media_source_id.as_deref();
+    let first = resolve_version(client, &load.item_id, &info, load.subtitle, version)?;
     let mut again = None;
     if max_bitrate.is_none() {
         let codec = first.video().and_then(|v| v.codec.as_deref());
@@ -415,10 +437,10 @@ pub fn negotiate(client: &Client, load: &Load) -> Result<Resolved> {
     let transcode = first.play_method == PlayMethod::Transcode || again.is_some();
     if transcode
         && load.audio.is_none()
-        && let Some(language) = client.audio_language()
+        && let Some(language) = client.audio_language_for(&load.item_id)
     {
         let named = first.audio_index.or_else(|| {
-            info.source(&load.item_id).and_then(|s| s.default_audio_stream_index)
+            info.source_for(&load.item_id, version).and_then(|s| s.default_audio_stream_index)
         });
         let preferred = first
             .embedded(StreamKind::Audio)
@@ -432,7 +454,7 @@ pub fn negotiate(client: &Client, load: &Load) -> Result<Resolved> {
     let mut resolved = match again {
         Some(again) => {
             let info = client.playback_info(&again, max_bitrate)?;
-            resolve(client, &load.item_id, &info, load.subtitle)?
+            resolve_version(client, &load.item_id, &info, load.subtitle, version)?
         }
         None => first,
     };
@@ -454,8 +476,13 @@ pub fn negotiate(client: &Client, load: &Load) -> Result<Resolved> {
 pub fn start(player: &Player, client: Client, load: Load) {
     let generation = player.prepare(&load.title, load.start_secs, load.paused);
     // A downloaded item plays from its file on this Mac, with no question
-    // to the server, so it also plays offline.
-    if let Some(path) = crate::downloads::local_source(player, client.server_id.as_deref(), &load.item_id) {
+    // to the server, so it also plays offline. A version other than the
+    // one downloaded comes from the server.
+    let server_id = client.server_id.as_deref();
+    let other_version = load.media_source_id.as_ref().is_some_and(|wanted| {
+        crate::downloads::downloaded_version(server_id, &load.item_id).is_some_and(|had| had.as_ref() != Some(wanted))
+    });
+    if !other_version && let Some(path) = crate::downloads::local_source(player, server_id, &load.item_id) {
         *CURRENT.lock().unwrap() = None;
         player.play_prepared(
             generation,
@@ -559,9 +586,12 @@ impl Bloom {
     /// when it chose some.
     pub fn stream_begin(&mut self, item: &Item, start_secs: f64) {
         let (audio, subtitle) = self.stream_take_choice(item);
+        let media_source_id = self.stream.wanted_source.take().filter(|id| *id != item.id);
+        let paused = std::mem::take(&mut self.stream.start_paused);
         let Some(session) = &self.session else { return };
         self.stream.failed_files.clear();
         self.stream.pending_reload = None;
+        self.stream.pending_version = None;
         self.stream.explicit_audio = false;
         self.stream.explicit_subtitle = false;
         start(
@@ -571,11 +601,12 @@ impl Bloom {
                 item_id: item.id.clone(),
                 title: item.display_title(),
                 start_secs,
-                paused: false,
+                paused,
                 token: 0,
                 audio,
                 subtitle,
                 burn_in: false,
+                media_source_id,
             },
         );
         // The server got the choice, for a transcode.
@@ -599,6 +630,8 @@ impl Bloom {
     /// item went to a SyncPlay group, whose load asks for no track. mpv
     /// keeps the choice for that load.
     pub fn stream_choice_left(&mut self, item: &Item) {
+        // A group or a receiver plays the item's own file.
+        self.stream.wanted_source = None;
         let (audio, subtitle) = self.stream_take_choice(item);
         self.stream_choice_to_player(item, audio, subtitle);
     }
@@ -654,6 +687,32 @@ impl Bloom {
     }
 
     fn stream_reload_with(&mut self, audio: Option<i64>, subtitle: Option<i64>, burn_in: bool) {
+        self.stream_reload_full(audio, subtitle, burn_in, None);
+    }
+
+    /// Plays another version of the item in the player (a media source id
+    /// of it), at the position it is at. The tracks of one file are not
+    /// those of another, so the server chooses them again.
+    pub fn stream_switch_version(&mut self, source_id: String, cx: &mut Context<Self>) {
+        let Some(item) = self.playback.playing.as_mut() else { return };
+        if item.media_sources.first().is_some_and(|s| s.id == source_id) || !item.put_source_first(&source_id) {
+            return;
+        }
+        log::info!("version {source_id} of {}", item.id);
+        let item_id = item.id.clone();
+        self.stream.explicit_audio = false;
+        self.stream.explicit_subtitle = false;
+        self.stream.failed_files.clear();
+        self.stream_reload_full(None, None, false, Some(source_id));
+        // The default tracks of the timeline are those of the new file.
+        self.load_timeline(item_id, cx);
+        self.rebuild_track_menus(cx);
+        cx.notify();
+    }
+
+    /// `version`: a change of the version, which leaves the tracks to the
+    /// server; none keeps the version and the tracks that play.
+    fn stream_reload_full(&mut self, audio: Option<i64>, subtitle: Option<i64>, burn_in: bool, version: Option<String>) {
         let (Some(item), Some(session)) = (self.playback.playing.as_ref(), self.session.as_ref()) else {
             return;
         };
@@ -662,6 +721,11 @@ impl Bloom {
             // A load is on its way, and it took the settings as they
             // were: this one follows it (`stream_poll`).
             PlayState::Starting => {
+                if version.is_some() {
+                    self.stream.pending_version = version;
+                    self.stream.pending_reload = None;
+                    return;
+                }
                 let before = self.stream.pending_reload.take().unwrap_or_default();
                 self.stream.pending_reload =
                     Some((audio.or(before.0), subtitle.or(before.1), burn_in || before.2));
@@ -669,18 +733,32 @@ impl Bloom {
             }
             _ => return,
         }
-        let Some(resolved) = current_of(&item.id) else { return };
+        // A downloaded file has no answer of the server; a change of the
+        // version needs none.
+        let resolved = current_of(&item.id);
+        if resolved.is_none() && version.is_none() {
+            return;
+        }
         let status = &self.playback.status;
         let selected = |kind: TrackKind| status.tracks.iter().find(|t| t.kind == kind && t.selected);
-        let audio = audio.or_else(|| match resolved.play_method {
-            PlayMethod::Transcode => resolved.audio_index,
-            PlayMethod::DirectPlay => selected(TrackKind::Audio).and_then(|t| resolved.audio_of(t.id)),
-        });
-        let subtitle = subtitle.or_else(|| {
-            resolved.burned_subtitle.or_else(|| {
-                Some(selected(TrackKind::Sub).and_then(|t| resolved.subtitle_of(t.id, status)).unwrap_or(-1))
-            })
-        });
+        let (audio, subtitle) = match (&resolved, &version) {
+            (Some(resolved), None) => (
+                audio.or_else(|| match resolved.play_method {
+                    PlayMethod::Transcode => resolved.audio_index,
+                    PlayMethod::DirectPlay => selected(TrackKind::Audio).and_then(|t| resolved.audio_of(t.id)),
+                }),
+                subtitle.or_else(|| {
+                    resolved.burned_subtitle.or_else(|| {
+                        Some(selected(TrackKind::Sub).and_then(|t| resolved.subtitle_of(t.id, status)).unwrap_or(-1))
+                    })
+                }),
+            ),
+            _ => (audio, subtitle),
+        };
+        // The version that plays stays, unless this is a change of it.
+        let media_source_id = version
+            .or_else(|| resolved.as_ref().map(|r| r.media_source_id.clone()))
+            .filter(|id| !id.is_empty() && *id != item.id);
         start(
             &self.player,
             session.client.clone(),
@@ -693,6 +771,7 @@ impl Bloom {
                 audio,
                 subtitle,
                 burn_in,
+                media_source_id,
             },
         );
     }
@@ -700,18 +779,52 @@ impl Bloom {
     /// Called with every poll of the player: a reload that waited for the
     /// load before it runs once the item plays.
     pub fn stream_poll(&mut self) {
-        if self.stream.pending_reload.is_none() {
+        if self.stream.pending_reload.is_none() && self.stream.pending_version.is_none() {
             return;
         }
         match self.playback.status.state {
             PlayState::Starting => {}
             PlayState::Playing => {
-                if let Some((audio, subtitle, burn_in)) = self.stream.pending_reload.take() {
+                if let Some(version) = self.stream.pending_version.take() {
+                    self.stream_reload_full(None, None, false, Some(version));
+                } else if let Some((audio, subtitle, burn_in)) = self.stream.pending_reload.take() {
                     self.stream_reload_with(audio, subtitle, burn_in);
                 }
             }
-            _ => self.stream.pending_reload = None,
+            _ => {
+                self.stream.pending_reload = None;
+                self.stream.pending_version = None;
+            }
         }
+    }
+
+    /// The "Version" entry of the player settings menu: the files of the
+    /// item, when it has more than one. The first source of the item in
+    /// the player is the one that plays (`stream_switch_version`).
+    pub fn version_menu_item(&self, cx: &mut Context<Self>) -> Option<MenuItem> {
+        let item = self.playback.playing.as_ref().filter(|i| i.has_versions())?;
+        let this = cx.weak_entity();
+        let playing = item.media_sources.first().map(|s| s.id.clone());
+        let items: Vec<MenuItem> = item
+            .versions()
+            .iter()
+            .enumerate()
+            .map(|(n, source)| {
+                let handle = this.clone();
+                let id = source.id.clone();
+                let name = bloom_core::versions::name(source, n);
+                let technical = bloom_core::versions::technical(source);
+                MenuItem::new(SharedString::from(format!("settings.version.{n}")), name.clone())
+                    .detail(if technical != name { technical } else { String::new() })
+                    .radio(playing.as_deref() == Some(source.id.as_str()))
+                    .on_click(move |_, _, cx| {
+                        let id = id.clone();
+                        handle.update(cx, |this, cx| this.stream_switch_version(id, cx)).ok();
+                    })
+            })
+            .collect();
+        let current = item.media_sources.first().map(|s| item.version_name(s)).unwrap_or_default();
+        Some(MenuItem::submenu("settings.version", "Version", items).detail(current))
     }
 
     /// Sets the bitrate the user allows (none is "Auto"), keeps it in the
@@ -1121,6 +1234,62 @@ impl Bloom {
             // The measurement and the stalls: see `adaptive`.
             _ => self.debug_adaptive(verb, arg, cx),
         }
+    }
+
+    /// `version`: the versions of the detail page and of the player (the
+    /// shown one marked `*`); `version page <n>` picks one on the page and
+    /// `version play <n>` in the player, by its place in the menu;
+    /// `version menu` opens the player's Version submenu.
+    pub fn debug_version(&mut self, rest: &str, window: &mut Window, cx: &mut Context<Self>) -> String {
+        let (verb, arg) = rest.split_once(' ').unwrap_or((rest, ""));
+        let place = arg.parse::<usize>().ok();
+        let list = |item: &Item| {
+            let shown = item.media_sources.first().map(|s| s.id.clone());
+            item.versions()
+                .iter()
+                .map(|s| format!("{}{}={}", if Some(&s.id) == shown.as_ref() { "*" } else { "" }, item.version_name(s), s.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match verb {
+            "page" => {
+                let crate::app::Page::Detail(data) = &mut self.nav.page else { return "error: no detail page".into() };
+                let Some(id) = place.and_then(|n| data.item.versions().get(n).map(|s| s.id.clone())) else {
+                    return "error: usage: version page <n>".into();
+                };
+                let own = id == data.item.id;
+                data.show_version((!own).then_some(id));
+                self.rebuild_detail_menus(cx);
+                cx.notify();
+            }
+            "play" => {
+                let Some(id) = self
+                    .playback
+                    .playing
+                    .as_ref()
+                    .and_then(|item| place.and_then(|n| item.versions().get(n).map(|s| s.id.clone())))
+                else {
+                    return "error: usage: version play <n>".into();
+                };
+                self.stream_switch_version(id, cx);
+            }
+            "menu" => {
+                self.rebuild_track_menus(cx);
+                self.playback.settings_menu.update(cx, |menu, cx| {
+                    menu.open(window, cx);
+                    menu.open_submenu("Version", window, cx);
+                });
+            }
+            "" => {}
+            _ => return "error: usage: version [page <n> | play <n> | menu]".into(),
+        }
+        let page = match &self.nav.page {
+            crate::app::Page::Detail(data) => format!("page=[{}] chosen={:?}", list(&data.item), data.version),
+            _ => "page=none".into(),
+        };
+        let playing = self.playback.playing.as_ref().map_or(String::new(), list);
+        let source = current().map(|r| r.media_source_id.clone()).unwrap_or_default();
+        format!("{page} player=[{playing}] loaded={source}")
     }
 }
 

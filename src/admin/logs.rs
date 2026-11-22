@@ -3,6 +3,9 @@
 //! log first, then the plugins', then the media conversions'), and the
 //! last lines of the one that is open. The Mac shows the list beside the
 //! viewer; a phone shows the list, and a file opens as a page of its own.
+//! The Follow switch reads the lines the server adds every few seconds
+//! while the viewer is on show (`Bloom::start_log_follow`) and keeps the
+//! viewer at its end; on the Mac the lines are then a box of their own.
 
 use crate::ui::tone::{self, State};
 use anyhow::Result;
@@ -25,6 +28,10 @@ use crate::{
 
 /// Lines of the log that the page keeps and shows.
 const TAIL_LINES: usize = 300;
+/// Lines the viewer keeps while it follows the log.
+const FOLLOW_LINES: usize = 1000;
+/// Time between two reads of a log that is followed.
+const FOLLOW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2500);
 /// The most of a log file that is read, from its end. A log of a busy day
 /// at the debug level is hundreds of megabytes; the page shows its last
 /// lines.
@@ -77,6 +84,8 @@ pub struct Data {
     /// Whether any line has a time and a level: the viewer keeps a column
     /// for them then. An FFmpeg log has none.
     pub timed: bool,
+    /// The byte after the last whole line read: a follow reads from there.
+    pub end: u64,
 }
 
 /// `wanted` is the file the user chose; without one, the page opens the
@@ -91,13 +100,14 @@ pub fn load(client: &Client, wanted: Option<&str>) -> Result<Data> {
         .or(files.iter().find(|f| f.name.starts_with("log_")))
         .or(files.first())
         .map(|f| f.name.clone());
-    let (lines, total_lines, cut) = match &open {
+    let (lines, total_lines, cut, end) = match &open {
         Some(name) => {
-            let (text, cut) = client.log_tail(name, READ_BYTES)?;
-            let (lines, total) = tail(&text);
-            (lines, total, cut)
+            // Whole lines, and where they end, for a follow.
+            let growth = client.log_since(name, 0, READ_BYTES)?;
+            let (lines, total) = tail(&growth.text);
+            (lines, total, growth.cut, growth.end)
         }
-        None => (Vec::new(), 0, false),
+        None => (Vec::new(), 0, false, 0),
     };
     let timed = lines.iter().any(|line| !line.time.is_empty());
     Ok(Data {
@@ -107,15 +117,50 @@ pub fn load(client: &Client, wanted: Option<&str>) -> Result<Data> {
         total_lines,
         cut,
         timed,
+        end,
     })
+}
+
+impl Data {
+    /// Adds the lines of a follow; the viewer keeps the last
+    /// [`FOLLOW_LINES`]. A file that started again replaces the lines.
+    /// True when lines came.
+    pub fn append(&mut self, growth: bloom_core::log_follow::LogGrowth) -> bool {
+        self.end = growth.end;
+        if growth.restarted {
+            let (lines, total) = tail(&growth.text);
+            self.lines = lines;
+            self.total_lines = total;
+            self.cut = growth.cut;
+            self.timed = self.lines.iter().any(|line| !line.time.is_empty());
+            return true;
+        }
+        if growth.text.is_empty() {
+            return false;
+        }
+        let level = self.lines.last().map_or(Level::Info, |line| line.level);
+        let all: Vec<&str> = growth.text.lines().collect();
+        self.total_lines += all.len();
+        self.cut |= growth.cut;
+        self.lines.extend(parse(&all, level));
+        let over = self.lines.len().saturating_sub(FOLLOW_LINES);
+        self.lines.drain(..over);
+        self.timed |= self.lines.iter().any(|line| !line.time.is_empty());
+        true
+    }
 }
 
 /// The last lines of a log, with the level of each, and the line count.
 fn tail(text: &str) -> (Vec<Line>, usize) {
     let all: Vec<&str> = text.lines().collect();
     let start = all.len().saturating_sub(TAIL_LINES);
-    let mut level = Level::Info;
-    let lines = all[start..]
+    (parse(&all[start..], Level::Info), all.len())
+}
+
+/// Lines with their time and level; a line without a level continues
+/// the entry above it, and `level` is the level of the line before.
+fn parse(raw_lines: &[&str], mut level: Level) -> Vec<Line> {
+    raw_lines
         .iter()
         .map(|raw| {
             // "[2026-10-03 03:43:28.781 -07:00] [INF] [105] Source: message"
@@ -156,8 +201,7 @@ fn tail(text: &str) -> (Vec<Line>, usize) {
                 text: rest.chars().take(LINE_CHARS).collect(),
             }
         })
-        .collect();
-    (lines, all.len())
+        .collect()
 }
 
 /// The time of day in the stamp of a log line ("2026-10-03 03:43:28.781
@@ -259,7 +303,7 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
     let chosen = app.admin_data().and_then(|d| d.log_open.clone());
     if compact {
         return if chosen.is_some() && chosen == data.open {
-            viewer(data, true, cx)
+            viewer(app, data, true, cx)
         } else {
             file_list(app, data, true, cx)
         };
@@ -270,7 +314,7 @@ pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
     let viewer = data
         .open
         .clone()
-        .map(|name| panel(name, cx).child(viewer(data, false, cx)));
+        .map(|name| panel(name, cx).child(viewer(app, data, false, cx)));
     if two_columns {
         div()
             .flex()
@@ -443,11 +487,14 @@ fn file_row(
 /// The last lines of the open file under a line with the count and the
 /// warnings and errors among them. On a phone the lines take the page's
 /// width, with no card around them.
-fn viewer(data: &Data, compact: bool, cx: &mut Context<Bloom>) -> Div {
+fn viewer(app: &Bloom, data: &Data, compact: bool, cx: &mut Context<Bloom>) -> Div {
     let t = UiTheme::read(cx).clone();
+    let (follow, scroll) = app
+        .admin_data()
+        .map_or((false, None), |d| (d.log_follow, Some(d.log_scroll.clone())));
     let warnings = data.lines.iter().filter(|l| l.level == Level::Warning).count();
     let errors = data.lines.iter().filter(|l| l.level == Level::Error).count();
-    let mut lines = div()
+    let lines = div()
         .rounded(px(12.))
         .bg(rgba(0x00000066))
         .py(px(10.))
@@ -467,6 +514,20 @@ fn viewer(data: &Data, compact: bool, cx: &mut Context<Bloom>) -> Div {
                 .map(|line| log_line(line, data.timed).into_any_element())
                 .collect()
         }));
+    // Following on the Mac: the lines are a box of their own that stays at
+    // its end, beside the list of files. On a phone the page is the box.
+    let lines = match scroll.filter(|_| follow && !compact) {
+        Some(scroll) => div()
+            .id("admin.log.follow")
+            .h(px((app.viewport_h - 300.).max(260.)))
+            .overflow_y_scroll()
+            .track_scroll(&scroll)
+            .rounded(px(12.))
+            .child(lines)
+            .into_any_element(),
+        None => lines.into_any_element(),
+    };
+    let mut lines = div().child(lines);
     if data.lines.is_empty() {
         lines = lines.child(
             div()
@@ -488,7 +549,8 @@ fn viewer(data: &Data, compact: bool, cx: &mut Context<Bloom>) -> Div {
             format!("Last {} lines of a large log (its last {} MB were read)", data.lines.len(), READ_BYTES >> 20)
         } else {
             format!("Last {} of {} lines", data.lines.len(), data.total_lines)
-        });
+        })
+        .child(follow_switch(follow, cx));
     if warnings > 0 {
         heading = heading.child(badge(
             format!("{warnings} {}", if warnings == 1 { "warning" } else { "warnings" }),
@@ -509,6 +571,141 @@ fn viewer(data: &Data, compact: bool, cx: &mut Context<Bloom>) -> Div {
         .when(compact, |el| el.pt(px(4.)))
         .child(heading)
         .child(lines)
+}
+
+/// The Follow switch: a quiet pill; on, a green dot says the view is live.
+fn follow_switch(on: bool, cx: &mut Context<Bloom>) -> gpui_kit::Stateful<Div> {
+    let t = UiTheme::read(cx).clone();
+    div()
+        .id("admin.log.followswitch")
+        .role(gpui_kit::Role::CheckBox)
+        .aria_label("Follow")
+        .aria_toggled(if on { gpui_kit::accesskit::Toggled::True } else { gpui_kit::accesskit::Toggled::False })
+        .h(px(30.))
+        .px(px(12.))
+        .rounded_full()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .cursor_pointer()
+        .bg(if on { rgba(0xffffff24) } else { rgba(0xffffff14) })
+        .hover(|s| s.bg(rgba(0xffffff2e)))
+        .text_size(px(13.))
+        .font_weight(gpui_kit::FontWeight::MEDIUM)
+        .text_color(t.colors.foreground)
+        .tooltip(crate::ui::tip::tip("Read the new lines every few seconds and stay at the end"))
+        .child(if on {
+            div().size(px(8.)).rounded_full().bg(State::Ok.color())
+        } else {
+            div().size(px(8.)).rounded_full().border_1().border_color(tone::INK_40)
+        })
+        .child(if on { "Following" } else { "Follow" })
+        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+            let on = this.admin_data().is_some_and(|d| d.log_follow);
+            this.set_log_follow(!on, cx);
+        }))
+}
+
+impl Bloom {
+    /// Turns the follow of the open log on or off.
+    pub(crate) fn set_log_follow(&mut self, on: bool, cx: &mut Context<Self>) {
+        let compact = self.compact_w();
+        let Some(data) = self.admin_data_mut() else {
+            return;
+        };
+        data.log_follow = on;
+        if on {
+            data.log_scroll.scroll_to_bottom();
+            if compact {
+                self.nav.scroll.scroll_to_bottom();
+            }
+            self.start_log_follow(cx);
+        }
+        cx.notify();
+    }
+
+    /// The timer of the follow. It reads only while the log viewer is on
+    /// show, and ends when the dashboard is left or the switch is off.
+    pub(crate) fn start_log_follow(&mut self, cx: &mut Context<Self>) {
+        if self.admin_live.follow.is_some() {
+            return;
+        }
+        self.admin_live.follow = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(FOLLOW_INTERVAL).await;
+                let go = this.update(cx, |this, cx| {
+                    let go = this.follow_log(cx);
+                    if !go {
+                        this.admin_live.follow = None;
+                    }
+                    go
+                });
+                if !matches!(go, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// One read of the followed log. False when the follow ends.
+    fn follow_log(&mut self, cx: &mut Context<Self>) -> bool {
+        let compact = self.compact_w();
+        let Page::Admin(data) = &self.nav.page else {
+            return false;
+        };
+        if data.section != super::Section::Logs || !data.log_follow {
+            return false;
+        }
+        let Some(logs) = &data.logs else {
+            return true;
+        };
+        let Some(name) = logs.open.clone() else {
+            return true;
+        };
+        // On a phone the viewer is a page of its own: the list reads nothing.
+        let shown = !compact || data.log_open.as_ref() == Some(&name);
+        if !shown
+            || data.loading
+            || self.admin_live.follow_busy
+            || crate::connection::is_offline()
+            || self.session.is_none()
+            || self.playback.playing.is_some()
+        {
+            return true;
+        }
+        let (end, generation) = (logs.end, self.nav.generation);
+        self.admin_live.follow_busy = true;
+        self.fetch(
+            cx,
+            move |client| client.log_follow(&name, end, READ_BYTES),
+            move |this, result, cx| {
+                this.admin_live.follow_busy = false;
+                if this.nav.generation != generation {
+                    return;
+                }
+                let Page::Admin(data) = &mut this.nav.page else {
+                    return;
+                };
+                let Some(logs) = data.logs.as_mut() else {
+                    return;
+                };
+                // The answer is for the file and the part on show.
+                if logs.end != end {
+                    return;
+                }
+                if let Ok(Some(growth)) = result
+                    && logs.append(growth)
+                {
+                    data.log_scroll.scroll_to_bottom();
+                    if this.compact_w() {
+                        this.nav.scroll.scroll_to_bottom();
+                    }
+                    cx.notify();
+                }
+            },
+        );
+        true
+    }
 }
 
 #[cfg(test)]
@@ -535,5 +732,44 @@ mod tests {
         assert_eq!((lines[2].time.as_str(), lines[2].text.as_str()), ("", "[libx264 @ 0x5581e0a3b2c0] using SAR=1/1"));
         assert_eq!((lines[3].time.as_str(), lines[3].text.as_str()), ("", "[1234567890\u{e9}abcdefghijk] text"));
         assert_eq!(lines[4].text, "plain");
+    }
+
+    fn data(text: &str) -> Data {
+        let (lines, total_lines) = tail(text);
+        Data { files: Vec::new(), open: None, lines, total_lines, cut: false, timed: true, end: text.len() as u64 }
+    }
+
+    /// The lines of a follow come after the ones on show; a line without a
+    /// level keeps the level of the line before it, from the last read.
+    #[test]
+    fn a_follow_appends_its_lines() {
+        use bloom_core::log_follow::LogGrowth;
+        let mut log = data("[2026-10-03 03:43:28.781 -07:00] [ERR] [1] Boom\n");
+        assert!(!log.append(LogGrowth::nothing(48)));
+        let came = log.append(LogGrowth {
+            text: "   at Frame.Line()\n[2026-10-03 03:43:29.001 -07:00] [INF] [1] Fine\n".into(),
+            end: 120,
+            ..LogGrowth::default()
+        });
+        assert!(came);
+        assert_eq!(log.end, 120);
+        assert_eq!(log.total_lines, 3);
+        assert!(log.lines[1].level == Level::Error && log.lines[1].time.is_empty());
+        assert!(log.lines[2].level == Level::Info);
+        // A file that started again replaces the lines.
+        log.append(LogGrowth { text: "fresh\n".into(), end: 6, restarted: true, cut: false });
+        assert_eq!((log.lines.len(), log.total_lines, log.end), (1, 1, 6));
+    }
+
+    /// A long follow keeps the last lines only.
+    #[test]
+    fn a_follow_keeps_the_last_lines() {
+        use bloom_core::log_follow::LogGrowth;
+        let mut log = data("");
+        let text: String = (0..FOLLOW_LINES + 50).map(|n| format!("line {n}\n")).collect();
+        log.append(LogGrowth { text, end: 1, ..LogGrowth::default() });
+        assert_eq!(log.lines.len(), FOLLOW_LINES);
+        assert_eq!(log.lines.last().map(|l| l.text.as_str()), Some(format!("line {}", FOLLOW_LINES + 49).as_str()));
+        assert_eq!(log.total_lines, FOLLOW_LINES + 50);
     }
 }

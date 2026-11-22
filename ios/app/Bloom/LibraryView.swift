@@ -57,6 +57,11 @@ struct LibraryPage: View {
     @State private var narrow = BrowseFilters()
     /// What the library can be narrowed to; loaded with the page.
     @State private var choices: FilterChoices?
+    /// The library's collections, playlists or studios in place of its
+    /// titles (the Mac's View menu); none shows the titles.
+    @State private var view: LibraryView?
+    /// The languages of its tracks (Jellyfin 12.0), loaded the same way.
+    @State private var languages: LanguageChoices?
 
     private let pageSize: UInt32 = 100
 
@@ -96,12 +101,38 @@ struct LibraryPage: View {
     /// of films and shows, the favourites and a genre's grid; not the
     /// playlists or a collection's few titles.
     private var narrows: Bool {
-        source.id != "playlists" && source.kind != .boxSet && source.kind != .folder
+        source.id != "playlists" && source.kind != .boxSet && source.kind != .folder && view == nil
     }
 
-    /// The page's order and filters, as one key: a change loads again.
+    /// The views of a film or show library besides its titles, as on the
+    /// Mac: the collections and playlists with its titles (Jellyfin 12.0
+    /// filters them by library) and its studios.
+    private var views: [LibraryView] {
+        guard source.kind == .collectionFolder, source.collectionType == .movies || source.collectionType == .tvShows else { return [] }
+        return [.collections, .playlists, .studios]
+    }
+
+    private static func title(_ view: LibraryView) -> String {
+        switch view {
+        case .collections: "Collections"
+        case .playlists: "Playlists"
+        case .studios: "Studios"
+        }
+    }
+
+    /// The page's order, filters and view, as one key: a change loads again.
     private var key: String {
-        "\(sort)|\(descending)|\(String(describing: filter))|\(narrow.key)"
+        "\(sort)|\(descending)|\(String(describing: filter))|\(narrow.key)|\(String(describing: view))"
+    }
+
+    /// Why a view of lists or studios is empty.
+    private var emptyView: (title: String, symbol: String, text: String)? {
+        switch view {
+        case nil: nil
+        case .collections: ("No collections", "square.stack", "No collection holds a title of this library.")
+        case .playlists: ("No playlists", "music.note.list", "No playlist holds a title of this library.")
+        case .studios: ("No studios", "building.2", "The titles of this library name no studio.")
+        }
     }
 
     var body: some View {
@@ -142,16 +173,41 @@ struct LibraryPage: View {
                     } actions: {
                         Button("Clear filters") { narrow = BrowseFilters(); filter = nil }.quietButton()
                     }
+                } else if let empty = emptyView {
+                    ContentUnavailableView(empty.title, systemImage: empty.symbol, description: Text(empty.text))
                 } else {
                     ContentUnavailableView("No items found", systemImage: "film")
                 }
             }
         }
         .background(Color.page)
-        .navigationTitle(source.title)
+        .navigationTitle(view.map { Self.title($0) } ?? source.title)
+        // The library's name stays in sight under a view's name.
+        .navigationSubtitle(view == nil ? "" : source.title)
+        // A view has no filters, and pages by name (a random order keeps
+        // one page).
+        .onChange(of: view) {
+            filter = nil
+            narrow = BrowseFilters()
+            if sort == .random { sort = .name }
+        }
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
-                if source.kind == .boxSet || source.kind == .folder {
+                if !views.isEmpty {
+                    Menu {
+                        Picker("View", selection: $view) {
+                            Text(source.title).tag(LibraryView?.none)
+                            ForEach(views, id: \.self) { Text(Self.title($0)).tag(LibraryView?.some($0)) }
+                        }
+                    } label: {
+                        Label("View", systemImage: view == nil ? "square.grid.2x2" : "square.grid.2x2.fill")
+                    }
+                    .accessibilityIdentifier("library.view")
+                }
+                // A library of films or shows too (Jellyfin Web 12; the
+                // Mac's `play_library`): a show plays its episodes.
+                if source.kind == .boxSet || source.kind == .folder
+                    || source.collectionType == .tvShows || source.collectionType == .movies {
                     Menu {
                         Button("Play All", systemImage: "play.fill") { Task { await playAll(shuffled: false) } }
                         Button("Shuffle", systemImage: "shuffle") { Task { await playAll(shuffled: true) } }
@@ -160,6 +216,25 @@ struct LibraryPage: View {
                     }
                     .accessibilityIdentifier("library.play")
                 }
+                // A view of lists or studios comes by name, unfiltered.
+                if view == nil {
+                    sortAndFilter
+                }
+            }
+        }
+        .task(id: key) { await reload() }
+        .task {
+            guard narrows, choices == nil, let server = model.server else { return }
+            let library = source.id.contains(":") || source.id == "favorites" ? nil : source.id
+            async let languages = try? server.languageChoices(libraryId: library, collectionType: source.collectionType)
+            choices = try? await server.filterChoices(libraryId: library, collectionType: source.collectionType)
+            self.languages = await languages
+        }
+        .refreshable { await reload() }
+    }
+
+    /// The Sort and Filter menus of the titles.
+    @ViewBuilder private var sortAndFilter: some View {
                 Menu {
                     Picker("Sort by", selection: $sort) {
                         ForEach(Self.sorts, id: \.self) { Text(Self.title($0)).tag($0) }
@@ -177,7 +252,7 @@ struct LibraryPage: View {
                         ForEach(Self.filters, id: \.self) { Text(Self.title($0)).tag($0) }
                     }
                     if narrows {
-                        BrowseFilterMenus(narrow: $narrow, choices: choices, genreFixed: source.id.hasPrefix("genre:"))
+                        BrowseFilterMenus(narrow: $narrow, choices: choices, languages: languages, genreFixed: source.id.hasPrefix("genre:"))
                     }
                     if narrow.active || filter != nil {
                         Divider()
@@ -187,24 +262,21 @@ struct LibraryPage: View {
                     Label("Filter", systemImage: narrow.active || filter != nil ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease")
                 }
                 .accessibilityIdentifier("library.filter")
-            }
-        }
-        .task(id: key) { await reload() }
-        .task {
-            guard narrows, choices == nil, let server = model.server else { return }
-            let library = source.id.contains(":") || source.id == "favorites" ? nil : source.id
-            choices = try? await server.filterChoices(libraryId: library, collectionType: source.collectionType)
-        }
-        .refreshable { await reload() }
     }
 
-    /// One page of the grid in the page's order and filters.
+    /// One page of the grid in the page's order and filters, or of the view.
     private func page(start: UInt32, limit: UInt32) async throws -> Page? {
         guard let server = model.server else { return nil }
+        if let view {
+            return try await server.libraryViewPage(libraryId: source.id, collectionType: source.collectionType, view: view,
+                                                    start: start, limit: limit)
+        }
         return try await server.browsePage(libraryId: source.id, collectionType: source.collectionType, start: start, limit: limit,
                                            sortBy: sort, descending: descending, filter: filter,
                                            genres: narrow.genre.map { [$0] } ?? [], years: narrow.years(choices?.years ?? []),
-                                           minRating: narrow.minRating)
+                                           minRating: narrow.minRating,
+                                           audioLanguages: narrow.audioLanguage.map { [$0.code] } ?? [],
+                                           subtitleLanguages: narrow.subtitleLanguage.map { [$0.code] } ?? [])
     }
 
     /// Every item of the folder, in the page's order, into the queue.

@@ -91,6 +91,15 @@ struct PlayerView: View {
         .animation(.easeOut(duration: 0.15), value: model.controls)
         .animation(.easeOut(duration: 0.15), value: model.skippable?.kind)
         .accessibilityAction(.escape) { close() }
+        // "Are you still watching?" over the next episode, paused until
+        // an answer (Jellyfin Web 12's question; the rule is core's).
+        .alert("Are you still watching?", isPresented: Binding(get: { model.stillWatchingAsk },
+                                                               set: { if !$0 { model.stillWatchingAsk = false } })) {
+            Button("Continue") { model.keepWatching() }
+            Button("Stop", role: .cancel) { model.stopWatching() }
+        } message: {
+            Text("\(model.info?.title ?? "The next episode") is paused.")
+        }
         // One sheet at a time over the video (CLAUDE.md, "One popup at a
         // time"). SyncPlay has its own here: the root's sheet is under this
         // cover.
@@ -257,11 +266,23 @@ struct PlayerView: View {
                 model.skip(-model.skipBack)
             }
             .font(.title)
+            // Paused, a frame at a time (the Mac's `,` and `.`); a group
+            // plays in step and has none.
+            if frameSteps {
+                Button("Previous frame", systemImage: "backward.frame") { model.frameStep(forward: false) }
+                    .font(.title3)
+                    .accessibilityIdentifier("player.frameBack")
+            }
             Button(model.state.paused ? "Play" : "Pause", systemImage: model.state.paused ? "play.fill" : "pause.fill") {
                 model.togglePause()
             }
             .font(.system(size: bigIcon))
             .accessibilityIdentifier("player.pause")
+            if frameSteps {
+                Button("Next frame", systemImage: "forward.frame") { model.frameStep(forward: true) }
+                    .font(.title3)
+                    .accessibilityIdentifier("player.frameForward")
+            }
             Button("Forward \(Int(model.skipForward)) seconds", systemImage: Self.skipSymbol("goforward", model.skipForward)) {
                 model.skip(model.skipForward)
             }
@@ -276,6 +297,9 @@ struct PlayerView: View {
         .padding(.horizontal, 28).padding(.vertical, 14)
         .glassEffect(.regular, in: .capsule)
     }
+
+    /// The frame steps show while the video is paused, outside a group.
+    private var frameSteps: Bool { (model.state.paused || model.frameStepping) && SyncBridge.shared.group == nil }
 
     private var bar: some View {
         let duration = max(model.state.duration, 1)

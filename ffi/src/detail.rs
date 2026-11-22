@@ -75,9 +75,26 @@ struct Stream {
     is_text_subtitle_stream: bool,
 }
 
+/// One version of a film or an episode (a media source of the item): its
+/// file, with a name to tell it from the others.
+#[derive(uniffi::Record, Clone)]
+pub struct MediaVersion {
+    /// The media source id, which `play_info` and `download_info` take.
+    pub id: String,
+    /// The server's name of the version, else its file in short
+    /// ("4K · HEVC · 58 GB").
+    pub name: String,
+    /// The file in short, when the name is not that already.
+    pub detail: Option<String>,
+    /// The item's own file: what a play without a choice gets.
+    pub is_default: bool,
+    pub file: MediaFile,
+}
+
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "PascalCase", default)]
 struct Source {
+    id: String,
     container: Option<String>,
     size: Option<u64>,
     bitrate: Option<u64>,
@@ -126,15 +143,56 @@ fn file(source: Source) -> MediaFile {
     MediaFile { container: source.container, size_bytes: source.size, bitrate: source.bitrate, video, tracks }
 }
 
+/// The versions of an item from its answer, in the order of a menu (the
+/// item's own file first; core's `Item::versions`).
+fn versions(value: serde_json::Value) -> Result<Vec<MediaVersion>, BloomError> {
+    let item: bloom_core::jellyfin::Item = serde_json::from_value(value.clone()).map_err(|e| BloomError::Answered { detail: e.to_string() })?;
+    let answer: Answer = serde_json::from_value(value).map_err(|e| BloomError::Answered { detail: e.to_string() })?;
+    let mut files: Vec<Source> = answer.media_sources;
+    Ok(item
+        .versions()
+        .iter()
+        .enumerate()
+        .filter_map(|(n, source)| {
+            let at = files.iter().position(|f| f.id == source.id)?;
+            let name = bloom_core::versions::name(source, n);
+            let technical = bloom_core::versions::technical(source);
+            Some(MediaVersion {
+                id: source.id.clone(),
+                detail: (!technical.is_empty() && technical != name).then_some(technical),
+                name,
+                is_default: source.id == item.id,
+                file: file(files.remove(at)),
+            })
+        })
+        .collect())
+}
+
 #[uniffi::export]
 impl Server {
-    /// The item's first media source; none for an item without a file.
+    /// The file a play without a choice gets (the item's own, else the
+    /// first); none for an item without a file.
     pub async fn media_file(&self, item_id: String) -> Result<Option<MediaFile>, BloomError> {
         let client = self.signed_in()?;
         run(move || {
             let user = client.user()?.to_string();
             let answer: Answer = client.get(&format!("/Items/{item_id}"), &[("userId", user)])?;
-            Ok(answer.media_sources.into_iter().next().map(file))
+            let mut sources = answer.media_sources;
+            let at = sources.iter().position(|s| s.id == item_id).unwrap_or(0);
+            Ok((at < sources.len()).then(|| file(sources.remove(at))))
+        })
+        .await
+    }
+
+    /// The versions of a film or an episode (Jellyfin 12 has them for
+    /// episodes too), the item's own file first; one for an item with one
+    /// file, none for an item without a file.
+    pub async fn media_versions(&self, item_id: String) -> Result<Vec<MediaVersion>, BloomError> {
+        let client = self.signed_in()?;
+        run(move || {
+            let user = client.user()?.to_string();
+            let value: serde_json::Value = client.get(&format!("/Items/{item_id}"), &[("userId", user)])?;
+            versions(value)
         })
         .await
     }
@@ -162,5 +220,31 @@ mod tests {
         assert_eq!(file.tracks.len(), 3);
         assert!(file.tracks[1].is_forced && !file.tracks[1].is_text);
         assert!(file.tracks[2].is_hearing_impaired && file.tracks[2].is_text);
+    }
+
+    /// Two files: the item's own first, each with its own tracks and a
+    /// name (the server's, else the file in short).
+    #[test]
+    fn lists_the_versions_own_file_first() {
+        let value = serde_json::json!({
+            "Id": "film", "Type": "Movie",
+            "MediaSources": [
+                { "Id": "v4k", "Size": 58_000_000_000u64, "MediaStreams": [
+                    { "Type": "Video", "Index": 0, "Codec": "hevc", "Width": 3840, "Height": 2160 },
+                    { "Type": "Audio", "Index": 1, "Codec": "truehd", "Language": "eng" },
+                    { "Type": "Audio", "Index": 2, "Codec": "ac3", "Language": "spa" } ] },
+                { "Id": "film", "Name": "1080p", "Size": 6_300_000_000u64, "MediaStreams": [
+                    { "Type": "Video", "Index": 0, "Codec": "h264", "Width": 1920, "Height": 1080 },
+                    { "Type": "Audio", "Index": 1, "Codec": "aac", "Language": "eng" } ] }
+            ]
+        });
+        let versions = versions(value).unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!((versions[0].id.as_str(), versions[0].name.as_str(), versions[0].is_default), ("film", "1080p", true));
+        assert_eq!(versions[0].detail.as_deref(), Some("1080p · H264 · 6.3 GB"));
+        assert_eq!(versions[1].name, "4K · HEVC · 58 GB");
+        assert_eq!(versions[1].detail, None);
+        assert_eq!(versions[1].file.tracks.len(), 2);
+        assert_eq!(versions[0].file.tracks.len(), 1);
     }
 }

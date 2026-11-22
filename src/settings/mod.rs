@@ -111,7 +111,6 @@ pub struct Prefs {
     /// Display preferences "usersettings" of the web client; its
     /// `CustomPrefs` hold the home sections and the skip lengths.
     pub display: Value,
-    pub has_password: bool,
     pub last_login: Option<String>,
     /// The saves of the two documents, see [`DocSave`].
     configuration_save: DocSave,
@@ -185,14 +184,13 @@ struct DocSave {
 
 impl Prefs {
     /// The settings as one load brought them: the server has these.
-    pub fn from_server(configuration: Value, display: Value, has_password: bool, last_login: Option<String>) -> Self {
+    pub fn from_server(configuration: Value, display: Value, last_login: Option<String>) -> Self {
         Self {
             loaded: true,
             configuration_save: DocSave { acknowledged: configuration.clone(), ..Default::default() },
             display_save: DocSave { acknowledged: display.clone(), ..Default::default() },
             configuration,
             display,
-            has_password,
             last_login,
         }
     }
@@ -226,6 +224,11 @@ impl Prefs {
     /// The next episode starts by itself when one ends.
     pub fn auto_play_next(&self) -> bool {
         self.flag("EnableNextEpisodeAutoPlay", true)
+    }
+
+    /// When the player asks "Are you still watching?" (the web's key).
+    pub fn still_watching(&self) -> bloom_core::still_watching::Choice {
+        bloom_core::still_watching::Choice::parse(self.custom(bloom_core::still_watching::PREF_KEY))
     }
 
     /// The "Up next" card shows near the end of an item.
@@ -311,7 +314,6 @@ fn revert_failed(current: &mut Value, sent: &Value, acknowledged: &Value) {
 struct Loaded {
     configuration: Value,
     display: Value,
-    has_password: bool,
     last_login: Option<String>,
 }
 
@@ -332,7 +334,6 @@ impl Client {
             configuration: me.get("Configuration").cloned().unwrap_or_default(),
             // The app works without them; the pages then show the defaults.
             display: display.unwrap_or_default(),
-            has_password: me.get("HasPassword").and_then(Value::as_bool).unwrap_or(true),
             last_login: me
                 .get("LastLoginDate")
                 .and_then(Value::as_str)
@@ -431,7 +432,6 @@ impl Bloom {
                         this.prefs = Prefs::from_server(
                             loaded.configuration,
                             loaded.display,
-                            loaded.has_password,
                             loaded.last_login,
                         );
                     }
@@ -627,11 +627,14 @@ impl Bloom {
         self.ask_prompt(
             Prompt {
                 title: "Change password".to_string(),
-                message: "Other devices stay signed in.".to_string(),
+                message: "Other devices stay signed in. An account with no password leaves the current one empty."
+                    .to_string(),
                 action: "Change password".to_string(),
-                // An account without a password has no current one.
+                // Jellyfin 12 no longer says whether the account has a
+                // password (`HasPassword` is always true), so the current
+                // one may be empty.
                 fields: vec![
-                    field("Current password", self.prefs.has_password),
+                    field("Current password", false),
                     field("New password", true),
                 ],
                 run: Rc::new(|this, values, cx| {
@@ -641,10 +644,7 @@ impl Bloom {
                         cx,
                         move |client| client.change_password(&current, &new),
                         |this, result, cx| match result {
-                            Ok(()) => {
-                                this.prefs.has_password = true;
-                                this.toast("Password changed", "", cx)
-                            }
+                            Ok(()) => this.toast("Password changed", "", cx),
                             Err(_) => this.toast(
                                 "The password was not changed",
                                 "Check the current password and try again.",
@@ -966,7 +966,7 @@ mod race_tests {
         let (bloom, cx) = app(cx);
         bloom.update(cx, |this, cx| {
             this.session = Some(session(&server.url, "u1"));
-            this.prefs = Prefs::from_server(json!({"A": false, "B": false}), json!({}), true, None);
+            this.prefs = Prefs::from_server(json!({"A": false, "B": false}), json!({}), None);
             this.set_user_config("A", json!(true), cx);
             this.set_user_config("B", json!(true), cx);
         });
@@ -994,7 +994,7 @@ mod race_tests {
         let (bloom, cx) = app(cx);
         bloom.update(cx, |this, cx| {
             this.session = Some(session(&server.url, "u1"));
-            this.prefs = Prefs::from_server(json!({"A": 0, "B": 0, "C": 0}), json!({}), true, None);
+            this.prefs = Prefs::from_server(json!({"A": 0, "B": 0, "C": 0}), json!({}), None);
             this.set_user_config("A", json!(1), cx);
             this.set_user_config("B", json!(1), cx);
             this.set_user_config("C", json!(1), cx);
@@ -1023,7 +1023,7 @@ mod race_tests {
         bloom.update(cx, |this, cx| {
             add_server(this, "two", &two.url, "u2");
             this.session = Some(session(&one.url, "u1"));
-            this.prefs = Prefs::from_server(json!({"A": false}), json!({}), true, None);
+            this.prefs = Prefs::from_server(json!({"A": false}), json!({}), None);
             this.set_user_config("A", json!(true), cx);
             assert!(this.open_session("two", "u2", cx));
         });
@@ -1105,7 +1105,7 @@ mod race_tests {
     /// B. That document D2 must not pass D1 on the way to the server.
     fn change_b_on_a_page_from_before_the_save(bloom: &gpui_kit::Entity<Bloom>, cx: &mut gpui_kit::VisualTestContext) {
         bloom.update(cx, |this, cx| {
-            this.prefs = Prefs::from_server(json!({"A": false, "B": false}), json!({}), true, None);
+            this.prefs = Prefs::from_server(json!({"A": false, "B": false}), json!({}), None);
             this.set_user_config("B", json!(true), cx);
         });
         cx.run_until_parked();
@@ -1143,7 +1143,7 @@ mod race_tests {
         let (bloom, cx) = app(cx);
         bloom.update(cx, |this, cx| {
             this.session = Some(session(&one.url, "u1"));
-            this.prefs = Prefs::from_server(json!({"A": false, "B": false}), json!({}), true, None);
+            this.prefs = Prefs::from_server(json!({"A": false, "B": false}), json!({}), None);
             this.set_user_config("A", json!(true), cx);
         });
         cx.run_until_parked();

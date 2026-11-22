@@ -130,12 +130,20 @@ impl Bloom {
         self.queue.timeline = TimelineInfo::default();
         self.queue.hover = None;
         self.queue.up_next_hidden = false;
+        // The version in the player: the first source of its item.
+        let source = self
+            .playback
+            .playing
+            .as_ref()
+            .filter(|i| i.id == item_id && i.has_versions())
+            .and_then(|i| i.media_sources.first())
+            .map(|s| s.id.clone());
         self.fetch(
             cx,
             {
                 let item_id = item_id.clone();
                 // The timeline works without them.
-                move |client| Ok(client.timeline_info(&item_id).unwrap_or_default())
+                move |client| Ok(client.timeline_info_for(&item_id, source.as_deref()).unwrap_or_default())
             },
             move |this, result, cx| {
                 if let Ok(timeline) = result
@@ -331,10 +339,21 @@ impl Bloom {
         // After an episode, the user's setting decides if the next starts.
         let stay = self.playback.playing.as_ref().is_some_and(|item| item.kind == ItemKind::Episode)
             && !self.prefs.auto_play_next();
-        self.playback.status.reached_end
-            && self.playback.status.error.is_none()
-            && !stay
-            && self.play_next(cx)
+        if !self.playback.status.reached_end || self.playback.status.error.is_some() || stay {
+            return false;
+        }
+        // "Are you still watching?": the next item starts paused under the
+        // question (src/still_watching.rs).
+        let ask = self.still_watching_asks();
+        let started = self.play_next(cx);
+        if ask {
+            if started {
+                self.still_watching_show(cx);
+            } else {
+                self.stream.start_paused = false;
+            }
+        }
+        started
     }
 
     /// Puts an item in the queue of the player: right after the item that

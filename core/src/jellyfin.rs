@@ -180,8 +180,7 @@ impl Client {
 
     /// POST with a JSON body; the answer as it is.
     fn post_response<B: Serialize>(&self, path: &str, body: &B) -> Result<Answer> {
-        self.agent
-            .post(&self.url(path, &[]))
+        with_language(self.agent.post(&self.url(path, &[])))
             .header("Authorization", self.auth_header())
             .header("Accept", "application/json")
             .send_json(body)
@@ -203,12 +202,9 @@ impl Client {
         let url = self.url(path, query);
         let (auth, json) = (self.auth_header(), "application/json");
         let answer = match method {
-            Method::Get => self.agent.get(&url).header("Authorization", auth).header("Accept", json).call(),
-            Method::Post => self.agent.post(&url).header("Authorization", auth).header("Accept", json).send_empty(),
-            Method::Delete => self
-                .agent
-                .delete(&url)
-                .force_send_body()
+            Method::Get => with_language(self.agent.get(&url)).header("Authorization", auth).header("Accept", json).call(),
+            Method::Post => with_language(self.agent.post(&url)).header("Authorization", auth).header("Accept", json).send_empty(),
+            Method::Delete => with_language(self.agent.delete(&url).force_send_body())
                 .header("Authorization", auth)
                 .header("Accept", json)
                 .send_empty(),
@@ -243,12 +239,44 @@ impl Client {
         Ok((String::from_utf8_lossy(&bytes).into_owned(), cut))
     }
 
+    /// GET of a text body from byte `from` on: the whole lines after it,
+    /// at most the last `max` bytes of them (`log_follow::since_of`). It
+    /// asks for a range; a server that answers 206 sends the new bytes
+    /// alone, one that answers 200 (Jellyfin 12) the whole body, read as
+    /// it comes with only its end kept.
+    pub fn get_text_since(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+        from: u64,
+        max: usize,
+    ) -> Result<crate::log_follow::LogGrowth> {
+        let url = self.url(path, query);
+        let answer = self
+            .agent
+            .get(&url)
+            .header("Authorization", self.auth_header())
+            .header("Range", format!("bytes={from}-"))
+            .call();
+        let mut answer = match answer {
+            // Nothing after `from`.
+            Err(ureq::Error::StatusCode(416)) => return Ok(crate::log_follow::LogGrowth::nothing(from)),
+            answer => answer.map_err(|e| map_err(e, path))?,
+        };
+        let partial = answer.status().as_u16() == 206;
+        let reader = answer.body_mut().with_config().limit(u64::MAX).reader();
+        let growth = if partial {
+            crate::log_follow::since_of(reader, 0, max).map(|growth| growth.shifted(from))
+        } else {
+            crate::log_follow::since_of(reader, from, max)
+        };
+        growth.map_err(|e| map_body_err(ureq::Error::Io(e), "read", path))
+    }
+
     /// GET that returns the body as text (log files).
     pub fn get_text(&self, path: &str, query: &[(&str, String)]) -> Result<String> {
         let url = self.url(path, query);
-        let mut response = self
-            .agent
-            .get(&url)
+        let mut response = with_language(self.agent.get(&url))
             .header("Authorization", self.auth_header())
             .call()
             .map_err(|e| map_err(e, path))?;
@@ -518,6 +546,22 @@ impl Client {
         self.item_list("/Genres", &params)
     }
 
+    /// The languages of the audio and subtitle tracks of the items of
+    /// these kinds, inside a library or (with no parent) in every library
+    /// (`/Items/Filters2`, Jellyfin 12.0). Empty lists from an older server.
+    pub fn language_filters(&self, parent_id: Option<&str>, include_types: &[&str]) -> Result<LanguageChoices> {
+        let mut params = vec![
+            ("userId", self.user()?.to_string()),
+            ("includeItemTypes", include_types.join(",")),
+            ("recursive", "true".to_string()),
+        ];
+        if let Some(parent) = parent_id {
+            params.push(("parentId", parent.to_string()));
+        }
+        let answer: serde_json::Value = self.get("/Items/Filters2", &params)?;
+        Ok(language_choices(&answer))
+    }
+
     pub fn seasons(&self, series_id: &str) -> Result<Vec<Item>> {
         self.item_list(&format!("/Shows/{series_id}/Seasons"), &[("fields", item_fields())])
     }
@@ -547,6 +591,58 @@ impl Client {
         self.item_list(
             &format!("/Items/{item_id}/Similar"),
             &[("limit", limit.to_string()), ("fields", item_fields())],
+        )
+    }
+
+    /// The studios of the titles of a library (or, with no parent, of the
+    /// server), one page of them: the query's parent, kinds, letter, start
+    /// and limit. The server sorts studios by name.
+    pub fn studios(&self, q: &ItemQuery) -> Result<ItemsResult> {
+        let mut params: Vec<(&str, String)> = vec![
+            ("userId", self.user()?.to_string()),
+            ("enableImageTypes", "Primary,Thumb".to_string()),
+            ("imageTypeLimit", "1".to_string()),
+            ("enableTotalRecordCount", "true".to_string()),
+        ];
+        if let Some(parent) = &q.parent_id {
+            params.push(("parentId", parent.clone()));
+        }
+        if !q.include_types.is_empty() {
+            params.push(("includeItemTypes", q.include_types.join(",")));
+        }
+        if let Some(prefix) = &q.name_starts_with {
+            params.push(("nameStartsWith", prefix.clone()));
+        }
+        if let Some(limit) = &q.name_less_than {
+            params.push(("nameLessThan", limit.clone()));
+        }
+        if let Some(start) = q.start {
+            params.push(("startIndex", start.to_string()));
+        }
+        if let Some(limit) = q.limit {
+            params.push(("limit", limit.to_string()));
+        }
+        self.get("/Studios", &params)
+    }
+
+    /// The collections that hold an item ("Included in", Jellyfin 12.0).
+    pub fn collections_of(&self, item_id: &str, limit: usize) -> Result<Vec<Item>> {
+        self.item_list(
+            &format!("/Items/{item_id}/Collections"),
+            &[("limit", limit.to_string()), ("fields", item_fields())],
+        )
+    }
+
+    /// Episodes that have not aired yet, the soonest first.
+    pub fn upcoming(&self, limit: usize) -> Result<Vec<Item>> {
+        self.item_list(
+            "/Shows/Upcoming",
+            &[
+                ("limit", limit.to_string()),
+                ("fields", item_fields()),
+                ("enableImageTypes", "Primary,Backdrop,Thumb".to_string()),
+                ("imageTypeLimit", "1".to_string()),
+            ],
         )
     }
 
@@ -833,6 +929,16 @@ struct MeConfiguration {
     play_default_audio_track: bool,
 }
 
+/// Where a title's language comes from: its original language (Jellyfin
+/// 12.0, two letters as the server keeps it: "en", or several with commas)
+/// and, for an episode, its series, which holds it instead.
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct Origin {
+    original_language: Option<String>,
+    series_id: Option<String>,
+}
+
 /// A 404 or 405: the server does not know the address (an older server has
 /// it under another one).
 fn not_this_address(err: &anyhow::Error) -> bool {
@@ -1101,6 +1207,34 @@ pub fn image_auth_header(url: &str) -> Option<String> {
     header_for(&IMAGE_AUTH.lock().unwrap(), url).map(str::to_string)
 }
 
+/// The `Accept-Language` of every request, from the system's preferred
+/// languages: Jellyfin 12.0 localises what it can of an answer by it (the
+/// names of the languages, "Default" and the like in the track titles).
+/// None sends no header, and the server answers in its own language.
+static ACCEPT_LANGUAGE: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Sets the languages the requests ask for, most wanted first, as the
+/// system lists them ("en-US", "de-DE"); see [`crate::languages::accept_language`].
+/// The app calls it once at start; an empty list sends no header.
+pub fn set_preferred_languages(tags: &[String]) {
+    let value = crate::languages::accept_language(tags);
+    log::info!("Accept-Language: {}", value.as_deref().unwrap_or("(none)"));
+    *ACCEPT_LANGUAGE.write().unwrap_or_else(std::sync::PoisonError::into_inner) = value;
+}
+
+/// The `Accept-Language` value the requests send, if any.
+pub fn accept_language() -> Option<String> {
+    ACCEPT_LANGUAGE.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
+/// A request with the `Accept-Language` header when the app set one.
+fn with_language<B>(request: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+    match accept_language() {
+        Some(value) => request.header("Accept-Language", value),
+        None => request,
+    }
+}
+
 /// Name of this machine for the server's list of devices. It is asked for
 /// once: every request sends it. Characters that are not plain ASCII are
 /// replaced, because a header value with them is refused.
@@ -1173,11 +1307,31 @@ pub struct ItemQuery {
     pub is_hd: Option<bool>,
     /// Only the items with (true) or without (false) a subtitle track.
     pub has_subtitles: Option<bool>,
+    /// Only the items with an audio track in one of these languages, by
+    /// the code the server lists them with (Jellyfin 12.0; `/Items/Filters2`).
+    pub audio_languages: Vec<String>,
+    /// Only the items with a subtitle track in one of these languages.
+    pub subtitle_languages: Vec<String>,
+}
+
+/// The parameters of `/Items` that narrow a query by the languages of the
+/// audio and subtitle tracks (Jellyfin 12.0). The server takes several
+/// codes with a comma between two and keeps an item with any of them
+/// (checked on Jellyfin 12.2: "und,eng" kept seven films, "und|eng" none).
+/// An older server ignores the parameters.
+pub fn language_params(audio: &[String], subtitles: &[String]) -> Vec<(&'static str, String)> {
+    let mut params = Vec::new();
+    for (name, codes) in [("audioLanguages", audio), ("subtitleLanguages", subtitles)] {
+        if !codes.is_empty() {
+            params.push((name, codes.join(",")));
+        }
+    }
+    params
 }
 
 /// The parameters of `/Items` that narrow a query by genre, year,
-/// resolution and subtitles. The server takes genre ids with a pipe
-/// between two and years with a comma (checked on Jellyfin 12.2).
+/// resolution, subtitles and track languages. The server takes genre ids
+/// with a pipe between two and years with a comma (checked on Jellyfin 12.2).
 pub fn narrowing_params(q: &ItemQuery) -> Vec<(&'static str, String)> {
     let mut params = Vec::new();
     if !q.genre_ids.is_empty() {
@@ -1192,7 +1346,68 @@ pub fn narrowing_params(q: &ItemQuery) -> Vec<(&'static str, String)> {
             params.push((name, value.to_string()));
         }
     }
+    params.extend(language_params(&q.audio_languages, &q.subtitle_languages));
     params
+}
+
+/// A language a library can be narrowed to: the code the server filters
+/// by ("eng") and the name to show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LanguageChoice {
+    pub code: String,
+    pub name: String,
+}
+
+/// The languages of the audio and of the subtitle tracks of a library's
+/// items, as `/Items/Filters2` lists them on Jellyfin 12.0 and later.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LanguageChoices {
+    pub audio: Vec<LanguageChoice>,
+    pub subtitles: Vec<LanguageChoice>,
+}
+
+impl LanguageChoices {
+    /// True when there is nothing to pick (a server before 12.0, or a
+    /// library with no tagged tracks).
+    pub fn is_empty(&self) -> bool {
+        self.audio.is_empty() && self.subtitles.is_empty()
+    }
+}
+
+/// The choices of an answer of `/Items/Filters2`: each `NameValuePair`
+/// of `AudioLanguages` and `SubtitleLanguages`, named by the app's table
+/// when it knows the code, else by the server's name without the code it
+/// adds in brackets ("Undetermined (und)"); sorted by name, each code once.
+pub fn language_choices(answer: &serde_json::Value) -> LanguageChoices {
+    let list = |key: &str| {
+        let mut choices: Vec<LanguageChoice> = answer
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|pair| {
+                let code = pair.get("Value")?.as_str()?.trim().to_string();
+                if code.is_empty() {
+                    return None;
+                }
+                let server = pair.get("Name").and_then(serde_json::Value::as_str).unwrap_or_default().trim();
+                let server = match server.rsplit_once(" (") {
+                    Some((name, rest)) if rest.trim_end_matches(')').eq_ignore_ascii_case(&code) => name,
+                    _ => server,
+                };
+                let name = crate::languages::name(&code)
+                    .map(str::to_string)
+                    .or_else(|| (!server.is_empty()).then(|| server.to_string()))
+                    .unwrap_or_else(|| code.clone());
+                Some(LanguageChoice { code, name })
+            })
+            .collect();
+        choices.sort_by_key(|choice| choice.name.to_lowercase());
+        let mut seen = std::collections::HashSet::new();
+        choices.retain(|choice| seen.insert(choice.code.to_lowercase()));
+        choices
+    };
+    LanguageChoices { audio: list("AudioLanguages"), subtitles: list("SubtitleLanguages") }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1249,12 +1464,14 @@ pub enum ItemKind {
     MusicArtist,
     Person,
     Trailer,
+    /// A studio or a TV network (`/Studios`); its titles are a page.
+    Studio,
     /// A kind with no variant, by its name; empty when the server sent none.
     Other(String),
 }
 
 impl ItemKind {
-    const NAMED: [(&'static str, ItemKind); 16] = [
+    const NAMED: [(&'static str, ItemKind); 17] = [
         ("Movie", ItemKind::Movie),
         ("Series", ItemKind::Series),
         ("Season", ItemKind::Season),
@@ -1271,6 +1488,7 @@ impl ItemKind {
         ("MusicArtist", ItemKind::MusicArtist),
         ("Person", ItemKind::Person),
         ("Trailer", ItemKind::Trailer),
+        ("Studio", ItemKind::Studio),
     ];
 
     /// True for a kind the server did not name: an item opened by its id
@@ -1386,6 +1604,8 @@ pub struct Item {
     /// "Continuing" or "Ended" for a series.
     pub status: Option<String>,
     pub end_date: Option<String>,
+    /// When the film came out or the episode airs ("2026-11-25T00:00:00Z").
+    pub premiere_date: Option<String>,
     #[serde(default)]
     pub user_data: UserData,
 }
@@ -1580,6 +1800,8 @@ pub struct MediaSource {
     /// File name and path; the quality tags read stub, 3D and IMAX hints here.
     pub path: Option<String>,
     pub name: Option<String>,
+    /// "mkv", "mp4"; a list of names for some files ("mov,mp4,m4a").
+    pub container: Option<String>,
     // The fields below are what the answer to `PlaybackInfo` adds.
     pub id: String,
     pub supports_direct_play: bool,
@@ -1756,6 +1978,17 @@ impl Item {
             return Some(client.image_url(&self.id, "Primary", Some(tag), width));
         }
         None
+    }
+
+    /// The day of the premiere as a card shows it: "25 Nov 2026".
+    pub fn premiere_label(&self) -> Option<String> {
+        const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        let date = self.premiere_date.as_deref()?;
+        let year: i32 = date.get(..4)?.parse().ok()?;
+        let month: usize = date.get(5..7)?.parse().ok()?;
+        let day: u32 = date.get(8..10)?.parse().ok()?;
+        let month = MONTHS.get(month.checked_sub(1)?)?;
+        Some(format!("{day} {month} {year}"))
     }
 
     /// The year line of a card: "2014", or "2011 - Present" for a series.
@@ -1967,9 +2200,50 @@ impl Client {
             .filter(|language| !language.is_empty() && !audio.play_default_audio_track)
     }
 
+    /// The language an audio track should be in for an item, as
+    /// [`Self::audio_language`] gives it, with "Original language" (Jellyfin
+    /// 12.0) turned into the item's original language. None when the user
+    /// has no preference or the title names no original language: the
+    /// track the server names plays (the server makes the same choice).
+    pub fn audio_language_for(&self, item_id: &str) -> Option<String> {
+        let preference = self.audio_language()?;
+        if !crate::languages::is_original(&preference) {
+            return Some(preference);
+        }
+        let user = self.user().ok()?.to_string();
+        let origin: Origin = self.get(&format!("/Items/{item_id}"), &[("userId", user)]).ok()?;
+        self.wanted_audio(&preference, &origin)
+    }
+
+    /// The language of the preference for a title of this origin. An
+    /// episode has no original language of its own on Jellyfin 12.2 (its
+    /// series has), so its series is asked when the setting needs it.
+    fn wanted_audio(&self, preference: &str, origin: &Origin) -> Option<String> {
+        if !crate::languages::is_original(preference) {
+            return crate::languages::wanted_audio(preference, None);
+        }
+        let own = origin.original_language.as_deref().filter(|list| !list.trim().is_empty());
+        let inherited = || {
+            let series = origin.series_id.as_deref().filter(|id| !id.is_empty())?;
+            let user = self.user().ok()?.to_string();
+            self.get::<Origin>(&format!("/Items/{series}"), &[("userId", user)]).ok()?.original_language
+        };
+        match own {
+            Some(own) => crate::languages::wanted_audio(preference, Some(own)),
+            None => crate::languages::wanted_audio(preference, inherited().as_deref()),
+        }
+    }
+
     /// Chapters and preview images of an item. The lists of items leave
     /// these out, because they are large.
     pub fn timeline_info(&self, item_id: &str) -> Result<TimelineInfo> {
+        self.timeline_info_for(item_id, None)
+    }
+
+    /// The same for one version of the item (`source_id`, a media source):
+    /// the default tracks are those of that file. None is the item's own.
+    /// The preview images stay the item's own.
+    pub fn timeline_info_for(&self, item_id: &str, source_id: Option<&str>) -> Result<TimelineInfo> {
         #[derive(Deserialize)]
         #[serde(rename_all = "PascalCase")]
         struct Full {
@@ -1983,6 +2257,8 @@ impl Client {
             >,
             #[serde(default)]
             media_sources: Vec<MediaSource>,
+            #[serde(flatten)]
+            origin: Origin,
         }
         let user = self.user()?.to_string();
         let full: Full = self.get(&format!("/Items/{item_id}"), &[("userId", user)])?;
@@ -2000,9 +2276,12 @@ impl Client {
                 .min_by_key(|t| t.width)
         });
         // The audio settings of the user, read now so a change made a
-        // moment ago in another client counts.
-        let language = self.audio_language();
-        let default_audio = full.media_sources.first().and_then(|source| {
+        // moment ago in another client counts; "Original language" turns
+        // into the language of this title.
+        let language = self.audio_language().and_then(|preference| self.wanted_audio(&preference, &full.origin));
+        // The file that plays: the version asked for, else the item's own.
+        let played = crate::versions::pick(&full.media_sources, item_id, source_id);
+        let default_audio = played.and_then(|source| {
             let tracks: Vec<&MediaStream> = source
                 .media_streams
                 .iter()
@@ -2023,7 +2302,7 @@ impl Client {
                 .and_then(|wanted| tracks.iter().position(|t| t.index == wanted));
             preferred.or(chosen).map(|place| place as i64 + 1)
         });
-        let default_subtitle = full.media_sources.first().and_then(|source| {
+        let default_subtitle = played.and_then(|source| {
             let Some(wanted) = source.default_subtitle_stream_index.filter(|i| *i >= 0) else {
                 return Some(None);
             };
@@ -2457,5 +2736,122 @@ mod tests {
         assert_eq!(format_runtime(59), "59 s");
         assert_eq!(format_runtime(60), "1m");
         assert_eq!(format_runtime(0), "0m");
+    }
+
+    #[test]
+    fn the_language_filters_are_sent_with_commas() {
+        let query = ItemQuery {
+            audio_languages: vec!["jpn".into(), "eng".into()],
+            subtitle_languages: vec!["spa".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            narrowing_params(&query),
+            [("audioLanguages", "jpn,eng".to_string()), ("subtitleLanguages", "spa".to_string())]
+        );
+        assert!(language_params(&[], &[]).is_empty());
+    }
+
+    /// The answer of `/Items/Filters2` on Jellyfin 12.2, with a code the
+    /// app's table lacks and one it lists twice.
+    #[test]
+    fn the_language_choices_of_a_library() {
+        let answer = serde_json::json!({
+            "Genres": [],
+            "AudioLanguages": [
+                {"Name": "Undetermined (und)", "Value": "und"},
+                {"Name": "Japanese (jpn)", "Value": "jpn"},
+                {"Name": "English (eng)", "Value": "eng"},
+                {"Name": "English", "Value": "ENG"},
+                {"Name": "Klingon", "Value": "tlh"},
+                {"Name": "", "Value": ""},
+            ],
+            "SubtitleLanguages": [{"Name": "Español (spa)", "Value": "spa"}],
+        });
+        let choices = language_choices(&answer);
+        let audio: Vec<(&str, &str)> = choices.audio.iter().map(|c| (c.code.as_str(), c.name.as_str())).collect();
+        assert_eq!(audio, [("eng", "English"), ("jpn", "Japanese"), ("tlh", "Klingon"), ("und", "Undetermined")]);
+        assert_eq!(choices.subtitles, [LanguageChoice { code: "spa".into(), name: "Spanish".into() }]);
+        // A server before 12.0 has no such lists.
+        assert!(language_choices(&serde_json::json!({"Genres": []})).is_empty());
+    }
+
+    #[test]
+    fn the_language_filters_are_asked_of_the_library() {
+        let server = crate::test_net::Routes::start(|_, path| match path {
+            p if p.starts_with("/Items/Filters2?") && p.contains("parentId=lib") && p.contains("includeItemTypes=Movie") => (
+                200,
+                r#"{"AudioLanguages":[{"Name":"French (fre)","Value":"fre"}],"SubtitleLanguages":[]}"#.into(),
+            ),
+            _ => (404, String::new()),
+        });
+        let client = Client::new(&server.url, "d").with_session("t", "u1");
+        let choices = client.language_filters(Some("lib"), &["Movie"]).unwrap();
+        assert_eq!(choices.audio, [LanguageChoice { code: "fre".into(), name: "French".into() }]);
+        assert!(choices.subtitles.is_empty());
+    }
+
+    /// "Original language" (Jellyfin 12.0) picks the track in the title's
+    /// original language: a film's own, an episode's from its series. A
+    /// title with none keeps the track the server names.
+    #[test]
+    fn the_original_language_picks_the_audio_track() {
+        const STREAMS: &str = r#""MediaSources":[{"Id":"x","DefaultAudioStreamIndex":1,"MediaStreams":[
+            {"Type":"Video","Index":0},
+            {"Type":"Audio","Index":1,"Language":"eng"},
+            {"Type":"Audio","Index":2,"Language":"jpn"},
+            {"Type":"Audio","Index":3,"Language":"fre"}]}]"#;
+        let server = crate::test_net::Routes::start(|_, path| {
+            let body = match path.split('?').next().unwrap_or_default() {
+                "/Users/Me" => r#"{"Configuration":{"AudioLanguagePreference":"OriginalLanguage"}}"#.to_string(),
+                "/Items/film" => format!(r#"{{"Id":"film","OriginalLanguage":"fr",{STREAMS}}}"#),
+                "/Items/episode" => format!(r#"{{"Id":"episode","SeriesId":"show",{STREAMS}}}"#),
+                "/Items/show" => r#"{"Id":"show","OriginalLanguage":"ja,en"}"#.to_string(),
+                "/Items/plain" => format!(r#"{{"Id":"plain",{STREAMS}}}"#),
+                _ => return (404, String::new()),
+            };
+            (200, body)
+        });
+        let client = Client::new(&server.url, "d").with_session("t", "u1");
+        let track = |id: &str| client.timeline_info(id).unwrap().default_audio;
+        assert_eq!(track("film"), Some(3), "the film's own original language, French");
+        assert_eq!(track("episode"), Some(2), "the series' first original language, Japanese");
+        assert_eq!(track("plain"), Some(1), "no original language: the server's track");
+        assert_eq!(client.audio_language_for("film").as_deref(), Some("fr"));
+        assert_eq!(client.audio_language_for("episode").as_deref(), Some("ja"));
+        assert_eq!(client.audio_language_for("plain"), None);
+    }
+
+    /// Every request carries the system's languages once the app set them.
+    #[test]
+    fn the_requests_ask_for_the_preferred_languages() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let heads = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (seen, stopping) = (heads.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            for mut stream in crate::test_net::connections(listener, stopping) {
+                let mut buffer = [0u8; 4096];
+                let n = stream.read(&mut buffer).unwrap_or(0);
+                seen.lock().unwrap().push(String::from_utf8_lossy(&buffer[..n]).to_lowercase());
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+            }
+        });
+        set_preferred_languages(&["de-DE".to_string(), "en".to_string()]);
+        let client = Client::new(&url, "d");
+        let _: serde_json::Value = client.get("/Items", &[]).unwrap();
+        let _: serde_json::Value = client.post_json("/Items", &serde_json::json!({})).unwrap();
+        let _ = client.get_text("/System/Logs/Log", &[]);
+        set_preferred_languages(&[]);
+        stop.store(true, Ordering::Release);
+        thread.join().unwrap();
+        let heads = heads.lock().unwrap();
+        assert_eq!(heads.len(), 3);
+        for head in heads.iter() {
+            assert!(head.contains("\r\naccept-language: de-de,de;q=0.9,en;q=0.8\r\n"), "{head}");
+        }
+        assert_eq!(accept_language(), None);
     }
 }

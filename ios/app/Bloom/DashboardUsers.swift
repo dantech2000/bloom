@@ -57,7 +57,6 @@ struct UserPage: View {
         List {
             Section {
                 LabeledContent("Role", value: user.admin ? "Administrator" : "User")
-                LabeledContent("Password", value: user.hasPassword ? "Set" : "None")
                 LabeledContent("Last active", value: When.text(user.lastActive))
             }
             Section {

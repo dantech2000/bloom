@@ -8,6 +8,7 @@
 
 pub mod access;
 pub mod activity;
+pub mod backups;
 pub mod api_keys;
 pub mod branding;
 pub mod config;
@@ -76,6 +77,7 @@ pub enum Section {
     Plugins,
     Networking,
     Tasks,
+    Backups,
     Logs,
     ApiKeys,
 }
@@ -104,7 +106,7 @@ impl Section {
         ("Plugins", &[Section::Plugins]),
         (
             "Advanced",
-            &[Section::Networking, Section::Tasks, Section::Logs, Section::ApiKeys],
+            &[Section::Networking, Section::Tasks, Section::Backups, Section::Logs, Section::ApiKeys],
         ),
     ];
 
@@ -127,6 +129,7 @@ impl Section {
             Section::Activity => "Activity",
             Section::Plugins => "Plugins",
             Section::Tasks => "Scheduled Tasks",
+            Section::Backups => "Backups",
             Section::Logs => "Logs",
             Section::ApiKeys => "API Keys",
         }
@@ -151,6 +154,7 @@ impl Section {
             Section::Activity => LucideIcon::Bell,
             Section::Plugins => LucideIcon::Boxes,
             Section::Tasks => LucideIcon::Clock,
+            Section::Backups => LucideIcon::Archive,
             Section::Logs => LucideIcon::Server,
             Section::ApiKeys => LucideIcon::Settings,
         }
@@ -183,6 +187,7 @@ enum Loaded {
     Activity(activity::Data),
     Plugins(plugins::Data),
     Tasks(tasks::Data),
+    Backups(backups::Data),
     Logs(logs::Data),
     ApiKeys(api_keys::Data),
     Config(Section, config::Data),
@@ -200,6 +205,10 @@ pub struct Live {
     pub(crate) load: u64,
     /// Timer that loads the live part again.
     pub(crate) tick: Option<gpui_kit::Task<()>>,
+    /// Timer of the follow of the open log (`logs::start_follow`).
+    pub(crate) follow: Option<gpui_kit::Task<()>>,
+    /// A follow read is on its way.
+    pub(crate) follow_busy: bool,
 }
 
 /// State of the admin page. The data of a section stays when the user goes to
@@ -220,6 +229,18 @@ pub struct AdminData {
     pub tasks: Option<tasks::Data>,
     pub logs: Option<logs::Data>,
     pub api_keys: Option<api_keys::Data>,
+    pub backups: Option<backups::Data>,
+    /// The parts the user picked for a new backup.
+    pub backup_contents: bloom_core::backups::Contents,
+    /// A new backup is on its way (the server answers when it is written).
+    pub backup_creating: bool,
+    /// The Follow switch of the log viewer: new lines come every few
+    /// seconds and the viewer stays at its end.
+    pub log_follow: bool,
+    /// The scroll of the viewer while it follows (its own box on the Mac).
+    pub log_scroll: gpui_kit::ScrollHandle,
+    /// The filters, the sort and the page of the activity log.
+    pub activity_query: bloom_core::activity_query::Query,
     /// The access editor of one user, inside the Users section.
     pub access: Option<access::Editor>,
     /// The trigger editor of one task, inside the Tasks section.
@@ -261,6 +282,12 @@ impl AdminData {
             tasks: None,
             logs: None,
             api_keys: None,
+            backups: None,
+            backup_contents: bloom_core::backups::Contents::new_backup(),
+            backup_creating: false,
+            log_follow: false,
+            log_scroll: gpui_kit::ScrollHandle::new(),
+            activity_query: bloom_core::activity_query::Query::default(),
             access: None,
             triggers: None,
             config: HashMap::new(),
@@ -509,6 +536,10 @@ impl Bloom {
         data.loading = true;
         let section = data.section;
         let log_open = data.log_open.clone();
+        let activity_query = data.activity_query.clone();
+        if section == Section::Logs && data.log_follow {
+            self.start_log_follow(cx);
+        }
         self.start_admin_tick(cx);
         self.fetch_for_page(
             cx,
@@ -519,9 +550,10 @@ impl Bloom {
                     Section::Users => Loaded::Users(users::load(client)?),
                     Section::Libraries => Loaded::Libraries(libraries::load(client, &[])?),
                     Section::Devices => Loaded::Devices(devices::load(client)?),
-                    Section::Activity => Loaded::Activity(activity::load(client)?),
+                    Section::Activity => Loaded::Activity(activity::load(client, &activity_query)?),
                     Section::Plugins => Loaded::Plugins(plugins::load(client)?),
                     Section::Tasks => Loaded::Tasks(tasks::load(client)?),
+                    Section::Backups => Loaded::Backups(backups::load(client)?),
                     Section::Logs => Loaded::Logs(logs::load(client, log_open.as_deref())?),
                     Section::ApiKeys => Loaded::ApiKeys(api_keys::load(client)?),
                     section => Loaded::Config(section, config::load(client, section)?),
@@ -541,6 +573,7 @@ impl Bloom {
                                 Loaded::Activity(d) => data.activity = Some(d),
                                 Loaded::Plugins(d) => data.plugins = Some(d),
                                 Loaded::Tasks(d) => data.tasks = Some(d),
+                                Loaded::Backups(d) => data.backups = Some(d),
                                 Loaded::Logs(d) => data.logs = Some(d),
                                 Loaded::ApiKeys(d) => data.api_keys = Some(d),
                                 // A page with edits keeps them; a visit
@@ -777,6 +810,7 @@ impl Bloom {
                 None => section_page(data, &data.plugins, cx, |d, cx| plugins::render(self, d, cx)),
             },
             Section::Tasks => section_page(data, &data.tasks, cx, |d, cx| tasks::render(self, d, cx)),
+            Section::Backups => section_page(data, &data.backups, cx, |d, cx| backups::render(self, d, cx)),
             Section::Logs => section_page(data, &data.logs, cx, |d, cx| logs::render(self, d, cx)),
             Section::ApiKeys => {
                 section_page(data, &data.api_keys, cx, |d, cx| api_keys::render(self, d, cx))

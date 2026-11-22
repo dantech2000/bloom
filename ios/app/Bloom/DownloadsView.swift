@@ -4,10 +4,10 @@ import SwiftUI
 /// Starts or resumes a download, with a toast when it does not start; the
 /// same on a card, the detail page and the downloads list.
 enum DownloadAction {
-    static func start(_ item: MediaItem, model: AppModel) {
+    static func start(_ item: MediaItem, model: AppModel, version: String? = nil) {
         Task {
             guard let server = model.server else { return }
-            if let failure = await Downloads.shared.download(item, server: server) {
+            if let failure = await Downloads.shared.download(item, server: server, version: version) {
                 model.say("The download did not start: \(failure)")
             } else {
                 model.say("Downloading \(item.name)")
@@ -214,6 +214,8 @@ struct DownloadButton: View {
     var entry: DownloadEntry?
     /// On the detail page's row of discs: the done mark sits on one too.
     var disc = false
+    /// The version chosen on the detail page; nil downloads the item's own file.
+    var version: String? = nil
     private var downloads: Downloads { Downloads.shared }
 
     var body: some View {
@@ -222,7 +224,7 @@ struct DownloadButton: View {
         Group {
             switch entry?.state {
             case nil:
-                Button("Download", systemImage: "arrow.down") { DownloadAction.start(item, model: model) }
+                Button("Download", systemImage: "arrow.down") { DownloadAction.start(item, model: model, version: version) }
             case .downloading:
                 Button { if let entry { downloads.pause(entry.id) } } label: {
                     ProgressView(value: entry?.progress ?? 0).progressViewStyle(.circular).frame(width: 22, height: 22)

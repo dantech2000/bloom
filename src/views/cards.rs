@@ -525,6 +525,8 @@ pub fn poster_card(
         ItemKind::BoxSet => LucideIcon::GalleryVerticalEnd,
         ItemKind::Playlist => LucideIcon::ListVideo,
         ItemKind::Folder | ItemKind::CollectionFolder => LucideIcon::Folder,
+        // A studio seldom has a picture.
+        ItemKind::Studio => LucideIcon::Building2,
         _ => LucideIcon::Clapperboard,
     };
     let card = card(
@@ -590,6 +592,40 @@ pub fn wide_card(
         subtitle,
         LucideIcon::Tv,
         row,
+        hovered,
+        cx,
+    )
+}
+
+/// Wide card of an episode that has not aired yet: the show, then the
+/// episode and the day it airs.
+pub fn upcoming_card(
+    item: &Item,
+    client: &Client,
+    w: f32,
+    hovered: Option<&SharedString>,
+    cx: &mut Context<Bloom>,
+) -> Stateful<Div> {
+    let h = (w * 9. / 16.).round();
+    let width = image_px(w);
+    let url = item
+        .wide_url(client, width)
+        .or_else(|| item.poster_url(client, width));
+    let (title, episode) = card_titles(item);
+    let subtitle = match (episode, item.premiere_label()) {
+        (Some(episode), Some(day)) => Some(format!("{day} · {episode}")),
+        (episode, day) => day.or(episode),
+    };
+    card(
+        "upcoming",
+        item,
+        url,
+        w,
+        h,
+        title,
+        subtitle,
+        LucideIcon::Tv,
+        CardRow::None,
         hovered,
         cx,
     )

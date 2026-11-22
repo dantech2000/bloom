@@ -145,6 +145,76 @@ final class DetailShots: XCTestCase {
         shot("d07-detail-file")
     }
 
+    /// A film with two files (Jellyfin 12 versions; the mock's "Glass
+    /// Weather"): the page offers its 1080p file and a 4K one, a pick
+    /// changes the tracks and the file facts, Play asks the server for that
+    /// version, and the player's settings name it.
+    func testVersionPickAndPlay() {
+        let app = launch()
+        app.buttons["Search"].firstMatch.tap()
+        XCTAssertTrue(app.searchFields.firstMatch.waitForExistence(timeout: 5), "No search field")
+        sleep(1)
+        // One word: the whole title typed did not find the card once.
+        app.typeText("Glass")
+        let card = app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS[c] 'Glass Weather'")).firstMatch
+        XCTAssertTrue(card.waitForExistence(timeout: 15), "Search did not find Glass Weather")
+        card.tap()
+        XCTAssertTrue(app.buttons["detail.play"].waitForExistence(timeout: 15), "The detail page did not load")
+        sleep(2)
+        let version = app.buttons["detail.version"]
+        if !version.waitForExistence(timeout: 5) || !version.isHittable {
+            app.swipeUp()
+            sleep(1)
+        }
+        XCTAssertTrue(version.waitForExistence(timeout: 10), "No version choice on the page")
+        XCTAssertTrue(version.label.contains("1080p"), "The page does not start on the item's own file: \(version.label)")
+        version.tap()
+        sleep(1)
+        shot("d20-detail-version-menu")
+        let fourK = app.buttons.matching(NSPredicate(format: "label BEGINSWITH '4K'")).firstMatch
+        XCTAssertTrue(fourK.waitForExistence(timeout: 5), "The menu has no 4K version")
+        fourK.tap()
+        XCTAssertTrue(becomes(version, "label CONTAINS '4K'", timeout: 10), "The pick does not show: \(version.label)")
+        // The 4K file's own tracks: Spanish is an audio track of it alone.
+        let audio = app.buttons["detail.audio"]
+        XCTAssertTrue(audio.waitForExistence(timeout: 5), "No audio choice")
+        audio.tap()
+        sleep(1)
+        XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Spanish'")).firstMatch.exists,
+                      "The audio tracks are not the 4K file's")
+        shot("d21-detail-version-4k-audio")
+        app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Default'")).firstMatch.tap()
+        sleep(1)
+        shot("d22-detail-version-4k")
+        tapPlay(app)
+        let pause = app.buttons["player.pause"]
+        XCTAssertTrue(pause.waitForExistence(timeout: 15), "The player did not open")
+        // The server was asked for the 4K file.
+        let asked = MockServer.wait(timeout: 15) {
+            (MockServer.json("/mock/playbackinfo") as? [[String: String]] ?? []).contains { $0["MediaSourceId"] == "f0df5172ec8ef14240dd3fbebbea5447" }
+        }
+        XCTAssertTrue(asked, "PlaybackInfo did not name the 4K version: \(String(describing: MockServer.json("/mock/playbackinfo")))")
+        sleep(3)
+        pause.tap()
+        sleep(1)
+        app.buttons["player.settings"].tap()
+        let row = app.buttons["player.version"]
+        XCTAssertTrue(row.waitForExistence(timeout: 5), "No Version row in the player's settings")
+        XCTAssertTrue(row.label.contains("4K"), "The player does not name the version: \(row.label)")
+        shot("d23-player-settings-version")
+        row.tap()
+        sleep(1)
+        shot("d24-player-version-menu")
+        // Back to the 1080p file, at the place: the server is asked for it.
+        app.buttons.matching(NSPredicate(format: "label BEGINSWITH '1080p'")).firstMatch.tap()
+        let back = MockServer.wait(timeout: 15) {
+            ((MockServer.json("/mock/playbackinfo") as? [[String: String]])?.last?["MediaSourceId"]) == "5d0f41c78d560ae815318c4925355400"
+        }
+        XCTAssertTrue(back, "The switch did not ask for the 1080p file")
+        sleep(2)
+        shot("d25-player-after-switch")
+    }
+
     /// Play on and SyncPlay from the page's top bar open their sheets.
     func testCastAndSyncFromPage() {
         let app = launch()

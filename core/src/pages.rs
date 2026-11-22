@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 
-use crate::jellyfin::{Client, Item, ItemKind, ItemQuery, ItemsResult, Person, PersonKind, SeerrItem};
+use crate::jellyfin::{Client, Item, ItemKind, ItemQuery, ItemsResult, LanguageChoices, Person, PersonKind, SeerrItem};
 
 pub const PAGE_SIZE: usize = 100;
 /// Slides in the home hero.
@@ -25,6 +25,10 @@ pub const STUDIO_VIEW: &str = "studio";
 pub const PLAYLISTS_ID: &str = "playlists";
 /// Titles in the "Pick something" row of a home page with nothing watched.
 pub const DISCOVER_ITEMS: usize = 16;
+/// Episodes in the "Upcoming" row of the home page.
+pub const UPCOMING_ITEMS: usize = 24;
+/// Collections in the "Included in" row of a detail page.
+pub const INCLUDED_IN_ITEMS: usize = 24;
 
 #[derive(Default)]
 pub struct HomeData {
@@ -36,6 +40,8 @@ pub struct HomeData {
     pub resume: Vec<Item>,
     pub next_up: Vec<Item>,
     pub latest: Vec<(Item, Vec<Item>)>,
+    /// Episodes that have not aired yet (the "upcoming" row).
+    pub upcoming: Vec<Item>,
     /// Random unwatched titles, for a user with nothing to continue or
     /// watch next ([`load_discover`]); empty otherwise.
     pub discover: Vec<Item>,
@@ -79,6 +85,22 @@ pub struct LibraryData {
     /// The genres of the library, for the filter menu; `None` until they
     /// load.
     pub genres: Option<Vec<Item>>,
+    /// The track languages the page is narrowed to and can be (Jellyfin
+    /// 12.0); boxed, as a page is one variant of the app's pages.
+    pub language: Box<LanguageFilter>,
+}
+
+/// The languages of the audio and subtitle tracks of a library page.
+#[derive(Clone, Debug, Default)]
+pub struct LanguageFilter {
+    /// The audio language the page is narrowed to: the server's code and
+    /// the name shown.
+    pub audio: Option<(String, String)>,
+    /// The subtitle language the page is narrowed to.
+    pub subtitle: Option<(String, String)>,
+    /// The languages of the library's tracks, for the filter menu; `None`
+    /// until they load, empty lists from a server before 12.0.
+    pub choices: Option<LanguageChoices>,
 }
 
 /// A resolution a library page can be narrowed to.
@@ -119,10 +141,16 @@ pub enum LibraryShow {
     #[default]
     All,
     Favorites,
-    /// The collections of the server (in a movie library).
+    /// The collections that hold titles of the library (Jellyfin 12.0
+    /// filters them by the library); on the page of the playlists, every
+    /// collection of the server.
     Collections,
     /// All episodes (in a show library).
     Episodes,
+    /// The playlists that hold titles of the library (Jellyfin 12.0).
+    Playlists,
+    /// The studios (or networks) of the library's titles, from `/Studios`.
+    Studios,
 }
 
 impl LibraryShow {
@@ -132,6 +160,8 @@ impl LibraryShow {
             LibraryShow::Favorites => "Favorites".to_string(),
             LibraryShow::Collections => "Collections".to_string(),
             LibraryShow::Episodes => "Episodes".to_string(),
+            LibraryShow::Playlists => "Playlists".to_string(),
+            LibraryShow::Studios => "Studios".to_string(),
         }
     }
 
@@ -142,14 +172,25 @@ impl LibraryShow {
                 LibraryShow::All,
                 LibraryShow::Favorites,
                 LibraryShow::Collections,
+                LibraryShow::Playlists,
+                LibraryShow::Studios,
             ],
             Some("tvshows") => &[
                 LibraryShow::All,
                 LibraryShow::Favorites,
                 LibraryShow::Episodes,
+                LibraryShow::Collections,
+                LibraryShow::Playlists,
+                LibraryShow::Studios,
             ],
             _ => &[],
         }
+    }
+
+    /// True for a view that lists lists or studios, not titles: the sort,
+    /// the filters and the letter of the titles do not all fit it.
+    pub fn lists_groups(self) -> bool {
+        matches!(self, LibraryShow::Collections | LibraryShow::Playlists | LibraryShow::Studios)
     }
 }
 
@@ -172,17 +213,20 @@ impl LibraryData {
             resolution: None,
             subtitles: false,
             genres: None,
+            language: Box::default(),
         }
     }
 
-    /// True when a filter, a genre, a decade, a resolution, subtitles or
-    /// a letter narrows the page.
+    /// True when a filter, a genre, a decade, a resolution, subtitles, a
+    /// track language or a letter narrows the page.
     pub fn narrowed(&self) -> bool {
         self.filter.is_some()
             || self.genre.is_some()
             || self.decade.is_some()
             || self.resolution.is_some()
             || self.subtitles
+            || self.language.audio.is_some()
+            || self.language.subtitle.is_some()
             || self.letter.is_some()
     }
 
@@ -193,6 +237,8 @@ impl LibraryData {
         self.decade = None;
         self.resolution = None;
         self.subtitles = false;
+        self.language.audio = None;
+        self.language.subtitle = None;
         self.letter = None;
     }
 
@@ -207,6 +253,7 @@ impl LibraryData {
     pub fn can_narrow_by_genre(&self) -> bool {
         let kinds = self.kinds();
         !kinds.is_empty()
+            && self.show != LibraryShow::Studios
             && kinds.iter().all(|k| k == "Movie" || k == "Series")
             && self.view.collection_type.as_deref() != Some(PERSON_VIEW)
     }
@@ -216,7 +263,20 @@ impl LibraryData {
     /// series does not.
     pub fn can_narrow_by_streams(&self) -> bool {
         let kinds = self.kinds();
-        !kinds.is_empty() && kinds.iter().all(|k| k == "Movie" || k == "Episode")
+        !kinds.is_empty()
+            && self.show != LibraryShow::Studios
+            && kinds.iter().all(|k| k == "Movie" || k == "Episode")
+    }
+
+    /// Whether the audio and subtitle language filters fit the page: the
+    /// server reads the tracks of a movie or an episode, and those of its
+    /// episodes for a series (checked on Jellyfin 12.2). A person's page
+    /// has none, as it has no genre filter.
+    pub fn can_narrow_by_language(&self) -> bool {
+        let kinds = self.kinds();
+        !kinds.is_empty()
+            && kinds.iter().all(|k| k == "Movie" || k == "Series" || k == "Episode")
+            && self.view.collection_type.as_deref() != Some(PERSON_VIEW)
     }
 }
 
@@ -252,6 +312,8 @@ pub struct DetailData {
     pub next_up: Option<Item>,
     /// "More Like This" for a movie or a series.
     pub similar: Vec<Item>,
+    /// The collections that hold the item ("Included in").
+    pub collections: Vec<Item>,
     /// Audio track picked on the page: its place among the audio streams.
     pub audio: Option<usize>,
     /// Subtitle picked on the page: `Some(None)` is "Off".
@@ -260,14 +322,36 @@ pub struct DetailData {
     /// with the roles joined ([`merged_people`]); made when the item loads.
     pub cast: Vec<(Person, String)>,
     pub guests: Vec<(Person, String)>,
+    /// The version picked on the page (a media source id); none is the
+    /// item's own file. The item's first source is the one shown
+    /// ([`DetailData::show_version`]).
+    pub version: Option<String>,
 }
 
 impl DetailData {
     /// Puts the item of the page in place, with its cast and guests.
-    pub fn set_item(&mut self, item: Item) {
+    pub fn set_item(&mut self, mut item: Item) {
         self.cast = merged_people(&item.people, false);
         self.guests = merged_people(&item.people, true);
+        // The version picked stays when the item is read again.
+        if !self.version.as_deref().is_some_and(|id| item.put_source_first(id)) {
+            self.version = None;
+            item.put_default_source_first();
+        }
         self.item = item;
+    }
+
+    /// Picks a version of the item: its source goes first, so the tracks
+    /// and the facts of the page are those of its file, and the tracks
+    /// picked for another file are dropped. None is the item's own file.
+    pub fn show_version(&mut self, source_id: Option<String>) {
+        let id = source_id.clone().unwrap_or_else(|| self.item.id.clone());
+        if self.item.media_sources.first().is_some_and(|s| s.id == id) || !self.item.put_source_first(&id) {
+            return;
+        }
+        self.version = source_id.filter(|id| *id != self.item.id);
+        self.audio = None;
+        self.subtitle = None;
     }
 }
 
@@ -316,14 +400,18 @@ pub fn library_query(data: &LibraryData) -> ItemQuery {
         Some(PLAYLISTS_ID) => vec!["Playlist".to_string()],
         _ => Vec::new(),
     };
+    let playlists = view.collection_type.as_deref() == Some(PLAYLISTS_ID);
     let include_types = match data.show {
         LibraryShow::Collections => vec!["BoxSet".to_string()],
+        LibraryShow::Playlists => vec!["Playlist".to_string()],
         LibraryShow::Episodes => vec!["Episode".to_string()],
+        // `/Studios` takes the kinds of the titles whose studios it lists.
         _ => include_types,
     };
-    // The collections are not inside the movie library.
-    let collections = data.show == LibraryShow::Collections;
-    let playlists = view.collection_type.as_deref() == Some(PLAYLISTS_ID);
+    // The page of the playlists (no parent) has every collection of the
+    // server as its second view; a library's collections and playlists
+    // are those with titles of the library, which Jellyfin 12.0 filters
+    // by `parentId`.
     let recursive = !include_types.is_empty();
     let filters: Vec<&str> = (favorites || data.show == LibraryShow::Favorites)
         .then_some("IsFavorite")
@@ -338,7 +426,7 @@ pub fn library_query(data: &LibraryData) -> ItemQuery {
     let years: Vec<i32> = data.decade.map(|first| (first..first + 10).collect()).unwrap_or_default();
     let resolution = data.resolution;
     ItemQuery {
-        parent_id: (!favorites && !person && !genre && !studio && !collections && !playlists)
+        parent_id: (!favorites && !person && !genre && !studio && !playlists)
             .then(|| view.id.clone()),
         genre_ids,
         years,
@@ -349,6 +437,8 @@ pub fn library_query(data: &LibraryData) -> ItemQuery {
             _ => None,
         },
         has_subtitles: data.subtitles.then_some(true),
+        audio_languages: data.language.audio.iter().map(|(code, _)| code.clone()).collect(),
+        subtitle_languages: data.language.subtitle.iter().map(|(code, _)| code.clone()).collect(),
         person_id: person.then(|| view.id.clone()),
         studio_id: studio.then(|| view.id.clone()),
         filters: (!filters.is_empty()).then(|| filters.join(",")),
@@ -367,6 +457,25 @@ pub fn library_query(data: &LibraryData) -> ItemQuery {
         name_less_than: (data.letter == Some('#')).then(|| "A".to_string()),
         limit: Some(PAGE_SIZE),
         start: Some(data.start),
+        ..Default::default()
+    }
+}
+
+/// One page of a library view: the studios from `/Studios`, every other
+/// view from `/Items`, both by the view's [`library_query`].
+pub fn library_items(client: &Client, query: &ItemQuery, show: LibraryShow) -> Result<ItemsResult> {
+    match show {
+        LibraryShow::Studios => client.studios(query),
+        _ => client.items(query),
+    }
+}
+
+/// The page of a studio's titles (a [`STUDIO_VIEW`]), from its card.
+pub fn studio_view(studio: &Item) -> Item {
+    Item {
+        id: studio.id.clone(),
+        name: studio.name.clone(),
+        collection_type: Some(STUDIO_VIEW.into()),
         ..Default::default()
     }
 }
@@ -422,6 +531,8 @@ pub fn load_home(client: &Client, libraries: Vec<Item>, need_views: bool, need_h
         let order = scope.spawn(|| client.home_sections());
         let resume = scope.spawn(|| client.resume(12));
         let next_up = scope.spawn(|| client.next_up(24));
+        // The row is optional: a failure leaves it out.
+        let upcoming = scope.spawn(|| client.upcoming(UPCOMING_ITEMS).unwrap_or_default());
         let hero = scope.spawn(|| {
             if !need_hero {
                 return Vec::new();
@@ -470,6 +581,7 @@ pub fn load_home(client: &Client, libraries: Vec<Item>, need_views: bool, need_h
                 resume: resume.join().map_err(|_| join("resume"))??,
                 next_up: next_up.join().map_err(|_| join("next up"))??,
                 latest,
+                upcoming: upcoming.join().map_err(|_| join("upcoming"))?,
                 hero: hero.join().map_err(|_| join("hero"))?,
                 discover: Vec::new(),
                 genres: Vec::new(),
@@ -508,8 +620,11 @@ pub fn discover_query() -> ItemQuery {
 pub fn load_detail(client: &Client, known: &Item) -> Result<DetailData> {
     let item_id = known.id.as_str();
     let is = |wanted: ItemKind| known.kind == wanted;
-    let (item, seasons, next_up, episodes, similar) = std::thread::scope(|scope| {
+    let (item, seasons, next_up, episodes, similar, collections) = std::thread::scope(|scope| {
         let item = scope.spawn(|| client.item(item_id));
+        // "Included in" is optional (a server before 12.0 has no such
+        // request); the page loads without it.
+        let collections = scope.spawn(|| client.collections_of(item_id, INCLUDED_IN_ITEMS).unwrap_or_default());
         let seasons = scope.spawn(|| match is(ItemKind::Series) {
             true => client.seasons(item_id),
             false => Ok(Vec::new()),
@@ -542,6 +657,7 @@ pub fn load_detail(client: &Client, known: &Item) -> Result<DetailData> {
             next_up.join().map_err(|_| stopped())?,
             episodes.join().map_err(|_| stopped())??,
             similar.join().map_err(|_| stopped())?,
+            collections.join().map_err(|_| stopped())?,
         ))
     })?;
     let mut fresh = DetailData {
@@ -549,6 +665,7 @@ pub fn load_detail(client: &Client, known: &Item) -> Result<DetailData> {
         next_up,
         episodes,
         similar,
+        collections,
         ..Default::default()
     };
     // An item opened by id alone has no kind until now.
@@ -673,11 +790,93 @@ mod tests {
         assert_eq!((studio.studio_id.as_deref(), studio.parent_id), (Some("lib"), None));
         assert_eq!(library_query(&library(FAVORITES_ID)).filters.as_deref(), Some("IsFavorite"));
         assert_eq!(library_query(&library(PLAYLISTS_ID)).include_types, ["Playlist"]);
-        // The collections are not inside the movie library.
-        let mut movies = library("movies");
-        movies.show = LibraryShow::Collections;
-        let query = library_query(&movies);
+        // The page of the playlists has every collection of the server.
+        let mut playlists = library(PLAYLISTS_ID);
+        playlists.show = LibraryShow::Collections;
+        let query = library_query(&playlists);
         assert_eq!((query.parent_id, query.include_types), (None, vec!["BoxSet".to_string()]));
+    }
+
+    #[test]
+    fn a_library_lists_its_own_collections_and_playlists() {
+        for kind in ["movies", "tvshows"] {
+            for (show, wanted) in [(LibraryShow::Collections, "BoxSet"), (LibraryShow::Playlists, "Playlist")] {
+                let mut page = library(kind);
+                assert!(LibraryShow::of(Some(kind)).contains(&show), "{kind} {show:?}");
+                page.show = show;
+                let query = library_query(&page);
+                assert_eq!(query.parent_id.as_deref(), Some("lib"), "{kind} {show:?}: Jellyfin 12.0 filters by parentId");
+                assert_eq!((query.include_types, query.recursive), (vec![wanted.to_string()], Some(true)));
+                assert!(!page.can_narrow_by_genre() && !page.can_narrow_by_streams());
+            }
+        }
+        assert_eq!(LibraryShow::Playlists.label("Movies"), "Playlists");
+    }
+
+    #[test]
+    fn the_studios_of_a_library_come_from_their_own_request() {
+        let server = Routes::start(|_, path| match path {
+            p if p.starts_with("/Studios?") => (200, items(&["st1", "st2"], "Studio", "")),
+            p if p.starts_with("/Items?") => (200, items(&["m1"], "Movie", "")),
+            _ => (404, String::new()),
+        });
+        let mut movies = library("movies");
+        movies.show = LibraryShow::Studios;
+        movies.letter = Some('B');
+        assert!(!movies.can_narrow_by_genre() && !movies.can_narrow_by_streams());
+        let query = library_query(&movies);
+        let page = library_items(&client(&server), &query, movies.show).unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].kind, ItemKind::Studio);
+        assert_eq!(server.count("/Studios?"), 1);
+        assert_eq!(server.count("parentId=lib"), 1, "the studios of this library");
+        assert_eq!(server.count("includeItemTypes=Movie"), 1);
+        assert_eq!(server.count("nameStartsWith=B"), 1);
+        assert_eq!(server.count("/Items?"), 0);
+        // Every other view asks `/Items`.
+        library_items(&client(&server), &library_query(&library("movies")), LibraryShow::All).unwrap();
+        assert_eq!(server.count("/Items?"), 1);
+        // A studio's card opens the page of its titles.
+        let studio = studio_view(&page.items[0]);
+        assert_eq!((studio.id.as_str(), studio.collection_type.as_deref()), ("st1", Some(STUDIO_VIEW)));
+        assert_eq!(library_query(&LibraryData::new(studio)).studio_id.as_deref(), Some("st1"));
+    }
+
+    #[test]
+    fn a_detail_page_shows_the_collections_that_hold_the_item() {
+        let server = Routes::start(|_, path| match path {
+            p if p.starts_with("/Items/m1/Collections") => (200, items(&["box1"], "BoxSet", "")),
+            p if p.starts_with("/Items/m1?") => (200, r#"{"Id":"m1","Name":"Film","Type":"Movie"}"#.into()),
+            p if p.starts_with("/Items/m2?") => (200, r#"{"Id":"m2","Name":"Other","Type":"Movie"}"#.into()),
+            _ => (404, String::new()),
+        });
+        let movie = |id: &str| Item { id: id.into(), kind: ItemKind::Movie, ..Default::default() };
+        let detail = load_detail(&client(&server), &movie("m1")).unwrap();
+        assert_eq!(detail.collections.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["box1"]);
+        assert_eq!(server.count("/Items/m1/Collections?userId=u1"), 1);
+        // A server without the request (before 12.0) gives no row.
+        assert!(load_detail(&client(&server), &movie("m2")).unwrap().collections.is_empty());
+    }
+
+    #[test]
+    fn the_home_page_loads_the_upcoming_episodes() {
+        let server = Routes::start(|_, path| match path {
+            p if p.starts_with("/Shows/Upcoming") => {
+                (200, items(&["u1", "u2"], "Episode", r#","PremiereDate":"2026-11-05T01:00:00.0000000Z""#))
+            }
+            _ => (200, items(&[], "Movie", "")),
+        });
+        let (_, home) = load_home(&client(&server), Vec::new(), true, false).unwrap();
+        assert_eq!(home.upcoming.len(), 2);
+        assert_eq!(home.upcoming[0].premiere_label().as_deref(), Some("5 Nov 2026"), "the day it airs");
+        assert_eq!(Item::default().premiere_label(), None);
+        assert_eq!(server.count(&format!("/Shows/Upcoming?userId=u1&limit={UPCOMING_ITEMS}")), 1);
+        // A failure leaves the row out and the page loads.
+        let down = Routes::start(|_, path| match path {
+            p if p.starts_with("/Shows/Upcoming") => (500, String::new()),
+            _ => (200, items(&[], "Movie", "")),
+        });
+        assert!(load_home(&client(&down), Vec::new(), true, false).unwrap().1.upcoming.is_empty());
     }
 
     #[test]
@@ -735,6 +934,22 @@ mod tests {
         assert!(!playlists.can_narrow_by_genre() && !playlists.can_narrow_by_streams());
         assert!(!library(PERSON_VIEW).can_narrow_by_genre());
         assert_eq!(decade_label(1990), "1990s");
+    }
+
+    #[test]
+    fn a_track_language_narrows_the_page() {
+        let mut movies = library("movies");
+        assert!(movies.can_narrow_by_language() && library("tvshows").can_narrow_by_language());
+        assert!(!library(PLAYLISTS_ID).can_narrow_by_language() && !library(PERSON_VIEW).can_narrow_by_language());
+        movies.language.audio = Some(("jpn".into(), "Japanese".into()));
+        movies.language.subtitle = Some(("eng".into(), "English".into()));
+        assert!(movies.narrowed());
+        let query = library_query(&movies);
+        assert_eq!((query.audio_languages, query.subtitle_languages), (vec!["jpn".to_string()], vec!["eng".to_string()]));
+        movies.clear_filters();
+        assert!(!movies.narrowed());
+        let query = library_query(&movies);
+        assert!(query.audio_languages.is_empty() && query.subtitle_languages.is_empty());
     }
 
     #[test]

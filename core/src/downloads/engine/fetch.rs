@@ -5,8 +5,12 @@
 use super::*;
 
 /// The item, its segments and the names of its files, for `meta.json`.
-pub(super) fn fetch_meta(client: &Client, item_id: &str, server_id: &str) -> Result<Value> {
-    let item = client.item_json(item_id)?;
+/// `source_id` is the version to download; its source goes first in the
+/// item's list, so that what reads the first source (the size, the file
+/// name, the tracks of the offline item) reads the file in the folder.
+pub(super) fn fetch_meta(client: &Client, item_id: &str, server_id: &str, source_id: Option<&str>) -> Result<Value> {
+    let mut item = client.item_json(item_id)?;
+    put_source_first(&mut item, item_id, source_id);
     // Intro and credits ranges; optional.
     let segments = client
         .media_segments_json(item_id)
@@ -18,9 +22,27 @@ pub(super) fn fetch_meta(client: &Client, item_id: &str, server_id: &str) -> Res
         "ServerId": server_id,
         "ItemId": item_id,
         "File": media_file_name(&source),
+        "SourceId": source_id,
         "Item": item,
         "Segments": segments,
     }))
+}
+
+/// Moves the source of the version to download to the front of the
+/// item's `MediaSources`: the wanted one, else the item's own file (what
+/// `/Items/{id}/Download` sends), else the list stays as it is.
+pub(super) fn put_source_first(item: &mut Value, item_id: &str, source_id: Option<&str>) {
+    let Some(sources) = item["MediaSources"].as_array_mut() else { return };
+    let place = |id: &str| sources.iter().position(|s| s["Id"].as_str() == Some(id));
+    let Some(at) = source_id.and_then(place).or_else(|| place(item_id)) else { return };
+    let source = sources.remove(at);
+    sources.insert(0, source);
+}
+
+/// The address of the media file: the version's own item, since the id of
+/// a version's source is the id of the item of its file.
+pub(super) fn download_path(item_id: &str, source_id: Option<&str>) -> String {
+    format!("/Items/{}/Download", source_id.unwrap_or(item_id))
 }
 
 /// "video.mkv": the container of the file, else the extension of its path.

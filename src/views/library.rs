@@ -46,10 +46,13 @@ impl Bloom {
         let m = self.metrics();
         let fg = colors.foreground;
         let soft = rgba(0xf5f5f7c7);
+        // A view of lists or studios has no titles to play in a row.
         let playable = matches!(
             data.view.collection_type.as_deref(),
             Some("movies") | Some("tvshows")
-        );
+        ) && !data.show.lists_groups();
+        // `/Studios` sorts by name and has no filters of a title.
+        let studios = data.show == LibraryShow::Studios;
 
         let range = if data.total == 0 {
             String::new()
@@ -240,18 +243,20 @@ impl Bloom {
                             TOOL_HOVER,
                         ))
                     })
-                    .child(menu(
-                        &self.popups.filter_menu,
-                        "Filter",
-                        LucideIcon::Funnel,
-                        !filter_pills(data).is_empty(),
-                    ))
-                    .child(menu(
-                        &self.popups.sort_menu,
-                        "Sort",
-                        LucideIcon::ArrowDownAZ,
-                        data.sort != "SortName" || data.descending,
-                    ))
+                    .when(!studios, |el| {
+                        el.child(menu(
+                            &self.popups.filter_menu,
+                            "Filter",
+                            LucideIcon::Funnel,
+                            !filter_pills(data).is_empty(),
+                        ))
+                        .child(menu(
+                            &self.popups.sort_menu,
+                            "Sort",
+                            LucideIcon::ArrowDownAZ,
+                            data.sort != "SortName" || data.descending,
+                        ))
+                    })
                     .when(!compact, |el| {
                         el.child(page_arrow(
                             "library.previous",
@@ -433,12 +438,57 @@ pub(crate) fn filter_pills(data: &LibraryData) -> Vec<(usize, String, Clear)> {
     if data.subtitles {
         pills.push((4, "Subtitles".to_string(), |d| d.subtitles = false));
     }
+    if let Some((_, name)) = &data.language.audio {
+        pills.push((5, format!("{name} audio"), |d| d.language.audio = None));
+    }
+    if let Some((_, name)) = &data.language.subtitle {
+        pills.push((6, format!("{name} subtitles"), |d| d.language.subtitle = None));
+    }
     pills
 }
 
+/// The submenu of one track language (Jellyfin 12.0): "Any" first, then
+/// each language of the library's tracks. `pick` sets the page's choice.
+fn language_menu(
+    kind: &'static str,
+    choices: Option<&[bloom_core::jellyfin::LanguageChoice]>,
+    current: Option<&(String, String)>,
+    pick: fn(&mut LibraryData, Option<(String, String)>),
+    this: &gpui_kit::WeakEntity<Bloom>,
+) -> MenuItem {
+    let entry = |id: String, label: String, value: Option<(String, String)>| {
+        let handle = this.clone();
+        MenuItem::new(SharedString::from(id), label).on_click(move |_, _, cx| {
+            let value = value.clone();
+            handle.update(cx, move |this, cx| this.update_library(|d| pick(d, value), cx)).ok();
+        })
+    };
+    let mut entries = vec![entry(format!("library.{kind}-language.any"), "Any language".into(), None).radio(current.is_none())];
+    for choice in choices.unwrap_or_default() {
+        let selected = current.is_some_and(|(code, _)| *code == choice.code);
+        entries.push(
+            entry(
+                format!("library.{kind}-language.{}", choice.code),
+                choice.name.clone(),
+                Some((choice.code.clone(), choice.name.clone())),
+            )
+            .radio(selected),
+        );
+    }
+    let title = if kind == "audio" { "Audio language" } else { "Subtitle language" };
+    let label = match current {
+        Some((_, name)) => format!("{title}: {name}"),
+        None if choices.is_none() => format!("{title} (loading…)"),
+        None => title.to_string(),
+    };
+    let icon = if kind == "audio" { LucideIcon::AudioLines } else { LucideIcon::Languages };
+    MenuItem::submenu(SharedString::from(format!("library.{kind}-language")), label, entries).icon(icon)
+}
+
 /// The entries of the filter menu: the watch state as before, then the
-/// genre, the decade and the resolution as submenus and "Has subtitles"
-/// as a check, each where it fits the page, and "Clear filters".
+/// genre, the decade and the resolution as submenus, "Has subtitles" as a
+/// check, the audio and subtitle languages as submenus, each where it fits
+/// the page, and "Clear filters".
 fn filter_menu_items(data: &LibraryData, this: &gpui_kit::WeakEntity<Bloom>) -> Vec<MenuItem> {
     // An entry that changes the page and reloads it.
     let entry = |id: String, label: String, change: Box<dyn Fn(&mut LibraryData)>| {
@@ -524,6 +574,29 @@ fn filter_menu_items(data: &LibraryData, this: &gpui_kit::WeakEntity<Bloom>) -> 
                 .checked(subtitles),
         );
     }
+    // The track languages: the server's lists, so a server before 12.0
+    // (no lists) gets no entries once they load.
+    if data.can_narrow_by_language() {
+        let languages = data.language.choices.as_ref();
+        if languages.is_none_or(|l| !l.audio.is_empty()) || data.language.audio.is_some() {
+            more.push(language_menu(
+                "audio",
+                languages.map(|l| l.audio.as_slice()),
+                data.language.audio.as_ref(),
+                |d, value| d.language.audio = value,
+                this,
+            ));
+        }
+        if languages.is_none_or(|l| !l.subtitles.is_empty()) || data.language.subtitle.is_some() {
+            more.push(language_menu(
+                "subtitle",
+                languages.map(|l| l.subtitles.as_slice()),
+                data.language.subtitle.as_ref(),
+                |d, value| d.language.subtitle = value,
+                this,
+            ));
+        }
+    }
     if !more.is_empty() {
         items.push(MenuItem::separator());
         items.extend(more);
@@ -547,6 +620,18 @@ pub(crate) enum EmptyAction {
     NewList(ListKind),
 }
 
+/// Shows another view of the library. The studios have no filters of a
+/// title, so those go (the letter stays: `/Studios` takes it too).
+pub(crate) fn set_show(data: &mut LibraryData, show: LibraryShow) {
+    data.show = show;
+    if show == LibraryShow::Studios {
+        let letter = data.letter;
+        data.clear_filters();
+        data.letter = letter;
+        (data.sort, data.descending) = ("SortName", false);
+    }
+}
+
 pub(crate) fn empty_words(data: &LibraryData, can_collect: bool) -> (&'static str, &'static str, Option<EmptyAction>) {
     if data.narrowed() {
         return (
@@ -559,13 +644,22 @@ pub(crate) fn empty_words(data: &LibraryData, can_collect: bool) -> (&'static st
         LibraryShow::Collections => (
             "No collections yet",
             "A collection groups titles that belong together, such as a film series.",
-            can_collect.then_some(EmptyAction::NewList(ListKind::Collection)),
+            // A library lists the collections with its titles, which a new
+            // (empty) one is not: the button is on the page of all lists.
+            (can_collect && data.view.id == PLAYLISTS_ID).then_some(EmptyAction::NewList(ListKind::Collection)),
         ),
         _ if data.view.id == PLAYLISTS_ID => (
             "No playlists yet",
             "A playlist plays titles in the order you choose. Make one here, or use Add to playlist in the menu of a title.",
             Some(EmptyAction::NewList(ListKind::Playlist)),
         ),
+        LibraryShow::Playlists => (
+            "No playlists yet",
+            // A new playlist is empty and would not show here: no button.
+            "A playlist with a title of this library shows here. Use Add to playlist in the menu of a title.",
+            None,
+        ),
+        LibraryShow::Studios => ("No studios", "The titles of this library name no studio.", None),
         LibraryShow::Favorites => ("No favorites yet", "Click the heart of a title to keep it here.", None),
         _ if data.view.id == crate::app::FAVORITES_ID => {
             ("No favorites yet", "Click the heart of a title to keep it here.", None)
@@ -640,7 +734,7 @@ impl Bloom {
                 .radio(data.show == show)
                 .on_click(move |_, _, cx| {
                     handle
-                        .update(cx, |this, cx| this.update_library(|d| d.show = show, cx))
+                        .update(cx, |this, cx| this.update_library(|d| set_show(d, show), cx))
                         .ok();
                 })
             })
@@ -657,6 +751,7 @@ impl Bloom {
     ///   browse tab | pills
     ///   browse filter genre <name> | decade <year> | resolution 4k|hd|sd
     ///                 | subtitles on|off | watch <server key>|none | clear
+    ///                 | audio-language|subtitle-language <code or name>|any
     ///   browse genre <name>          open the titles of a genre
     ///   browse playlists [collections]
     ///   browse new-list playlist|collection   (opens the dialog only)
@@ -703,12 +798,30 @@ impl Bloom {
                         self.update_library(|d| d.resolution = Some(resolution), cx)
                     }
                     "subtitles" => self.update_library(|d| d.subtitles = value != "off", cx),
+                    // A track language by its code or name, as the menu
+                    // lists it; "any" drops it.
+                    kind @ ("audio-language" | "subtitle-language") => {
+                        let choices = data.language.choices.clone().unwrap_or_default();
+                        let list = if kind == "audio-language" { choices.audio } else { choices.subtitles };
+                        let picked = match value.as_str() {
+                            "any" => None,
+                            _ => match list.iter().find(|c| c.code.eq_ignore_ascii_case(&value) || c.name.eq_ignore_ascii_case(&value)) {
+                                Some(choice) => Some((choice.code.clone(), choice.name.clone())),
+                                None => return format!("error: no {kind} {value:?} in this library"),
+                            },
+                        };
+                        if kind == "audio-language" {
+                            self.update_library(|d| d.language.audio = picked, cx)
+                        } else {
+                            self.update_library(|d| d.language.subtitle = picked, cx)
+                        }
+                    }
                     "watch" => {
                         let key = LIBRARY_FILTERS.iter().map(|(_, k)| *k).find(|k| *k == value);
                         self.update_library(|d| d.filter = key, cx)
                     }
                     "clear" => self.update_library(|d| d.clear_filters(), cx),
-                    _ => return "error: usage: browse filter genre|decade|resolution|subtitles|watch|clear ...".into(),
+                    _ => return "error: usage: browse filter genre|decade|resolution|subtitles|audio-language|subtitle-language|watch|clear ...".into(),
                 }
                 return pills(self);
             }
@@ -825,9 +938,15 @@ mod tests {
         movies.decade = Some(1990);
         movies.resolution = Some(Resolution::Uhd);
         movies.subtitles = true;
+        movies.language.audio = Some(("jpn".into(), "Japanese".into()));
+        movies.language.subtitle = Some(("eng".into(), "English".into()));
         movies.letter = Some('K');
         let labels: Vec<String> = filter_pills(&movies).into_iter().map(|(_, label, _)| label).collect();
-        assert_eq!(labels, ["Unplayed", "Drama", "1990s", "4K", "Subtitles"], "the letter has the rail");
+        assert_eq!(
+            labels,
+            ["Unplayed", "Drama", "1990s", "4K", "Subtitles", "Japanese audio", "English subtitles"],
+            "the letter has the rail"
+        );
         for (_, _, clear) in filter_pills(&movies) {
             clear(&mut movies);
         }

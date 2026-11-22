@@ -149,6 +149,20 @@ struct PlayerTools: View {
                 Label("Quality · \(qualityName)", systemImage: "sparkles.tv")
             }
             .accessibilityIdentifier("player.quality")
+            // The files of the item, when it has more than one (Jellyfin
+            // 12: films and episodes): a choice loads that file here.
+            if model.versions.count > 1 {
+                Menu {
+                    ForEach(model.versions, id: \.id) { version in
+                        Button { model.releaseControls(); Task { await model.switchVersion(version.id) } } label: {
+                            Checked(title: version.name, on: version.id == model.currentVersion?.id)
+                        }
+                    }
+                } label: {
+                    Label("Version · \(model.currentVersion?.name ?? "Default")", systemImage: "square.stack.3d.up")
+                }
+                .accessibilityIdentifier("player.version")
+            }
             Menu {
                 ForEach([0.5, 0.75, 1, 1.25, 1.5, 2], id: \.self) { speed in
                     Button { model.setSpeed(speed); model.releaseControls() } label: {

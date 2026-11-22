@@ -175,22 +175,31 @@ private struct ServerSection<Content: View>: View {
     }
 }
 
-/// A choice of the server's languages, "Any language" first.
+/// A choice of the server's languages, "Any language" first. With
+/// `original`, "Original language" follows it (Jellyfin 12.0): each title
+/// plays in the language it was made in.
 private struct LanguagePicker: View {
     @Environment(AppModel.self) private var model
     let title: String
     let key: String
+    var original = false
+    /// The server's value of "Original language" (`AudioLanguagePreference`).
+    static let originalLanguage = "OriginalLanguage"
 
     var body: some View {
         let prefs = model.prefs
         Picker(title, selection: Binding(get: { prefs.text(key) }, set: { prefs.set(key, $0) })) {
             Text("Any language").tag("")
+            if original {
+                Text("Original language").tag(Self.originalLanguage)
+            }
             ForEach(prefs.languages, id: \.code) { language in
                 Text(language.name).tag(language.code)
             }
             // A code the list lacks still shows as chosen.
             let current = prefs.text(key)
-            if !current.isEmpty, !prefs.languages.contains(where: { $0.code == current }) {
+            if !current.isEmpty, !(original && current == Self.originalLanguage),
+               !prefs.languages.contains(where: { $0.code == current }) {
                 Text(current).tag(current)
             }
         }
@@ -243,6 +252,15 @@ struct PlaybackSettings: View {
                 Toggle("Show the Up next card", isOn: Binding(get: { prefs.upNextCard },
                                                              set: { prefs.setCustom(["enableNextVideoInfoOverlay": $0 ? "true" : "false"]) }))
             }
+            Section {
+                Picker("Ask \u{201C}Are you still watching?\u{201D}", selection: Binding(get: { prefs.stillWatching },
+                                                                    set: { prefs.setCustom([stillWatchingKey(): stillWatchingValue(choice: $0)]) })) {
+                    ForEach(stillWatchingChoices(), id: \.self) { Text(stillWatchingLabel(choice: $0)).tag($0) }
+                }
+                .accessibilityIdentifier("settings.stillWatching")
+            } footer: {
+                Text("After this many episodes in a row, or this long with no touch, the next episode waits paused for an answer.")
+            }
             Section("Skip buttons") {
                 ForEach([("Skip back length", "skipBackLength"), ("Skip forward length", "skipForwardLength")], id: \.1) { title, key in
                     Picker(title, selection: Binding(get: { Int(prefs.skipSecs(key)) },
@@ -271,11 +289,12 @@ struct AudioSettings: View {
     var body: some View {
         ServerSection(title: "Audio") {
             Section {
-                LanguagePicker(title: "Audio language", key: "AudioLanguagePreference")
+                LanguagePicker(title: "Audio language", key: "AudioLanguagePreference", original: true)
+                    .accessibilityIdentifier("settings.audioLanguage")
                 ServerToggle(title: "Play default audio track regardless of language", key: "PlayDefaultAudioTrack", fallback: false)
                 ServerToggle(title: "Remember audio selections", key: "RememberAudioSelections", fallback: true)
             } footer: {
-                Text("Every Jellyfin app of yours uses these settings.")
+                Text("Original language plays each title in the language it was made in, when the server knows it. Every Jellyfin app of yours uses these settings.")
             }
         }
     }
@@ -350,10 +369,12 @@ struct SubtitleSettings: View {
 
 struct HomeSettings: View {
     @Environment(AppModel.self) private var model
-    /// The kinds of the web client.
+    /// The kinds of the web client, and Bloom's own "upcoming" (Jellyfin
+    /// Web leaves a kind it does not know empty, as the Mac notes).
     static let kinds: [(key: String, name: String)] = [
         ("latestmedia", "Recently Added"), ("smalllibrarytiles", "My Media"),
         ("librarybuttons", "My Media (small)"), ("resume", "Continue Watching"), ("nextup", "Next Up"),
+        ("upcoming", "Upcoming"),
         ("resumeaudio", "Continue Listening"), ("resumebook", "Continue Reading"),
         ("livetv", "Live TV"), ("activerecordings", "Active Recordings"),
     ]
@@ -554,8 +575,12 @@ struct PasswordSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                if model.prefs.hasPassword {
+                // Jellyfin 12 sends `HasPassword` as true for every user:
+                // the current password shows always, empty for none.
+                Section {
                     SecureField("Current password", text: $current).textContentType(.password)
+                } footer: {
+                    Text("Leave it empty if the account has no password.")
                 }
                 Section {
                     SecureField("New password", text: $new).textContentType(.newPassword)

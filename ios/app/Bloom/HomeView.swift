@@ -39,6 +39,9 @@ struct HomeView: View {
                                 PosterRow(title: "Recently Added in \(row.title)", items: row.items,
                                           seeAll: row.items.count > PosterRow.shown ? latestGrid(row) : nil)
                             }
+                        case .upcoming:
+                            // Episodes not aired yet; no row when there are none.
+                            WideRow(title: "Upcoming", items: home.upcoming, airDates: true)
                         case .smallLibraryTiles, .libraryButtons:
                             WideRow(title: "My Media", items: model.libraries,
                                     seeAll: model.libraries.count > WideRow.shown
@@ -234,6 +237,8 @@ struct WideRow: View {
     let items: [MediaItem]
     var row: CardLink<WideCard>.Row? = nil
     var seeAll: AnyView? = nil
+    /// Each card says the day its episode airs (Upcoming).
+    var airDates = false
 
     /// A phone shows one wide card and the edge of the next; a row of more
     /// than two has "See all".
@@ -243,7 +248,7 @@ struct WideRow: View {
         if !items.isEmpty {
             Shelf(title: title, seeAll: seeAll) {
                 ForEach(items, id: \.id) { item in
-                    CardLink(item: item, row: row) { WideCard(item: item) }
+                    CardLink(item: item, row: row) { WideCard(item: item, detail: airDates ? item.airLine : nil) }
                         .containerRelativeFrame(.horizontal) { width, _ in
                             // A wide card: a peek of the next on a phone, more on an iPad.
                             width < 600 ? width * 0.6 : Metrics.cardWidth(width, minimum: 280)

@@ -16,7 +16,6 @@ pub struct PublicProfile {
     pub name: String,
     /// The user's picture, when they set one.
     pub picture: Option<String>,
-    pub has_password: bool,
 }
 
 /// An item added to the libraries lately, with the date it came.
@@ -185,7 +184,6 @@ impl Server {
                     picture: u.primary_image_tag.as_deref().map(|tag| format!("{base}/Users/{}/Images/Primary?maxWidth=240&tag={tag}", u.id)),
                     id: u.id,
                     name: u.name,
-                    has_password: u.has_password,
                 })
                 .collect())
         })

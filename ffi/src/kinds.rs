@@ -72,6 +72,7 @@ named! {
         MusicArtist = "MusicArtist",
         Person = "Person",
         Trailer = "Trailer",
+        Studio = "Studio",
     }
 }
 
@@ -94,6 +95,7 @@ impl From<&ItemKind> for MediaKind {
             ItemKind::MusicArtist => Self::MusicArtist,
             ItemKind::Person => Self::Person,
             ItemKind::Trailer => Self::Trailer,
+            ItemKind::Studio => Self::Studio,
             ItemKind::Other(name) => Self::Other { name: name.clone() },
         }
     }
@@ -266,6 +268,8 @@ named! {
         Resume = "resume",
         NextUp = "nextup",
         LatestMedia = "latestmedia",
+        /// Episodes that have not aired yet: a row of Bloom's own.
+        Upcoming = "upcoming",
     }
 }
 

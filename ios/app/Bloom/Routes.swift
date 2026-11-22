@@ -42,6 +42,8 @@ struct Destinations: ViewModifier {
             case .item(let item):
                 if item.kind == .playlist {
                     PlaylistPage(playlist: item)
+                } else if item.kind == .studio {
+                    LibraryPage(source: .studio(item.id, item.name))
                 } else if [.boxSet, .folder, .collectionFolder].contains(item.kind) {
                     LibraryPage(source: GridSource(item))
                 } else {

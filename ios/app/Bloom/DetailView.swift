@@ -20,8 +20,13 @@ struct DetailView: View {
     @State private var bookmarks: [Bookmark] = []
     /// Its audio and subtitle tracks, and the ones chosen for the next play.
     @State private var streams: [StreamOption] = []
-    /// The file: its video, sound, tracks with their flags, and size.
+    /// The file: its video, sound, tracks with their flags, and size. Of
+    /// the version chosen, when the item has more than one.
     @State private var file: MediaFile?
+    /// The files of a film or an episode (Jellyfin 12), its own first, and
+    /// the one chosen for the next play (nil: the item's own).
+    @State private var versions: [MediaVersion] = []
+    @State private var version: String?
     @State private var audio: Int64?
     @State private var subtitle: Int64?
     /// The show and the season of an episode or a season page, for the
@@ -68,11 +73,19 @@ struct DetailView: View {
                                 Text(shown.genres.joined(separator: " · "))
                                     .font(.footnote).foregroundStyle(Color.ink.opacity(0.6))
                             }
+                            // A show's creators (Jellyfin Web 12; the Mac's
+                            // "Creator" row), each a link to their page.
+                            if let creators = detail?.creators, !creators.isEmpty {
+                                CreatedBy(creators: creators)
+                            }
                             actions
                                 .padding(.top, 4)
                             TrackPickers(choices: trackChoices, audio: $audio, subtitle: $subtitle)
                             if let overview = shown.overview {
                                 Overview(text: overview)
+                            }
+                            if versions.count > 1, shown.playable {
+                                VersionPicker(versions: versions, chosen: $version)
                             }
                             if let file, shown.playable {
                                 FileSection(file: file)
@@ -98,6 +111,9 @@ struct DetailView: View {
                 }
                 if let detail {
                     CastRow(cast: detail.cast)
+                    // The collections that hold this title (Jellyfin 12.0);
+                    // no row when there are none.
+                    PosterRow(title: "Included In", items: detail.collections)
                     PosterRow(title: "More Like This", items: HiddenTitles.shared.visible(detail.similar, on: .library))
                 }
                 if let extras {
@@ -131,6 +147,13 @@ struct DetailView: View {
             castAndSync
         }
         .task { await load() }
+        // Another version is another file: its facts show, and the tracks
+        // picked for the file before name nothing in it.
+        .onChange(of: version) {
+            file = (versions.first { $0.id == version } ?? versions.first(where: \.isDefault) ?? versions.first)?.file
+            audio = nil
+            subtitle = nil
+        }
         .confirmationDialog("Request the missing seasons of \(shown.name)?", isPresented: Binding(get: { askMore != nil }, set: { if !$0 { askMore = nil } }),
                             titleVisibility: .visible) {
             Button("Request") {
@@ -250,7 +273,8 @@ struct DetailView: View {
             VStack(spacing: 16) {
                 if let next = playTarget {
                     Button {
-                        model.play(next, audio: next.id == shown.id ? audio : nil, subtitle: next.id == shown.id ? subtitle : nil)
+                        model.play(next, audio: next.id == shown.id ? audio : nil, subtitle: next.id == shown.id ? subtitle : nil,
+                                   version: next.id == shown.id ? version : nil)
                     } label: {
                         HStack(spacing: 8) {
                             Image(systemName: "play.fill")
@@ -269,7 +293,8 @@ struct DetailView: View {
                 HStack(alignment: .top, spacing: 0) {
                     if let next = playTarget, next.resumeSecs > 0 {
                         action("Restart", label: "From the beginning", symbol: "arrow.counterclockwise") {
-                            model.play(next, fromStart: true, audio: next.id == shown.id ? audio : nil, subtitle: next.id == shown.id ? subtitle : nil)
+                            model.play(next, fromStart: true, audio: next.id == shown.id ? audio : nil, subtitle: next.id == shown.id ? subtitle : nil,
+                                       version: next.id == shown.id ? version : nil)
                         }
                     }
                     action("Watched", label: shown.played ? "Mark unplayed" : "Mark played",
@@ -283,7 +308,7 @@ struct DetailView: View {
                     }
                     if shown.playable, model.prefs.canDownload {
                         captioned(downloadWord) {
-                            DownloadButton(item: shown, disc: true).buttonStyle(DiscButtonStyle())
+                            DownloadButton(item: shown, disc: true, version: version).buttonStyle(DiscButtonStyle())
                         }
                     }
                     captioned("More") { more }
@@ -418,7 +443,9 @@ struct DetailView: View {
             if detail.item.playable, streams.isEmpty, file == nil {
                 // The file with its tracks' flags; the plain list when the
                 // bridge cannot read it.
-                file = (try? await server.mediaFile(itemId: item.id)) ?? nil
+                // Every version comes with its file; the item's own shows first.
+                versions = (try? await server.mediaVersions(itemId: item.id)) ?? []
+                file = (versions.first(where: \.isDefault) ?? versions.first)?.file
                 if file == nil { streams = (try? await server.streams(itemId: item.id)) ?? [] }
             }
             if model.enhanced?.bookmarks == true, detail.item.playable {
@@ -502,6 +529,34 @@ struct TrackEntry: View {
     }
 }
 
+/// The version for the next play (the Mac's Version box): one row in the
+/// quiet pane of the track pickers, the files in a menu. The file section
+/// under it and the track pickers follow the choice.
+struct VersionPicker: View {
+    let versions: [MediaVersion]
+    @Binding var chosen: String?
+
+    private var current: MediaVersion? {
+        versions.first { $0.id == chosen } ?? versions.first(where: \.isDefault) ?? versions.first
+    }
+
+    var body: some View {
+        Menu {
+            ForEach(versions, id: \.id) { version in
+                TrackEntry(name: TrackName(name: version.name, detail: version.detail), on: version.id == current?.id) {
+                    chosen = version.isDefault ? nil : version.id
+                }
+            }
+        } label: {
+            TrackPickers.row("Version", symbol: "square.stack.3d.up", value: current?.name ?? "Default")
+        }
+        .accessibilityIdentifier("detail.version")
+        .buttonStyle(.plain)
+        .background(Color.ink.opacity(0.06), in: .rect(cornerRadius: Metrics.controlCorner))
+        .frame(maxWidth: 480)
+    }
+}
+
 /// Audio and subtitles for the next play (the Mac's track rows): a row
 /// each in one quiet pane, the choice at the right.
 struct TrackPickers: View {
@@ -521,7 +576,7 @@ struct TrackPickers: View {
                             TrackEntry(name: choice.name, on: audio == choice.index) { audio = choice.index }
                         }
                     } label: {
-                        row("Audio", symbol: "speaker.wave.2", value: audios.first { $0.index == audio }?.name.name ?? "Default")
+                        Self.row("Audio", symbol: "speaker.wave.2", value: audios.first { $0.index == audio }?.name.name ?? "Default")
                     }
                     .accessibilityIdentifier("detail.audio")
                 }
@@ -536,7 +591,7 @@ struct TrackPickers: View {
                             TrackEntry(name: choice.name, on: subtitle == choice.index) { subtitle = choice.index }
                         }
                     } label: {
-                        row("Subtitles", symbol: "captions.bubble",
+                        Self.row("Subtitles", symbol: "captions.bubble",
                             value: subtitle == -1 ? "Off" : (subtitles.first { $0.index == subtitle }?.name.name ?? "Default"))
                     }
                     .accessibilityIdentifier("detail.subtitles")
@@ -553,7 +608,7 @@ struct TrackPickers: View {
         list.first(where: \.isDefault)?.name.name
     }
 
-    private func row(_ title: String, symbol: String, value: String) -> some View {
+    static func row(_ title: String, symbol: String, value: String) -> some View {
         HStack(spacing: 12) {
             Image(systemName: symbol).frame(width: 24).foregroundStyle(Color.ink.opacity(0.7))
             Text(title)
@@ -757,6 +812,30 @@ struct EpisodeRow: View {
         }
         .contentShape(.rect)
         .accessibilityElement(children: .combine)
+    }
+}
+
+/// "Created by" and the names, one quiet line under the genres.
+struct CreatedBy: View {
+    let creators: [PersonName]
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text("Created by").foregroundStyle(Color.ink.opacity(0.6))
+            ForEach(Array(creators.enumerated()), id: \.element.id) { index, person in
+                NavigationLink(value: Route.person(id: person.id, name: person.name)) {
+                    Text(person.name + (index < creators.count - 1 ? "," : ""))
+                        .foregroundStyle(Color.ink)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(person.name)
+                .accessibilityIdentifier("detail.creator.\(person.name)")
+            }
+        }
+        .font(.footnote)
+        .lineLimit(1)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("detail.createdBy")
     }
 }
 

@@ -16,12 +16,12 @@ pub enum PrefsDoc {
     Display,
 }
 
-/// The two documents as JSON, and two facts of the user.
+/// The two documents as JSON, and facts of the user. (No `HasPassword`:
+/// Jellyfin 12 sends it as true for every user.)
 #[derive(uniffi::Record)]
 pub struct UserPrefs {
     pub configuration_json: String,
     pub display_json: String,
-    pub has_password: bool,
     /// The user may run the server's dashboard.
     pub is_admin: bool,
     /// The user may make and edit collections.
@@ -58,7 +58,6 @@ impl Server {
             Ok(UserPrefs {
                 configuration_json: me.get("Configuration").cloned().unwrap_or_default().to_string(),
                 display_json: display.to_string(),
-                has_password: me.get("HasPassword").and_then(Value::as_bool).unwrap_or(true),
                 is_admin: flag(&me["Policy"], "IsAdministrator"),
                 can_collect: flag(&me["Policy"], "EnableCollectionManagement")
                     || flag(&me["Policy"], "IsAdministrator"),

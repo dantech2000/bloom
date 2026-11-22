@@ -372,9 +372,31 @@ pub fn ends_at(secs: i64) -> String {
     format_clock(end.time(), clock_is_12_hour())
 }
 
+/// The languages of the user, most wanted first, as the system lists them
+/// (`NSLocale.preferredLanguages`: "en-US", "de-DE"). For the
+/// `Accept-Language` of the requests to the server. Empty when the class
+/// is not there.
+pub fn preferred_languages() -> Vec<String> {
+    let list = send!(Id, class(c"NSLocale"), c"preferredLanguages");
+    if list.is_null() {
+        return Vec::new();
+    }
+    let count = send!(usize, list, c"count");
+    (0..count).filter_map(|index| string_of(send!(Id, list, c"objectAtIndex:", index => usize))).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_preferred_languages_of_this_mac_are_read() {
+        // Not a fixed answer: it depends on the Mac. A Mac has one at least.
+        let languages = preferred_languages();
+        assert!(!languages.is_empty(), "{languages:?}");
+        assert!(bloom_core::languages::accept_language(&languages).is_some(), "{languages:?}");
+        eprintln!("preferred languages: {languages:?}");
+    }
 
     #[test]
     fn only_http_and_https_links_open() {

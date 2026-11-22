@@ -235,6 +235,10 @@ final class Mpv {
         state.duration = 0
         state.buffering = true
         player.setProperty("http-header-fields", to: header)
+        // MPVUI loads a paused file with no pause event: the state says so
+        // here, or the bar shows Pause over a paused video ("Are you still
+        // watching?" read it as playing, 2026-11-21).
+        state.paused = paused
         player.load(target, playAutomatically: !paused, startTime: .seconds(start))
     }
 
@@ -272,6 +276,12 @@ final class Mpv {
 
     func skip(_ secs: Double) {
         player.seek(by: .seconds(secs))
+    }
+
+    /// One frame on or back; mpv pauses for it (the Mac's `,` and `.`).
+    func frameStep(forward: Bool) {
+        setPaused(true)
+        player.executeCommand(forward ? "frame-step" : "frame-back-step", arguments: [])
     }
 
     func stop() {

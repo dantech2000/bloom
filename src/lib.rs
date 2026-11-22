@@ -38,6 +38,7 @@ mod seasons;
 mod settings;
 mod signal;
 mod socket;
+mod still_watching;
 mod stream;
 mod subtitles;
 mod swipe;
@@ -124,6 +125,10 @@ pub fn init(cx: &mut App) -> Config {
             macos::set_app_icon(include_bytes!("../assets/icon/bloom.png"));
         }
     }
+
+    // The server's answers in the user's languages (Jellyfin 12.0 reads
+    // `Accept-Language`), from the system's list as it is at start.
+    bloom_core::jellyfin::set_preferred_languages(&macos::preferred_languages());
 
     // The folders of the name the app had before come along.
     brand::migrate_folders();

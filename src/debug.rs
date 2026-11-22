@@ -155,7 +155,8 @@ const COMMANDS: &[&str] = &[
     "syncplay", "lists", "events", "socket-inject", "cast", "downloads", "connection",
     "chromecast", "subs", "quality", "episodes", "rows", "perf", "theme", "glass", "mpv",
     "mpv-set", "stream", "quit", "pacing", "hero-video", "sizes", "prefs", "catalog", "menubar",
-    "action", "appearance", "reopen", "state",
+    "action", "appearance", "reopen", "frame", "key", "still-watching", "state", "backups", "logs-follow",
+    "activity",
 ];
 
 impl Bloom {
@@ -442,6 +443,24 @@ impl Bloom {
                 return command.to_string();
             }
             "pause" => self.request_toggle_pause(cx),
+            // `frame back|forward`: as the `,` and `.` keys of the player.
+            "frame" => match rest {
+                "back" => self.frame_step(false, cx),
+                "forward" => self.frame_step(true, cx),
+                _ => return "error: usage: frame back|forward".into(),
+            },
+            "still-watching" => return self.still_watching_debug(rest, cx),
+            // `key <keystroke>` ("," "." "enter" "shift-n"): the key goes
+            // through the window's own dispatch to the focused element, as a
+            // key the user typed would. Nothing reaches the system's input.
+            "key" => match gpui_kit::Keystroke::parse(rest) {
+                // After this update of the app: the dispatch draws the window,
+                // which updates the app again.
+                Ok(keystroke) => window.defer(cx, move |window, cx| {
+                    window.dispatch_keystroke(keystroke, cx);
+                }),
+                Err(_) => return "error: usage: key <keystroke>, as GPUI writes one (\",\", \"shift-n\")".into(),
+            },
             "seek" => match rest.parse::<f64>() {
                 Ok(secs) => self.request_seek_to(secs, cx),
                 Err(_) => return "error: usage: seek <seconds>".into(),
@@ -472,6 +491,11 @@ impl Bloom {
                 }
                 None => return format!("error: no dashboard section named {rest:?}"),
             },
+            // The Backups section (`admin::backups::debug`), the follow of
+            // the open log, the filters of the activity log.
+            "backups" => return crate::admin::backups::debug(self, rest, cx),
+            "logs-follow" => self.set_log_follow(rest != "off", cx),
+            "activity" => return crate::admin::activity::debug_query(self, rest, cx),
             // Opens the metadata manager for the item of the detail page, to
             // look at it. `browse <type>` reads the provider images (a GET).
             "meta" => return self.debug_meta(rest, window, cx),
@@ -535,9 +559,11 @@ impl Bloom {
                     "favorites" => LibraryShow::Favorites,
                     "collections" => LibraryShow::Collections,
                     "episodes" => LibraryShow::Episodes,
+                    "playlists" => LibraryShow::Playlists,
+                    "studios" => LibraryShow::Studios,
                     _ => LibraryShow::All,
                 };
-                self.update_library(|d| d.show = show, cx);
+                self.update_library(|d| crate::views::library::set_show(d, show), cx);
             }
             // Holds the seek slider at a time, as a drag of its thumb does.
             "scrub" => match rest.parse::<f32>() {
@@ -575,6 +601,8 @@ impl Bloom {
                     cx.notify();
                     return self.debug_state(window);
                 }
+                // "filter Audio language": the menu with that submenu open.
+                let (rest, submenu) = rest.split_once(' ').map_or((rest, None), |(menu, label)| (menu, Some(label)));
                 let menu = match rest {
                     "profile" => self.popups.profile_menu.clone(),
                     "sort" => self.popups.sort_menu.clone(),
@@ -584,6 +612,7 @@ impl Bloom {
                     "audio" => self.popups.detail_audio_menu.clone(),
                     "subtitles" => self.playback.subtitle_menu.clone(),
                     "detail-subtitles" => self.popups.detail_subtitle_menu.clone(),
+                    "version" => self.popups.detail_version_menu.clone(),
                     _ => {
                         // The entries of the player's menus follow its
                         // tracks; a menu opened before a rebuild was empty.
@@ -594,11 +623,17 @@ impl Bloom {
                 if menu.read(cx).is_empty() {
                     return "error: the menu has no entries".into();
                 }
-                menu.update(cx, |menu, cx| menu.open(window, cx));
+                match submenu {
+                    Some(label) => menu.update(cx, |menu, cx| menu.open_submenu(label, window, cx)),
+                    None => menu.update(cx, |menu, cx| menu.open(window, cx)),
+                }
             }
             // Opens a page of the settings; "password" opens that form.
             "settings" => match rest {
                 "password" => self.ask_new_password(cx),
+                audio if audio.starts_with("audio-language") => {
+                    return self.debug_audio_language(audio.trim_start_matches("audio-language").trim(), window, cx);
+                }
                 // The list of home rows: `home-rows` prints the ten slots;
                 // `home-rows up|down|remove <n>`, `add <kind>` and
                 // `web-remove <slot>` change it as its buttons do (a save).
@@ -667,6 +702,8 @@ impl Bloom {
             "subs" => return self.debug_subs(rest, window, cx),
             // Playback quality: the play method, the bitrate limit, the menu.
             "quality" => return self.debug_quality(rest, window, cx),
+            // The versions of an item: on the detail page and in the player.
+            "version" => return self.debug_version(rest, window, cx),
             // Opens or closes the episode list of the player.
             "episodes" => self.toggle_episode_picker(window, cx),
             "rows" => return self.debug_rows(),

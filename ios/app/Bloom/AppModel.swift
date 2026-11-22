@@ -45,6 +45,9 @@ struct PlayRequest: Identifiable, Hashable {
     /// The tracks chosen on the detail page, by the server's index.
     var audioIndex: Int64? = nil
     var subtitleIndex: Int64? = nil
+    /// The version chosen on the detail page (a media source id); nil
+    /// plays the item's own file.
+    var mediaSourceId: String? = nil
     var id: String { item.id + (fromStart ? ".start" : "") }
 }
 
@@ -480,9 +483,9 @@ final class AppModel {
         screen = .connect
     }
 
-    func play(_ item: MediaItem, fromStart: Bool = false, audio: Int64? = nil, subtitle: Int64? = nil) {
+    func play(_ item: MediaItem, fromStart: Bool = false, audio: Int64? = nil, subtitle: Int64? = nil, version: String? = nil) {
         if playElsewhere([item], start: fromStart ? 0 : Double(item.resumeSecs)) { return }
-        playing = PlayRequest(item: item, fromStart: fromStart, audioIndex: audio, subtitleIndex: subtitle)
+        playing = PlayRequest(item: item, fromStart: fromStart, audioIndex: audio, subtitleIndex: subtitle, mediaSourceId: version)
     }
 
     /// Plays from a place (a bookmark), wherever plays go.
@@ -492,16 +495,40 @@ final class AppModel {
     }
 
     /// Plays a list in order (Play All, Shuffle, Play from here). A remote
-    /// target gets the whole list; a Chromecast the first item.
+    /// target gets the whole list; a Chromecast the first item. A show in
+    /// the list (a library of shows) stands for its episodes from the next
+    /// one not watched: the first is looked up before the play, the others
+    /// when their turn comes (`PlayerModel.playNext`), as on the Mac.
     func play(all items: [MediaItem], shuffled: Bool = false) {
-        var items = items.filter { $0.playable }
+        var items = items.filter { $0.playable || $0.isSeries }
         if shuffled { items.shuffle() }
         guard let first = items.first else {
             say("Nothing here plays.")
             return
         }
+        if first.isSeries {
+            Task { await playFromShow(items) }
+            return
+        }
         if playElsewhere(items, start: 0) { return }
         playing = PlayRequest(item: first, fromStart: true, queue: Array(items.dropFirst()))
+    }
+
+    /// A list that starts with a show: its episodes take its place (a show
+    /// with none is passed over), and the list plays.
+    private func playFromShow(_ items: [MediaItem]) async {
+        var rest = items
+        while let first = rest.first, first.isSeries {
+            rest.removeFirst()
+            if let episodes = try? await server?.seriesQueue(seriesId: first.id) {
+                rest.insert(contentsOf: episodes, at: 0)
+            }
+        }
+        guard !rest.isEmpty else {
+            say("Nothing here plays.")
+            return
+        }
+        play(all: rest)
     }
 
     /// A play that is not this device's, in this order: the SyncPlay group
@@ -974,6 +1001,8 @@ struct GridSource: Hashable {
     static let favorites = GridSource(id: "favorites", title: "Favorites")
     static let playlists = GridSource(id: "playlists", title: "Playlists")
     static func person(_ id: String, _ name: String) -> GridSource { GridSource(id: "person:\(id)", title: name) }
+    /// The films and shows of a studio (a card of a library's Studios).
+    static func studio(_ id: String, _ name: String) -> GridSource { GridSource(id: "studio:\(id)", title: name) }
 }
 
 extension MediaItem: @retroactive Identifiable {}
