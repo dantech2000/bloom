@@ -11,10 +11,13 @@
 /// Number of slots the server keeps.
 pub const SLOTS: usize = crate::jellyfin::HOME_SECTION_SLOTS;
 
-/// The kinds this app shows, with their names.
-pub const APP_KINDS: [(&str, &str); 5] = [
+/// The kinds this app shows, with their names. "upcoming" (episodes not
+/// aired yet) is Bloom's own: Jellyfin Web skips a kind it does not know
+/// (`homesections.js` clears that section), so the slot is safe to share.
+pub const APP_KINDS: [(&str, &str); 6] = [
     ("resume", "Continue Watching"),
     ("nextup", "Next Up"),
+    ("upcoming", "Upcoming"),
     ("latestmedia", "Recently Added"),
     ("smalllibrarytiles", "My Media"),
     ("librarybuttons", "My Media (small)"),
@@ -182,14 +185,25 @@ mod tests {
     fn a_row_shows_once() {
         let list = HomeRows::from_slots(&slots(&["resume", "nextup", "resume", "librarybuttons", "smalllibrarytiles"]));
         assert_eq!(list.rows, ["resume", "nextup", "librarybuttons"]);
-        assert_eq!(list.addable(), ["latestmedia"]);
+        assert_eq!(list.addable(), ["upcoming", "latestmedia"]);
         let mut list = list;
         list.add("resume");
         list.add("smalllibrarytiles");
         assert_eq!(list.rows.len(), 3);
         list.add("latestmedia");
-        assert_eq!(list.rows, ["resume", "nextup", "librarybuttons", "latestmedia"]);
+        list.add("upcoming");
+        assert_eq!(list.rows, ["resume", "nextup", "librarybuttons", "latestmedia", "upcoming"]);
         assert!(list.addable().is_empty());
+        assert_eq!(name("upcoming"), "Upcoming");
+    }
+
+    /// "upcoming" is a row of this app: it moves with the others and does
+    /// not stay put as a kind of the web.
+    #[test]
+    fn the_upcoming_row_is_one_of_the_app() {
+        let list = HomeRows::from_slots(&slots(&["resume", "upcoming", "livetv"]));
+        assert_eq!(list.rows, ["resume", "upcoming"]);
+        assert_eq!(list.web, [(2, "livetv".to_string())]);
     }
 
     #[test]

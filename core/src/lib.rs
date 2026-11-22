@@ -5,6 +5,8 @@
 //! so its tests run without them, and a change to a page does not build
 //! this crate again.
 
+pub mod activity_query;
+pub mod backups;
 pub mod bitrate;
 pub mod brand;
 pub mod cast;
@@ -19,6 +21,7 @@ pub mod fsutil;
 pub mod images;
 pub mod jellyfin;
 pub mod languages;
+pub mod log_follow;
 pub mod news;
 pub mod options;
 pub mod pages;
@@ -27,10 +30,12 @@ pub mod quality_tags;
 pub mod queue;
 pub mod realtime;
 pub mod search_index;
+pub mod still_watching;
 pub mod subtitles;
 pub mod syncplay;
 pub mod test_time;
 pub mod track_names;
 pub mod trailers;
+pub mod versions;
 #[cfg(test)]
 mod test_net;

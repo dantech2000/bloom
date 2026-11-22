@@ -135,6 +135,11 @@ fn connect(client: &Client) -> Result<Socket> {
     request
         .headers_mut()
         .insert("Authorization", client.auth_header().parse()?);
+    // The texts the server sends over the socket (a message to show) in
+    // the user's language, as for the REST requests.
+    if let Some(language) = crate::jellyfin::accept_language() {
+        request.headers_mut().insert("Accept-Language", language.parse()?);
+    }
     let uri = request.uri().clone();
     let host = uri.host().context("no host")?.to_string();
     let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });

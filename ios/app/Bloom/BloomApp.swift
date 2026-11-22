@@ -10,6 +10,10 @@ struct BloomApp: App {
 
     init() {
         installPanicHook()
+        // The server's answers in the user's languages (Jellyfin 12.0 reads
+        // Accept-Language), from the list of Settings › General › Language
+        // & Region as it is at start.
+        setPreferredLanguages(tags: Locale.preferredLanguages)
     }
 
     var body: some Scene {

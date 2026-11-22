@@ -183,13 +183,19 @@ struct HeroShade: View {
 }
 
 extension MediaItem {
-    /// Played and favourite apply to it: a title, an episode, a series or a
-    /// season, not a library or a folder.
-    var markable: Bool { playable || isSeries || kind == .season }
+    /// Played and favourite apply to it: a title, an episode, a series, a
+    /// season, a collection or a folder (Jellyfin 12 marks a folder's
+    /// items; the web's `canMarkPlayed`), not a library.
+    var markable: Bool { playable || isSeries || kind == .season || kind == .boxSet || kind == .folder }
 
     /// A card's title: an episode's show, else the name (the Mac's
     /// `card_titles`).
     var cardTitle: String { kind == .episode ? seriesName ?? name : name }
+
+    /// An upcoming episode's line: the day it airs, its code and name.
+    var airLine: String {
+        [premiere, episodeCode, name].compactMap { $0 }.joined(separator: " · ")
+    }
 
     /// The line under it: an episode's code and name, else the year.
     var subtitle: String {
@@ -304,7 +310,8 @@ struct PosterCard: View {
         VStack(alignment: .leading, spacing: 6) {
             // An episode shows its show's poster (Recently Added), as on
             // the Mac's poster cards.
-            Picture(url: item.showPoster ?? item.poster)
+            // A studio seldom has a picture: its glyph stands in.
+            Picture(url: item.showPoster ?? item.poster, symbol: item.kind == .studio ? "building.2" : "film")
                 .aspectRatio(2 / 3, contentMode: .fit)
                 .overlay(alignment: .topLeading) { QualityTags(labels: item.qualityTags) }
                 .overlay(alignment: .topTrailing) { Badge(item: item) }
@@ -331,6 +338,9 @@ extension MediaItem {
 /// the episode.
 struct WideCard: View {
     let item: MediaItem
+    /// The line under the title in place of the episode's: the day an
+    /// upcoming episode airs with its code.
+    var detail: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -342,7 +352,7 @@ struct WideCard: View {
             Text(item.cardTitle).font(.footnote.weight(.medium)).lineLimit(1)
             // A library has its name alone: no empty line under it.
             if item.kind != .collectionFolder {
-                Text(item.subtitle)
+                Text(detail ?? item.subtitle)
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
         }
@@ -425,7 +435,7 @@ struct CardLink<Card: View>: View {
                 if item.playable || item.isSeries {
                     Button("Play", systemImage: "play.fill") { model.play(item) }
                 }
-                // Not on a library or a folder: Mark played would mark all of it.
+                // Not on a library: Mark played would mark all of it.
                 if item.markable {
                     Button(item.played ? "Mark unplayed" : "Mark played", systemImage: item.played ? "arrow.uturn.backward.circle" : "checkmark.circle") {
                         Task { await model.togglePlayed(item) }

@@ -28,6 +28,7 @@ struct DashboardSheet: View {
                 Section("Advanced") {
                     NavigationLink { TasksPage() } label: { Label("Scheduled tasks", systemImage: "clock.arrow.circlepath") }
                     NavigationLink { PluginsPage() } label: { Label("Plugins", systemImage: "puzzlepiece.extension") }
+                    NavigationLink { BackupsPage() } label: { Label("Backups", systemImage: "archivebox") }
                     NavigationLink { LogsPage() } label: { Label("Logs", systemImage: "doc.plaintext") }
                     NavigationLink { ApiKeysPage() } label: { Label("API keys", systemImage: "key") }
                 }

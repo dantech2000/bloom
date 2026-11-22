@@ -60,6 +60,11 @@ impl PlaybackInfo {
             .find(|s| s.id == item_id)
             .or_else(|| self.media_sources.first())
     }
+
+    /// The source of a load: the version it asked for, else as `source`.
+    pub fn source_for(&self, item_id: &str, wanted: Option<&str>) -> Option<&MediaSource> {
+        crate::versions::pick(&self.media_sources, item_id, wanted)
+    }
 }
 
 /// The name of a stream in a menu.
@@ -121,6 +126,9 @@ pub struct Load {
     /// The subtitle is burned into the transcode, whatever the profile
     /// says: after its file did not come (`subtitle_file_failed`).
     pub burn_in: bool,
+    /// The version to play (the id of a media source of the item); none
+    /// plays the item's own file, as before versions.
+    pub media_source_id: Option<String>,
 }
 
 /// The limit sent for "Auto": above every file. The server still applies
@@ -230,7 +238,7 @@ pub fn request_body(client: &Client, load: &Load, max_bitrate: Option<u64>) -> s
         "UserId": client.user_id.as_deref().unwrap_or_default(),
         "DeviceProfile": device_profile(max_bitrate),
         "StartTimeTicks": (load.start_secs.max(0.) * TICKS_PER_SECOND as f64) as i64,
-        "MediaSourceId": load.item_id,
+        "MediaSourceId": load.media_source_id.as_deref().unwrap_or(&load.item_id),
         "EnableDirectPlay": true,
         "EnableDirectStream": true,
         "EnableTranscoding": true,
@@ -328,8 +336,12 @@ mod tests {
             burn_in: false,
             audio: Some(1),
             subtitle: None,
+            media_source_id: None,
         };
         let body = request_body(&client(), &load, None);
+        assert_eq!(body["MediaSourceId"], ITEM, "no choice: the item's own file");
+        let version = Load { media_source_id: Some("version-2".into()), ..load.clone() };
+        assert_eq!(request_body(&client(), &version, None)["MediaSourceId"], "version-2");
         assert_eq!(body["StartTimeTicks"], 900_000_000);
         assert_eq!(body["AudioStreamIndex"], 1);
         assert!(body.get("SubtitleStreamIndex").is_none());
@@ -360,6 +372,20 @@ mod tests {
         assert_eq!(mpv_id(&streams, StreamKind::Subtitle, 0), None, "a file of its own is not a track of the file");
         assert_eq!(mpv_id(&streams, StreamKind::Audio, 9), None);
         assert_eq!(mpv_id(&streams, StreamKind::Subtitle, -1), None);
+    }
+
+    /// The answer names the version the load asked for; without a choice
+    /// (or for a version the answer lacks) the item's own file plays.
+    #[test]
+    fn the_load_plays_the_version_it_asked_for() {
+        let info: PlaybackInfo = serde_json::from_value(serde_json::json!({
+            "MediaSources": [{ "Id": "v4k", "Name": "4K" }, { "Id": ITEM, "Name": "1080p" }]
+        }))
+        .unwrap();
+        assert_eq!(info.source_for(ITEM, Some("v4k")).unwrap().id, "v4k");
+        assert_eq!(info.source_for(ITEM, None).unwrap().id, ITEM);
+        assert_eq!(info.source_for(ITEM, Some("gone")).unwrap().id, ITEM);
+        assert_eq!(info.source(ITEM).unwrap().id, ITEM);
     }
 
     #[test]

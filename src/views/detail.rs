@@ -301,6 +301,24 @@ impl Bloom {
         }
         rows.extend(self.bookmarks_detail_section(item, l.content_left, l.side, cx));
         rows.extend(self.render_cast(data, &client, &l, cx));
+        // The collections that hold the item; a card opens the collection.
+        if !data.collections.is_empty() {
+            let w = self.metrics().portrait_w;
+            let cards = Cards::new(w, data.collections.len(), |i, cx| {
+                poster_card(&data.collections[i], &client, w, self.nav.hovered_card.as_ref(), cx)
+            });
+            rows.push(section_padded(
+                self,
+                "detail.included-in",
+                "Included In",
+                None,
+                w * 1.5 + CARD_TEXT_H,
+                cards,
+                l.content_left,
+                l.side,
+                cx,
+            ));
+        }
         if !data.similar.is_empty() {
             let w = self.metrics().portrait_w;
             let cards = Cards::new(w, data.similar.len(), |i, cx| {
@@ -633,6 +651,23 @@ impl Bloom {
         };
 
         let mut rows = div().max_w(px(655.)).flex().flex_col().gap(px(10.));
+        // The files of the item, when it has more than one: the tracks
+        // and the facts below are those of the one picked (its source is
+        // the item's first, `DetailData::show_version`).
+        if let Some(shown) = item.media_sources.first().filter(|_| item.has_versions()) {
+            let longest = item
+                .versions()
+                .iter()
+                .map(|source| item.version_name(source).chars().count())
+                .max()
+                .unwrap_or(0);
+            rows = rows.child(row("Version").child(select(
+                &self.popups.detail_version_menu,
+                "Version",
+                item.version_name(shown),
+                longest,
+            )));
+        }
         if let Some(video) = item.stream_title(StreamKind::Video) {
             rows = rows.child(row("Video").h(px(34.)).child(div().text_color(value).child(video)));
         }
@@ -1317,6 +1352,39 @@ impl Bloom {
             subtitles.push(search);
         }
 
+        // The versions, in an order a pick does not change; the item's
+        // first source is the one shown.
+        let shown = data.item.media_sources.first().map(|s| s.id.clone());
+        let item_id = data.item.id.clone();
+        let versions: Vec<MenuItem> = data
+            .item
+            .versions()
+            .iter()
+            .enumerate()
+            .map(|(n, source)| {
+                let handle = this.clone();
+                let name = bloom_core::versions::name(source, n);
+                let technical = bloom_core::versions::technical(source);
+                let id = source.id.clone();
+                let own = id == item_id;
+                MenuItem::new(SharedString::from(format!("detail.version.{n}")), name.clone())
+                    .detail(if technical != name { technical } else { String::new() })
+                    .radio(shown.as_deref() == Some(id.as_str()))
+                    .on_click(move |_, _, cx| {
+                        let id = id.clone();
+                        handle
+                            .update(cx, |this, cx| {
+                                if let Page::Detail(data) = &mut this.nav.page {
+                                    data.show_version((!own).then_some(id));
+                                }
+                                this.rebuild_detail_menus(cx);
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+            })
+            .collect();
+
         let web = self
             .session
             .as_ref()
@@ -1378,6 +1446,8 @@ impl Bloom {
             .update(cx, |menu, cx| menu.set_items(audio, cx));
         self.popups.detail_subtitle_menu
             .update(cx, |menu, cx| menu.set_items(subtitles, cx));
+        self.popups.detail_version_menu
+            .update(cx, |menu, cx| menu.set_items(versions, cx));
         self.popups.more_menu.update(cx, |menu, cx| menu.set_items(more, cx));
     }
 
@@ -1387,6 +1457,7 @@ impl Bloom {
             return;
         };
         let (item, audio, subtitle) = (data.item.clone(), data.audio, data.subtitle);
+        let version = data.version.clone();
         if item.is_series() {
             self.play_series(&item, window, cx);
             return;
@@ -1395,6 +1466,7 @@ impl Bloom {
         // and mpv, for the file itself (`stream_begin`).
         self.stream.wanted_audio = audio;
         self.stream.wanted_subtitle = subtitle;
+        self.stream.wanted_source = version;
         self.play(&item, resume, window, cx);
         self.stream_choice_left(&item);
     }

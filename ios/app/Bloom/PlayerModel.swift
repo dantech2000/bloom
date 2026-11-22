@@ -41,6 +41,16 @@ final class PlayerModel {
     /// The server's tracks of the item that plays, with their flags.
     private(set) var fileTracks: [TrackInfo] = []
     @ObservationIgnored private var fileTracksFor: String?
+    /// The files of the item that plays (its versions), its own first.
+    private(set) var versions: [MediaVersion] = []
+    /// The version chosen for an item (a media source id): on the detail
+    /// page or in the settings menu. It holds over the reloads of that
+    /// item (a quality change) and names nothing for another.
+    @ObservationIgnored private var version: (itemId: String, sourceId: String)?
+    /// The version that plays.
+    var currentVersion: MediaVersion? {
+        versions.first { $0.id == info?.mediaSourceId } ?? versions.first(where: \.isDefault)
+    }
     /// The Play on sheet over the video.
     var showPlayOn = false
     var scrubbing: Double?
@@ -95,6 +105,14 @@ final class PlayerModel {
     var nextItem: MediaItem? { queue.first ?? info?.next }
     /// "Hide" on the Up next card.
     var upNextHidden = false
+    /// "Are you still watching?" shows over the paused next episode.
+    var stillWatchingAsk = false
+    /// A frame step runs: mpv plays one frame and pauses again, so the
+    /// paused state flickers; the step buttons stay meanwhile.
+    var frameStepping = false
+    @ObservationIgnored private var frameStepToken = 0
+    /// The session of that question (core's rule, as on the Mac).
+    @ObservationIgnored private let stillWatching = StillWatching()
 
     private var mpv: Mpv?
     /// MPVUI's player, for the video view and Picture in Picture.
@@ -172,9 +190,11 @@ final class PlayerModel {
         applySubtitleLook()
         startRequest = request
         queue = request.queue
+        stillWatching.begin(itemId: request.item.id, episode: request.item.kind == .episode)
         chosenAudio = request.audioIndex
         chosenSubtitle = request.subtitleIndex
         choicesFor = request.item.id
+        version = request.mediaSourceId.map { (itemId: request.item.id, sourceId: $0) }
         observeSystem()
         watchExternalPlayback(mpv.player)
         remoteCommands()
@@ -241,6 +261,7 @@ final class PlayerModel {
         mpv.set(property: "aid", keep?.aid ?? info.audioMpvId.map { "\($0)" } ?? "auto")
         mpv.set(property: "sid", keep?.sid ?? info.subtitleMpvId.map { $0 == 0 ? "no" : "\($0)" } ?? "auto")
         mpv.load(url: info.url, header: info.httpHeader, start: info.startSecs, paused: paused)
+        state.paused = paused
         SyncBridge.shared.loadIssued(itemId: info.itemId)
         NSLog("PLAYER: load %@; chosen audio %@ subtitle %@ (mpv %@/%@), %d server files", info.itemId,
               String(describing: chosenAudio), String(describing: info.subtitleIndex),
@@ -260,9 +281,12 @@ final class PlayerModel {
         liftSubtitles()
         Task { await loadSeason(info) }
         // Another item's tracks name nothing here; a reload keeps them.
-        if fileTracksFor != info.itemId {
+        // Another version is another file, with tracks of its own.
+        let file = info.itemId + "/" + info.mediaSourceId
+        if fileTracksFor != file {
+            if fileTracksFor?.hasPrefix(info.itemId + "/") != true { versions = [] }
             fileTracks = []
-            fileTracksFor = info.itemId
+            fileTracksFor = file
             Task { await loadFile(info) }
         }
         Task { await loadBookmarks() }
@@ -354,14 +378,21 @@ final class PlayerModel {
     /// offline, from what the download kept. With the cap the stream was
     /// asked with, which `load` keeps once the answer is its own.
     private func playInfo(server: Server, itemId: String, fromStart: Bool, at: Double?) async throws -> (PlayInfo, UInt64?) {
-        guard let file = Downloads.shared.localFile(itemId), let entry = Downloads.shared.entry(itemId) else {
+        // The version chosen for this item. A download plays from this
+        // device when nothing is chosen or it is the version chosen; another
+        // version comes from the server.
+        let source = version?.itemId == itemId ? version?.sourceId : nil
+        let saved = Downloads.shared.entry(itemId)
+        guard source == nil || source == saved?.mediaSourceId,
+              let file = Downloads.shared.localFile(itemId), let entry = saved else {
             // On cellular the cellular limit too, the lower of the two
             // (spec Q11).
             let cellular = Preferences.shared.cellularCap
             let base = requestCap(chosen: quality, cellular: cellular, onCellular: LinkWatch.shared.onCellular)
             if base != quality { NSLog("PLAYER: cellular: the stream is capped at %@", bitrateLabel(bitrate: base ?? 0)) }
             let info = try await server.playInfo(itemId: itemId, fromStart: fromStart, startSecs: at, maxBitrate: base,
-                                                 audioIndex: chosenAudio, subtitleIndex: chosenSubtitle, burnIn: burnIn)
+                                                 audioIndex: chosenAudio, subtitleIndex: chosenSubtitle, burnIn: burnIn,
+                                                 mediaSourceId: source)
             // Auto on a slow link: the rung the link carries, and under it
             // the cap that stalls set (core's rules); never over the
             // cellular limit.
@@ -372,12 +403,14 @@ final class PlayerModel {
                   base.map({ cap < $0 }) ?? true else { return (info, base) }
             NSLog("PLAYER: Auto lowers the stream to %@%@", bitrateLabel(bitrate: cap), cap == decided ? "" : " (after stalls)")
             let lowered = try await server.playInfo(itemId: itemId, fromStart: fromStart, startSecs: at, maxBitrate: cap,
-                                                    audioIndex: chosenAudio, subtitleIndex: chosenSubtitle, burnIn: burnIn)
+                                                    audioIndex: chosenAudio, subtitleIndex: chosenSubtitle, burnIn: burnIn,
+                                                    mediaSourceId: source)
             return (lowered, cap)
         }
         let start = at ?? (fromStart ? 0 : Double(entry.item.resumeSecs))
         if var online = try? await server.playInfo(itemId: itemId, fromStart: fromStart, startSecs: at, maxBitrate: nil,
-                                                   audioIndex: chosenAudio, subtitleIndex: chosenSubtitle, burnIn: burnIn) {
+                                                   audioIndex: chosenAudio, subtitleIndex: chosenSubtitle, burnIn: burnIn,
+                                                   mediaSourceId: entry.mediaSourceId) {
             online.url = file.path
             online.httpHeader = ""
             online.transcoding = false
@@ -385,7 +418,7 @@ final class PlayerModel {
             online.rungs = []
             return (online, nil)
         }
-        let offline = PlayInfo(url: file.path, httpHeader: "", itemId: itemId, mediaSourceId: itemId,
+        let offline = PlayInfo(url: file.path, httpHeader: "", itemId: itemId, mediaSourceId: entry.mediaSourceId ?? itemId,
                         playSessionId: UUID().uuidString.lowercased(), playMethod: .directPlay, transcoding: false,
                         startSecs: start, title: entry.item.title, item: entry.item, segments: entry.segments,
                         externalSubtitles: [], next: nil, rungs: [], sourceBitrate: nil,
@@ -468,26 +501,49 @@ final class PlayerModel {
         }
     }
 
-    /// The next episode, from the Up next card or at the end of this one.
-    func playNext() async {
+    /// The next episode, from the Up next card or at the end of this one;
+    /// `paused` when "Are you still watching?" asks first.
+    func playNext(paused: Bool = false) async {
         if let group = SyncBridge.shared.group {
             group.user(intent: .next)
             return
         }
         if !queue.isEmpty {
             if let current = info?.item { history.append(current) }
-            let next = queue.removeFirst()
-            await play(next, fromStart: true)
+            guard let next = await nextOfQueue() else {
+                finished = true
+                return
+            }
+            await play(next, fromStart: true, paused: paused)
             return
         }
         guard let next = info?.next else { return }
-        await play(next)
+        await play(next, paused: paused)
+    }
+
+    /// The first item of the queue to play. A show (Play All on a library
+    /// of shows) stands for its episodes from the next one not watched
+    /// (core's `series_queue`, the Mac's `expand_series`); a show with none
+    /// is passed over.
+    private func nextOfQueue() async -> MediaItem? {
+        while !queue.isEmpty {
+            let next = queue.removeFirst()
+            guard next.isSeries else { return next }
+            guard let server, let episodes = try? await server.seriesQueue(seriesId: next.id), let first = episodes.first else {
+                NSLog("PLAYER: no episodes for the show %@ of the queue", next.id)
+                continue
+            }
+            queue.insert(contentsOf: episodes.dropFirst(), at: 0)
+            return first
+        }
+        return nil
     }
 
     /// Another item in this player (the episode picker, Up next); an item
     /// of a SyncPlay group comes at the group's place, paused.
     func play(_ item: MediaItem, fromStart: Bool = false, at secs: Double? = nil, paused: Bool = false) async {
         showEpisodes = false
+        stillWatching.note(itemId: item.id, episode: item.kind == .episode)
         await endSession()
         await load(itemId: item.id, fromStart: fromStart, at: secs, paused: paused)
     }
@@ -836,7 +892,18 @@ final class PlayerModel {
         }
         // A queue the user made plays on; the next episode follows the setting.
         if !queue.isEmpty || (info?.next != nil && prefs?.bool("EnableNextEpisodeAutoPlay", default: true) ?? true) {
-            Task { await playNext() }
+            // "Are you still watching?" (core's rule): the next episode
+            // loads paused, and the question shows over it.
+            if let next = nextItem,
+               stillWatching.ask(itemId: next.id, episode: next.kind == .episode, choice: prefs?.stillWatching ?? .off) {
+                NSLog("PLAYER: still watching? asking before %@", next.id)
+                Task {
+                    await playNext(paused: true)
+                    if !finished, mpv != nil { stillWatchingAsk = true }
+                }
+            } else {
+                Task { await playNext() }
+            }
         } else {
             finished = true
         }
@@ -844,7 +911,40 @@ final class PlayerModel {
 
     // MARK: Controls
 
+    /// Continue: the paused episode plays, and a new session of the
+    /// question starts with it.
+    func keepWatching() {
+        stillWatchingAsk = false
+        if let id = info?.itemId { stillWatching.keepWatching(itemId: id) }
+        mpv?.setPaused(false)
+        hideSoon()
+    }
+
+    /// Stop: the player closes.
+    func stopWatching() {
+        stillWatchingAsk = false
+        finished = true
+    }
+
+    /// One frame on or back, paused (the Mac's `,` and `.`). A group plays
+    /// in step, so a member does not step alone.
+    func frameStep(forward: Bool) {
+        guard SyncBridge.shared.group == nil else { return }
+        stillWatching.input()
+        frameStepping = true
+        frameStepToken += 1
+        let token = frameStepToken
+        mpv?.frameStep(forward: forward)
+        hideSoon()
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(600))
+            guard let self, self.frameStepToken == token else { return }
+            self.frameStepping = false
+        }
+    }
+
     func togglePause() {
+        stillWatching.input()
         if let group = SyncBridge.shared.group {
             group.user(intent: .togglePause)
             hideSoon()
@@ -860,6 +960,7 @@ final class PlayerModel {
     }
 
     func skip(_ secs: Double) {
+        stillWatching.input()
         if let group = SyncBridge.shared.group {
             group.user(intent: .seek(positionSecs: max(0, state.position + secs)))
             hideSoon()
@@ -902,12 +1003,14 @@ final class PlayerModel {
     }
 
     func tapVideo() {
+        stillWatching.input()
         holding = false
         controls.toggle()
         if controls { hideSoon() }
     }
 
     func holdControls() {
+        stillWatching.input()
         holding = true
         hideTask?.cancel()
         controls = true
@@ -963,12 +1066,25 @@ final class PlayerModel {
         return TrackName(kind: .subtitle, language: subtitle.language, codec: subtitle.codec, title: nil)
     }
 
-    /// The tracks of the item's file with their flags, for the names.
+    /// The tracks of the item's file with their flags, for the names, and
+    /// the item's versions, for the settings menu.
     private func loadFile(_ info: PlayInfo) async {
         guard let server else { return }
-        let file = (try? await server.mediaFile(itemId: info.itemId)) ?? nil
+        let list = (try? await server.mediaVersions(itemId: info.itemId)) ?? []
         guard isCurrent(info) else { return }
-        fileTracks = file?.tracks ?? []
+        versions = list
+        let file = list.first { $0.id == info.mediaSourceId } ?? list.first(where: \.isDefault) ?? list.first
+        fileTracks = file?.file.tracks ?? []
+    }
+
+    /// Plays another version of the item at the place it is at. The tracks
+    /// of one file name nothing in another: the server and mpv choose
+    /// them again.
+    func switchVersion(_ sourceId: String) async {
+        guard let info, sourceId != info.mediaSourceId else { return }
+        NSLog("PLAYER: version %@ of %@", sourceId, info.itemId)
+        version = (itemId: info.itemId, sourceId: sourceId)
+        await reloadHere(chosen: true)
     }
 
     /// The server's subtitle files not yet in mpv.

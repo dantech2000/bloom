@@ -128,6 +128,10 @@ pub struct Entry {
     /// Unix seconds when the item was added.
     #[serde(default)]
     pub added: i64,
+    /// The version downloaded (a media source id of the item); none is the
+    /// item's own file.
+    #[serde(default)]
+    pub source_id: Option<String>,
     /// Bytes per second right now; 0 when not downloading.
     #[serde(skip)]
     pub speed: f64,
@@ -191,6 +195,7 @@ impl Entry {
             error: None,
             file: None,
             added: unix_now(),
+            source_id: None,
             speed: 0.,
             cancel: Arc::new(AtomicBool::new(false)),
             generation,
@@ -228,6 +233,9 @@ impl Entry {
             error: None,
             file: Some(file.to_string()),
             added: unix_now(),
+            // The version the folder was made for, so a resume asks for
+            // that file again.
+            source_id: meta["SourceId"].as_str().filter(|id| check_id("media source id", id).is_ok()).map(str::to_string),
             speed: 0.,
             cancel: Arc::new(AtomicBool::new(false)),
             generation: Generation::default(),
@@ -516,7 +524,7 @@ impl State {
 
     /// Puts an item in the queue; see [`Engine::add`]. True when the
     /// entries changed.
-    fn add(&mut self, item: &Item) -> Result<bool> {
+    fn add(&mut self, item: &Item, source_id: Option<&str>) -> Result<bool> {
         if self.owner.is_none() {
             return Err(NotOwner.into());
         }
@@ -531,7 +539,12 @@ impl State {
             }
             None => {
                 let generation = self.next_generation();
-                let entry = Entry::from_item(item, &self.server_id, generation);
+                let mut entry = Entry::from_item(item, &self.server_id, generation);
+                // A version's id goes in a path of the server: it must be an id.
+                if let Some(id) = source_id.filter(|id| *id != item.id) {
+                    check_id("media source id", id)?;
+                    entry.source_id = Some(id.to_string());
+                }
                 entry.validate()?;
                 self.entries.push(entry);
                 Ok(true)
@@ -588,6 +601,7 @@ impl State {
 struct Job {
     server_id: String,
     item_id: String,
+    source_id: Option<String>,
     generation: Generation,
     client: Client,
     folder: PathBuf,
@@ -780,8 +794,15 @@ impl Engine {
     /// and so is every item while another instance holds the folder
     /// ([`NotOwner`]).
     pub fn add(&self, item: &Item) -> Result<()> {
+        self.add_version(item, None)
+    }
+
+    /// Puts one version of an item in the queue (`source_id`, a media
+    /// source of the item; none is its own file). An item in the list
+    /// already keeps the version it has: its part file is of that file.
+    pub fn add_version(&self, item: &Item, source_id: Option<&str>) -> Result<()> {
         let mut s = self.inner.lock();
-        let changed = s.add(item)?;
+        let changed = s.add(item, source_id)?;
         self.inner.commit(s, changed);
         Ok(())
     }
@@ -796,7 +817,7 @@ impl Engine {
         }
         let mut added = 0;
         for item in items {
-            match s.add(item) {
+            match s.add(item, None) {
                 Ok(changed) => added += changed as usize,
                 Err(err) => log::warn!("download refused: {err:#}"),
             }

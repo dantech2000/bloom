@@ -4,9 +4,10 @@
 //! row ("See all"), and the picks of a new user's Home.
 
 use bloom_core::jellyfin::{Client, Item, ItemsResult};
+use bloom_core::pages::{LibraryData, LibraryShow};
 use serde_json::Value;
 
-use crate::{BloomError, CollectionType, LibraryFilter, LibrarySort, MediaItem, Page, Server, media, medias, run};
+use crate::{BloomError, CollectionType, LibraryFilter, LibrarySort, MediaItem, Page, Server, media, medias, prefs::Language, run};
 
 /// The fields of a card, as core asks for them (`item_fields`), with the
 /// streams while the quality tags are on.
@@ -51,6 +52,34 @@ pub struct PersonPage {
 pub struct FilterChoices {
     pub genres: Vec<String>,
     pub years: Vec<i32>,
+}
+
+/// A view of a film or show library besides its titles: the lists that
+/// hold its titles and its studios (Jellyfin 12.0 filters collections and
+/// playlists by library).
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LibraryView {
+    Collections,
+    Playlists,
+    Studios,
+}
+
+impl LibraryView {
+    fn show(self) -> LibraryShow {
+        match self {
+            Self::Collections => LibraryShow::Collections,
+            Self::Playlists => LibraryShow::Playlists,
+            Self::Studios => LibraryShow::Studios,
+        }
+    }
+}
+
+/// The languages of a library's audio and subtitle tracks, to narrow its
+/// grid by (Jellyfin 12.0, `/Items/Filters2`); empty from an older server.
+#[derive(uniffi::Record)]
+pub struct LanguageChoices {
+    pub audio: Vec<Language>,
+    pub subtitles: Vec<Language>,
 }
 
 /// A home row a "See all" opens in full.
@@ -115,8 +144,10 @@ fn spaced(kind: &str) -> String {
 
 #[uniffi::export]
 impl Server {
-    /// One page of a grid, as `library_page`, narrowed by genres, years
-    /// and a lowest community rating. Besides the ids `library_page`
+    /// One page of a grid, as `library_page`, narrowed by genres, years,
+    /// a lowest community rating and the languages of the audio and
+    /// subtitle tracks (codes of [`Self::language_choices`], any of them
+    /// keeps a title; Jellyfin 12.0). Besides the ids `library_page`
     /// takes, "genre:<name>" lists the films and shows of a genre in every
     /// library.
     #[allow(clippy::too_many_arguments, reason = "an export: Swift calls it with labels, a struct adds a type for one call")]
@@ -132,20 +163,24 @@ impl Server {
         genres: Vec<String>,
         years: Vec<i32>,
         min_rating: Option<f32>,
+        audio_languages: Vec<String>,
+        subtitle_languages: Vec<String>,
     ) -> Result<Page, BloomError> {
         let client = self.signed_in()?;
         run(move || {
             let person = library_id.strip_prefix("person:").map(str::to_string);
             let genre = library_id.strip_prefix("genre:").map(str::to_string);
+            let studio = library_id.strip_prefix("studio:").map(str::to_string);
             let favorites = library_id == "favorites";
+            let across = favorites || person.is_some() || genre.is_some() || studio.is_some();
             let types = match collection_type {
                 Some(CollectionType::Movies) => "Movie",
                 Some(CollectionType::TvShows) => "Series",
-                _ if favorites || person.is_some() || genre.is_some() => "Movie,Series",
+                _ if across => "Movie,Series",
                 _ if library_id == "playlists" => "Playlist",
                 _ => "",
             };
-            let no_parent = favorites || person.is_some() || genre.is_some() || library_id == "playlists";
+            let no_parent = across || library_id == "playlists";
             let mut params: Vec<(&str, String)> = vec![
                 ("userId", client.user()?.to_string()),
                 ("recursive", "true".into()),
@@ -166,6 +201,9 @@ impl Server {
             if let Some(person) = person {
                 params.push(("personIds", person));
             }
+            if let Some(studio) = studio {
+                params.push(("studioIds", studio));
+            }
             let mut wanted = genres;
             if let Some(genre) = genre {
                 wanted.push(genre);
@@ -179,6 +217,7 @@ impl Server {
             if let Some(rating) = min_rating {
                 params.push(("minCommunityRating", rating.to_string()));
             }
+            params.extend(bloom_core::jellyfin::language_params(&audio_languages, &subtitle_languages));
             let mut filters: Vec<&str> = Vec::new();
             if favorites {
                 filters.push("IsFavorite");
@@ -190,6 +229,27 @@ impl Server {
                 params.push(("filters", filters.join(",")));
             }
             let page: ItemsResult = client.get("/Items", &params)?;
+            Ok(Page { items: medias(&client, &page.items), total: page.total_record_count as u32 })
+        })
+        .await
+    }
+
+    /// One page of a library's collections, playlists or studios, by name,
+    /// as the Mac's library asks for them (core's `library_query`). A
+    /// studio's card opens "studio:<id>" with `browse_page`.
+    pub async fn library_view_page(&self, library_id: String, collection_type: Option<CollectionType>, view: LibraryView, start: u32, limit: u32) -> Result<Page, BloomError> {
+        let client = self.signed_in()?;
+        run(move || {
+            let mut data = LibraryData::new(Item {
+                id: library_id,
+                collection_type: collection_type.map(|kind| kind.text().to_string()),
+                ..Default::default()
+            });
+            data.show = view.show();
+            let mut query = bloom_core::pages::library_query(&data);
+            (query.start, query.limit) = (Some(start as usize), Some(limit as usize));
+            query.fields = Some(card_fields());
+            let page = bloom_core::pages::library_items(&client, &query, data.show)?;
             Ok(Page { items: medias(&client, &page.items), total: page.total_record_count as u32 })
         })
         .await
@@ -233,6 +293,27 @@ impl Server {
             years.sort_unstable();
             years.dedup();
             Ok(FilterChoices { genres, years })
+        })
+        .await
+    }
+
+    /// The languages of the audio and subtitle tracks of a library's films
+    /// and shows (of their episodes for shows), as `filter_choices` takes
+    /// its library; no library for every library of the user.
+    pub async fn language_choices(&self, library_id: Option<String>, collection_type: Option<CollectionType>) -> Result<LanguageChoices, BloomError> {
+        let client = self.signed_in()?;
+        run(move || {
+            let types: &[&str] = match collection_type {
+                Some(CollectionType::Movies) => &["Movie"],
+                Some(CollectionType::TvShows) => &["Series"],
+                _ => &["Movie", "Series"],
+            };
+            let library = library_id.filter(|id| !id.contains(':') && id != "favorites" && id != "playlists");
+            let choices = client.language_filters(library.as_deref(), types)?;
+            let languages = |list: Vec<bloom_core::jellyfin::LanguageChoice>| {
+                list.into_iter().map(|choice| Language { name: choice.name, code: choice.code }).collect()
+            };
+            Ok(LanguageChoices { audio: languages(choices.audio), subtitles: languages(choices.subtitles) })
         })
         .await
     }

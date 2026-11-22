@@ -13,7 +13,7 @@ struct DownloadEntry: Codable, Identifiable {
     /// kept in the Keychain alone (spec §8.1). An index of an older build
     /// still has it; the decoder passes over it.
     private enum CodingKeys: String, CodingKey {
-        case item, segments, file, url, state, received, total, resumeData, server, size, reason, recovered, estimate
+        case item, segments, file, url, state, received, total, resumeData, server, size, reason, recovered, estimate, mediaSourceId
     }
 
     /// The server and the item: two servers can know one item id.
@@ -38,6 +38,9 @@ struct DownloadEntry: Codable, Identifiable {
     var size: Int64?
     /// Why the download failed, in words.
     var reason: String?
+    /// The version downloaded (a media source id), when the detail page
+    /// chose one; nil is the item's own file. A resume asks for the same.
+    var mediaSourceId: String?
     /// Made again from the folder without its record: the server gives the
     /// details at the next look.
     var recovered: Bool?
@@ -323,14 +326,14 @@ final class Downloads {
     /// or nil. `server` must be the active one: the entry records the
     /// active server's id.
     @discardableResult
-    func download(_ item: MediaItem, server: Server) async -> String? {
+    func download(_ item: MediaItem, server: Server, version: String? = nil) async -> String? {
         guard AppModel.current?.server === server else { return Self.serverChanged }
         guard entry(item.id) == nil else { return nil }
         guard Self.safeId(item.id) else { return "The item's id is not safe for a file name." }
         let serverId = activeServer
         if let serverId, !Self.safeId(serverId) { return "The server's id is not safe for a file name." }
         do {
-            let info = try await server.downloadInfo(itemId: item.id)
+            let info = try await server.downloadInfo(itemId: item.id, mediaSourceId: version)
             // A switch of server while the server answered: the id is stale.
             guard AppModel.current?.server === server, activeServer == serverId else { return Self.serverChanged }
             guard entry(item.id) == nil else { return nil } // a second tap while the first asked
@@ -343,6 +346,7 @@ final class Downloads {
             var entry = DownloadEntry(item: info.item, segments: info.segments, file: file, url: info.url,
                                       authorization: info.authorization, state: .downloading, server: serverId)
             entry.estimate = estimate > 0 ? estimate : nil
+            entry.mediaSourceId = version
             entries.append(entry)
             writeRecord(entry)
             start(entry, resumeData: nil)
@@ -395,7 +399,7 @@ final class Downloads {
             guard isOfActiveServer(entry) else { return Self.otherServer }
             guard let server else { return "The server cannot be reached." }
             do {
-                let info = try await server.downloadInfo(itemId: entry.item.id)
+                let info = try await server.downloadInfo(itemId: entry.item.id, mediaSourceId: entry.mediaSourceId)
                 guard let index = entries.firstIndex(where: { $0.id == key }) else { return nil }
                 entries[index].authorization = info.authorization
             } catch {
@@ -415,7 +419,7 @@ final class Downloads {
         guard isOfActiveServer(entry) else { return Self.otherServer }
         guard let server else { return "The server cannot be reached." }
         do {
-            let info = try await server.downloadInfo(itemId: entry.item.id)
+            let info = try await server.downloadInfo(itemId: entry.item.id, mediaSourceId: entry.mediaSourceId)
             guard let index = entries.firstIndex(where: { $0.id == key }), entries[index].state != .downloading else { return nil }
             let estimate = Int64(info.estimatedBytes ?? 0)
             if let refused = roomFor(estimate, besides: key) { return refused }
@@ -470,7 +474,7 @@ final class Downloads {
         guard let server else { return }
         for key in entries.filter({ $0.recovered == true && isOfActiveServer($0) }).map(\.id) {
             guard let entry = entries.first(where: { $0.id == key }),
-                  let info = try? await server.downloadInfo(itemId: entry.item.id),
+                  let info = try? await server.downloadInfo(itemId: entry.item.id, mediaSourceId: entry.mediaSourceId),
                   let index = entries.firstIndex(where: { $0.id == key }) else { continue }
             entries[index].item = info.item
             entries[index].segments = info.segments

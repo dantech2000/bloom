@@ -240,6 +240,8 @@ impl Bloom {
     pub fn open_item(&mut self, item: Item, cx: &mut Context<Self>) {
         match item.kind {
             ItemKind::Playlist => self.open_playlist(item, cx),
+            // A studio's card (the Studios view of a library): its titles.
+            ItemKind::Studio => self.open_folder(crate::pages::studio_view(&item), cx),
             ItemKind::CollectionFolder | ItemKind::UserView | ItemKind::Folder | ItemKind::BoxSet => {
                 self.open_folder(item, cx)
             }
@@ -334,7 +336,7 @@ impl Bloom {
 
     /// Every menu of the app. A new menu goes into this list, and nowhere
     /// else: the observers of `Bloom::new` and `close_popups` read it.
-    pub(super) fn menus(&self) -> [&Entity<MenuState>; 12] {
+    pub(super) fn menus(&self) -> [&Entity<MenuState>; 13] {
         [
             &self.popups.admin_menu,
             &self.popups.profile_menu,
@@ -345,6 +347,7 @@ impl Bloom {
             &self.popups.filter_menu,
             &self.popups.detail_audio_menu,
             &self.popups.detail_subtitle_menu,
+            &self.popups.detail_version_menu,
             &self.popups.more_menu,
             &self.popups.card_menu,
             &self.playback.subtitle_menu,
@@ -371,6 +374,18 @@ impl Bloom {
         if self.close_panels() {
             cx.notify();
         }
+    }
+
+    /// Shows a panel in the place of every popup that is open, for an
+    /// opener with no window at hand (the player's poll): the menus close
+    /// with the focus left where it is.
+    pub(crate) fn show_panel_alone(&mut self, panel: Panel, cx: &mut Context<Self>) {
+        let open: Vec<Entity<MenuState>> =
+            self.menus().into_iter().filter(|menu| menu.read(cx).is_open()).cloned().collect();
+        for menu in open {
+            menu.update(cx, |menu, cx| menu.shut(cx));
+        }
+        self.replace_panel(panel, cx);
     }
 
     /// True while a panel that is not a menu is open.
@@ -588,6 +603,7 @@ impl Bloom {
         };
         data.loading = true;
         let query = library_query(data);
+        let show = data.show;
         // The genres of the library, for its filter menu, load once with
         // its first page, in the same pass. A genre's own page has no
         // genre filter.
@@ -598,11 +614,16 @@ impl Bloom {
             let parent = (!query.parent_id.as_deref().unwrap_or("").is_empty()).then(|| data.view.id.clone());
             (parent, query.include_types.clone())
         });
+        // The languages of its tracks (Jellyfin 12.0), the same way.
+        let languages_of = (data.language.choices.is_none() && data.can_narrow_by_language()).then(|| {
+            let parent = (!query.parent_id.as_deref().unwrap_or("").is_empty()).then(|| data.view.id.clone());
+            (parent, query.include_types.clone())
+        });
         self.fetch_for_page(
             cx,
             move |client| {
                 let started = std::time::Instant::now();
-                let (page, genres) = std::thread::scope(|scope| {
+                let (page, genres, languages) = std::thread::scope(|scope| {
                     let genres = scope.spawn(|| {
                         genres_of.map(|(parent, kinds)| {
                             let kinds: Vec<&str> = kinds.iter().map(String::as_str).collect();
@@ -610,8 +631,14 @@ impl Bloom {
                             client.genres(parent.as_deref(), &kinds).unwrap_or_default()
                         })
                     });
-                    let page = client.items(&query);
-                    (page, genres.join().unwrap_or_default())
+                    let languages = scope.spawn(|| {
+                        languages_of.map(|(parent, kinds)| {
+                            let kinds: Vec<&str> = kinds.iter().map(String::as_str).collect();
+                            client.language_filters(parent.as_deref(), &kinds).unwrap_or_default()
+                        })
+                    });
+                    let page = crate::pages::library_items(&client, &query, show);
+                    (page, genres.join().unwrap_or_default(), languages.join().unwrap_or_default())
                 });
                 let page = page?;
                 log::info!(
@@ -619,17 +646,23 @@ impl Bloom {
                     started.elapsed().as_millis(),
                     page.items.len()
                 );
-                Ok((page, genres))
+                Ok((page, genres, languages))
             },
             move |this, result, cx| {
                 if let Page::Library(data) = &mut this.nav.page {
                     data.loading = false;
                     match result {
-                        Ok((page, genres)) => {
+                        Ok((page, genres, languages)) => {
                             data.total = page.total_record_count;
                             data.items = page.items;
+                            let menus = genres.is_some() || languages.is_some();
                             if genres.is_some() {
                                 data.genres = genres;
+                            }
+                            if languages.is_some() {
+                                data.language.choices = languages;
+                            }
+                            if menus {
                                 this.rebuild_library_menus(cx);
                             }
                         }
@@ -673,8 +706,10 @@ impl Bloom {
                     match result {
                         Ok(mut fresh) => {
                             // A reload of the same item keeps the
-                            // tracks the user picked on the page.
+                            // version and the tracks the user picked on
+                            // the page.
                             if fresh.item.id == data.item.id {
+                                fresh.show_version(data.version.clone());
                                 (fresh.audio, fresh.subtitle) = (data.audio, data.subtitle);
                             }
                             **data = fresh;

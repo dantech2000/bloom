@@ -233,7 +233,7 @@ impl<'a> Input<'a> {
     }
 }
 
-fn resolution(video: &MediaStream) -> Option<&'static str> {
+pub(crate) fn resolution(video: &MediaStream) -> Option<&'static str> {
     let title = video.display_title.as_deref().unwrap_or("");
     let height = video.height.unwrap_or(0);
     let width = video.width.unwrap_or(0);
@@ -283,7 +283,7 @@ fn resolution(video: &MediaStream) -> Option<&'static str> {
     })
 }
 
-fn video_codec(video: &MediaStream) -> Option<&'static str> {
+pub(crate) fn video_codec(video: &MediaStream) -> Option<&'static str> {
     let codec = lower(&video.codec);
     let tag = lower(&video.codec_tag);
     let from = |text: &str, tag: &str| -> Option<&'static str> {

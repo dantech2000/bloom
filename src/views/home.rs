@@ -15,7 +15,7 @@ use crate::{
     views::{hero::HERO_ROWS_START, shell::TOPBAR_H},
     views::cards::{
         CARD_TEXT_H, Cards, GENRE_TILE_H, empty_state, genre_tile, library_tile, poster_card,
-        section as section_row, section_height, skeleton_row, wide_card,
+        section as section_row, section_height, skeleton_row, upcoming_card, wide_card,
     },
 };
 
@@ -38,6 +38,8 @@ enum HomeSection<'a> {
     Media,
     Resume,
     NextUp,
+    /// Episodes that have not aired yet.
+    Upcoming,
     /// Random unwatched titles, for a user with nothing to continue.
     Pick,
     /// The genres of the server, for the same user.
@@ -120,6 +122,7 @@ impl Bloom {
                 }
                 "resume" if !data.resume.is_empty() => sections.push((HomeSection::Resume, wide)),
                 "nextup" if !data.next_up.is_empty() => sections.push((HomeSection::NextUp, wide)),
+                "upcoming" if !data.upcoming.is_empty() => sections.push((HomeSection::Upcoming, wide)),
                 _ => {}
             }
         }
@@ -287,6 +290,17 @@ impl Bloom {
                 row_h,
                 Cards::new(m.backdrop_w, data.next_up.len(), |i, cx| {
                     wide_card(&data.next_up[i], client, m.backdrop_w, CardRow::NextUp, self.nav.hovered_card.as_ref(), cx)
+                }),
+                cx,
+            ),
+            HomeSection::Upcoming => section_row(
+                self,
+                "home.upcoming",
+                "Upcoming",
+                None,
+                row_h,
+                Cards::new(m.backdrop_w, data.upcoming.len(), |i, cx| {
+                    upcoming_card(&data.upcoming[i], client, m.backdrop_w, self.nav.hovered_card.as_ref(), cx)
                 }),
                 cx,
             ),

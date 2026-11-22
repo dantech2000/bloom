@@ -141,6 +141,8 @@ impl Bloom {
             return;
         }
         self.clear_queue();
+        // A new play, also from the episode list of an open player.
+        self.still_watching_started(item, true);
         self.begin(item, resume, cx);
         window.focus(&self.playback.focus, cx);
         self.start_player_poll(cx);
@@ -157,9 +159,24 @@ impl Bloom {
         // While an item is on an AirPlay receiver, the next one goes there
         // too; the local player stays quiet.
         if self.airplay.active() {
+            // The receiver plays the item's own file.
+            self.stream.wanted_source = None;
             self.airplay_send(item, start_secs as f64, cx);
             return;
         }
+        // The first source of the item in the player is the version that
+        // plays: the one the detail page picked, else the item's own file.
+        let mut item = item.clone();
+        match self.stream.wanted_source.as_deref() {
+            Some(id) => {
+                item.put_source_first(id);
+            }
+            None => item.put_default_source_first(),
+        }
+        let item = &item;
+        // The first item of a closed player starts a session of "Are you
+        // still watching?"; one that follows counts toward it.
+        self.still_watching_started(item, !self.playback.open);
         // A downloaded item plays from its file on this Mac; otherwise the
         // server says how the item plays (the file, or a transcode).
         self.stream_begin(item, start_secs as f64);

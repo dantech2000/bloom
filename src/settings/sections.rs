@@ -58,6 +58,9 @@ fn language_name(code: &str) -> String {
     if code.is_empty() {
         return "Any language".to_string();
     }
+    if languages::is_original(code) {
+        return "Original language".to_string();
+    }
     languages::name(code).map_or_else(|| code.to_string(), str::to_string)
 }
 
@@ -86,27 +89,54 @@ fn server_check(key: &'static str, default: bool, app: &Bloom, cx: &mut Context<
     ))
 }
 
-/// A select of a language field of the user's configuration.
-fn language_select(id: &'static str, key: &'static str, app: &Bloom, cx: &mut Context<Bloom>) -> BaseButton {
+/// A select of a language field of the user's configuration. With
+/// `original`, "Original language" (Jellyfin 12.0) follows "Any language":
+/// each title plays in the language it was made in.
+fn language_select(id: &'static str, key: &'static str, original: bool, app: &Bloom, cx: &mut Context<Bloom>) -> BaseButton {
     let current = app.prefs.text(key);
-    select_field(
-        id,
-        language_name(&current),
-        "Any language",
-        move |app| {
-            let current = app.prefs.text(key);
-            let mut choices = vec![Choice::new("Any language", current.is_empty(), move |this, cx| {
-                this.set_user_config(key, Value::String(String::new()), cx)
-            })];
-            choices.extend(languages::LANGUAGES.iter().map(|languages::Language { code, name, .. }| {
-                Choice::new(*name, current == *code, move |this, cx| {
-                    this.set_user_config(key, Value::String(code.to_string()), cx)
-                })
-            }));
-            choices
-        },
-        cx,
-    )
+    let longest = if original { "Original language" } else { "Any language" };
+    select_field(id, language_name(&current), longest, move |app| language_choices(app, key, original), cx)
+}
+
+/// The list of a language select: "Any language", "Original language"
+/// with `original`, then the languages of the table.
+fn language_choices(app: &Bloom, key: &'static str, original: bool) -> Vec<Choice> {
+    let current = app.prefs.text(key);
+    let mut choices = vec![Choice::new("Any language", current.is_empty(), move |this, cx| {
+        this.set_user_config(key, Value::String(String::new()), cx)
+    })];
+    if original {
+        choices.push(Choice::new("Original language", languages::is_original(&current), move |this, cx| {
+            this.set_user_config(key, Value::String(languages::ORIGINAL_LANGUAGE.to_string()), cx)
+        }));
+    }
+    choices.extend(languages::LANGUAGES.iter().map(|languages::Language { code, name, .. }| {
+        Choice::new(*name, current == *code, move |this, cx| {
+            this.set_user_config(key, Value::String(code.to_string()), cx)
+        })
+    }));
+    choices
+}
+
+impl Bloom {
+    /// The `settings audio-language [<choice>]` debug command: with no
+    /// choice it opens the list of the select, as a click does; with one
+    /// ("Original language", "Japanese") it picks it, a save to the server.
+    pub(crate) fn debug_audio_language(&mut self, choice: &str, window: &mut gpui_kit::Window, cx: &mut Context<Self>) -> String {
+        let choices = language_choices(self, "AudioLanguagePreference", true);
+        if choice.is_empty() {
+            let at = gpui_kit::point(px(self.viewport_w * 0.6), px(220.));
+            self.open_choices(choices, at, window, cx);
+            return "opened".into();
+        }
+        match choices.into_iter().find(|c| c.label.eq_ignore_ascii_case(choice)) {
+            Some(picked) => {
+                (picked.apply)(self, cx);
+                format!("picked {}", picked.label)
+            }
+            None => format!("error: no audio language {choice:?}"),
+        }
+    }
 }
 
 impl Bloom {
@@ -214,11 +244,7 @@ impl Bloom {
             ))
             .child(field(
                 "Password",
-                if self.prefs.has_password {
-                    "This account has a password."
-                } else {
-                    "This account has no password."
-                },
+                "The password you sign in with on every device.",
                 password,
                 cx,
             ))
@@ -241,8 +267,8 @@ impl Bloom {
         let audio = group("Audio", cx)
             .child(field(
                 "Preferred audio language",
-                "A track in this language plays when the file has one.",
-                language_select("settings.audio-language", "AudioLanguagePreference", self, cx),
+                "A track in this language plays when the file has one. Original language picks the language each title was made in.",
+                language_select("settings.audio-language", "AudioLanguagePreference", true, self, cx),
                 cx,
             ))
             .child(field(
@@ -277,6 +303,29 @@ impl Bloom {
                         )
                     },
                 )),
+                cx,
+            ))
+            .child(field(
+                "Ask \"Are you still watching?\"",
+                "After this many episodes in a row, or this long with no key or click, the next episode waits paused for an answer.",
+                select_field(
+                    "settings.still-watching",
+                    self.prefs.still_watching().label(),
+                    "8 episodes or 240 minutes",
+                    |app| {
+                        use bloom_core::still_watching::{Choice as Still, PREF_KEY};
+                        let current = app.prefs.still_watching();
+                        Still::ALL
+                            .into_iter()
+                            .map(|choice| {
+                                Choice::new(choice.label(), choice == current, move |this, cx| {
+                                    this.set_custom_prefs(vec![(PREF_KEY.to_string(), choice.key().to_string())], cx)
+                                })
+                            })
+                            .collect()
+                    },
+                    cx,
+                ),
                 cx,
             ));
 
@@ -436,7 +485,7 @@ impl Bloom {
             .child(field(
                 "Preferred subtitle language",
                 "",
-                language_select("settings.sub-language", "SubtitleLanguagePreference", self, cx),
+                language_select("settings.sub-language", "SubtitleLanguagePreference", false, self, cx),
                 cx,
             ))
             .child(field(

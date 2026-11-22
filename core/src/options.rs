@@ -68,6 +68,9 @@ pub struct Options {
     pub pacing_trace: bool,
     /// `BLOOM_PACING_LOG`: every settled frame is written to this file.
     pub pacing_log: Option<PathBuf>,
+    /// `BLOOM_STILL_WATCHING=count:secs`: the "Are you still watching?"
+    /// rule of every choice but Off, short enough for a test.
+    pub still_watching: Option<crate::still_watching::Rule>,
 }
 
 impl Options {
@@ -110,6 +113,13 @@ impl Options {
                 .unwrap_or_default(),
             pacing_trace: set("BLOOM_PACING_TRACE"),
             pacing_log: path("BLOOM_PACING_LOG"),
+            still_watching: text("BLOOM_STILL_WATCHING").and_then(|value| {
+                let (count, secs) = value.split_once(':')?;
+                Some(crate::still_watching::Rule {
+                    count: count.trim().parse().ok()?,
+                    duration: std::time::Duration::from_secs(secs.trim().parse().ok()?),
+                })
+            }),
         }
     }
 }

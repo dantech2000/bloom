@@ -46,8 +46,9 @@ final class AccountShots: XCTestCase {
 
     /// The mock answers the discovery question (asked directly at its
     /// address, BLOOM_DISCOVERY_TARGETS); its row connects, and its user
-    /// shows as a profile with a picture. A user with no password signs in
-    /// at the tap.
+    /// shows as a profile with a picture. A tap fills the name and puts the
+    /// password field in focus (Jellyfin 12 says every user has a
+    /// password); the mock's user signs in with it empty.
     func testNearbyAndProfiles() {
         let app = launchConnect(["BLOOM_DISCOVERY_TARGETS": MockServer.host])
         let row = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'connect.nearby.'")).firstMatch
@@ -60,7 +61,15 @@ final class AccountShots: XCTestCase {
         sleep(2) // the picture
         shot("a02-profiles")
         profile.tap()
-        XCTAssertTrue(app.descendants(matching: .any)["hero"].waitForExistence(timeout: 30), "The tap on a profile did not sign in")
+        let password = app.secureTextFields["connect.password"]
+        XCTAssertTrue(password.waitForExistence(timeout: 5), "No password field after the tap on a profile")
+        let focused = NSPredicate { field, _ in (field as? XCUIElement)?.value(forKey: "hasKeyboardFocus") as? Bool == true }
+        XCTAssertEqual(XCTWaiter().wait(for: [XCTNSPredicateExpectation(predicate: focused, object: password)], timeout: 5), .completed,
+                       "The tap on a profile did not focus the password")
+        XCTAssertFalse(app.descendants(matching: .any)["hero"].exists, "The tap on a profile signed in without the password")
+        shot("a02b-profile-password")
+        app.buttons["Sign In"].firstMatch.tap()
+        XCTAssertTrue(app.descendants(matching: .any)["hero"].waitForExistence(timeout: 30), "Sign In with an empty password did not sign in")
     }
 
     /// A server that lists no user names itself in the title; a wrong

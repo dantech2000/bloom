@@ -48,6 +48,7 @@ pub(super) fn schedule(weak: Weak<Inner>) {
             let job = Job {
                 server_id,
                 item_id: entry.item_id.clone(),
+                source_id: entry.source_id.clone(),
                 generation,
                 client,
                 folder,
@@ -160,7 +161,8 @@ pub(super) fn agent(stall: Duration, cancel: Arc<AtomicBool>) -> ureq::Agent {
 /// One run of a download. `again` says the item was read from the server
 /// again in this download already (see the size check below).
 pub(super) fn download_run(inner: &Arc<Inner>, job: &Job, again: bool) -> Result<(), Stop> {
-    let Job { client, folder, cancel, options, server_id, item_id, .. } = job;
+    let Job { client, folder, cancel, options, server_id, item_id, source_id, .. } = job;
+    let source_id = source_id.as_deref();
     let failed = |err: anyhow::Error| Stop::Failed(format!("{err:#}"));
     // A job whose entry is gone writes nothing, not even its folder.
     job.check(inner)?;
@@ -175,7 +177,7 @@ pub(super) fn download_run(inner: &Arc<Inner>, job: &Job, again: bool) -> Result
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or(Value::Null);
     if meta.get("Item").is_none() {
-        meta = fetch_meta(client, item_id, server_id).map_err(failed)?;
+        meta = fetch_meta(client, item_id, server_id, source_id).map_err(failed)?;
         job.check(inner)?;
         write_json(&meta_path, &meta).map_err(failed)?;
     }
@@ -234,7 +236,7 @@ pub(super) fn download_run(inner: &Arc<Inner>, job: &Job, again: bool) -> Result
     let part_len = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
     check_space(inner, job, total, part_len)?;
 
-    let url = client.url(&format!("/Items/{item_id}/Download"), &[]);
+    let url = client.url(&download_path(item_id, source_id), &[]);
     let mut attempt = 0;
     let mut wait = options.retry_wait;
     // The longest the part file has been in this download.
@@ -253,7 +255,7 @@ pub(super) fn download_run(inner: &Arc<Inner>, job: &Job, again: bool) -> Result
         // now, so the item is read again first (once in a download).
         if start > 0 && total == Some(start) {
             if !again {
-                let fresh = fetch_meta(client, item_id, server_id).map_err(failed)?;
+                let fresh = fetch_meta(client, item_id, server_id, source_id).map_err(failed)?;
                 if size_of(&fresh) != total {
                     job.check(inner)?;
                     start_over(folder, &part, false);
@@ -280,7 +282,7 @@ pub(super) fn download_run(inner: &Arc<Inner>, job: &Job, again: bool) -> Result
                 // has now the download starts over. A part file that came
                 // whole in this request is the new file and stays.
                 if got != want && !again {
-                    let fresh = fetch_meta(client, item_id, server_id).map_err(failed)?;
+                    let fresh = fetch_meta(client, item_id, server_id, source_id).map_err(failed)?;
                     let size = size_of(&fresh);
                     if size != total {
                         job.check(inner)?;

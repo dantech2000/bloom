@@ -185,6 +185,8 @@ pub enum Panel {
     Bookmarks,
     /// The dialog of "Request more seasons" (src/seasons.rs).
     Seasons,
+    /// "Are you still watching?" over the paused player (src/still_watching.rs).
+    StillWatching,
 }
 
 /// The player as the window holds it.
@@ -240,6 +242,8 @@ pub struct PlayerUi {
     /// picture; `None` when it is not.
     pub(crate) pip: Option<crate::pip::Frame>,
     pub(crate) last_activity: std::time::Instant,
+    /// The play session of "Are you still watching?" (src/still_watching.rs).
+    pub(crate) still: bloom_core::still_watching::Session,
 }
 
 /// The page on show, the pages Back and Forward return to, and the scroll places.
@@ -295,6 +299,8 @@ pub struct Popups {
     pub(crate) filter_menu: Entity<MenuState>,
     pub(crate) detail_audio_menu: Entity<MenuState>,
     pub(crate) detail_subtitle_menu: Entity<MenuState>,
+    /// The versions of the item of the detail page (its files).
+    pub(crate) detail_version_menu: Entity<MenuState>,
     pub(crate) more_menu: Entity<MenuState>,
     /// Context menu of the card under the pointer.
     pub(crate) card_menu: Entity<MenuState>,
@@ -438,6 +444,7 @@ impl Bloom {
         let filter_menu = cx.new(|cx| MenuState::new([], cx));
         let detail_audio_menu = cx.new(|cx| MenuState::new([], cx));
         let detail_subtitle_menu = cx.new(|cx| MenuState::new([], cx));
+        let detail_version_menu = cx.new(|cx| MenuState::new([], cx));
         let more_menu = cx.new(|cx| MenuState::new([], cx));
         let card_menu = cx.new(|cx| MenuState::new([], cx));
         let admin_menu = cx.new(|cx| MenuState::new([], cx));
@@ -707,6 +714,7 @@ impl Bloom {
                 pause_screen: false,
                 pip: None,
                 last_activity: std::time::Instant::now(),
+                still: Default::default(),
             },
             nav: Navigation {
                 page: Page::Home(HomeData::default()),
@@ -733,6 +741,7 @@ impl Bloom {
                 filter_menu,
                 detail_audio_menu,
                 detail_subtitle_menu,
+                detail_version_menu,
                 more_menu,
                 card_menu,
                 admin_menu,
@@ -1001,6 +1010,7 @@ impl Render for Bloom {
             )
             .children(self.render_enhanced_help(cx))
             .children(self.render_seasons_dialog(cx))
+            .children(self.render_still_watching(cx))
             // A test instance says so in its window, so nobody takes it for
             // the app in use (`dev/run-test` sets the name).
             .children(crate::options::options().test_name.clone().map(|name| {

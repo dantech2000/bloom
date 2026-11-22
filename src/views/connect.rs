@@ -1024,7 +1024,6 @@ impl Bloom {
                 .as_ref()
                 .map(|tag| urls::user_image(&server.url, &user.id, tag));
             let name = user.name.clone();
-            let needs_password = user.has_password;
             public.push(
                 person(
                     SharedString::from(format!("public.{}", user.id)),
@@ -1038,12 +1037,11 @@ impl Bloom {
                     this.connect
                         .password
                         .update(cx, |input, cx| input.set_value("", window, cx));
-                    if needs_password {
-                        let focus = this.connect.password.read(cx).focus_handle(cx);
-                        window.focus(&focus, cx);
-                    } else {
-                        this.sign_in(cx);
-                    }
+                    // Jellyfin 12 says every user has a password
+                    // (`HasPassword` is always true): the field takes the
+                    // focus, and an account with none signs in with it empty.
+                    let focus = this.connect.password.read(cx).focus_handle(cx);
+                    window.focus(&focus, cx);
                 })),
             );
         }

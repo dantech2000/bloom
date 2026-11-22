@@ -29,6 +29,7 @@ uniffi::setup_scaffolding!();
 
 mod account;
 mod admin;
+mod admin_extra;
 mod browse;
 mod detail;
 mod enhanced;
@@ -37,6 +38,7 @@ mod link;
 mod lists;
 mod prefs;
 mod socket;
+mod still_watching;
 mod subtitles;
 mod syncplay;
 mod titles;
@@ -204,6 +206,23 @@ fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "a panic".into())
 }
 
+// ----- Languages ------------------------------------------------------------
+
+/// The user's languages, most wanted first, as iOS lists them
+/// (`Locale.preferredLanguages`: "en-US", "de-DE"): every request to the
+/// server sends them as its `Accept-Language` (Jellyfin 12.0 localises by
+/// it). Call once at start, before the first request.
+#[uniffi::export]
+pub fn set_preferred_languages(tags: Vec<String>) {
+    bloom_core::jellyfin::set_preferred_languages(&tags);
+}
+
+/// The `Accept-Language` the requests send, for a test.
+#[uniffi::export]
+pub fn accept_language() -> Option<String> {
+    bloom_core::jellyfin::accept_language()
+}
+
 // ----- Panics on other threads ---------------------------------------------
 
 static LAST_PANIC: Mutex<Option<String>> = Mutex::new(None);
@@ -330,6 +349,10 @@ pub struct MediaItem {
     /// 7.1"...), in the user's order; none while the tags are off.
     #[uniffi(default = [])]
     pub quality_tags: Vec<String>,
+    /// The day it came out or airs ("25 Nov 2026"), for an episode that
+    /// has not aired yet.
+    #[uniffi(default = None)]
+    pub premiere: Option<String>,
 }
 
 fn media(client: &Client, item: &Item) -> MediaItem {
@@ -370,7 +393,20 @@ fn media(client: &Client, item: &Item) -> MediaItem {
         season_number: item.parent_index_number,
         episode_number: item.index_number,
         quality_tags: enhanced::card_tags(item),
+        premiere: item.premiere_label(),
     }
+}
+
+/// The creators of a show, once each, in the server's order (the Mac's
+/// "Creator" row of the detail page).
+fn creators(item: &Item) -> Vec<PersonName> {
+    let mut out: Vec<PersonName> = Vec::new();
+    for person in item.people.iter().filter(|p| p.kind == bloom_core::jellyfin::PersonKind::Creator) {
+        if !out.iter().any(|known| known.name == person.name) {
+            out.push(PersonName { id: person.id.clone(), name: person.name.clone() });
+        }
+    }
+    out
 }
 
 /// An episode's show, wide: the series thumb, a parent's thumb, the
@@ -443,6 +479,9 @@ pub struct Home {
     pub resume: Vec<MediaItem>,
     pub next_up: Vec<MediaItem>,
     pub latest: Vec<Row>,
+    /// Episodes that have not aired yet (the "upcoming" row).
+    #[uniffi(default = [])]
+    pub upcoming: Vec<MediaItem>,
 }
 
 #[derive(uniffi::Record)]
@@ -467,6 +506,19 @@ pub struct Detail {
     pub next_up: Option<MediaItem>,
     pub similar: Vec<MediaItem>,
     pub cast: Vec<CastMember>,
+    /// The collections that hold the item ("Included in").
+    #[uniffi(default = [])]
+    pub collections: Vec<MediaItem>,
+    /// A show's creators (people of kind Creator), for "Created by".
+    #[uniffi(default = [])]
+    pub creators: Vec<PersonName>,
+}
+
+/// A person's name with the id of their page.
+#[derive(uniffi::Record, Clone)]
+pub struct PersonName {
+    pub id: String,
+    pub name: String,
 }
 
 /// What the player needs to open an item. The server decides through
@@ -766,6 +818,7 @@ impl Server {
                 resume: medias(&client, &home.resume),
                 next_up: medias(&client, &home.next_up),
                 latest: home.latest.iter().map(|(view, items)| Row { id: view.id.clone(), title: view.name.clone(), items: medias(&client, items) }).collect(),
+                upcoming: medias(&client, &home.upcoming),
             })
         })
         .await
@@ -840,6 +893,8 @@ impl Server {
                 next_up: data.next_up.as_ref().map(|item| media(&client, item)),
                 similar: medias(&client, &data.similar),
                 cast,
+                collections: medias(&client, &data.collections),
+                creators: creators(&data.item),
             })
         })
         .await
@@ -850,6 +905,14 @@ impl Server {
     pub async fn item(&self, item_id: String) -> Result<MediaItem, BloomError> {
         let client = self.signed_in()?;
         run(move || Ok(media(&client, &client.item(&item_id)?))).await
+    }
+
+    /// The episodes a show stands for in a queue (Play All on a library
+    /// of shows): from the next one not watched on, or all of them when
+    /// it was watched through. The Mac's `expand_series`.
+    pub async fn series_queue(&self, series_id: String) -> Result<Vec<MediaItem>, BloomError> {
+        let client = self.signed_in()?;
+        run(move || Ok(medias(&client, &client.series_queue(&series_id)?))).await
     }
 
     pub async fn episodes(&self, series_id: String, season_id: String) -> Result<Vec<MediaItem>, BloomError> {
@@ -890,9 +953,13 @@ impl Server {
     /// tracks the user chose (-1: no subtitles); none leaves it to the server.
     /// `burn_in` asks the server to draw the chosen subtitle into the
     /// video: after its file did not come (core's `Load::burn_in`).
+    /// `media_source_id` is the version to play (`media_versions`); none
+    /// plays the item's own file.
+    #[uniffi::method(default(media_source_id = None))]
     #[allow(clippy::too_many_arguments, reason = "an export: Swift calls it with labels, a struct adds a type for one call")]
     pub async fn play_info(&self, item_id: String, from_start: bool, start_secs: Option<f64>, max_bitrate: Option<u64>,
-                           audio_index: Option<i64>, subtitle_index: Option<i64>, burn_in: bool) -> Result<PlayInfo, BloomError> {
+                           audio_index: Option<i64>, subtitle_index: Option<i64>, burn_in: bool,
+                           media_source_id: Option<String>) -> Result<PlayInfo, BloomError> {
         let client = self.signed_in()?;
         run(move || {
             use bloom_core::{
@@ -910,12 +977,15 @@ impl Server {
                 audio: audio_index,
                 subtitle: subtitle_index,
                 burn_in,
+                media_source_id: media_source_id.filter(|id| !id.is_empty() && *id != item.id),
             };
             let info: PlaybackInfo = client.post_json(&format!("/Items/{}/PlaybackInfo", item.id), &request_body(&client, &load, max_bitrate))?;
             if let Some(code) = &info.error_code {
                 return Err(BloomError::Answered { detail: code.clone() });
             }
-            let source = info.source(&item.id).ok_or_else(|| BloomError::Answered { detail: "no media source".into() })?;
+            let source = info
+                .source_for(&item.id, load.media_source_id.as_deref())
+                .ok_or_else(|| BloomError::Answered { detail: "no media source".into() })?;
             let (url, method) = if source.supports_direct_play {
                 (client.stream_url(&item.id, &source.id), PlayMethod::DirectPlay)
             } else if let Some(path) = source.transcoding_url.as_deref().filter(|_| source.supports_transcoding || source.supports_direct_stream) {
@@ -980,14 +1050,18 @@ impl Server {
         .await
     }
 
-    /// What a download of an item needs.
-    pub async fn download_info(&self, item_id: String) -> Result<DownloadInfo, BloomError> {
+    /// What a download of an item needs. `media_source_id` is the version
+    /// to download (`media_versions`); none is the item's own file.
+    #[uniffi::method(default(media_source_id = None))]
+    pub async fn download_info(&self, item_id: String, media_source_id: Option<String>) -> Result<DownloadInfo, BloomError> {
         let client = self.signed_in()?;
         run(move || {
             let item = client.item(&item_id)?;
-            let file_extension = item
-                .media_sources
-                .first()
+            // The version's own item serves its file (a source id is the id
+            // of the item of its file).
+            let source = bloom_core::versions::pick(&item.media_sources, &item.id, media_source_id.as_deref());
+            let file_id = source.map_or(item.id.as_str(), |s| if s.id.is_empty() { item.id.as_str() } else { s.id.as_str() });
+            let file_extension = source
                 .and_then(|s| s.path.as_deref())
                 .and_then(|p| std::path::Path::new(p).extension())
                 .map(|e| e.to_string_lossy().to_lowercase())
@@ -995,14 +1069,12 @@ impl Server {
                 .unwrap_or_else(|| "mkv".into());
             let segments = segments(&client, &item.id);
             Ok(DownloadInfo {
-                url: client.url(&format!("/Items/{}/Download", item.id), &[]),
+                url: client.url(&format!("/Items/{file_id}/Download"), &[]),
                 authorization: client.auth_header(),
                 item: media(&client, &item),
                 file_extension,
                 segments,
-                estimated_bytes: item
-                    .media_sources
-                    .first()
+                estimated_bytes: source
                     .and_then(|s| s.bitrate)
                     .zip(item.runtime_secs())
                     .map(|(bitrate, secs)| (bitrate / 8).saturating_mul(secs.max(0).unsigned_abs())),

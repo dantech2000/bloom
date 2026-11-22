@@ -247,8 +247,10 @@ struct ConnectView: View {
         }
     }
 
-    /// The server's users as pictures to tap, three across: a user with no
-    /// password signs in at the tap, as in Jellyfin Web.
+    /// The server's users as pictures to tap, three across: a tap fills the
+    /// name and puts the password field in focus. (Jellyfin 12 sends
+    /// `HasPassword` as true for every user, so no tap signs in alone; an
+    /// account with no password signs in with the field empty.)
     private func profiles(_ found: Found) -> some View {
         // One or two users sit in the middle; more go three across.
         LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12, alignment: .top), count: min(max(found.users.count, 1), 3)),
@@ -258,11 +260,7 @@ struct ConnectView: View {
                     chosen = user.id
                     username = user.name
                     password = ""
-                    if user.hasPassword {
-                        field = .password
-                    } else {
-                        Task { await signIn() }
-                    }
+                    field = .password
                 } label: {
                     VStack(spacing: 8) {
                         ProfileDisc(name: user.name, picture: user.picture, size: 72)

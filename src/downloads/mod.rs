@@ -59,6 +59,12 @@ pub fn local_path(server_id: Option<&str>, item_id: &str) -> Option<PathBuf> {
     ENGINE.get()?.local_path(Key::of(server_id, item_id))
 }
 
+/// The version an item was downloaded as (a media source id; `Some(None)`
+/// is the item's own file); none for an item not in the downloads.
+pub fn downloaded_version(server_id: Option<&str>, item_id: &str) -> Option<Option<String>> {
+    ENGINE.get()?.entry(Key::of(server_id, item_id)).map(|entry| entry.source_id)
+}
+
 /// The source the player loads for an item: its local file when the item
 /// is downloaded, with its external subtitles beside it, else `None` and
 /// the caller uses the stream. This is the one hook of playback.
@@ -244,6 +250,12 @@ impl Bloom {
 
     /// Puts an item in the queue, with a word when it cannot go.
     pub fn download_item(&mut self, item: &Item, cx: &mut Context<Self>) {
+        self.download_version(item, None, cx);
+    }
+
+    /// The same for one version of the item (a media source id); none is
+    /// the item's own file.
+    pub fn download_version(&mut self, item: &Item, version: Option<&str>, cx: &mut Context<Self>) {
         if self.downloads.offline {
             self.toast("Downloads", "The server cannot be reached.", cx);
             return;
@@ -257,7 +269,7 @@ impl Bloom {
             return;
         }
         let fresh = engine.state_of(&item.id).is_none();
-        if let Err(err) = engine.add(item) {
+        if let Err(err) = engine.add_version(item, version) {
             log::warn!("download refused: {err:#}");
             self.toast("Downloads", "The server sent an item that cannot be saved safely.", cx);
             return;

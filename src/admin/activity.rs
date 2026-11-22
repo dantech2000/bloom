@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Activity log of the server as a timeline, one group for each day.
+//! Activity log of the server as a timeline, one group for each day. The
+//! server filters, sorts and pages it (Jellyfin 12.0): the kind of event,
+//! the level, the user, how far back, newest or oldest first
+//! (`bloom_core::activity_query`); the page holds a hundred entries.
 
 use crate::ui::rows::rows;
 use crate::ui::tone::State;
 use std::collections::HashMap;
+use std::rc::Rc;
+
+use bloom_core::activity_query::{Kind, Level, Period, Query, Who};
 
 use anyhow::Result;
 use gpui_icons::LucideIcon;
 use gpui_kit::{
-    Context, Div, InteractiveElement as _, IntoElement as _, ParentElement as _, Styled,
-    div, px, rgba,
+    ClickEvent, Context, Div, InteractiveElement as _, IntoElement as _, ParentElement as _,
+    SharedString, Styled, div, px, rgba,
 };
 use serde::Deserialize;
 
@@ -19,8 +25,6 @@ use super::{
 };
 use crate::{app::Bloom, jellyfin::Client, ui::theme::UiTheme};
 
-/// Entries the page asks for.
-const LIMIT: usize = 100;
 /// Height of a row of the timeline: two lines of text and the padding.
 const ROW_H: f32 = 58.;
 
@@ -153,13 +157,18 @@ impl Entry {
 
 pub struct Data {
     pub entries: Vec<Entry>,
-    /// Entries the server has in all.
+    /// Entries the server has in all that match the filters.
     pub total: usize,
+    /// The page these entries are (its filters, sort and start).
+    pub query: Query,
+    /// Entries the server sent for the page, before `collapse` joined the
+    /// starts and stops of a playback.
+    pub fetched: usize,
     /// Names of the users, by id.
     pub users: HashMap<String, String>,
 }
 
-pub fn load(client: &Client) -> Result<Data> {
+pub fn load(client: &Client, query: &Query) -> Result<Data> {
     #[derive(Deserialize)]
     #[serde(rename_all = "PascalCase")]
     struct Page {
@@ -179,7 +188,7 @@ pub fn load(client: &Client) -> Result<Data> {
     // The two requests run at the same time.
     let (page, users) = std::thread::scope(|scope| {
         let names = scope.spawn(|| client.users::<Vec<Name>>());
-        let page: Result<Page> = client.activity_log(&[("Limit", LIMIT.to_string())]);
+        let page: Result<Page> = client.activity_log(&query.pairs(jiff::Timestamp::now().as_second()));
         (page, names.join().expect("names thread"))
     });
     let page = page?;
@@ -189,14 +198,27 @@ pub fn load(client: &Client) -> Result<Data> {
         .into_iter()
         .map(|u| (u.id, u.name))
         .collect();
+    let fetched = page.items.len();
+    // `collapse` reads the newest first.
+    let entries = if query.oldest_first {
+        let mut items = page.items;
+        items.reverse();
+        let mut joined = collapse(items);
+        joined.reverse();
+        joined
+    } else {
+        collapse(page.items)
+    };
     Ok(Data {
-        entries: collapse(page.items),
+        entries,
         total: page.total_record_count,
+        query: query.clone(),
+        fetched,
         users,
     })
 }
 
-pub fn render(_app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
+pub fn render(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
     let t = UiTheme::read(cx).clone();
     let today = jiff::Zoned::now().date();
     let yesterday = today.yesterday().ok();
@@ -212,24 +234,40 @@ pub fn render(_app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
         .filter(|e| matches!(e.kind.as_str(), "VideoPlayback" | "AudioPlayback" | PLAYED))
         .count();
 
-    let page = div().flex().flex_col().gap(px(18.)).child(
-        div()
-            .flex()
-            .flex_wrap()
-            .gap(px(12.))
-            .child(stat(LucideIcon::Activity, "Entries shown", data.entries.len(), cx))
-            .child(stat(LucideIcon::Server, "In the log", data.total, cx))
-            .child(stat(LucideIcon::Play, "Playbacks", plays, cx))
-            .child(stat(LucideIcon::TriangleAlert, "Warnings and errors", alerts, cx)),
-    );
+    let filtered = data.query.filtered();
+    let page = div()
+        .flex()
+        .flex_col()
+        .gap(px(18.))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(12.))
+                .child(stat(LucideIcon::Activity, "Entries shown", data.entries.len(), cx))
+                .child(stat(LucideIcon::Server, if filtered { "Matching" } else { "In the log" }, data.total, cx))
+                .child(stat(LucideIcon::Play, "Playbacks", plays, cx))
+                .child(stat(LucideIcon::TriangleAlert, "Warnings and errors", alerts, cx)),
+        )
+        .child(toolbar(app, data, cx));
 
     if data.entries.is_empty() {
-        return page.child(
-            card(cx)
+        let mut empty = card(cx).gap(px(14.)).child(
+            div()
                 .text_size(px(15.))
                 .text_color(t.colors.muted_foreground)
-                .child("The activity log is empty."),
+                .child(if filtered { "No entries match these filters." } else { "The activity log is empty." }),
         );
+        if filtered {
+            empty = empty.child(div().flex().child(
+                super::button("activity.clear", "Clear filters", super::ButtonKind::Plain, cx).on_click(
+                    cx.listener(|this, _: &ClickEvent, _, cx| {
+                        set_query(this, |q| *q = Query { oldest_first: q.oldest_first, ..Query::default() }, false, cx)
+                    }),
+                ),
+            ));
+        }
+        return page.child(empty);
     }
 
     // Entries come newest first; a new group starts when the local day changes.
@@ -268,6 +306,7 @@ pub fn render(_app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
         .map(|(_, start)| *start)
         .chain([data.entries.len()])
         .collect::<Vec<_>>();
+    let pager = pager(data, cx);
     page.children(groups.into_iter().zip(ends).map(|((group, start), end)| {
         group.child(rows(cx, end - start, ROW_H, move |this, range, cx| {
             let Some(data) = this.admin_data().and_then(|d| d.activity.as_ref()) else {
@@ -282,6 +321,189 @@ pub fn render(_app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
                 .collect()
         }))
     }))
+    .children(pager)
+}
+
+/// Changes the query of the page and loads it. A change of a filter or
+/// of the sort starts at the first page; a step of the pager keeps the
+/// start it sets (`keep_page`).
+fn set_query(app: &mut Bloom, change: impl FnOnce(&mut Query), keep_page: bool, cx: &mut Context<Bloom>) {
+    let Some(data) = app.admin_data_mut() else {
+        return;
+    };
+    change(&mut data.activity_query);
+    if !keep_page {
+        data.activity_query.start = 0;
+    }
+    app.nav.scroll.set_offset(gpui_kit::point(px(0.), px(0.)));
+    app.load_page(cx);
+    cx.notify();
+}
+
+/// One select of the toolbar: the value on show, and a click opens the
+/// list of the options (the shared list of the selects, one popup).
+fn filter(
+    id: &'static str,
+    shown: String,
+    options: Vec<(String, bool, Rc<dyn Fn(&mut Query)>)>,
+    cx: &mut Context<Bloom>,
+) -> gpui_kit::base::Button {
+    use crate::{settings::Choice, ui::form::select};
+    let longest = options
+        .iter()
+        .map(|(label, _, _)| label.as_str())
+        .max_by_key(|label| label.chars().count())
+        .unwrap_or_default()
+        .to_string();
+    let options = Rc::new(options);
+    select(SharedString::from(id), shown, &longest, cx)
+        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+            let choices = options
+                .iter()
+                .map(|(label, selected, change)| {
+                    let change = change.clone();
+                    Choice::new(label.clone(), *selected, move |this, cx| set_query(this, |q| change(q), false, cx))
+                })
+                .collect();
+            this.open_choices(choices, event.position(), window, cx);
+        }))
+}
+
+/// The filters and the sort, as selects on one line (they wrap).
+fn toolbar(app: &Bloom, data: &Data, cx: &mut Context<Bloom>) -> Div {
+    let q = app.admin_data().map_or_else(|| data.query.clone(), |d| d.activity_query.clone());
+    let kinds = Kind::ALL
+        .iter()
+        .map(|&kind| (kind.label().to_string(), q.kind == kind, Rc::new(move |q: &mut Query| q.kind = kind) as Rc<dyn Fn(&mut Query)>))
+        .collect();
+    let levels = Level::ALL
+        .iter()
+        .map(|&level| (level.label().to_string(), q.level == level, Rc::new(move |q: &mut Query| q.level = level) as Rc<dyn Fn(&mut Query)>))
+        .collect();
+    let mut names: Vec<String> = data.users.values().cloned().collect();
+    names.sort_by_key(|name| name.to_lowercase());
+    let whos = [Who::Anyone, Who::Server]
+        .into_iter()
+        .chain(names.into_iter().map(Who::User))
+        .map(|who| {
+            let (label, on) = (who.label(), q.who == who);
+            (label, on, Rc::new(move |q: &mut Query| q.who = who.clone()) as Rc<dyn Fn(&mut Query)>)
+        })
+        .collect();
+    let periods = Period::ALL
+        .iter()
+        .map(|&period| (period.label().to_string(), q.period == period, Rc::new(move |q: &mut Query| q.period = period) as Rc<dyn Fn(&mut Query)>))
+        .collect();
+    let sorts = [("Newest first", false), ("Oldest first", true)]
+        .into_iter()
+        .map(|(label, oldest)| {
+            (label.to_string(), q.oldest_first == oldest, Rc::new(move |q: &mut Query| q.oldest_first = oldest) as Rc<dyn Fn(&mut Query)>)
+        })
+        .collect();
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap(px(10.))
+        .child(filter("activity.filter.kind", q.kind.label().to_string(), kinds, cx))
+        .child(filter("activity.filter.level", q.level.label().to_string(), levels, cx))
+        .child(filter("activity.filter.user", q.who.label(), whos, cx))
+        .child(filter("activity.filter.period", q.period.label().to_string(), periods, cx))
+        .child(filter(
+            "activity.filter.sort",
+            if q.oldest_first { "Oldest first" } else { "Newest first" }.to_string(),
+            sorts,
+            cx,
+        ))
+}
+
+/// Previous, the range on show, Next; none when one page holds all.
+fn pager(data: &Data, cx: &mut Context<Bloom>) -> Option<Div> {
+    let q = &data.query;
+    let (previous, next) = (q.previous(), q.next(data.total));
+    if previous.is_none() && next.is_none() {
+        return None;
+    }
+    let t = UiTheme::read(cx).clone();
+    let step = |id: &'static str, label: &'static str, to: Option<usize>, cx: &mut Context<Bloom>| {
+        let button = super::button(id, label, super::ButtonKind::Plain, cx);
+        match to {
+            Some(start) => button.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                set_query(this, |q| q.start = start, true, cx)
+            })),
+            None => button.opacity(0.35),
+        }
+    };
+    Some(
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(14.))
+            .child(step("activity.page.previous", "Previous", previous, cx))
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .text_color(t.colors.foreground.opacity(0.6))
+                    .child(q.range_label(data.fetched, data.total)),
+            )
+            .child(step("activity.page.next", "Next", next, cx)),
+    )
+}
+
+/// Sets the activity log's query from words, for the debug channel:
+/// `kind=session level=error who=server|<name>|anyone period=week
+/// sort=oldest page=next|previous|first`. The page loads again.
+pub(crate) fn debug_query(app: &mut Bloom, words: &str, cx: &mut Context<Bloom>) -> String {
+    let Some(data) = app.admin_data() else {
+        return "error: the dashboard is not open".into();
+    };
+    let mut q = data.activity_query.clone();
+    let total = data.activity.as_ref().map_or(0, |d| d.total);
+    let start = q.start;
+    q.start = 0;
+    for word in words.split_whitespace() {
+        let (key, value) = word.split_once('=').unwrap_or((word, ""));
+        let pick = |labels: &[&str]| labels.iter().position(|l| l.to_lowercase().replace([' ', '-'], "").contains(value));
+        match key {
+            "kind" => match pick(&Kind::ALL.map(Kind::label)) {
+                Some(i) => q.kind = Kind::ALL[i],
+                None => return format!("error: no kind {value:?}"),
+            },
+            "level" => match pick(&Level::ALL.map(Level::label)) {
+                Some(i) => q.level = Level::ALL[i],
+                None => return format!("error: no level {value:?}"),
+            },
+            "period" => match value {
+                "any" => q.period = Period::Any,
+                "day" => q.period = Period::Day,
+                "week" => q.period = Period::Week,
+                "month" => q.period = Period::Month,
+                _ => return format!("error: no period {value:?}"),
+            },
+            "who" => {
+                q.who = match value {
+                    "anyone" | "" => Who::Anyone,
+                    "server" => Who::Server,
+                    name => Who::User(name.to_string()),
+                }
+            }
+            "sort" => q.oldest_first = value == "oldest",
+            "page" => {
+                let at = Query { start, ..q.clone() };
+                q.start = match value {
+                    "next" => at.next(total).unwrap_or(start),
+                    "previous" => at.previous().unwrap_or(0),
+                    _ => 0,
+                }
+            }
+            "reset" => q = Query::default(),
+            _ => return format!("error: activity kind= level= who= period= sort= page= | reset ({key:?})"),
+        }
+    }
+    let wanted = q.clone();
+    set_query(app, move |query| *query = wanted, true, cx);
+    format!("ok: {:?}", q.pairs(jiff::Timestamp::now().as_second()))
 }
 
 /// One entry of the timeline.

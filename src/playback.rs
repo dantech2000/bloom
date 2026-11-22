@@ -54,6 +54,16 @@ impl Bloom {
     }
 
     /// Stops playback and closes the player.
+    /// One frame on (`forward`) or back; mpv pauses for it. A group plays
+    /// in step, so a member does not step alone.
+    pub fn frame_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.sync.holds_player() {
+            self.toast("SyncPlay", "A group plays in step: frame steps are off.", cx);
+            return;
+        }
+        self.player.command(if forward { "frame-step" } else { "frame-back-step" }, &[]);
+    }
+
     pub fn request_stop(&mut self, cx: &mut Context<Self>) {
         // The user leaves the player, not the group: the group goes on and
         // does not wait for this player.

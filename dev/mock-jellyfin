@@ -22,7 +22,9 @@ The test's hands (`/mock/...`, no token needed): POST /mock/reset puts the
 library, the settings, the playlists and the plugin's data back as they
 were at the start; GET /mock/remote lists the play commands sent to other
 sessions; GET /mock/counts counts the library pages and searches served;
-POST /mock/search?hold=1 holds every search answer until ?hold=0.
+POST /mock/search?hold=1 holds every search answer until ?hold=0;
+GET /mock/accept-language gives the Accept-Language of the last request.
+POST /mock/folders adds a library of folders (until the next reset).
 
 BLOOM_MOCK_EXTRA_MOVIES=N adds N films ("The Extra Reel 1" ...) to the
 Movies library, so a grid and a search have pages to scroll (the
@@ -42,7 +44,7 @@ import struct
 import sys
 import threading
 import zlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -193,6 +195,206 @@ def build():
 ITEMS, ORDER = build()
 
 
+# ----- Studios, collections of a library, Included in, Upcoming (Jellyfin 12.0)
+# The films name one of two studios, the shows a network; `/Studios` lists
+# those of a library's titles. A library's collections and playlists are
+# the ones that hold a title of it (12.0 filters BoxSet and Playlist by
+# parentId); `/Items/{id}/Collections` gives the collections of an item;
+# `/Shows/Upcoming` gives the last episodes of The Night Desk as if they
+# had not aired yet.
+STUDIO_NAMES = ["Harbour Pictures", "North Light Studio", "Night Desk Network"]
+
+
+def studio_ref(name):
+    return {"Name": name, "Id": ident("studio " + name)}
+
+
+def add_studios():
+    for item in ITEMS.values():
+        if item["Type"] == "Movie" and item["Name"] in dict(MOVIES):
+            n = [name for name, _ in MOVIES].index(item["Name"])
+            item["Studios"] = [studio_ref(STUDIO_NAMES[n % 2])]
+        elif item["Type"] == "Series":
+            item["Studios"] = [studio_ref(STUDIO_NAMES[2])]
+
+
+add_studios()
+
+
+def library_lists(found, parent, kinds):
+    """BoxSets and Playlists that hold a title of the library `parent`."""
+    def children(item):
+        if item["Type"] == "Playlist":
+            return [entry[1] for entry in PLAYLISTS.get(item["Id"], [])]
+        return item.get("_children", [])
+    return [i for i in found if i["Type"] in kinds and i["Type"] in ("BoxSet", "Playlist")
+            and any(c in ITEMS and descends_from(ITEMS[c], parent) for c in children(i))]
+
+
+def studios_of(q):
+    parent = (q.get("parentId") or [""])[0]
+    kinds = [k for k in (q.get("includeItemTypes") or ["Movie,Series"])[0].split(",") if k]
+    titles = [i for i in all_items() if i["Type"] in kinds and (not parent or descends_from(i, parent))]
+    names = sorted({s["Name"] for i in titles for s in i.get("Studios", [])})
+    starts = (q.get("nameStartsWith") or [""])[0].lower()
+    if starts:
+        names = [n for n in names if n.lower().startswith(starts)]
+    less = (q.get("nameLessThan") or [""])[0].lower()
+    if less:
+        names = [n for n in names if n.lower() < less]
+    return [dict(studio_ref(n), Type="Studio", ServerId=SERVER_ID, ImageTags={}) for n in names]
+
+
+def collections_holding(item_id):
+    return [i for i in all_items() if i["Type"] == "BoxSet" and item_id in i.get("_children", [])]
+
+
+def upcoming_episodes():
+    show = ident(SHOWS[1][0])
+    episodes = [i for i in all_items() if i["Type"] == "Episode" and i["SeriesId"] == show][-3:]
+    return [dict(public(e), PremiereDate=f"2026-12-{10 + n * 7:02d}T01:00:00.0000000Z", LocationType="Virtual")
+            for n, e in enumerate(episodes)]
+
+
+# ----- versions (Jellyfin 12: a film or an episode with two files) -----------
+# "Glass Weather" and episode 3 of "The Night Desk" have a 1080p file of their
+# own and a 4K version beside it (a second media source, whose id is the id of
+# its own item, as on a server). The 4K file has other audio tracks, so a page
+# shows the tracks follow the version. PlaybackInfo answers the version its
+# MediaSourceId names; GET /mock/playbackinfo lists the ids asked for.
+VERSIONED = {ident("Glass Weather"): "Glass Weather", ident("The Night Desk s1e3"): "The Night Desk s1e3"}
+PLAYBACK_ASKS = []
+
+
+def version_sources(item_id):
+    """The two sources of a versioned item, its own file first."""
+    other = ident(VERSIONED[item_id] + " 4k")
+    own = {"Id": item_id, "Name": "1080p", "Container": "mkv", "Size": 6_300_000_000,
+           "Path": f"/media/{item_id}/1080p.mkv", "Bitrate": 8_000_000,
+           "DefaultAudioStreamIndex": 1,
+           "MediaStreams": [
+               {"Type": "Video", "Index": 0, "Codec": "h264", "IsDefault": True, "Width": 1920, "Height": 1080,
+                "VideoRangeType": "SDR", "DisplayTitle": "1080p H264 SDR"},
+               {"Type": "Audio", "Index": 1, "Codec": "aac", "Language": "eng", "DisplayTitle": "English · AAC",
+                "IsDefault": True, "Channels": 2},
+               {"Type": "Audio", "Index": 2, "Codec": "aac", "Language": "fre", "DisplayTitle": "French · AAC", "Channels": 2},
+               {"Type": "Subtitle", "Index": 3, "Codec": "subrip", "Language": "eng", "DisplayTitle": "English · SRT",
+                "IsTextSubtitleStream": True},
+           ]}
+    # No name: the app names it by its file ("4K · HEVC · 58 GB").
+    four_k = {"Id": other, "Container": "mkv", "Size": 58_000_000_000,
+              "Path": f"/media/{item_id}/2160p.mkv", "Bitrate": 60_000_000,
+              "DefaultAudioStreamIndex": 1,
+              "MediaStreams": [
+                  {"Type": "Video", "Index": 0, "Codec": "hevc", "IsDefault": True, "Width": 3840, "Height": 2160,
+                   "VideoRangeType": "DOVIWithHDR10", "DisplayTitle": "4K HEVC Dolby Vision"},
+                  {"Type": "Audio", "Index": 1, "Codec": "truehd", "Language": "eng", "DisplayTitle": "English · TrueHD 7.1",
+                   "IsDefault": True, "Channels": 8, "ChannelLayout": "7.1"},
+                  {"Type": "Audio", "Index": 2, "Codec": "ac3", "Language": "spa", "DisplayTitle": "Spanish · AC3 5.1",
+                   "Channels": 6, "ChannelLayout": "5.1"},
+                  {"Type": "Audio", "Index": 3, "Codec": "aac", "Language": "eng", "Title": "Commentary",
+                   "DisplayTitle": "English · Commentary · AAC", "Channels": 2},
+                  {"Type": "Subtitle", "Index": 4, "Codec": "PGSSUB", "Language": "eng", "DisplayTitle": "English · PGSSUB"},
+              ]}
+    # The server lists the larger file first; the app plays the item's own
+    # file when nothing is chosen.
+    return [four_k, own]
+
+
+def version_playback(item_id, body):
+    """PlaybackInfo of a versioned item: the source its MediaSourceId names."""
+    wanted = (json.loads(body or b"{}") or {}).get("MediaSourceId") or item_id
+    PLAYBACK_ASKS.append({"ItemId": item_id, "MediaSourceId": wanted})
+    print(f"mock-jellyfin: playbackinfo {item_id} source {wanted}", file=sys.stderr, flush=True)
+    sources = version_sources(item_id)
+    source = next((s for s in sources if s["Id"] == wanted), sources[1])
+    source = dict(source, SupportsDirectPlay=True, SupportsDirectStream=True, SupportsTranscoding=True)
+    return {"PlaySessionId": "mock-session", "MediaSources": [source]}
+
+
+# ----- Track languages (Jellyfin 12.0) ---------------------------------------
+# The films and episodes have audio and subtitle languages (kept as `_audio`
+# and `_subs`, which `public` leaves out), so `audioLanguages` and
+# `subtitleLanguages` of /Items narrow a page and /Items/Filters2 lists them;
+# a series has those of its episodes, as on the server. Each film and show has
+# an OriginalLanguage (two letters, as 12.x keeps it); an episode has none.
+LANGUAGE_NAMES = {"eng": "English", "fre": "French", "jpn": "Japanese", "spa": "Spanish", "ger": "German"}
+# The last Accept-Language a GET of the core sent (GET /mock/accept-language).
+ACCEPT_LANGUAGE = {"last": None}
+
+
+def add_languages():
+    for n, (name, _) in enumerate(MOVIES):
+        film = ITEMS[ident(name)]
+        film["_audio"] = ["eng"] + (["fre"] if n % 3 == 1 else []) + (["jpn"] if n % 4 == 2 else [])
+        film["_subs"] = (["eng"] if n % 2 == 0 else []) + (["spa"] if n % 3 == 0 else [])
+        film["OriginalLanguage"] = {"fre": "fr", "jpn": "ja"}.get(film["_audio"][-1], "en")
+    for s, show in enumerate(SHOWS):
+        series = ITEMS[ident(show[0])]
+        audio, subs = [(["eng", "ger"], ["eng"]), (["jpn", "eng"], ["eng", "spa"])][s % 2]
+        series["OriginalLanguage"] = ["en", "ja"][s % 2]
+        series["_audio"], series["_subs"] = audio, subs
+        for item in ITEMS.values():
+            if item["Type"] == "Episode" and item.get("SeriesId") == series["Id"]:
+                item["_audio"], item["_subs"] = audio, subs
+
+
+add_languages()
+
+
+def language_filter(found, one):
+    """`audioLanguages` and `subtitleLanguages` of /Items: an item with any of the codes."""
+    for key, field in (("audioLanguages", "_audio"), ("subtitleLanguages", "_subs")):
+        codes = [c for c in one(key).split(",") if c]
+        if codes:
+            found = [i for i in found if any(c in i.get(field, []) for c in codes)]
+    return found
+
+
+def filters2(q):
+    """/Items/Filters2: the genres and the track languages of the titles a query lists."""
+    def one(name):
+        return (q.get(name) or q.get(name[0].upper() + name[1:]) or [""])[0]
+
+    titles = query_items(q)
+    pairs = lambda field: [{"Name": f"{LANGUAGE_NAMES.get(c, c)} ({c})", "Value": c}
+                           for c in sorted({c for i in titles for c in i.get(field, [])})]
+    genres = sorted({g for i in titles for g in i.get("Genres", [])})
+    return {"Genres": [{"Name": g, "Id": ident("genre " + g)} for g in genres], "Tags": [],
+            "AudioLanguages": pairs("_audio"), "SubtitleLanguages": pairs("_subs")}
+
+
+# Jellyfin 12 (agent `player`): the shows have creators (People of type
+# Creator) for "Created by" on a show's page.
+CREATORS = {"Station Eleven North": ["Noor Halvorsen", "Ade Brandt"], "The Night Desk": ["Ade Brandt"]}
+for show_name, names in CREATORS.items():
+    ITEMS[ident(show_name)]["People"] = [{"Id": person_id(n), "Name": n, "Type": "Creator"} for n in names]
+for n in sorted({n for names in CREATORS.values() for n in names}):
+    PERSONS[person_id(n)] = {"Id": person_id(n), "Name": n, "Type": "Person", "ServerId": SERVER_ID, "ImageTags": {}}
+
+
+def add_folders():
+    """POST /mock/folders: a library of folders (CollectionType folders)
+    with a folder of two videos, for "Mark played" on a folder (Jellyfin
+    12). A reset takes it away again."""
+    library = ident("lib folders")
+    if library in ITEMS:
+        return
+    def put(item):
+        item.setdefault("ImageTags", {"Primary": "p"})
+        item.setdefault("BackdropImageTags", ["b"])
+        item.setdefault("ServerId", SERVER_ID)
+        ITEMS[item["Id"]] = item
+        ORDER.append(item["Id"])
+    put({"Id": library, "Name": "Folders", "Type": "CollectionFolder", "CollectionType": "folders"})
+    folder = ident("folder holiday clips")
+    put({"Id": folder, "Name": "Holiday Clips", "Type": "Folder", "IsFolder": True, "ParentId": library,
+         "ChildCount": 2, "UserData": user_data(1)})
+    for n in (1, 2):
+        put({"Id": ident(f"holiday clip {n}"), "Name": f"Holiday Clip {n}", "Type": "Video", "ParentId": folder,
+             "RunTimeTicks": 3 * 60 * TICKS, "UserData": user_data(n + 1)})
+
+
 # Playlists made in this run: id -> [(entry id, item id)].
 PLAYLISTS = {}
 
@@ -232,7 +434,11 @@ def query_items(q):
         found = [i for i in found if i["Id"] in wanted]
     parent = one("parentId")
     recursive = one("recursive").lower() == "true"
-    if parent:
+    kinds = [k for k in one("includeItemTypes").split(",") if k]
+    if (parent and kinds and all(k in ("BoxSet", "Playlist") for k in kinds)
+            and ITEMS.get(parent, {}).get("CollectionType") in ("movies", "tvshows")):
+        found = library_lists(found, parent, kinds)
+    elif parent:
         box = ITEMS.get(parent, {}).get("_children")
         if box is not None:
             found = [i for i in found if i["Id"] in box]
@@ -264,6 +470,10 @@ def query_items(q):
         found = [i for i in found if i.get("ProductionYear") in years]
     if "IsPlayed" in filters:
         found = [i for i in found if i["UserData"]["Played"]]
+    studio = one("studioIds")
+    if studio:
+        found = [i for i in found if any(s["Id"] == studio for s in i.get("Studios", []))]
+    found = language_filter(found, one)
     person = one("personIds")
     if person:
         found = [i for i in found if any(p["Id"] == person for p in i.get("People", []))]
@@ -446,6 +656,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(204)
         if method == "GET" and lower == "/mock/remote":
             return self.send(200, REMOTE)
+        if method == "GET" and lower == "/mock/playbackinfo":
+            return self.send(200, PLAYBACK_ASKS)
         if method == "POST" and lower == "/mock/fresh":
             # A new user: nothing played or started, so Continue Watching
             # and Next Up are empty (until the next reset).
@@ -453,6 +665,11 @@ class Handler(BaseHTTPRequestHandler):
                 if "UserData" in item:
                     item["UserData"].update(Played=False, PlaybackPositionTicks=0, PlayCount=0)
             FRESH["on"] = True
+            return self.send(204)
+        if lower in ("/mock/admin", "/mock/dashboard"):
+            return self.dashboard_control(method)
+        if method == "POST" and lower == "/mock/folders":
+            add_folders()
             return self.send(204)
         if method == "GET" and lower == "/mock/counts":
             return self.send(200, COUNTS)
@@ -469,9 +686,17 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         path, q = url.path.rstrip("/"), parse_qs(url.query)
         lower = path.lower()
+        if lower == "/mock/accept-language":
+            return self.send(200, {"AcceptLanguage": ACCEPT_LANGUAGE["last"]})
         if lower.startswith("/mock/"):
             return self.mock_control("GET", lower, b"")
+        # The core's own requests (ureq), not a system loader's, which adds
+        # an Accept-Language by itself; the image loader sends none.
+        if (self.headers.get("User-Agent") or "").startswith("ureq") and self.headers.get("Accept-Language"):
+            ACCEPT_LANGUAGE["last"] = self.headers.get("Accept-Language")
         if self.refused("GET"):
+            return
+        if USER["Policy"].get("IsAdministrator") and self.dashboard_get(lower, q):
             return
         match = re.fullmatch(r"/items/([0-9a-f]{32})/images/(\w+)(/\d+)?", lower)
         if match and match[1] in PERSONS:
@@ -525,10 +750,24 @@ class Handler(BaseHTTPRequestHandler):
             elif (q.get("parentId") or q.get("ParentId")):
                 COUNTS["LibraryPages"] += 1
             return self.send(200, page(found, q))
+        # Studios, Included in and Upcoming (see `studios_of`).
+        if lower == "/studios":
+            return self.send(200, page(studios_of(q), q))
+        match = re.fullmatch(r"/items/([0-9a-f]{32})/collections", lower)
+        if match:
+            return self.send(200, page(collections_holding(match[1]), q))
+        if lower == "/shows/upcoming":
+            return self.send(200, page(upcoming_episodes(), q))
+        match = re.fullmatch(r"(?:/users/[^/]+)?/items/([0-9a-f]{32})", lower)
+        studio = match and next((s for s in STUDIO_NAMES if studio_ref(s)["Id"] == match[1]), None)
+        if studio:
+            return self.send(200, dict(studio_ref(studio), Type="Studio", ServerId=SERVER_ID, ImageTags={}))
         if lower == "/persons":
             text = (q.get("searchTerm") or [""])[0].lower()
             found = [p for p in PERSONS.values() if text in p["Name"].lower()]
             return self.send(200, {"Items": found, "TotalRecordCount": len(found)})
+        if lower == "/items/filters2":
+            return self.send(200, filters2(q))
         if lower in ("/genres", "/years"):
             # The genres or the years of a library's (or every) film and show.
             parent = (q.get("parentId") or [""])[0]
@@ -549,6 +788,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, PERSONS[match[1]])
         if match:
             item = ITEMS.get(match[1])
+            if item and item["Id"] in VERSIONED:
+                return self.send(200, dict(public(item), MediaSources=version_sources(item["Id"])))
             if item and os.environ.get("BLOOM_MOCK_CLIP") and item["Type"] in ("Movie", "Episode"):
                 # With a clip, the streams a detail page offers: two audio
                 # tracks and the subtitle file of PlaybackInfo.
@@ -674,6 +915,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.mock_control("POST", lower, body)
         if self.refused("POST"):
             return
+        if USER["Policy"].get("IsAdministrator") and self.dashboard_post(lower, body):
+            return
         # The test's hand on the socket (BLOOM_MOCK_SOCKET): the body, a
         # {"MessageType", "Data"} message, goes to every open socket.
         if lower == "/mock/socket" and os.environ.get("BLOOM_MOCK_SOCKET") == "1":
@@ -704,6 +947,8 @@ class Handler(BaseHTTPRequestHandler):
         # answers PlaybackInfo for a file it plays as it is, with one
         # subtitle file beside it. Without a clip, a play fails as before.
         match = re.fullmatch(r"/items/([0-9a-f]{32})/playbackinfo", lower)
+        if match and match[1] in VERSIONED and os.environ.get("BLOOM_MOCK_CLIP"):
+            return self.send(200, version_playback(match[1], body))
         if match and match[1] in ITEMS and os.environ.get("BLOOM_MOCK_CLIP"):
             item = match[1]
             return self.send(200, {
@@ -856,6 +1101,186 @@ def enhanced_post(self, lower, body):
     return self.send(204)
 
 
+# The server's dashboard, for the dashboard's tests (BLOOM_MOCK_ADMIN=1, or
+# POST /mock/admin?on=1 before the app signs in): the user is an
+# administrator, and the mock serves the backups (a list, Create, the
+# manifest, Restore, which restarts nothing), a server log that grows by a
+# line a second, and an activity log of 300 entries with the server's
+# filters and sort (12.0: type and username match a part, severity is
+# exact). POST /mock/admin?scan=1 makes the library scan run (the backup
+# warning); GET /mock/dashboard tells what was created and restored.
+DASH_START = datetime.now(timezone.utc)
+DASH = {"backups": [], "created": 0, "restored": [], "scan": False}
+DASH_USERS = [(USER_ID, USER_NAME), ("u2", "alex")]
+DASH_NOBODY = "00000000000000000000000000000000"
+
+
+def dash_stamp(when):
+    return when.strftime("%Y-%m-%dT%H:%M:%S.%f0Z")
+
+
+def dash_backup(when, metadata, version="10.11.0.0"):
+    name = "jellyfin-backup-" + when.strftime("%Y%m%d%H%M%S") + ".zip"
+    return {"ServerVersion": version, "BackupEngineVersion": "0.2.0", "DateCreated": dash_stamp(when),
+            "Path": "/config/data/backups/" + name,
+            "Options": {"Metadata": metadata, "Trickplay": False, "Subtitles": metadata, "Database": True}}
+
+
+def dash_reset():
+    DASH["backups"] = [dash_backup(DASH_START - timedelta(days=9, hours=3), True),
+                       dash_backup(DASH_START - timedelta(days=2, hours=5), False)]
+    DASH["created"] = 0
+    DASH["restored"] = []
+    DASH["scan"] = False
+
+
+def dash_log_text():
+    """The server log: 40 lines from the start, then one a second."""
+    count = 40 + int((datetime.now(timezone.utc) - DASH_START).total_seconds())
+    lines = []
+    for n in range(count):
+        when = DASH_START + timedelta(seconds=n - 40)
+        level, text = "INF", f"Mock.Server: tick {n}, all is well"
+        if n % 13 == 5:
+            level, text = "WRN", f"Mock.Library: slow scan of folder {n}"
+        if n % 29 == 11:
+            level, text = "ERR", f"Mock.Transcode: ffmpeg exited with code 1 (line {n})"
+        lines.append(f"[{when.strftime('%Y-%m-%d %H:%M:%S.%f')[:23]} +00:00] [{level}] [{n % 40}] {text}\n")
+    return "".join(lines)
+
+
+DASH_LOG = "log_" + DASH_START.strftime("%Y%m%d") + ".log"
+DASH_FFMPEG = "FFmpeg.Transcode-" + DASH_START.strftime("%Y-%m-%d_%H-%M-%S") + "_mock.log"
+DASH_FFMPEG_TEXT = "".join(f"[libx264 @ 0x5581e0a3b2c0] frame={n * 24} fps=48 q=28.0\n" for n in range(60))
+
+
+def dash_activity():
+    """300 entries over the last 40 days, the newest first."""
+    kinds = [("SessionStarted", "Information", True, "{u} is online from Mock TV"),
+             ("AuthenticationSucceeded", "Information", True, "{u} successfully authenticated"),
+             ("VideoPlayback", "Information", True, "{u} is playing The Long Harbour on Mock TV"),
+             ("VideoPlaybackStopped", "Information", True, "{u} has finished playing The Long Harbour on Mock TV"),
+             ("AuthenticationFailed", "Error", False, "Failed login try from mallory"),
+             ("PluginUpdated", "Information", False, "Mock Plugin was updated to version 2.1"),
+             ("SubtitleDownloadFailure", "Warning", False, "Subtitles failed to download for Glass Weather"),
+             ("SessionEnded", "Information", True, "{u} has disconnected from Mock TV")]
+    entries = []
+    for n in range(300):
+        kind, severity, has_user, name = kinds[n % len(kinds)]
+        uid, uname = DASH_USERS[(n // len(kinds)) % 2] if has_user else (DASH_NOBODY, "")
+        when = DASH_START - timedelta(minutes=n * 190 + 3)
+        entries.append({"Id": 1000 - n, "Name": name.format(u=uname), "ShortOverview": "IP address: 10.0.0.7",
+                        "Type": kind, "Date": dash_stamp(when), "UserId": uid, "Severity": severity,
+                        "Username": uname})
+    return entries
+
+
+def dash_activity_page(q):
+    q = {k.lower(): v[0] for k, v in q.items()}
+    found = dash_activity()
+    if q.get("type"):
+        found = [e for e in found if q["type"].lower() in e["Type"].lower()]
+    if q.get("username"):
+        found = [e for e in found if q["username"].lower() in e["Username"].lower()]
+    if q.get("severity"):
+        found = [e for e in found if e["Severity"] == q["severity"]]
+    if q.get("hasuserid") in ("true", "false"):
+        want = q["hasuserid"] == "true"
+        found = [e for e in found if (e["UserId"] != DASH_NOBODY) == want]
+    if q.get("mindate"):
+        found = [e for e in found if e["Date"][:19] >= q["mindate"][:19]]
+    if q.get("sortorder", "").lower() == "ascending":
+        found.reverse()
+    start, limit = int(q.get("startindex") or 0), int(q.get("limit") or 100)
+    items = [{k: v for k, v in e.items() if k != "Username"} for e in found[start:start + limit]]
+    return {"Items": items, "TotalRecordCount": len(found), "StartIndex": start}
+
+
+def dashboard_control(self, method):
+    q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+    if method == "POST":
+        if "on" in q:
+            USER["Policy"]["IsAdministrator"] = q["on"] == "1"
+        if "scan" in q:
+            DASH["scan"] = q["scan"] == "1"
+        return self.send(204)
+    return self.send(200, {"Admin": USER["Policy"].get("IsAdministrator", False), "Created": DASH["created"],
+                           "Restored": DASH["restored"], "Backups": len(DASH["backups"])})
+
+
+def dashboard_get(self, lower, q):
+    """True when the dashboard answered."""
+    if lower == "/backup":
+        self.send(200, sorted(DASH["backups"], key=lambda b: b["DateCreated"], reverse=True))
+        return True
+    if lower == "/backup/manifest":
+        name = (q.get("path") or [""])[0].rsplit("/", 1)[-1]
+        found = next((b for b in DASH["backups"] if b["Path"].endswith("/" + name)), None)
+        self.send(200, found) if found else self.send(404)
+        return True
+    if lower == "/system/logs":
+        text = dash_log_text()
+        self.send(200, [{"Name": DASH_LOG, "Size": len(text.encode()), "DateCreated": dash_stamp(DASH_START),
+                         "DateModified": utc_now()},
+                        {"Name": DASH_FFMPEG, "Size": len(DASH_FFMPEG_TEXT), "DateCreated": dash_stamp(DASH_START),
+                         "DateModified": dash_stamp(DASH_START)}])
+        return True
+    if lower == "/system/logs/log":
+        name = (q.get("name") or [""])[0]
+        text = dash_log_text() if name == DASH_LOG else DASH_FFMPEG_TEXT if name == DASH_FFMPEG else None
+        # As Jellyfin 12: a Range header gets the whole file (200).
+        if text is None:
+            self.send(404)
+        else:
+            self.send(200, text.encode(), "text/plain; charset=utf-8")
+        return True
+    if lower == "/system/activitylog/entries":
+        self.send(200, dash_activity_page(q))
+        return True
+    if lower == "/users":
+        self.send(200, [{"Id": uid, "Name": name, "Policy": {"IsAdministrator": uid == USER_ID}}
+                        for uid, name in DASH_USERS])
+        return True
+    if lower == "/scheduledtasks":
+        self.send(200, [{"Id": "scan", "Key": "RefreshLibrary", "Name": "Scan Media Library", "Category": "Library",
+                         "State": "Running" if DASH["scan"] else "Idle", "Triggers": [],
+                         "CurrentProgressPercentage": 42.0 if DASH["scan"] else None}])
+        return True
+    return False
+
+
+def dashboard_post(self, lower, body):
+    """True when the dashboard answered."""
+    if lower == "/backup/create":
+        options = json.loads(body or b"{}")
+        backup = dash_backup(datetime.now(timezone.utc), False)
+        backup["Options"] = {k: bool(options.get(k, k == "Database"))
+                             for k in ("Metadata", "Trickplay", "Subtitles", "Database")}
+        DASH["backups"].append(backup)
+        DASH["created"] += 1
+        print(f"mock-jellyfin: backup created {backup['Path']}", file=sys.stderr, flush=True)
+        self.send(200, backup)
+        return True
+    if lower == "/backup/restore":
+        name = json.loads(body or b"{}").get("ArchiveFileName", "").rsplit("/", 1)[-1]
+        if not any(b["Path"].endswith("/" + name) for b in DASH["backups"]):
+            self.send(404)
+            return True
+        DASH["restored"].append(name)
+        print(f"mock-jellyfin: restore scheduled {name} (nothing restarts)", file=sys.stderr, flush=True)
+        self.send(204)
+        return True
+    return False
+
+
+dash_reset()
+Handler.dashboard_get = dashboard_get
+Handler.dashboard_post = dashboard_post
+Handler.dashboard_control = dashboard_control
+if os.environ.get("BLOOM_MOCK_ADMIN") == "1":
+    USER["Policy"]["IsAdministrator"] = True
+
+
 # The state at the start, for POST /mock/reset: each test starts from it,
 # whatever the test before it saved, hid, made or played.
 INITIAL = copy.deepcopy({"items": ITEMS, "order": ORDER, "playlists": PLAYLISTS, "user": USER,
@@ -870,11 +1295,13 @@ def reset():
         live.update(start[key])
     ORDER[:] = start["order"]
     REMOTE.clear()
+    PLAYBACK_ASKS.clear()
     for key in COUNTS:
         COUNTS[key] = 0
     QUICK["polls"] = 0
     FRESH["on"] = False
     SEARCH_GATE.set()
+    dash_reset()
 
 
 Handler.enhanced_get = enhanced_get

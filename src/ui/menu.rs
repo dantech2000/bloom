@@ -228,6 +228,13 @@ impl MenuState {
             cx.notify();
         }
     }
+    /// Closes with the focus left where it is, for a caller with no
+    /// window at hand (the player's poll).
+    pub fn shut(&mut self, cx: &mut Context<Self>) {
+        self.open = false;
+        self.path.clear();
+        cx.notify();
+    }
     /// Closes and optionally restores the prior context focus or menu trigger.
     pub fn close(&mut self, restore: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.open = false;

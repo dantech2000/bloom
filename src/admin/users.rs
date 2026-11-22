@@ -36,8 +36,6 @@ pub struct User {
     #[serde(default)]
     pub primary_image_tag: Option<String>,
     #[serde(default)]
-    pub has_password: bool,
-    #[serde(default)]
     pub last_login_date: Option<String>,
     #[serde(default)]
     pub last_activity_date: Option<String>,
@@ -117,7 +115,6 @@ fn render_list(app: &Bloom, data: &Data, session: &crate::app::Session, cx: &mut
 
     let admins = data.users.iter().filter(|u| u.is_admin()).count();
     let disabled = data.users.iter().filter(|u| u.is_disabled()).count();
-    let open = data.users.iter().filter(|u| !u.has_password).count();
 
     let query = app.admin_users_filter.read(cx).value().trim().to_lowercase();
     let shown: Vec<&Arc<User>> = data
@@ -135,11 +132,10 @@ fn render_list(app: &Bloom, data: &Data, session: &crate::app::Session, cx: &mut
                 .text_size(px(13.))
                 .text_color(t.colors.foreground.opacity(0.6))
                 .child(format!(
-                    "{} users · {} administrators · {} disabled · {} without password",
+                    "{} users · {} administrators · {} disabled",
                     data.users.len(),
                     admins,
                     disabled,
-                    open
                 )),
         );
     } else {
@@ -151,7 +147,6 @@ fn render_list(app: &Bloom, data: &Data, session: &crate::app::Session, cx: &mut
                 .child(stat(LucideIcon::Users, "Users", data.users.len(), cx))
                 .child(stat(LucideIcon::ShieldCheck, "Administrators", admins, cx))
                 .child(stat(LucideIcon::Ban, "Disabled", disabled, cx))
-                .child(stat(LucideIcon::LockOpen, "Without password", open, cx))
                 .child(div().flex_1())
                 .child(
                     div().h(px(56.)).flex().items_center().child(
@@ -337,13 +332,9 @@ fn render_user(app: &Bloom, user: &Arc<User>, session: &crate::app::Session, cx:
                 .flex_col()
                 .child(fact("Last active", seen(&user.last_activity_date), false))
                 .child(hairline())
-                .child(fact("Last login", seen(&user.last_login_date), false))
-                .child(hairline())
-                .child(if user.has_password {
-                    fact("Password", "Set".to_string(), false)
-                } else {
-                    fact("Password", "No password".to_string(), true)
-                }),
+                // No line for the password: Jellyfin 12 sends `HasPassword`
+                // as true for every user, with or without one.
+                .child(fact("Last login", seen(&user.last_login_date), false)),
         );
 
     let mut actions = div().relative().flex().flex_col().child({

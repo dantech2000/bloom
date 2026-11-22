@@ -16,7 +16,6 @@ final class ServerPrefs {
     enum Load: Equatable { case idle, loading, loaded, failed(String) }
 
     private(set) var load: Load = .idle
-    private(set) var hasPassword = true
     private(set) var isAdmin = false
     private(set) var canCollect = false
     private(set) var canDownload = true
@@ -58,7 +57,6 @@ final class ServerPrefs {
             let display = Self.object(prefs.displayJson)
             current = [.configuration: configuration, .display: display]
             acknowledged = current
-            hasPassword = prefs.hasPassword
             isAdmin = prefs.isAdmin
             canCollect = prefs.canCollect
             canDownload = prefs.canDownload
@@ -104,6 +102,10 @@ final class ServerPrefs {
     }
 
     var upNextCard: Bool { custom("enableNextVideoInfoOverlay") != "false" }
+
+    /// When the player asks "Are you still watching?" (the web's key and
+    /// values; core's rule, as on the Mac).
+    var stillWatching: StillWatchingChoice { stillWatchingChoice(value: custom(stillWatchingKey())) }
 
     // MARK: Changing
 
